@@ -27,7 +27,6 @@ class MultiLeafState:
     leaves_threaded: Tuple[int, ...]
     current_focal_leaf: Optional[int]
     inner_state: Optional[ThreadPathState]
-    accumulated_log_score: float
 
 @dataclass(frozen=True)
 class ThreadingConfig:
@@ -61,7 +60,6 @@ class BackboneSegment:
     leaf_ids: Tuple[int, ...]
     node_sample_ids: Tuple[int, ...]
 
-
 @dataclass(frozen=True)
 class SiteBackboneTree:
     site: int
@@ -74,7 +72,6 @@ class SiteBackboneTree:
     parent_of_child: Tuple[int, ...]
     node_sample_ids: Tuple[int, ...]
     descendant_signatures: Tuple[Tuple[int, ...], ...]
-
 
 def _thread_leaf_into_site_tree_full(
     site_tree: SiteBackboneTree,
@@ -228,49 +225,6 @@ def compress_thread_path_to_segments(
             current_key = next_key
     segments.append({"start": start, "end": len(thread_path), "choice": current})
     return tuple(segments)
-
-
-def score_thread_path(env: "ARGweaverThreadEnv", thread_path: Sequence[ThreadChoice]) -> float:
-    if len(thread_path) != env.sequence_length:
-        raise ValueError("Thread path length must equal the environment sequence length")
-
-    first_idx = env.choice_to_index[0][thread_path[0]]
-    total = float(env.initial_logps[first_idx].item()) + float(env.emission_logps[0][first_idx].item())
-    prev_idx = first_idx
-    for site in range(1, env.sequence_length):
-        curr_idx = env.choice_to_index[site][thread_path[site]]
-        total += float(env.transition_logps[site - 1][prev_idx, curr_idx].item())
-        total += float(env.emission_logps[site][curr_idx].item())
-        prev_idx = curr_idx
-    return total
-
-def initial_log_probs(site_choices: Sequence[ThreadChoice]) -> torch.Tensor:
-    if len(site_choices) == 0:
-        raise ValueError("initial_log_probs requires at least one valid choice")
-    return torch.full((len(site_choices),), -math.log(len(site_choices)), dtype=torch.float32)
-
-def emission_log_probs(
-    site_tree: SiteBackboneTree,
-    choices: Sequence[ThreadChoice],
-    focal_leaf: int,
-    site_observation: torch.Tensor,
-    theta: float,
-) -> torch.Tensor:
-    emission_values = []
-    for choice in choices:
-        threaded = _thread_leaf_into_site_tree_full(site_tree, focal_leaf, choice)
-        emission_values.append(
-            _binary_site_log_likelihood(
-                threaded["edge_index"],
-                threaded["num_nodes"],
-                threaded["root"],
-                threaded["node_times"],
-                threaded["node_sample_ids"],
-                site_observation,
-                theta,
-            )
-        )
-    return torch.tensor(emission_values, dtype=torch.float32)
 
 def _canonical_choice(choice: ThreadChoice) -> tuple[int, int, tuple[int, ...]]:
     return choice.site, choice.branch_child, choice.branch_signature

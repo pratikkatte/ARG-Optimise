@@ -83,27 +83,6 @@ class ARGweaverThreadEnv:
         self.site_choices = tuple(enumerate_thread_choices(site_tree, self.config.time_grid) for site_tree in self.site_trees)
         self.choice_to_index = tuple({choice: idx for idx, choice in enumerate(choices)} for choices in self.site_choices)
 
-        self.initial_logps = initial_log_probs(self.site_choices[0])
-        self.emission_logps = tuple(
-            emission_log_probs(
-                site_tree,
-                choices,
-                self.focal_leaf,
-                self.config.geno[:, site_tree.site],
-                self.config.mutation_rate,
-            )
-            for site_tree, choices in zip(self.site_trees, self.site_choices)
-        )
-        self.transition_logps = tuple(
-            transition_log_probs(
-                self.site_choices[site - 1],
-                self.site_choices[site],
-                self.config.recomb_rate,
-                self.config.time_grid,
-            )
-            for site in range(1, self.config.sequence_length)
-        )
-
     @property
     def sequence_length(self):
         return self.config.sequence_length
@@ -161,8 +140,6 @@ class ARGweaverThreadEnv:
         branch_label = "root" if choice.is_root_branch else choice.branch_signature
         return f"site {choice.site} -> branch {branch_label} @ t{choice.time_idx}={choice.time_value:.2f} {tag}"
 
-    def thread_path_log_score(self, path: Sequence[ThreadChoice]) -> float:
-        return score_thread_path(self, path)
 
     def step(self, st: ThreadPathState, action_idx: int) -> tuple[ThreadPathState, float, bool]:
         if self.is_terminal(st):
@@ -181,8 +158,8 @@ class ARGweaverThreadEnv:
             recomb_count=recomb_count,
         )
         if self.is_terminal(next_state):
-            log_score = self.thread_path_log_score(next_state.choices)
-            reward = math.exp(self.config.reward_temperature * log_score)
+            # reward = math.exp(self.config.reward_temperature)
+            reward = 1.0
             return next_state, reward, True
         return next_state, 0.0, False
 
@@ -241,7 +218,6 @@ class MultiLeafThreadEnv:
             {"sites": tuple(seg["sites"]), "tree": seg["tree"]}
             for seg in reference_full_trees
         )
-
         self._inner_env: Optional[ARGweaverThreadEnv] = None
 
     @property
@@ -334,8 +310,7 @@ class MultiLeafThreadEnv:
             current_full_trees=self.reference_full_trees,
             leaves_threaded=(),
             current_focal_leaf=first_leaf,
-            inner_state=inner_state,
-            accumulated_log_score=0.0,
+            inner_state=inner_state
         )
 
     def is_terminal(self, st: MultiLeafState) -> bool:
@@ -365,16 +340,10 @@ class MultiLeafThreadEnv:
                     leaves_threaded=st.leaves_threaded,
                     current_focal_leaf=st.current_focal_leaf,
                     inner_state=inner_next,
-                    accumulated_log_score=st.accumulated_log_score,
                 ),
                 0.0,
                 False,
             )
-
-        leaf_log_score = self._inner_env.thread_path_log_score(
-            inner_next.choices
-        )
-        new_accumulated = st.accumulated_log_score + leaf_log_score
 
         new_full_trees = self._update_full_trees(
             st.current_full_trees,
@@ -386,14 +355,13 @@ class MultiLeafThreadEnv:
         new_leaves_threaded = st.leaves_threaded + (st.current_focal_leaf,)
 
         if len(new_leaves_threaded) == self.num_leaves:
-            reward = math.exp(self.config.reward_temperature * new_accumulated)
+            reward = 1.0
             return (
                 MultiLeafState(
                     current_full_trees=new_full_trees,
                     leaves_threaded=new_leaves_threaded,
                     current_focal_leaf=None,
-                    inner_state=None,
-                    accumulated_log_score=new_accumulated,
+                    inner_state=None
                 ),
                 reward,
                 True,
@@ -410,7 +378,6 @@ class MultiLeafThreadEnv:
                 leaves_threaded=new_leaves_threaded,
                 current_focal_leaf=next_leaf,
                 inner_state=new_inner_state,
-                accumulated_log_score=new_accumulated,
             ),
             0.0,
             False,
