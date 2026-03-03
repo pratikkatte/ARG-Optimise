@@ -408,10 +408,85 @@ def expand_backbone_segments(
         raise ValueError(f"Backbone segments do not cover sites: {missing}")
     return [site_tree for site_tree in site_trees if site_tree is not None]
 
+def get_max_actions(num_backbone_lineages: int, time_grid: Sequence[float]) -> int:
+    """
+    Calculates the absolute theoretical upper bound of mathematical actions 
+    if no lineages ever coalesced until the final time point.
+    """
+    num_grid_points = sum(1 for t in time_grid if t > 0)
+    return num_backbone_lineages * num_grid_points
+
+def get_mathematically_valid_actions(backbone_edges: list[dict], time_grid: Sequence[float]) -> list[tuple]:
+    """
+    Iterates through the actual backbone_edges.
+    Finds every valid intersection where a time point t from the time_grid falls strictly 
+    within the edge's lifespan: start_time < t <= end_time.
+    Returns a list of all valid (edge_id, t) tuples.
+    """
+    valid_actions = []
+    for edge in backbone_edges:
+        edge_id = edge["edge_id"]
+        start_time = edge["start_time"]
+        end_time = edge["end_time"]
+        for t in time_grid:
+            if start_time < t <= end_time:
+                valid_actions.append((edge_id, t))
+    return valid_actions
+
+def get_distinct_topological_outcomes(mathematical_actions: list[tuple], backbone_edges: list[dict]) -> list[tuple]:
+    """
+    Takes the mathematical actions and collapses them based on topological equivalence.
+    Logic: If two or more edges share the exact same end_time (e.g., t = 1.0) AND 
+    merge into the exact same target_node_at_end, then regrafting the pruned lineage 
+    onto *any* of those edges at t = 1.0 results in the exact same polytomy.
+    
+    Returns a list of distinct actions (states/choices).
+    """
+    edge_id_to_target = {e["edge_id"]: e["target_node_at_end"] for e in backbone_edges}
+    edge_id_to_end_time = {e["edge_id"]: e["end_time"] for e in backbone_edges}
+    
+    seen_polytomies = set()
+    distinct_actions = []
+    
+    for edge_id, t in mathematical_actions:
+        end_time = edge_id_to_end_time[edge_id]
+        target_node = edge_id_to_target[edge_id]
+        
+        if math.isclose(t, end_time) and target_node is not None:
+            polytomy_signature = (t, target_node)
+            if polytomy_signature not in seen_polytomies:
+                seen_polytomies.add(polytomy_signature)
+                distinct_actions.append((edge_id, t))
+        else:
+            distinct_actions.append((edge_id, t))
+            
+    return distinct_actions
+
 def enumerate_thread_choices(
     site_tree: SiteBackboneTree,
     time_grid: Sequence[float],
 ) -> tuple[ThreadChoice, ...]:
+    backbone_edges = []
+    for branch_child in site_tree.branch_children:
+        parent = site_tree.parent_of_child[branch_child]
+        backbone_edges.append({
+            "edge_id": branch_child,
+            "start_time": float(site_tree.node_times[branch_child].item()),
+            "end_time": float(site_tree.node_times[parent].item()),
+            "target_node_at_end": parent
+        })
+        
+    backbone_edges.append({
+        "edge_id": site_tree.root,
+        "start_time": float(site_tree.node_times[site_tree.root].item()),
+        "end_time": float('inf'),
+        "target_node_at_end": None
+    })
+    
+    math_actions = get_mathematically_valid_actions(backbone_edges, list(time_grid))
+    distinct_actions = get_distinct_topological_outcomes(math_actions, backbone_edges)
+    distinct_set = set(distinct_actions)
+
     choices: list[ThreadChoice] = []
     for branch_child, branch_signature in zip(site_tree.branch_children, site_tree.branch_signatures):
         parent = site_tree.parent_of_child[branch_child]
@@ -419,30 +494,32 @@ def enumerate_thread_choices(
         parent_time = float(site_tree.node_times[parent].item())
         for time_idx, time_value in enumerate(time_grid):
             if child_time < float(time_value) <= parent_time:
-                choices.append(
-                    ThreadChoice(
-                        site=site_tree.site,
-                        branch_child=branch_child,
-                        branch_signature=branch_signature,
-                        time_idx=time_idx,
-                        time_value=float(time_value),
-                        is_root_branch=False,
+                if (branch_child, float(time_value)) in distinct_set:
+                    choices.append(
+                        ThreadChoice(
+                            site=site_tree.site,
+                            branch_child=branch_child,
+                            branch_signature=branch_signature,
+                            time_idx=time_idx,
+                            time_value=float(time_value),
+                            is_root_branch=False,
+                        )
                     )
-                )
 
     root_signature = site_tree.descendant_signatures[site_tree.root]
     root_time = float(site_tree.node_times[site_tree.root].item())
     for time_idx, time_value in enumerate(time_grid):
         if float(time_value) > root_time:
-            choices.append(
-                ThreadChoice(
-                    site=site_tree.site,
-                    branch_child=site_tree.root,
-                    branch_signature=root_signature,
-                    time_idx=time_idx,
-                    time_value=float(time_value),
-                    is_root_branch=True,
+            if (site_tree.root, float(time_value)) in distinct_set:
+                choices.append(
+                    ThreadChoice(
+                        site=site_tree.site,
+                        branch_child=site_tree.root,
+                        branch_signature=root_signature,
+                        time_idx=time_idx,
+                        time_value=float(time_value),
+                        is_root_branch=True,
+                    )
                 )
-            )
     return tuple(choices)
 

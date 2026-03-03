@@ -6,7 +6,7 @@ import math
 import random
 
 def _canonical_choice(choice: ThreadChoice) -> tuple[int, int, tuple[int, ...]]:
-    return choice.site, choice.branch_child, choice.branch_signature
+    return choice.branch_child, choice.branch_signature
 
 def _thread_leaf_into_site_tree_full(
     site_tree: SiteBackboneTree,
@@ -117,7 +117,7 @@ class ARGweaverThreadEnv:
         if self.is_terminal(st):
             return []
         return list(range(len(self.site_choices[st.site_index])))
-
+        
     def _site_tree_for_encoding(self, st: ThreadPathState) -> SiteBackboneTree:
         if self.is_terminal(st):
             return self.site_trees[-1]
@@ -131,13 +131,22 @@ class ARGweaverThreadEnv:
         """
         NotImplemented
 
-    def describe_action(self, st: ThreadPathState, action_idx: int) -> str:
+    def describe_action(self, st: ThreadPathState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
         choice = self.site_choices[st.site_index][action_idx]
         if st.choices:
             tag = "[recomb]" if _canonical_choice(choice) != _canonical_choice(st.choices[-1]) else "[stay]"
         else:
             tag = "[start]"
-        branch_label = "root" if choice.is_root_branch else choice.branch_signature
+            
+        if choice.is_root_branch:
+            branch_label = "root"
+        elif leaf_names:
+            branch_label = "(" + ",".join(
+                leaf_names[s] if s < len(leaf_names) else str(s) for s in choice.branch_signature
+            ) + ")"
+        else:
+            branch_label = str(choice.branch_signature)
+            
         return f"site {choice.site} -> branch {branch_label} @ t{choice.time_idx}={choice.time_value:.2f} {tag}"
 
 
@@ -388,10 +397,11 @@ class MultiLeafThreadEnv:
         """
         NotImplemented
 
-    def describe_action(self, st: MultiLeafState, action_idx: int) -> str:
+    def describe_action(self, st: MultiLeafState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
         assert self._inner_env is not None and st.inner_state is not None
-        desc = self._inner_env.describe_action(st.inner_state, action_idx)
-        return f"[leaf {st.current_focal_leaf}] {desc}"
+        desc = self._inner_env.describe_action(st.inner_state, action_idx, leaf_names=leaf_names)
+        focal = leaf_names[st.current_focal_leaf] if leaf_names and st.current_focal_leaf < len(leaf_names) else st.current_focal_leaf
+        return f"[leaf {focal}] {desc}"
 
     def reconstruct_all_local_trees(
         self, st: MultiLeafState
