@@ -338,10 +338,12 @@ class MultiLeafThreadEnv:
             raise RuntimeError("Cannot step a terminal state")
         assert self._inner_env is not None and st.inner_state is not None
 
+        ## This does one site action for the current focal leaf.
         inner_next, inner_reward, inner_done = self._inner_env.step(
             st.inner_state, action_idx
         )
 
+        
         if not inner_done:
             return (
                 MultiLeafState(
