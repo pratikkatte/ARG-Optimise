@@ -8,7 +8,7 @@ class TreeMPNN(nn.Module):
         super().__init__()
         self.node_embed = nn.Linear(node_feature_dim, hidden_dim)
         
-        # Message passing layers
+        # Message passing layers for aggregating sequence info (Bottom-Up)
         self.bottom_up_mp = GATv2Conv(hidden_dim, hidden_dim, add_self_loops=False)
         self.top_down_mp = GATv2Conv(hidden_dim, hidden_dim, add_self_loops=False)
         
@@ -39,6 +39,8 @@ class TreeMPNN(nn.Module):
             return torch.empty((0, 1), device=x.device)
             
         # Node Embedding
+        # The node features x[:, 4:] contain the genotype strings initialized to 0s for internal nodes.
+        # GAT should help propagate leaf genotypes to internal nodes.
         h = self.node_embed(x)
         
         # Create bottom-up edges (child -> parent)
@@ -52,7 +54,7 @@ class TreeMPNN(nn.Module):
         h_td = self.top_down_mp(h, edge_index)
         h = h + torch.relu(h_td)
         
-        # Context embedding
+        # Context embedding (using sequence embedder)
         context = self.seq_embed(focal_seq) # [1, hidden_dim]
         
         # Compute action logits

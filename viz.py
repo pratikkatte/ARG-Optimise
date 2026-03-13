@@ -174,22 +174,39 @@ def draw_local_tree_sequence(
         fig.suptitle(title)
         
     for ax, tree in zip(axes, tree_sequence):
-        start = _read_attr(tree, "start")
-        end = _read_attr(tree, "end")
-        choice = _read_attr(tree, "choice")
+        # Handle dict wrapping a tree tuple
+        if isinstance(tree, dict) and "tree" in tree and isinstance(tree["tree"], tuple):
+            from utils import _timed_tree_to_graph_full
+            edge_index, num_nodes, root, node_times, node_sample_ids = _timed_tree_to_graph_full(tree["tree"])
+            state = {
+                "start": tree.get("sites", (None, None))[0],
+                "end": tree.get("sites", (None, None))[1],
+                "edge_index": edge_index,
+                "num_nodes": num_nodes,
+                "root": root,
+                "node_times": node_times,
+                "node_sample_ids": node_sample_ids
+            }
+        else:
+            state = tree
+            
+        start = _read_attr(state, "start")
+        end = _read_attr(state, "end")
+        choice = _read_attr(state, "choice")
         interval = f"sites [{start}:{end})" if start is not None and end is not None else ""
         if choice is not None:
             branch_label = "root" if getattr(choice, "is_root_branch", False) else getattr(choice, "branch_signature", "")
             interval = f"{interval}\nbranch {branch_label} @ t{choice.time_idx}"
      
         draw_tree_edge_index(
-            tree,
+            state,
             leaf_names=leaf_names,
             ax=ax,
             title=interval,
             use_time_as_y=use_time_as_y,
             time_grid=time_grid
         )
+
 
     fig.tight_layout(rect=(0, 0, 1, 0.9))
     plt.show()

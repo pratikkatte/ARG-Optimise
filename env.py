@@ -5,7 +5,6 @@ from utils import _canonical_choice
 import math
 import random
 import torch
-from torch_geometric.data import Data
 
 def _canonical_choice(choice: ThreadChoice) -> tuple[int, int, tuple[int, ...]]:
     return choice.branch_child, choice.branch_signature
@@ -128,11 +127,12 @@ class ARGweaverThreadEnv:
     def _prev_choice(self, st: ThreadPathState) -> Optional[ThreadChoice]:
         return st.choices[-1] if st.choices else None
 
-    def encode(self, st: ThreadPathState, window_size: int = 5) -> Data:
+    def encode(self, st: ThreadPathState, window_size: int = 5):
         """
         Encode the current state into a PyG Data object.
         Includes a window of genotypes around the current site.
         """
+        from torch_geometric.data import Data  # Lazy import to avoid circular import in torch_geometric
         site_tree = self._site_tree_for_encoding(st)
         
         # 1. Edge Index
