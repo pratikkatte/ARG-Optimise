@@ -127,89 +127,10 @@ class ARGweaverThreadEnv:
     def _prev_choice(self, st: ThreadPathState) -> Optional[ThreadChoice]:
         return st.choices[-1] if st.choices else None
 
-    def encode(self, st: ThreadPathState, window_size: int = 5):
+    def encode(self):
         """
-        Encode the current state into a PyG Data object.
-        Includes a window of genotypes around the current site.
         """
-        from torch_geometric.data import Data  # Lazy import to avoid circular import in torch_geometric
-        site_tree = self._site_tree_for_encoding(st)
-        
-        # 1. Edge Index
-        edge_index = site_tree.edge_index
-        
-        # 2. Node Features (Time, Type, Genotype Window)
-        num_nodes = site_tree.num_nodes
-        node_times = site_tree.node_times.unsqueeze(1) # [N, 1]
-        
-        # Node Type: 0 for leaf, 1 for internal, 2 for root
-        node_types = torch.zeros(num_nodes, dtype=torch.long)
-        # Leaves are 0..len(site_tree.node_sample_ids)-1 where id != -1
-        # Actually in site_tree, typically leaves are at the beginning
-        # We can find leaves by checking out-degree == 0
-        out_degree = torch.bincount(edge_index[0], minlength=num_nodes)
-        node_types[out_degree > 0] = 1 # Internal
-        node_types[site_tree.root] = 2 # Root
-        node_types_one_hot = torch.nn.functional.one_hot(node_types, num_classes=3).float()
-        
-        # Genotype Window
-        seq_len = self.config.sequence_length
-        start_idx = max(0, st.site_index - window_size)
-        end_idx = min(seq_len, st.site_index + window_size + 1)
-        
-        # Pad if near edges
-        pad_left = max(0, window_size - st.site_index)
-        pad_right = max(0, (st.site_index + window_size + 1) - seq_len)
-        
-        # Extract window
-        geno_window = self.config.geno[:, start_idx:end_idx].clone() # [num_samples, actual_window_len]
-        
-        if pad_left > 0 or pad_right > 0:
-            geno_window = torch.nn.functional.pad(geno_window, (pad_left, pad_right), value=-1) # -1 for padding/missing
-            
-        # Map genotypes to nodes. For internal nodes, we just use zeros (to be imputed by GNN)
-        node_genos = torch.zeros(num_nodes, window_size * 2 + 1, dtype=torch.float32)
-        for i, sample_id in enumerate(site_tree.node_sample_ids):
-            if sample_id != -1:
-                node_genos[i] = geno_window[sample_id].float()
-                
-        node_features = torch.cat([node_times, node_types_one_hot, node_genos], dim=-1)
-        
-        # Focal Sequence
-        focal_seq = self.config.geno[self.focal_leaf, start_idx:end_idx].clone()
-        if pad_left > 0 or pad_right > 0:
-            focal_seq = torch.nn.functional.pad(focal_seq, (pad_left, pad_right), value=-1)
-        focal_seq = focal_seq.float().unsqueeze(0) # [1, window_size*2+1]
-        
-        # We also need focal sequence to have the same dim as node features for the context embedding
-        focal_node_features = torch.zeros(1, node_features.shape[1])
-        focal_node_features[0, 0] = 0.0 # time
-        focal_node_features[0, 1:4] = torch.tensor([1, 0, 0]) # type leaf
-        focal_node_features[0, 4:] = focal_seq
-        
-        
-        # Valid Actions Information
-        valid_acts = self.valid_actions(st)
-        valid_action_info = []
-        for action_idx in valid_acts:
-            choice = self.site_choices[st.site_index][action_idx]
-            parent = site_tree.parent_of_child[choice.branch_child] if not choice.is_root_branch else -1
-            valid_action_info.append({
-                'action_idx': action_idx,
-                'branch_child': choice.branch_child,
-                'branch_parent': parent,
-                'time_idx': choice.time_idx,
-                'time_value': choice.time_value
-            })
-            
-        data = Data(
-            x=node_features,
-            edge_index=edge_index,
-            focal_seq=focal_node_features,
-            valid_action_info=valid_action_info,
-            valid_action_indices=torch.tensor(valid_acts, dtype=torch.long)
-        )
-        return data
+        raise NotImplementedError("to encode data")
 
     def describe_action(self, st: ThreadPathState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
         choice = self.site_choices[st.site_index][action_idx]
@@ -474,12 +395,11 @@ class MultiLeafThreadEnv:
             False,
         )
 
-    def encode(self, st: MultiLeafState, window_size: int = 5):
-        """Encode the current state as a PyG Data object and feed it to the model.
+    def encode(self):
         """
-        if st.inner_state is None or self._inner_env is None:
-            return None
-        return self._inner_env.encode(st.inner_state, window_size)
+        """
+        raise NotImplementedError("This is outer env. To encode data")
+        
 
     def describe_action(self, st: MultiLeafState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
         assert self._inner_env is not None and st.inner_state is not None
