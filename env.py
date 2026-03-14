@@ -1,7 +1,7 @@
 from utils import ThreadingConfig, ThreadChoice, ThreadPathState, MultiLeafState, SiteBackboneTree, BackboneSegment
 from typing import Optional, Tuple, Sequence, Any, List, Dict
 from utils import *
-from utils import _canonical_choice
+from utils import _canonical_choice, _children_from_edge_index
 import math
 import random
 import torch
@@ -81,8 +81,6 @@ class ARGweaverThreadEnv:
         self.reference_full_trees = tuple(reference_full_trees or ())
 
         self.site_trees = tuple(expand_backbone_segments(self.backbone_segments, self.config.sequence_length))
-        self.site_choices = tuple(enumerate_thread_choices(site_tree, self.config.time_grid) for site_tree in self.site_trees)
-        self.choice_to_index = tuple({choice: idx for idx, choice in enumerate(choices)} for choices in self.site_choices)
 
     @property
     def sequence_length(self):
@@ -114,10 +112,44 @@ class ARGweaverThreadEnv:
     def is_terminal(self, st: ThreadPathState) -> bool:
         return st.site_index >= self.config.sequence_length
 
-    def valid_actions(self, st: ThreadPathState) -> list[int]:
+    def get_action_masks(self, st: ThreadPathState, target_node: Optional[int] = None) -> dict:
         if self.is_terminal(st):
-            return []
-        return list(range(len(self.site_choices[st.site_index])))
+            return {}
+
+        site_tree = self.site_trees[st.site_index]
+        if target_node is None:
+            node_mask = torch.zeros(site_tree.num_nodes, dtype=torch.bool)
+            for node in range(site_tree.num_nodes):
+                target_time = float(site_tree.node_times[node])
+                is_root = (node == site_tree.root)
+                if is_root:
+                    parent_time = float('inf')
+                else:
+                    parent = site_tree.parent_of_child[node]
+                    parent_time = float(site_tree.node_times[parent])
+                
+                # Check if there is any valid time in time_grid
+                for t in self.time_grid:
+                    if float(t) > target_time and (is_root or float(t) <= parent_time):
+                        node_mask[node] = True
+                        break
+            return {"target_node_mask": node_mask}
+            
+        time_mask = torch.zeros(len(self.time_grid), dtype=torch.bool)
+        target_time = float(site_tree.node_times[target_node])
+        is_root = (target_node == site_tree.root)
+        
+        if not is_root:
+            parent = site_tree.parent_of_child[target_node]
+            parent_time = float(site_tree.node_times[parent])
+        else:
+            parent_time = float('inf')
+            
+        for time_idx, t in enumerate(self.time_grid):
+            if float(t) > target_time and (is_root or float(t) <= parent_time):
+                time_mask[time_idx] = True
+                    
+        return {"time_mask": time_mask}
         
     def _site_tree_for_encoding(self, st: ThreadPathState) -> SiteBackboneTree:
         if self.is_terminal(st):
@@ -127,37 +159,185 @@ class ARGweaverThreadEnv:
     def _prev_choice(self, st: ThreadPathState) -> Optional[ThreadChoice]:
         return st.choices[-1] if st.choices else None
 
-    def encode(self):
+    def encode(self, st: ThreadPathState) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        Takes a local site tree and observed mutational states, and converts them into 
+        tensors formatted for a custom self-attention mechanism.
+        
+        Args:
+            site_tree: The local tree at a specific genomic site.
+            site_observation: The mutational states (alleles) for the samples.
+            
+        Returns:
+            X: (N, 4) tensor containing node features.
+            D: (N, N) tensor containing path distances between nodes.
+            A: (N, N) binary tensor where A[i, j] = 1 if i is an ancestor of j.
         """
-        raise NotImplementedError("to encode data")
+        site_tree = self._site_tree_for_encoding(st)
+        site_observation = self.geno[:, st.site_index]
 
-    def describe_action(self, st: ThreadPathState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
-        choice = self.site_choices[st.site_index][action_idx]
+        children = _children_from_edge_index(site_tree.edge_index, site_tree.num_nodes)
+        
+        # Post-Order Traversal & Feature Extraction
+        post_order_nodes = []
+        def postorder_traverse(node):
+            for child in children[node]:
+                postorder_traverse(child)
+            post_order_nodes.append(node)
+            
+        postorder_traverse(site_tree.root)
+        
+        # Fitch algorithm to determine internal node states and mutations
+        node_states = {}
+        for node in post_order_nodes:
+            sample_id = site_tree.node_sample_ids[node]
+            if sample_id >= 0:
+                # Leaf node: allele state
+                val = float(site_observation[sample_id].item())
+                node_states[node] = {val}
+            else:
+                # Internal node
+                kids = children[node]
+                if len(kids) == 0:
+                    node_states[node] = {0.0}
+                elif len(kids) == 1:
+                    node_states[node] = node_states[kids[0]].copy()
+                else:
+                    left_states = node_states[kids[0]]
+                    right_states = node_states[kids[1]]
+                    intersect = left_states.intersection(right_states)
+                    if intersect:
+                        node_states[node] = intersect
+                    else:
+                        node_states[node] = left_states.union(right_states)
+                        
+        resolved_states = {}
+        mut_above = {}
+        
+        def preorder_resolve(node, parent_state):
+            if parent_state in node_states[node]:
+                state = parent_state
+            else:
+                state = 0.0 if 0.0 in node_states[node] else list(node_states[node])[0]
+                
+            resolved_states[node] = state
+            if parent_state is not None and state != parent_state:
+                mut_above[node] = 1.0
+            else:
+                mut_above[node] = 0.0
+                
+            for child in children[node]:
+                preorder_resolve(child, state)
+                
+        # Start pre-order from root
+        root_state_choice = 0.0 if 0.0 in node_states[site_tree.root] else list(node_states[site_tree.root])[0]
+        preorder_resolve(site_tree.root, root_state_choice)
+        mut_above[site_tree.root] = 0.0
+
+        # Build feature matrix X
+        X_list = []
+        for node in post_order_nodes:
+            t_i = float(site_tree.node_times[node].item())
+            
+            parent = site_tree.parent_of_child[node]
+            b_i = 0.0 if parent == -1 else float(site_tree.node_times[parent].item()) - t_i
+            
+            # Count of leaf descendants below this node
+            n_i = float(len(site_tree.descendant_signatures[node]))
+            
+            # Mutational state: sample allele state for leaves, mutation on branch for internal nodes
+            sample_id = site_tree.node_sample_ids[node]
+            m_i = resolved_states[node] if sample_id >= 0 else mut_above[node]
+                
+            X_list.append([t_i, b_i, n_i, m_i])
+            
+        X = torch.tensor(X_list, dtype=torch.float32)
+        
+        # Relative Tree Positional Encodings
+        N = len(post_order_nodes)
+        node_to_idx = {node: idx for idx, node in enumerate(post_order_nodes)}
+        
+        # Build undirected adjacency list for shortest path distance computing
+        adj = {i: [] for i in range(site_tree.num_nodes)}
+        for node in range(site_tree.num_nodes):
+            for child in children[node]:
+                adj[node].append(child)
+                adj[child].append(node)
+                
+        # Calculate D: Path Distance Matrix
+        D = torch.zeros((N, N), dtype=torch.float32)
+        for i, node in enumerate(post_order_nodes):
+            dist = {node: 0}
+            queue = [node]
+            while queue:
+                curr = queue.pop(0)
+                d = dist[curr]
+                for nxt in adj.get(curr, []):
+                    if nxt not in dist:
+                        dist[nxt] = d + 1
+                        queue.append(nxt)
+                        
+            for j_node, d in dist.items():
+                if j_node in node_to_idx:
+                    D[i, node_to_idx[j_node]] = d
+                    
+        # Calculate A: Ancestry Matrix
+        A = torch.zeros((N, N), dtype=torch.float32)
+        for j_idx, node in enumerate(post_order_nodes):
+            curr = site_tree.parent_of_child[node]
+            while curr != -1:
+                if curr in node_to_idx:
+                    i_idx = node_to_idx[curr]
+                    A[i_idx, j_idx] = 1.0
+                curr = site_tree.parent_of_child[curr]
+                
+        return X, D, A
+
+    def describe_action(self, st: ThreadPathState, action: tuple[int, int], leaf_names: Optional[Sequence[str]] = None) -> str:
+        target_node, time_idx = action
+        site_tree = self.site_trees[st.site_index]
+        is_root_branch = (target_node == site_tree.root)
+        branch_signature = site_tree.descendant_signatures[target_node]
+        time_value = self.time_grid[time_idx]
+
         if st.choices:
+            choice = ThreadChoice(
+                site=st.site_index, time_idx=time_idx, time_value=time_value,
+                branch_child=target_node, is_root_branch=is_root_branch,
+                branch_signature=branch_signature
+            )
             tag = "[recomb]" if _canonical_choice(choice) != _canonical_choice(st.choices[-1]) else "[stay]"
         else:
             tag = "[start]"
             
-        if choice.is_root_branch:
+        if is_root_branch:
             branch_label = "root"
         elif leaf_names:
             branch_label = "(" + ",".join(
-                leaf_names[s] if s < len(leaf_names) else str(s) for s in choice.branch_signature
+                leaf_names[s] if s < len(leaf_names) else str(s) for s in branch_signature
             ) + ")"
         else:
-            branch_label = str(choice.branch_signature)
+            branch_label = str(branch_signature)
             
-        return f"site {choice.site} -> branch {branch_label} @ t{choice.time_idx}={choice.time_value:.2f} {tag}"
+        return f"site {st.site_index} -> branch {branch_label} @ t{time_idx}={time_value:.2f} {tag}"
 
 
-    def step(self, st: ThreadPathState, action_idx: int) -> tuple[ThreadPathState, float, bool]:
+    def step(self, st: ThreadPathState, action: tuple[int, int]) -> tuple[ThreadPathState, float, bool]:
         if self.is_terminal(st):
             raise RuntimeError("Cannot step a terminal state")
-        if action_idx not in self.valid_actions(st):
-            raise ValueError(f"Invalid action index {action_idx} at site {st.site_index}")
 
-        choice = self.site_choices[st.site_index][action_idx]
+        target_node, time_idx = action
+        site_tree = self.site_trees[st.site_index]
+        
+        choice = ThreadChoice(
+            site=st.site_index,
+            time_idx=time_idx,
+            time_value=self.time_grid[time_idx],
+            branch_child=target_node,
+            is_root_branch=(target_node == site_tree.root),
+            branch_signature=site_tree.descendant_signatures[target_node]
+        )
+
         recomb_count = st.recomb_count
         if st.choices and _canonical_choice(choice) != _canonical_choice(st.choices[-1]):
             recomb_count += 1
@@ -191,7 +371,7 @@ class ARGweaverThreadEnv:
 
     def generate_random_trajectory(
         self, seed: int | None = None
-    ) -> tuple[ThreadPathState, float, list[int]]:
+    ) -> tuple[ThreadPathState, float, list[tuple[int, int]]]:
         """Generates a random trajectory by choosing uniform random valid actions."""
         if seed is not None:
             random.seed(seed)
@@ -199,8 +379,15 @@ class ARGweaverThreadEnv:
         st = self.reset()
         actions = []
         while not self.is_terminal(st):
-            valid_acts = self.valid_actions(st)
-            action = random.choice(valid_acts)
+            node_mask = self.get_action_masks(st)["target_node_mask"]
+            valid_nodes = torch.where(node_mask)[0].tolist()
+            target_node = random.choice(valid_nodes)
+            
+            time_mask = self.get_action_masks(st, target_node)["time_mask"]
+            valid_times = torch.where(time_mask)[0].tolist()
+            time_idx = random.choice(valid_times)
+            
+            action = (target_node, time_idx)
             actions.append(action)
             st, reward, done = self.step(st, action)
 
@@ -326,14 +513,14 @@ class MultiLeafThreadEnv:
     def is_terminal(self, st: MultiLeafState) -> bool:
         return len(st.leaves_threaded) == self.num_leaves
 
-    def valid_actions(self, st: MultiLeafState) -> list[int]:
+    def get_action_masks(self, st: MultiLeafState, target_node: Optional[int] = None) -> dict:
         if self.is_terminal(st):
-            return []
+            return {}
         assert self._inner_env is not None and st.inner_state is not None
-        return self._inner_env.valid_actions(st.inner_state)
+        return self._inner_env.get_action_masks(st.inner_state, target_node)
 
     def step(
-        self, st: MultiLeafState, action_idx: int
+        self, st: MultiLeafState, action: tuple[int, int]
     ) -> tuple[MultiLeafState, float, bool]:
         if self.is_terminal(st):
             raise RuntimeError("Cannot step a terminal state")
@@ -341,7 +528,7 @@ class MultiLeafThreadEnv:
 
         ## This does one site action for the current focal leaf.
         inner_next, inner_reward, inner_done = self._inner_env.step(
-            st.inner_state, action_idx
+            st.inner_state, action
         )
 
         
@@ -395,15 +582,18 @@ class MultiLeafThreadEnv:
             False,
         )
 
-    def encode(self):
+    def encode(self, st: ThreadPathState) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        Delegates encoding to the inner environment logic.
         """
-        raise NotImplementedError("This is outer env. To encode data")
+        if self._inner_env is None:
+            raise RuntimeError("Inner environment is not initialized")
+        return self._inner_env.encode(st.inner_state)
         
 
-    def describe_action(self, st: MultiLeafState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
+    def describe_action(self, st: MultiLeafState, action: tuple[int, int], leaf_names: Optional[Sequence[str]] = None) -> str:
         assert self._inner_env is not None and st.inner_state is not None
-        desc = self._inner_env.describe_action(st.inner_state, action_idx, leaf_names=leaf_names)
+        desc = self._inner_env.describe_action(st.inner_state, action, leaf_names=leaf_names)
         focal = leaf_names[st.current_focal_leaf] if leaf_names and st.current_focal_leaf < len(leaf_names) else st.current_focal_leaf
         return f"[leaf {focal}] {desc}"
 
@@ -415,7 +605,7 @@ class MultiLeafThreadEnv:
 
     def generate_random_trajectory(
         self, seed: int | None = None
-    ) -> tuple[MultiLeafState, float, list[int]]:
+    ) -> tuple[MultiLeafState, float, list[tuple[int, int]]]:
         """
         Generates a random trajectory wihtout model, threading all leaves by choosing random actions.
         """
@@ -425,8 +615,15 @@ class MultiLeafThreadEnv:
         st = self.reset()
         actions = []
         while not self.is_terminal(st):
-            valid_acts = self.valid_actions(st)
-            action = random.choice(valid_acts)
+            node_mask = self.get_action_masks(st)["target_node_mask"]
+            valid_nodes = torch.where(node_mask)[0].tolist()
+            target_node = random.choice(valid_nodes)
+            
+            time_mask = self.get_action_masks(st, target_node)["time_mask"]
+            valid_times = torch.where(time_mask)[0].tolist()
+            time_idx = random.choice(valid_times)
+            
+            action = (target_node, time_idx)
             actions.append(action)
             st, reward, done = self.step(st, action)
 
