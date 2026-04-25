@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Sequence, Any
 import torch
 import math
+import json
+import numpy as np
 
 TimedTree = Any
 
@@ -523,3 +525,173 @@ def enumerate_thread_choices(
                 )
     return tuple(choices)
 
+
+def _metadata_to_name(metadata: Any) -> Optional[str]:
+    if metadata in (None, b"", ""):
+        return None
+    if isinstance(metadata, bytes):
+        try:
+            metadata = metadata.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            return metadata if metadata else None
+    if isinstance(metadata, dict):
+        for key in ("name", "sample_id", "id"):
+            value = metadata.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return None
+
+
+def _sample_leaf_names(ts: Any, sample_nodes: Sequence[int]) -> list[str]:
+    leaf_names: list[str] = []
+    for sample_node in sample_nodes:
+        node = ts.node(sample_node)
+        name = None
+        if node.individual != -1:
+            name = _metadata_to_name(ts.individual(node.individual).metadata)
+        if name is None:
+            name = _metadata_to_name(node.metadata)
+        leaf_names.append(name if name is not None else str(sample_node))
+    return leaf_names
+
+
+def _timed_tree_from_tskit_tree(
+    tree: Any,
+    sample_id_by_node: Dict[int, int],
+) -> TimedTree:
+    roots = list(tree.roots)
+    if len(roots) != 1:
+        raise ValueError(
+            f"tskit tree interval {tree.interval} has {len(roots)} roots; expected exactly 1"
+        )
+
+    def build(node_id: int) -> TimedTree:
+        children = list(tree.children(node_id))
+        sample_id = sample_id_by_node.get(node_id)
+        if sample_id is not None:
+            if children:
+                raise ValueError(
+                    f"Sample node {node_id} has children in interval {tree.interval}; "
+                    "only leaf sample nodes are supported"
+                )
+            return sample_id
+        if len(children) != 2:
+            raise ValueError(
+                f"Internal node {node_id} has {len(children)} children in interval "
+                f"{tree.interval}; expected a binary local tree"
+            )
+        left, right = children
+        return ("n", float(tree.time(node_id)), build(left), build(right))
+
+    return build(roots[0])
+
+
+def _validate_binary_genotypes(geno: np.ndarray) -> None:
+    if geno.ndim != 2:
+        raise ValueError(f"Expected a 2D genotype matrix, got shape {geno.shape}")
+    bad = np.setdiff1d(np.unique(geno), np.array([0, 1], dtype=geno.dtype))
+    if bad.size:
+        raise ValueError(
+            "Only binary 0/1 tskit genotypes are supported; "
+            f"found values {bad.tolist()}"
+        )
+
+
+def _validate_binary_variants(ts: Any) -> None:
+    for variant in ts.variants():
+        if variant.alleles != ("0", "1"):
+            raise ValueError(
+                "Only binary 0/1 tskit variants are supported; expected "
+                f"allele labels ('0', '1'), but site {variant.site.id} has "
+                f"alleles {variant.alleles}"
+            )
+
+
+def load_tskit_threading_inputs(
+    trees_path: str,
+    time_grid_size: int,
+) -> tuple[torch.Tensor, tuple[dict, ...], list[str], list[int], tuple[float, ...]]:
+    """Load a tskit ``.trees`` file into the existing threading-env inputs.
+
+    The environment steps over tskit variant sites. Local tree genomic intervals
+    are converted to site-index intervals covering the variant positions inside
+    each tree interval.
+    """
+    if time_grid_size < 2:
+        raise ValueError("time_grid_size must be at least 2")
+
+    try:
+        import tskit
+    except ImportError as exc:
+        raise ImportError("load_tskit_threading_inputs requires the tskit package") from exc
+
+    ts = tskit.load(trees_path)
+    if ts.num_sites == 0:
+        raise ValueError("The tree sequence has no variant sites to use as env steps")
+
+    sample_nodes = list(ts.samples())
+    if not sample_nodes:
+        raise ValueError("The tree sequence has no sample nodes")
+
+    geno_np = ts.genotype_matrix().T
+    _validate_binary_genotypes(geno_np)
+    _validate_binary_variants(ts)
+    geno = torch.as_tensor(geno_np, dtype=torch.long)
+
+    node_times = np.asarray(ts.tables.nodes.time, dtype=float)
+    if node_times.size == 0:
+        raise ValueError("The tree sequence has no nodes")
+    time_grid = tuple(
+        float(t)
+        for t in np.linspace(
+            float(node_times.min()),
+            float(node_times.max()),
+            time_grid_size,
+        )
+    )
+
+    sample_id_by_node = {
+        node_id: sample_id for sample_id, node_id in enumerate(sample_nodes)
+    }
+    site_positions = np.asarray([site.position for site in ts.sites()], dtype=float)
+    reference_full_trees: list[dict] = []
+
+    for tree in ts.trees():
+        left = float(tree.interval.left)
+        right = float(tree.interval.right)
+        start_site = int(np.searchsorted(site_positions, left, side="left"))
+        end_site = int(np.searchsorted(site_positions, right, side="left"))
+        if start_site == end_site:
+            continue
+        timed_tree = _timed_tree_from_tskit_tree(tree, sample_id_by_node)
+        if reference_full_trees and reference_full_trees[-1]["tree"] == timed_tree:
+            reference_full_trees[-1]["sites"] = (reference_full_trees[-1]["sites"][0], end_site)
+        else:
+            reference_full_trees.append({"sites": (start_site, end_site), "tree": timed_tree})
+
+    if not reference_full_trees:
+        raise ValueError("No local trees overlap variant sites")
+
+    expected_start = 0
+    for segment in reference_full_trees:
+        start, end = segment["sites"]
+        if start != expected_start:
+            raise ValueError(
+                "Converted tskit trees do not cover all variant-site indices; "
+                f"expected segment to start at {expected_start}, got {start}"
+            )
+        expected_start = end
+    if expected_start != ts.num_sites:
+        raise ValueError(
+            "Converted tskit trees do not cover all variant-site indices; "
+            f"covered {expected_start} of {ts.num_sites}"
+        )
+
+    leaf_names = _sample_leaf_names(ts, sample_nodes)
+    all_leaf_ids = list(range(len(sample_nodes)))
+    return geno, tuple(reference_full_trees), leaf_names, all_leaf_ids, time_grid
