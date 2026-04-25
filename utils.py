@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Tuple, Optional, Dict, Sequence, Any
+from typing import List, Tuple, Optional, Dict, Sequence, Any
 import torch
 import math
 import json
@@ -74,6 +74,40 @@ class SiteBackboneTree:
     parent_of_child: Tuple[int, ...]
     node_sample_ids: Tuple[int, ...]
     descendant_signatures: Tuple[Tuple[int, ...], ...]
+
+
+def attachment_candidate_node_ids(site_tree: SiteBackboneTree) -> List[int]:
+    """
+    Nodes on which a leaf can attach, matching :func:`enumerate_thread_choices` branches:
+    every backbone branch child, plus the root (for the root-regrafting action set).
+    """
+    cands = set(site_tree.branch_children)
+    cands.add(site_tree.root)
+    return sorted(cands)
+
+
+def _graph_postorder(root: int, children: Tuple[Tuple[int, ...], ...]) -> List[int]:
+    order: List[int] = []
+
+    def visit(u: int) -> None:
+        for v in children[u]:
+            visit(v)
+        order.append(u)
+
+    visit(root)
+    return order
+
+
+def _graph_preorder(root: int, children: Tuple[Tuple[int, ...], ...]) -> List[int]:
+    order: List[int] = []
+
+    def visit(u: int) -> None:
+        order.append(u)
+        for v in children[u]:
+            visit(v)
+
+    visit(root)
+    return order
 
 def _thread_leaf_into_site_tree_full(
     site_tree: SiteBackboneTree,
