@@ -2,7 +2,7 @@ from utils import ThreadingConfig, ThreadChoice, ThreadPathState, MultiLeafState
 from typing import Optional, Tuple, Sequence, Any, List, Dict
 from utils import *
 from utils import _canonical_choice
-import math
+from rewards import ARGRewardMixin
 import random
 import torch
 
@@ -67,7 +67,7 @@ def _thread_leaf_into_site_tree_full(
         "choice": choice,
     }
 
-class ARGweaverThreadEnv:
+class ARGweaverThreadEnv(ARGRewardMixin):
     def __init__(
         self,
         config: ThreadingConfig,
@@ -128,88 +128,94 @@ class ARGweaverThreadEnv:
         return st.choices[-1] if st.choices else None
 
     def encode(self, st: ThreadPathState, window_size: int = 5):
-        """
-        Encode the current state into a PyG Data object.
-        Includes a window of genotypes around the current site.
-        """
-        from torch_geometric.data import Data  # Lazy import to avoid circular import in torch_geometric
+        import torch.nn.functional as F
+
         site_tree = self._site_tree_for_encoding(st)
-        
-        # 1. Edge Index
-        edge_index = site_tree.edge_index
-        
-        # 2. Node Features (Time, Type, Genotype Window)
         num_nodes = site_tree.num_nodes
-        node_times = site_tree.node_times.unsqueeze(1) # [N, 1]
+        num_grid_points = len(self.config.time_grid)
         
-        # Node Type: 0 for leaf, 1 for internal, 2 for root
-        node_types = torch.zeros(num_nodes, dtype=torch.long)
-        # Leaves are 0..len(site_tree.node_sample_ids)-1 where id != -1
-        # Actually in site_tree, typically leaves are at the beginning
-        # We can find leaves by checking out-degree == 0
-        out_degree = torch.bincount(edge_index[0], minlength=num_nodes)
-        node_types[out_degree > 0] = 1 # Internal
-        node_types[site_tree.root] = 2 # Root
-        node_types_one_hot = torch.nn.functional.one_hot(node_types, num_classes=3).float()
+        # 1. The Local Tree
+        node_ids = torch.arange(num_nodes, dtype=torch.float32)
+        parent_ids = torch.tensor(site_tree.parent_of_child, dtype=torch.float32)
+        start_times = site_tree.node_times.clone().float()
         
-        # Genotype Window
-        seq_len = self.config.sequence_length
-        start_idx = max(0, st.site_index - window_size)
-        end_idx = min(seq_len, st.site_index + window_size + 1)
-        
-        # Pad if near edges
-        pad_left = max(0, window_size - st.site_index)
-        pad_right = max(0, (st.site_index + window_size + 1) - seq_len)
-        
-        # Extract window
-        geno_window = self.config.geno[:, start_idx:end_idx].clone() # [num_samples, actual_window_len]
-        
-        if pad_left > 0 or pad_right > 0:
-            geno_window = torch.nn.functional.pad(geno_window, (pad_left, pad_right), value=-1) # -1 for padding/missing
-            
-        # Map genotypes to nodes. For internal nodes, we just use zeros (to be imputed by GNN)
-        node_genos = torch.zeros(num_nodes, window_size * 2 + 1, dtype=torch.float32)
-        for i, sample_id in enumerate(site_tree.node_sample_ids):
-            if sample_id != -1:
-                node_genos[i] = geno_window[sample_id].float()
+        # End times
+        end_times = torch.zeros(num_nodes, dtype=torch.float32)
+        max_time = float(self.config.time_grid[-1])
+        for i in range(num_nodes):
+            pid = site_tree.parent_of_child[i]
+            if pid != -1:
+                end_times[i] = site_tree.node_times[pid]
+            else:
+                end_times[i] = max_time
                 
-        node_features = torch.cat([node_times, node_types_one_hot, node_genos], dim=-1)
+        is_leaf = torch.tensor([1.0 if s != -1 else 0.0 for s in site_tree.node_sample_ids], dtype=torch.float32)
         
-        # Focal Sequence
-        focal_seq = self.config.geno[self.focal_leaf, start_idx:end_idx].clone()
-        if pad_left > 0 or pad_right > 0:
-            focal_seq = torch.nn.functional.pad(focal_seq, (pad_left, pad_right), value=-1)
-        focal_seq = focal_seq.float().unsqueeze(0) # [1, window_size*2+1]
+        # 3. Previous State
+        is_prev_branch = torch.zeros(num_nodes, dtype=torch.float32)
+        prev_time_value = torch.zeros(num_nodes, dtype=torch.float32)
         
-        # We also need focal sequence to have the same dim as node features for the context embedding
-        focal_node_features = torch.zeros(1, node_features.shape[1])
-        focal_node_features[0, 0] = 0.0 # time
-        focal_node_features[0, 1:4] = torch.tensor([1, 0, 0]) # type leaf
-        focal_node_features[0, 4:] = focal_seq
+        prev_choice = self._prev_choice(st)
+        if prev_choice is not None:
+            prev_node_id = prev_choice.branch_child
+            if 0 <= prev_node_id < num_nodes:
+                is_prev_branch[prev_node_id] = 1.0
+                prev_time_value[prev_node_id] = prev_choice.time_value
+                
+        # 2. Genotype Data
+        seq_len = self.config.sequence_length
+        curr_site = st.site_index
         
+        window_end = min(curr_site + window_size, seq_len)
+        actual_window = window_end - curr_site
         
-        # Valid Actions Information
-        valid_acts = self.valid_actions(st)
-        valid_action_info = []
-        for action_idx in valid_acts:
-            choice = self.site_choices[st.site_index][action_idx]
-            parent = site_tree.parent_of_child[choice.branch_child] if not choice.is_root_branch else -1
-            valid_action_info.append({
-                'action_idx': action_idx,
-                'branch_child': choice.branch_child,
-                'branch_parent': parent,
-                'time_idx': choice.time_idx,
-                'time_value': choice.time_value
-            })
+        num_samples = self.config.geno.shape[0]
+        if actual_window > 0:
+            geno_slice = self.config.geno[:, curr_site:window_end].float()
+        else:
+            geno_slice = torch.empty((num_samples, 0), dtype=torch.float32)
             
-        data = Data(
-            x=node_features,
-            edge_index=edge_index,
-            focal_seq=focal_node_features,
-            valid_action_info=valid_action_info,
-            valid_action_indices=torch.tensor(valid_acts, dtype=torch.long)
-        )
-        return data
+        pad_size = window_size - actual_window
+        if pad_size > 0:
+            geno_window = F.pad(geno_slice, (0, pad_size), value=-1.0)
+        else:
+            geno_window = geno_slice
+            
+        # Map to nodes
+        node_geno = torch.full((num_nodes, window_size), -1.0, dtype=torch.float32)
+        for i in range(num_nodes):
+            sample_id = site_tree.node_sample_ids[i]
+            if sample_id != -1:
+                node_geno[i] = geno_window[sample_id]
+                
+        # Combine node features 
+        node_features = torch.stack([
+            node_ids, 
+            parent_ids, 
+            start_times, 
+            end_times, 
+            is_leaf,
+            is_prev_branch,
+            prev_time_value
+        ], dim=1)
+        
+        node_features = torch.cat([node_features, node_geno], dim=1)
+        
+        # EDGE INDEX
+        edge_index = site_tree.edge_index.clone()
+        
+        # VALID ACTION MASK
+        valid_action_mask = torch.zeros((num_nodes, num_grid_points), dtype=torch.bool)
+        if not self.is_terminal(st):
+            for choice in self.site_choices[curr_site]:
+                valid_action_mask[choice.branch_child, choice.time_idx] = True
+            
+        return {
+            "node_features": node_features,
+            "edge_index": edge_index,
+            "genotype_window": geno_window,
+            "valid_action_mask": valid_action_mask
+        }
 
     def describe_action(self, st: ThreadPathState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
         choice = self.site_choices[st.site_index][action_idx]
@@ -237,6 +243,8 @@ class ARGweaverThreadEnv:
             raise ValueError(f"Invalid action index {action_idx} at site {st.site_index}")
 
         choice = self.site_choices[st.site_index][action_idx]
+        prev_choice = st.choices[-1] if st.choices else None
+        local_log_reward = self.compute_log_local_reward(prev_choice, choice, st.site_index)
         recomb_count = st.recomb_count
         if st.choices and _canonical_choice(choice) != _canonical_choice(st.choices[-1]):
             recomb_count += 1
@@ -246,11 +254,7 @@ class ARGweaverThreadEnv:
             choices=st.choices + (choice,),
             recomb_count=recomb_count,
         )
-        if self.is_terminal(next_state):
-            # reward = math.exp(self.config.reward_temperature)
-            reward = 1.0
-            return next_state, reward, True
-        return next_state, 0.0, False
+        return next_state, local_log_reward, self.is_terminal(next_state)
 
     def reconstruct_local_trees(self, path: Sequence[ThreadChoice]) -> tuple[dict, ...]:
         segments = compress_thread_path_to_segments(path)
@@ -277,13 +281,15 @@ class ARGweaverThreadEnv:
 
         st = self.reset()
         actions = []
+        total_reward = 0.0
         while not self.is_terminal(st):
             valid_acts = self.valid_actions(st)
             action = random.choice(valid_acts)
             actions.append(action)
             st, reward, done = self.step(st, action)
+            total_reward += reward
 
-        return st, reward, actions
+        return st, total_reward, actions
 
 class MultiLeafThreadEnv:
     """Outer environment that cycles through all leaf nodes.
@@ -432,7 +438,7 @@ class MultiLeafThreadEnv:
                     current_focal_leaf=st.current_focal_leaf,
                     inner_state=inner_next,
                 ),
-                0.0,
+                inner_reward,
                 False,
             )
 
@@ -446,7 +452,6 @@ class MultiLeafThreadEnv:
         new_leaves_threaded = st.leaves_threaded + (st.current_focal_leaf,)
 
         if len(new_leaves_threaded) == self.num_leaves:
-            reward = 1.0
             return (
                 MultiLeafState(
                     current_full_trees=new_full_trees,
@@ -454,7 +459,7 @@ class MultiLeafThreadEnv:
                     current_focal_leaf=None,
                     inner_state=None
                 ),
-                reward,
+                inner_reward,
                 True,
             )
 
@@ -470,16 +475,13 @@ class MultiLeafThreadEnv:
                 current_focal_leaf=next_leaf,
                 inner_state=new_inner_state,
             ),
-            0.0,
+            inner_reward,
             False,
         )
 
     def encode(self, st: MultiLeafState, window_size: int = 5):
-        """Encode the current state as a PyG Data object and feed it to the model.
-        """
-        if st.inner_state is None or self._inner_env is None:
-            return None
-        return self._inner_env.encode(st.inner_state, window_size)
+        assert self._inner_env is not None and st.inner_state is not None
+        return self._inner_env.encode(st.inner_state, window_size=window_size)
 
     def describe_action(self, st: MultiLeafState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
         assert self._inner_env is not None and st.inner_state is not None
@@ -504,11 +506,13 @@ class MultiLeafThreadEnv:
 
         st = self.reset()
         actions = []
+        total_reward = 0.0
         while not self.is_terminal(st):
             valid_acts = self.valid_actions(st)
             action = random.choice(valid_acts)
             actions.append(action)
             st, reward, done = self.step(st, action)
+            total_reward += reward
 
-        return st, reward, actions
+        return st, total_reward, actions
 
