@@ -516,3 +516,118 @@ class MultiLeafThreadEnv:
 
         return st, total_reward, actions
 
+
+class SingleLeafThreadEnv(MultiLeafThreadEnv):
+    """Outer coordinator for one inner leaf-threading episode.
+
+    The outer state holds the current inferred ARG backbone. Each reset chooses
+    one focal leaf, builds an inner ``ARGweaverThreadEnv`` by removing that leaf
+    from the current full trees, and a terminal episode is reached once that
+    focal leaf has been threaded across all sites.
+    """
+
+    def __init__(
+        self,
+        config: ThreadingConfig,
+        all_leaf_ids: Sequence[int],
+        reference_full_trees: Sequence[dict],
+    ):
+        super().__init__(config, all_leaf_ids, reference_full_trees)
+        self.current_full_trees = self.reference_full_trees
+
+    def reset(
+        self,
+        focal_leaf: Optional[int] = None,
+        full_trees: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> MultiLeafState:
+        if focal_leaf is None:
+            focal_leaf = self.all_leaf_ids[-1]
+        focal_leaf = int(focal_leaf)
+        if focal_leaf not in self.all_leaf_ids:
+            raise ValueError(
+                f"focal_leaf {focal_leaf!r} is not in all_leaf_ids {self.all_leaf_ids!r}"
+            )
+
+        if full_trees is not None:
+            self.current_full_trees = tuple(
+                {"sites": tuple(seg["sites"]), "tree": seg["tree"]}
+                for seg in full_trees
+            )
+
+        self._inner_env = self._build_inner_env(
+            self.current_full_trees, focal_leaf
+        )
+        inner_state = self._inner_env.reset()
+        return MultiLeafState(
+            current_full_trees=self.current_full_trees,
+            leaves_threaded=(),
+            current_focal_leaf=focal_leaf,
+            inner_state=inner_state,
+        )
+
+    def is_terminal(self, st: MultiLeafState) -> bool:
+        return len(st.leaves_threaded) == 1
+
+    def step(
+        self, st: MultiLeafState, action_idx: int
+    ) -> tuple[MultiLeafState, float, bool]:
+        if self.is_terminal(st):
+            raise RuntimeError("Cannot step a terminal state")
+        assert self._inner_env is not None and st.inner_state is not None
+        if st.current_focal_leaf is None:
+            raise RuntimeError("Single-leaf episode has no focal leaf")
+
+        inner_next, inner_reward, inner_done = self._inner_env.step(
+            st.inner_state, action_idx
+        )
+
+        if not inner_done:
+            return (
+                MultiLeafState(
+                    current_full_trees=st.current_full_trees,
+                    leaves_threaded=st.leaves_threaded,
+                    current_focal_leaf=st.current_focal_leaf,
+                    inner_state=inner_next,
+                ),
+                inner_reward,
+                False,
+            )
+
+        new_full_trees = self._update_full_trees(
+            st.current_full_trees,
+            st.current_focal_leaf,
+            inner_next.choices,
+            self._inner_env,
+        )
+        self.current_full_trees = new_full_trees
+        new_leaves_threaded = st.leaves_threaded + (st.current_focal_leaf,)
+
+        return (
+            MultiLeafState(
+                current_full_trees=new_full_trees,
+                leaves_threaded=new_leaves_threaded,
+                current_focal_leaf=st.current_focal_leaf,
+                inner_state=inner_next,
+            ),
+            inner_reward,
+            True,
+        )
+
+    def generate_random_trajectory(
+        self, focal_leaf: int | None = None, seed: int | None = None
+    ) -> tuple[MultiLeafState, float, list[int]]:
+        """Generate one random inner trajectory for a single focal leaf."""
+        if seed is not None:
+            random.seed(seed)
+
+        st = self.reset(focal_leaf=focal_leaf)
+        actions = []
+        total_reward = 0.0
+        while not self.is_terminal(st):
+            valid_acts = self.valid_actions(st)
+            action = random.choice(valid_acts)
+            actions.append(action)
+            st, reward, _done = self.step(st, action)
+            total_reward += reward
+
+        return st, total_reward, actions

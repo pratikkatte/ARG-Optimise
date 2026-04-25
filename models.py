@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Sequence, Tuple
-from ete3 import Tree
 from torch import Tensor
 
 from utils import SiteBackboneTree, ThreadChoice, _children_from_edge_index
@@ -140,6 +139,7 @@ class Policy(nn.Module):
         self.leaf_names = leaf_names
         n_leaves = len(leaf_names)
         self.register_buffer("leaf_features", torch.eye(n_leaves, dtype=torch.float32))
+        self.log_Z = nn.Parameter(torch.zeros(()))
         in_dim = n_leaves
         self.gnn = GNNStack(
             in_dim, hidden_dim, num_layers=num_layers, bias=True, gnn_type="gcn"
@@ -205,7 +205,6 @@ class Policy(nn.Module):
         """Same as ``node_embedding`` (ete3) but for :class:`SiteBackboneTree` (graph format)."""
         device = self.device
         n = site_tree.num_nodes
-        L = len(self.leaf_names)
         nfeat = self.leaf_features.shape[0]
         children = _children_from_edge_index(site_tree.edge_index, n)
         parent = site_tree.parent_of_child
@@ -222,15 +221,6 @@ class Policy(nn.Module):
                     raise ValueError(
                         f"SiteBackboneTree: internal node {u} must have 2 children, got {nch}"
                     )
-        j = L
-        namenum_name: List[int] = [0] * n
-        for u in _graph_postorder(root, children):
-            s = node_sample[u]
-            if s >= 0:
-                namenum_name[u] = s
-            else:
-                namenum_name[u] = j
-                j += 1
         c = torch.zeros(n, device=device)
         d = torch.zeros(n, nfeat, device=device, dtype=self.leaf_features.dtype)
         lf = self.leaf_features.to(device)
@@ -251,31 +241,24 @@ class Policy(nn.Module):
             p = parent[u]
             d[u] = c[u] * d[p] + d[u]
         node_features: List[torch.Tensor] = []
-        node_idx_list: List[int] = []
         edge_list: List[List[int]] = []
-        for u in _graph_preorder(root, children):
+        for u in range(n):
             s = node_sample[u]
             if u != root:
-                neigh: List[int] = [namenum_name[parent[u]]]
+                neigh: List[int] = [parent[u]]
                 if s >= 0:
                     neigh.extend((-1, -1))
                 else:
                     for v in children[u]:
-                        neigh.append(namenum_name[v])
+                        neigh.append(v)
             else:
-                neigh = [namenum_name[v] for v in children[u]]
+                neigh = [v for v in children[u]]
                 while len(neigh) < 3:
                     neigh.append(-1)
             edge_list.append(neigh)
             node_features.append(d[u])
-            node_idx_list.append(namenum_name[u])
-        branch_idx_map = torch.sort(
-            torch.tensor(node_idx_list, dtype=torch.long, device=device), dim=0, descending=False
-        )[1]
         edge_index = torch.tensor(edge_list, dtype=torch.long, device=device)
-        return torch.index_select(torch.stack(node_features, dim=0), 0, branch_idx_map), edge_index[
-            branch_idx_map
-        ]
+        return torch.stack(node_features, dim=0), edge_index
     
     def _focal_leaf_feature(
         self,
