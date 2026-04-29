@@ -1,88 +1,176 @@
-from utils import ThreadingConfig, ThreadChoice, ThreadPathState, MultiLeafState, SiteBackboneTree, BackboneSegment
-from typing import Optional, Tuple, Sequence, Any, List, Dict
-from utils import *
-from utils import _canonical_choice
-from rewards import ARGRewardMixin
+from typing import Optional, Sequence, Any
+import bisect
 import random
+
 import torch
+import torch.nn.functional as F
+from torch_geometric.data import Data
 
-def _canonical_choice(choice: ThreadChoice) -> tuple[int, int, tuple[int, ...]]:
-    return choice.branch_child, choice.branch_signature
+from rewards import ARGRewardMixin
+from utils import (
+    GraphSegment,
+    MultiLeafState,
+    ThreadChoice,
+    ThreadPathState,
+    ThreadingConfig,
+    build_backbone_segments_from_graph_segments,
+    compress_thread_path_to_segments,
+    enumerate_thread_choices,
+    graph_node_sample_ids,
+    graph_parent_of_child,
+    graph_segments_to_timed_tree_segments,
+    graph_with_site,
+    graphs_equivalent,
+    thread_leaf_into_graph,
+)
 
-def _thread_leaf_into_site_tree_full(
-    site_tree: SiteBackboneTree,
-    focal_leaf: int,
-    choice: ThreadChoice) -> dict:
-    edges = [tuple(edge) for edge in site_tree.edge_index.t().tolist()]
-    node_times = site_tree.node_times.tolist()
-    node_sample_ids = list(site_tree.node_sample_ids)
 
-    focal_node = len(node_times)
-    node_times.append(0.0)
-    node_sample_ids.append(focal_leaf)
-    highlight_edges: list[tuple[int, int]] = []
+def _canonical_choice(choice: ThreadChoice) -> tuple[int, tuple[int, ...], int, bool]:
+    return (
+        choice.branch_child,
+        choice.branch_signature,
+        choice.time_idx,
+        choice.is_root_branch,
+    )
 
-    if choice.is_root_branch:
-        new_root = len(node_times)
-        node_times.append(float(choice.time_value))
-        node_sample_ids.append(-1)
-        edges.append((new_root, site_tree.root))
-        edges.append((new_root, focal_node))
-        highlight_edges.extend([(new_root, site_tree.root), (new_root, focal_node)])
-        root = new_root
-    else:
-        parent = site_tree.parent_of_child[choice.branch_child]
-        if parent == -1:
-            raise ValueError("Non-root branch choice cannot point to the root without is_root_branch")
 
-        new_internal = len(node_times)
-        node_times.append(float(choice.time_value))
-        node_sample_ids.append(-1)
-        edges = [(u, v) for (u, v) in edges if not (u == parent and v == choice.branch_child)]
-        edges.extend(
-            [
-                (parent, new_internal),
-                (new_internal, choice.branch_child),
-                (new_internal, focal_node),
-            ]
-        )
-        highlight_edges.extend(
-            [
-                (parent, new_internal),
-                (new_internal, choice.branch_child),
-                (new_internal, focal_node),
-            ]
-        )
-        root = site_tree.root
+def _copy_graph_segment(segment: GraphSegment) -> GraphSegment:
+    return GraphSegment(
+        start=int(segment.start),
+        end=int(segment.end),
+        genomic_interval=(
+            tuple(float(x) for x in segment.genomic_interval)
+            if segment.genomic_interval is not None
+            else None
+        ),
+        graph=segment.graph.clone(),
+    )
 
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-    return {
-        "edge_index": edge_index,
-        "num_nodes": len(node_times),
-        "root": root,
-        "node_times": torch.tensor(node_times, dtype=torch.float32),
-        "node_sample_ids": tuple(node_sample_ids),
-        "highlight_edges": tuple(highlight_edges),
-        "highlight_samples": (focal_leaf,),
-        "choice": choice,
-    }
+
+class _LazySiteGraphSequence:
+    def __init__(self, env: "ARGweaverThreadEnv"):
+        self.env = env
+
+    def __len__(self) -> int:
+        return self.env.config.sequence_length
+
+    def __getitem__(self, site_index: int) -> Data:
+        if site_index < 0:
+            site_index += self.env.config.sequence_length
+        return self.env._site_graph_for_site(site_index)
+
+
+class _LazySiteChoicesSequence:
+    def __init__(self, env: "ARGweaverThreadEnv"):
+        self.env = env
+
+    def __len__(self) -> int:
+        return self.env.config.sequence_length
+
+    def __getitem__(self, site_index: int) -> tuple[ThreadChoice, ...]:
+        if site_index < 0:
+            site_index += self.env.config.sequence_length
+        return self.env._choices_for_site(site_index)
+
+
+class _LazyChoiceToIndexSequence:
+    def __init__(self, env: "ARGweaverThreadEnv"):
+        self.env = env
+
+    def __len__(self) -> int:
+        return self.env.config.sequence_length
+
+    def __getitem__(self, site_index: int) -> dict[ThreadChoice, int]:
+        if site_index < 0:
+            site_index += self.env.config.sequence_length
+        return self.env._choice_to_index_for_site(site_index)
+
 
 class ARGweaverThreadEnv(ARGRewardMixin):
     def __init__(
         self,
         config: ThreadingConfig,
         focal_leaf: int,
-        backbone_segments,
-        reference_full_trees=None,
+        backbone_segments: Sequence[GraphSegment],
     ):
         self.config = config
         self.focal_leaf = int(focal_leaf)
-        self.backbone_segments = tuple(backbone_segments)
-        self.reference_full_trees = tuple(reference_full_trees or ())
+        self.backbone_segments = tuple(
+            sorted((_copy_graph_segment(seg) for seg in backbone_segments), key=lambda seg: seg.start)
+        )
+        self._segment_starts = tuple(seg.start for seg in self.backbone_segments)
+        self._segment_ends = tuple(seg.end for seg in self.backbone_segments)
+        self._validate_backbone_coverage()
 
-        self.site_trees = tuple(expand_backbone_segments(self.backbone_segments, self.config.sequence_length))
-        self.site_choices = tuple(enumerate_thread_choices(site_tree, self.config.time_grid) for site_tree in self.site_trees)
-        self.choice_to_index = tuple({choice: idx for idx, choice in enumerate(choices)} for choices in self.site_choices)
+        self._site_graph_template_cache: dict[int, Data] = {}
+        self._choice_cache: dict[int, tuple[ThreadChoice, ...]] = {}
+        self._choice_to_index_cache: dict[int, dict[ThreadChoice, int]] = {}
+        self.site_graphs = _LazySiteGraphSequence(self)
+        self.site_trees = self.site_graphs
+        self.site_choices = _LazySiteChoicesSequence(self)
+        self.choice_to_index = _LazyChoiceToIndexSequence(self)
+
+    def _validate_backbone_coverage(self) -> None:
+        expected = 0
+        for segment in self.backbone_segments:
+            if segment.start != expected:
+                raise ValueError(
+                    f"Backbone graph segments do not cover site {expected}; "
+                    f"next segment starts at {segment.start}"
+                )
+            if segment.end <= segment.start:
+                raise ValueError(f"Invalid empty graph segment {segment}")
+            expected = segment.end
+        if expected < self.config.sequence_length:
+            raise ValueError(
+                f"Backbone graph segments cover {expected} sites, "
+                f"expected {self.config.sequence_length}"
+            )
+
+    def _segment_index_for_site(self, site_index: int) -> int:
+        if not (0 <= site_index < self.config.sequence_length):
+            raise IndexError(
+                f"site_index {site_index} is out of bounds for sequence length "
+                f"{self.config.sequence_length}"
+            )
+        segment_idx = bisect.bisect_right(self._segment_starts, site_index) - 1
+        if segment_idx < 0 or site_index >= self._segment_ends[segment_idx]:
+            raise ValueError(f"No backbone graph segment covers site {site_index}")
+        return segment_idx
+
+    def _site_graph_template_for_segment(self, segment_idx: int) -> Data:
+        cached = self._site_graph_template_cache.get(segment_idx)
+        if cached is None:
+            cached = graph_with_site(self.backbone_segments[segment_idx].graph, -1)
+            self._site_graph_template_cache[segment_idx] = cached
+        return cached
+
+    def _site_graph_for_site(self, site_index: int) -> Data:
+        template = self._site_graph_template_for_segment(
+            self._segment_index_for_site(site_index)
+        )
+        return graph_with_site(template, site_index)
+
+    def _choices_for_site(self, site_index: int) -> tuple[ThreadChoice, ...]:
+        segment_idx = self._segment_index_for_site(site_index)
+        cached = self._choice_cache.get(segment_idx)
+        if cached is None:
+            cached = enumerate_thread_choices(
+                self._site_graph_template_for_segment(segment_idx),
+                self.config.time_grid,
+            )
+            self._choice_cache[segment_idx] = cached
+        return cached
+
+    def _choice_to_index_for_site(self, site_index: int) -> dict[ThreadChoice, int]:
+        segment_idx = self._segment_index_for_site(site_index)
+        cached = self._choice_to_index_cache.get(segment_idx)
+        if cached is None:
+            cached = {
+                choice: idx for idx, choice in enumerate(self._choices_for_site(site_index))
+            }
+            self._choice_to_index_cache[segment_idx] = cached
+        return cached
 
     @property
     def sequence_length(self):
@@ -117,124 +205,87 @@ class ARGweaverThreadEnv(ARGRewardMixin):
     def valid_actions(self, st: ThreadPathState) -> list[int]:
         if self.is_terminal(st):
             return []
-        return list(range(len(self.site_choices[st.site_index])))
-        
-    def _site_tree_for_encoding(self, st: ThreadPathState) -> SiteBackboneTree:
+        return list(range(len(self._choices_for_site(st.site_index))))
+
+    def _site_tree_for_encoding(self, st: ThreadPathState) -> Data:
         if self.is_terminal(st):
-            return self.site_trees[-1]
-        return self.site_trees[st.site_index]
+            return self._site_graph_for_site(self.config.sequence_length - 1)
+        return self._site_graph_for_site(st.site_index)
 
     def _prev_choice(self, st: ThreadPathState) -> Optional[ThreadChoice]:
         return st.choices[-1] if st.choices else None
 
-    def encode(self, st: ThreadPathState, window_size: int = 5):
-        import torch.nn.functional as F
-
-        site_tree = self._site_tree_for_encoding(st)
-        num_nodes = site_tree.num_nodes
+    def encode(self, st: ThreadPathState, window_size: int = 5) -> Data:
+        graph = self._site_tree_for_encoding(st)
+        num_nodes = int(graph.num_nodes)
         num_grid_points = len(self.config.time_grid)
-        
-        # 1. The Local Tree
-        node_ids = torch.arange(num_nodes, dtype=torch.float32)
-        parent_ids = torch.tensor(site_tree.parent_of_child, dtype=torch.float32)
-        start_times = site_tree.node_times.clone().float()
-        
-        # End times
+        parent = graph_parent_of_child(graph)
+        node_sample_ids = graph_node_sample_ids(graph)
+
         end_times = torch.zeros(num_nodes, dtype=torch.float32)
         max_time = float(self.config.time_grid[-1])
-        for i in range(num_nodes):
-            pid = site_tree.parent_of_child[i]
-            if pid != -1:
-                end_times[i] = site_tree.node_times[pid]
-            else:
-                end_times[i] = max_time
-                
-        is_leaf = torch.tensor([1.0 if s != -1 else 0.0 for s in site_tree.node_sample_ids], dtype=torch.float32)
-        
-        # 3. Previous State
-        is_prev_branch = torch.zeros(num_nodes, dtype=torch.float32)
-        prev_time_value = torch.zeros(num_nodes, dtype=torch.float32)
-        
-        prev_choice = self._prev_choice(st)
-        if prev_choice is not None:
-            prev_node_id = prev_choice.branch_child
-            if 0 <= prev_node_id < num_nodes:
-                is_prev_branch[prev_node_id] = 1.0
-                prev_time_value[prev_node_id] = prev_choice.time_value
-                
-        # 2. Genotype Data
-        seq_len = self.config.sequence_length
-        curr_site = st.site_index
-        
-        window_end = min(curr_site + window_size, seq_len)
-        actual_window = window_end - curr_site
-        
-        num_samples = self.config.geno.shape[0]
-        if actual_window > 0:
-            geno_slice = self.config.geno[:, curr_site:window_end].float()
-        else:
-            geno_slice = torch.empty((num_samples, 0), dtype=torch.float32)
-            
-        pad_size = window_size - actual_window
-        if pad_size > 0:
-            geno_window = F.pad(geno_slice, (0, pad_size), value=-1.0)
-        else:
-            geno_window = geno_slice
-            
-        # Map to nodes
-        node_geno = torch.full((num_nodes, window_size), -1.0, dtype=torch.float32)
-        for i in range(num_nodes):
-            sample_id = site_tree.node_sample_ids[i]
-            if sample_id != -1:
-                node_geno[i] = geno_window[sample_id]
-                
-        # Combine node features 
-        node_features = torch.stack([
-            node_ids, 
-            parent_ids, 
-            start_times, 
-            end_times, 
-            is_leaf,
-            is_prev_branch,
-            prev_time_value
-        ], dim=1)
-        
-        node_features = torch.cat([node_features, node_geno], dim=1)
-        
-        # EDGE INDEX
-        edge_index = site_tree.edge_index.clone()
-        
-        # VALID ACTION MASK
-        valid_action_mask = torch.zeros((num_nodes, num_grid_points), dtype=torch.bool)
-        if not self.is_terminal(st):
-            for choice in self.site_choices[curr_site]:
-                valid_action_mask[choice.branch_child, choice.time_idx] = True
-            
-        return {
-            "node_features": node_features,
-            "edge_index": edge_index,
-            "genotype_window": geno_window,
-            "valid_action_mask": valid_action_mask
-        }
+        for node_id, parent_id in enumerate(parent):
+            end_times[node_id] = graph.node_times[parent_id] if parent_id != -1 else max_time
 
-    def describe_action(self, st: ThreadPathState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
-        choice = self.site_choices[st.site_index][action_idx]
+        prev_branch = torch.zeros(num_nodes, dtype=torch.float32)
+        prev_time_value = torch.zeros(num_nodes, dtype=torch.float32)
+        prev_choice = self._prev_choice(st)
+        if prev_choice is not None and 0 <= prev_choice.branch_child < num_nodes:
+            prev_branch[prev_choice.branch_child] = 1.0
+            prev_time_value[prev_choice.branch_child] = float(prev_choice.time_value)
+
+        curr_site = min(st.site_index, self.config.sequence_length)
+        window_end = min(curr_site + window_size, self.config.sequence_length)
+        geno_slice = self.config.geno[:, curr_site:window_end].float()
+        geno_window = F.pad(geno_slice, (0, window_size - geno_slice.shape[1]), value=-1.0)
+        node_geno = torch.full((num_nodes, window_size), -1.0, dtype=torch.float32)
+        for node_id, sample_id in enumerate(node_sample_ids):
+            if sample_id >= 0:
+                node_geno[node_id] = geno_window[sample_id]
+
+        out = graph.clone()
+        out.x = torch.cat(
+            [
+                graph.x.float(),
+                torch.arange(num_nodes, dtype=torch.float32).unsqueeze(-1),
+                torch.tensor(parent, dtype=torch.float32).unsqueeze(-1),
+                end_times.unsqueeze(-1),
+                prev_branch.unsqueeze(-1),
+                prev_time_value.unsqueeze(-1),
+                node_geno,
+            ],
+            dim=1,
+        )
+        out.genotype_window = geno_window
+        out.valid_action_mask = torch.zeros((num_nodes, num_grid_points), dtype=torch.bool)
+        if not self.is_terminal(st):
+            for choice in self._choices_for_site(st.site_index):
+                out.valid_action_mask[choice.branch_child, choice.time_idx] = True
+        return out
+
+    def describe_action(
+        self,
+        st: ThreadPathState,
+        action_idx: int,
+        leaf_names: Optional[Sequence[str]] = None,
+    ) -> str:
+        choice = self._choices_for_site(st.site_index)[action_idx]
         if st.choices:
             tag = "[recomb]" if _canonical_choice(choice) != _canonical_choice(st.choices[-1]) else "[stay]"
         else:
             tag = "[start]"
-            
+
         if choice.is_root_branch:
             branch_label = "root"
         elif leaf_names:
             branch_label = "(" + ",".join(
-                leaf_names[s] if s < len(leaf_names) else str(s) for s in choice.branch_signature
+                leaf_names[s] if s < len(leaf_names) else str(s)
+                for s in choice.branch_signature
             ) + ")"
         else:
             branch_label = str(choice.branch_signature)
-            
-        return f"site {choice.site} -> branch {branch_label} @ t{choice.time_idx}={choice.time_value:.2f} {tag}"
 
+        return f"site {st.site_index} -> branch {branch_label} @ t{choice.time_idx}={choice.time_value:.2f} {tag}"
 
     def step(self, st: ThreadPathState, action_idx: int) -> tuple[ThreadPathState, float, bool]:
         if self.is_terminal(st):
@@ -242,7 +293,7 @@ class ARGweaverThreadEnv(ARGRewardMixin):
         if action_idx not in self.valid_actions(st):
             raise ValueError(f"Invalid action index {action_idx} at site {st.site_index}")
 
-        choice = self.site_choices[st.site_index][action_idx]
+        choice = self._choices_for_site(st.site_index)[action_idx]
         prev_choice = st.choices[-1] if st.choices else None
         local_log_reward = self.compute_log_local_reward(prev_choice, choice, st.site_index)
         recomb_count = st.recomb_count
@@ -256,18 +307,31 @@ class ARGweaverThreadEnv(ARGRewardMixin):
         )
         return next_state, local_log_reward, self.is_terminal(next_state)
 
-    def reconstruct_local_trees(self, path: Sequence[ThreadChoice]) -> tuple[dict, ...]:
+    def reconstruct_local_graphs(self, path: Sequence[ThreadChoice]) -> tuple[GraphSegment, ...]:
         segments = compress_thread_path_to_segments(path)
-        rendered = []
+        rendered: list[GraphSegment] = []
         for segment in segments:
-            site_tree = self.site_trees[segment["start"]]
-            threaded = _thread_leaf_into_site_tree_full(site_tree, self.focal_leaf, segment["choice"])
-            threaded["start"] = segment["start"]
-            threaded["end"] = segment["end"]
-            rendered.append(threaded)
+            start = int(segment["start"])
+            end = int(segment["end"])
+            threaded = thread_leaf_into_graph(
+                self._site_graph_for_site(start),
+                self.focal_leaf,
+                segment["choice"],
+            )
+            rendered.append(
+                GraphSegment(
+                    start=start,
+                    end=end,
+                    genomic_interval=self.config.genomic_interval_for_site_span(start, end),
+                    graph=threaded,
+                )
+            )
         return tuple(rendered)
 
-    def snapshot_state(self, st: ThreadPathState) -> tuple[dict, ...]:
+    def reconstruct_local_trees(self, path: Sequence[ThreadChoice]) -> tuple[dict[str, Any], ...]:
+        return graph_segments_to_timed_tree_segments(self.reconstruct_local_graphs(path))
+
+    def snapshot_state(self, st: ThreadPathState) -> tuple[dict[str, Any], ...]:
         if not st.choices:
             return tuple()
         return self.reconstruct_local_trees(st.choices)
@@ -275,7 +339,6 @@ class ARGweaverThreadEnv(ARGRewardMixin):
     def generate_random_trajectory(
         self, seed: int | None = None
     ) -> tuple[ThreadPathState, float, list[int]]:
-        """Generates a random trajectory by choosing uniform random valid actions."""
         if seed is not None:
             random.seed(seed)
 
@@ -286,33 +349,25 @@ class ARGweaverThreadEnv(ARGRewardMixin):
             valid_acts = self.valid_actions(st)
             action = random.choice(valid_acts)
             actions.append(action)
-            st, reward, done = self.step(st, action)
+            st, reward, _done = self.step(st, action)
             total_reward += reward
 
         return st, total_reward, actions
 
-class MultiLeafThreadEnv:
-    """Outer environment that cycles through all leaf nodes.
 
-    One episode = threading every leaf exactly once (in fixed order).
-    Each leaf sub-episode delegates to an inner ``ARGweaverThreadEnv``.
-    After each leaf is fully threaded, the full trees are updated with the
-    result and the next leaf's backbone is built from the updated trees.
-    """
+class MultiLeafThreadEnv:
+    """Outer environment that cycles through leaves while storing PyG graph segments."""
 
     def __init__(
         self,
         config: ThreadingConfig,
         all_leaf_ids: Sequence[int],
-        reference_full_trees: Sequence[dict],
+        reference_graph_segments: Sequence[GraphSegment],
     ):
         self.config = config
         self.all_leaf_ids = tuple(int(lid) for lid in all_leaf_ids)
         self.num_leaves = len(self.all_leaf_ids)
-        self.reference_full_trees = tuple(
-            {"sites": tuple(seg["sites"]), "tree": seg["tree"]}
-            for seg in reference_full_trees
-        )
+        self.reference_graph_segments = tuple(_copy_graph_segment(seg) for seg in reference_graph_segments)
         self._inner_env: Optional[ARGweaverThreadEnv] = None
 
     @property
@@ -340,72 +395,81 @@ class MultiLeafThreadEnv:
         return self.config.recomb_rate
 
     def _build_inner_env(
-        self, full_trees: Sequence[Dict[str, Any]], focal_leaf: int
+        self, graph_segments: Sequence[GraphSegment], focal_leaf: int
     ) -> ARGweaverThreadEnv:
-        backbone_segments = build_backbone_segments_from_reference(
-            full_trees, focal_leaf
+        backbone_segments = build_backbone_segments_from_graph_segments(
+            graph_segments,
+            focal_leaf,
         )
-        env = ARGweaverThreadEnv(
+        return ARGweaverThreadEnv(
             self.config,
             focal_leaf=focal_leaf,
             backbone_segments=backbone_segments,
-            reference_full_trees=full_trees,
         )
-        return env
 
-    def _update_full_trees(self,
-        full_trees: Sequence[Dict[str, Any]],
+    def _update_graph_segments(
+        self,
+        graph_segments: Sequence[GraphSegment],
         focal_leaf: int,
         thread_path: Sequence[ThreadChoice],
-        inner_env: "ARGweaverThreadEnv",
-    ) -> Tuple[Dict[str, Any], ...]:
-        """Reconstruct full timed trees after threading *focal_leaf*."""
-        segments = compress_thread_path_to_segments(thread_path)
-        
-        boundaries = set([0, inner_env.config.sequence_length])
-        for t in full_trees:
-            boundaries.add(t["sites"][0])
-            boundaries.add(t["sites"][1])
-        for s in segments:
-            boundaries.add(s["start"])
-            boundaries.add(s["end"])
-            
-        boundaries = sorted(list(boundaries))
-        
-        updated: list[Dict[str, Any]] = []
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
+        inner_env: ARGweaverThreadEnv,
+    ) -> tuple[GraphSegment, ...]:
+        compressed = compress_thread_path_to_segments(thread_path)
+        boundaries = {0, inner_env.config.sequence_length}
+        for segment in graph_segments:
+            boundaries.add(segment.start)
+            boundaries.add(segment.end)
+        for segment in compressed:
+            boundaries.add(int(segment["start"]))
+            boundaries.add(int(segment["end"]))
+
+        updated: list[GraphSegment] = []
+        for start, end in zip(sorted(boundaries)[:-1], sorted(boundaries)[1:]):
             if start >= inner_env.config.sequence_length:
                 break
-            site_tree = inner_env.site_trees[start]
             choice = thread_path[start]
-            threaded = _thread_leaf_into_site_tree_full(
-                site_tree, focal_leaf, choice
+            threaded = thread_leaf_into_graph(
+                inner_env.site_graphs[start],
+                focal_leaf,
+                choice,
             )
-            new_tree = timed_tree_from_graph(
-                threaded["edge_index"],
-                threaded["num_nodes"],
-                threaded["root"],
-                threaded["node_times"],
-                threaded["node_sample_ids"],
-            )
-            if updated and updated[-1]["tree"] == new_tree:
-                updated[-1]["sites"] = (updated[-1]["sites"][0], end)
+            interval = inner_env.config.genomic_interval_for_site_span(start, end)
+            if updated and graphs_equivalent(updated[-1].graph, threaded):
+                prev = updated[-1]
+                prev_left = (
+                    prev.genomic_interval[0]
+                    if prev.genomic_interval is not None
+                    else inner_env.config.genomic_interval_for_site_span(prev.start, start)[0]
+                )
+                updated[-1] = GraphSegment(
+                    start=prev.start,
+                    end=end,
+                    genomic_interval=(prev_left, interval[1]),
+                    graph=prev.graph,
+                )
             else:
-                updated.append({"sites": (start, end), "tree": new_tree})
-                
+                updated.append(
+                    GraphSegment(
+                        start=start,
+                        end=end,
+                        genomic_interval=interval,
+                        graph=threaded,
+                    )
+                )
+
         return tuple(updated)
 
     def reset(self) -> MultiLeafState:
         first_leaf = self.all_leaf_ids[0]
         self._inner_env = self._build_inner_env(
-            self.reference_full_trees, first_leaf
+            self.reference_graph_segments,
+            first_leaf,
         )
-        inner_state = self._inner_env.reset()
         return MultiLeafState(
-            current_full_trees=self.reference_full_trees,
+            current_graph_segments=self.reference_graph_segments,
             leaves_threaded=(),
             current_focal_leaf=first_leaf,
-            inner_state=inner_state
+            inner_state=self._inner_env.reset(),
         )
 
     def is_terminal(self, st: MultiLeafState) -> bool:
@@ -417,23 +481,19 @@ class MultiLeafThreadEnv:
         assert self._inner_env is not None and st.inner_state is not None
         return self._inner_env.valid_actions(st.inner_state)
 
-    def step(
-        self, st: MultiLeafState, action_idx: int
-    ) -> tuple[MultiLeafState, float, bool]:
+    def step(self, st: MultiLeafState, action_idx: int) -> tuple[MultiLeafState, float, bool]:
         if self.is_terminal(st):
             raise RuntimeError("Cannot step a terminal state")
         assert self._inner_env is not None and st.inner_state is not None
 
-        ## This does one site action for the current focal leaf.
         inner_next, inner_reward, inner_done = self._inner_env.step(
-            st.inner_state, action_idx
+            st.inner_state,
+            action_idx,
         )
-
-        
         if not inner_done:
             return (
                 MultiLeafState(
-                    current_full_trees=st.current_full_trees,
+                    current_graph_segments=st.current_graph_segments,
                     leaves_threaded=st.leaves_threaded,
                     current_focal_leaf=st.current_focal_leaf,
                     inner_state=inner_next,
@@ -442,65 +502,67 @@ class MultiLeafThreadEnv:
                 False,
             )
 
-        new_full_trees = self._update_full_trees(
-            st.current_full_trees,
+        new_graph_segments = self._update_graph_segments(
+            st.current_graph_segments,
             st.current_focal_leaf,
             inner_next.choices,
             self._inner_env,
         )
-
         new_leaves_threaded = st.leaves_threaded + (st.current_focal_leaf,)
 
         if len(new_leaves_threaded) == self.num_leaves:
             return (
                 MultiLeafState(
-                    current_full_trees=new_full_trees,
+                    current_graph_segments=new_graph_segments,
                     leaves_threaded=new_leaves_threaded,
                     current_focal_leaf=None,
-                    inner_state=None
+                    inner_state=None,
                 ),
                 inner_reward,
                 True,
             )
 
-        next_leaf_idx = len(new_leaves_threaded)
-        next_leaf = self.all_leaf_ids[next_leaf_idx]
-        self._inner_env = self._build_inner_env(new_full_trees, next_leaf)
-        new_inner_state = self._inner_env.reset()
-
+        next_leaf = self.all_leaf_ids[len(new_leaves_threaded)]
+        self._inner_env = self._build_inner_env(new_graph_segments, next_leaf)
         return (
             MultiLeafState(
-                current_full_trees=new_full_trees,
+                current_graph_segments=new_graph_segments,
                 leaves_threaded=new_leaves_threaded,
                 current_focal_leaf=next_leaf,
-                inner_state=new_inner_state,
+                inner_state=self._inner_env.reset(),
             ),
             inner_reward,
             False,
         )
 
-    def encode(self, st: MultiLeafState, window_size: int = 5):
+    def encode(self, st: MultiLeafState, window_size: int = 5) -> Data:
         assert self._inner_env is not None and st.inner_state is not None
         return self._inner_env.encode(st.inner_state, window_size=window_size)
 
-    def describe_action(self, st: MultiLeafState, action_idx: int, leaf_names: Optional[Sequence[str]] = None) -> str:
+    def describe_action(
+        self,
+        st: MultiLeafState,
+        action_idx: int,
+        leaf_names: Optional[Sequence[str]] = None,
+    ) -> str:
         assert self._inner_env is not None and st.inner_state is not None
         desc = self._inner_env.describe_action(st.inner_state, action_idx, leaf_names=leaf_names)
-        focal = leaf_names[st.current_focal_leaf] if leaf_names and st.current_focal_leaf < len(leaf_names) else st.current_focal_leaf
+        focal = (
+            leaf_names[st.current_focal_leaf]
+            if leaf_names and st.current_focal_leaf is not None and st.current_focal_leaf < len(leaf_names)
+            else st.current_focal_leaf
+        )
         return f"[leaf {focal}] {desc}"
 
-    def reconstruct_all_local_trees(
-        self, st: MultiLeafState
-    ) -> Tuple[Dict[str, Any], ...]:
-        """Return the full trees from the terminal state."""
-        return st.current_full_trees
+    def reconstruct_all_local_graphs(self, st: MultiLeafState) -> tuple[GraphSegment, ...]:
+        return st.current_graph_segments
+
+    def reconstruct_all_local_trees(self, st: MultiLeafState) -> tuple[dict[str, Any], ...]:
+        return graph_segments_to_timed_tree_segments(st.current_graph_segments)
 
     def generate_random_trajectory(
         self, seed: int | None = None
     ) -> tuple[MultiLeafState, float, list[int]]:
-        """
-        Generates a random trajectory wihtout model, threading all leaves by choosing random actions.
-        """
         if seed is not None:
             random.seed(seed)
 
@@ -511,34 +573,28 @@ class MultiLeafThreadEnv:
             valid_acts = self.valid_actions(st)
             action = random.choice(valid_acts)
             actions.append(action)
-            st, reward, done = self.step(st, action)
+            st, reward, _done = self.step(st, action)
             total_reward += reward
 
         return st, total_reward, actions
 
 
 class SingleLeafThreadEnv(MultiLeafThreadEnv):
-    """Outer coordinator for one inner leaf-threading episode.
-
-    The outer state holds the current inferred ARG backbone. Each reset chooses
-    one focal leaf, builds an inner ``ARGweaverThreadEnv`` by removing that leaf
-    from the current full trees, and a terminal episode is reached once that
-    focal leaf has been threaded across all sites.
-    """
+    """Single-leaf GFlowNet environment backed by PyG graph segments."""
 
     def __init__(
         self,
         config: ThreadingConfig,
         all_leaf_ids: Sequence[int],
-        reference_full_trees: Sequence[dict],
+        reference_graph_segments: Sequence[GraphSegment],
     ):
-        super().__init__(config, all_leaf_ids, reference_full_trees)
-        self.current_full_trees = self.reference_full_trees
+        super().__init__(config, all_leaf_ids, reference_graph_segments)
+        self.current_graph_segments = self.reference_graph_segments
 
     def reset(
         self,
         focal_leaf: Optional[int] = None,
-        full_trees: Optional[Sequence[Dict[str, Any]]] = None,
+        graph_segments: Optional[Sequence[GraphSegment]] = None,
     ) -> MultiLeafState:
         if focal_leaf is None:
             focal_leaf = self.all_leaf_ids[-1]
@@ -548,29 +604,21 @@ class SingleLeafThreadEnv(MultiLeafThreadEnv):
                 f"focal_leaf {focal_leaf!r} is not in all_leaf_ids {self.all_leaf_ids!r}"
             )
 
-        if full_trees is not None:
-            self.current_full_trees = tuple(
-                {"sites": tuple(seg["sites"]), "tree": seg["tree"]}
-                for seg in full_trees
-            )
+        if graph_segments is not None:
+            self.current_graph_segments = tuple(_copy_graph_segment(seg) for seg in graph_segments)
 
-        self._inner_env = self._build_inner_env(
-            self.current_full_trees, focal_leaf
-        )
-        inner_state = self._inner_env.reset()
+        self._inner_env = self._build_inner_env(self.current_graph_segments, focal_leaf)
         return MultiLeafState(
-            current_full_trees=self.current_full_trees,
+            current_graph_segments=self.current_graph_segments,
             leaves_threaded=(),
             current_focal_leaf=focal_leaf,
-            inner_state=inner_state,
+            inner_state=self._inner_env.reset(),
         )
 
     def is_terminal(self, st: MultiLeafState) -> bool:
         return len(st.leaves_threaded) == 1
 
-    def step(
-        self, st: MultiLeafState, action_idx: int
-    ) -> tuple[MultiLeafState, float, bool]:
+    def step(self, st: MultiLeafState, action_idx: int) -> tuple[MultiLeafState, float, bool]:
         if self.is_terminal(st):
             raise RuntimeError("Cannot step a terminal state")
         assert self._inner_env is not None and st.inner_state is not None
@@ -578,13 +626,13 @@ class SingleLeafThreadEnv(MultiLeafThreadEnv):
             raise RuntimeError("Single-leaf episode has no focal leaf")
 
         inner_next, inner_reward, inner_done = self._inner_env.step(
-            st.inner_state, action_idx
+            st.inner_state,
+            action_idx,
         )
-
         if not inner_done:
             return (
                 MultiLeafState(
-                    current_full_trees=st.current_full_trees,
+                    current_graph_segments=st.current_graph_segments,
                     leaves_threaded=st.leaves_threaded,
                     current_focal_leaf=st.current_focal_leaf,
                     inner_state=inner_next,
@@ -593,19 +641,17 @@ class SingleLeafThreadEnv(MultiLeafThreadEnv):
                 False,
             )
 
-        new_full_trees = self._update_full_trees(
-            st.current_full_trees,
+        new_graph_segments = self._update_graph_segments(
+            st.current_graph_segments,
             st.current_focal_leaf,
             inner_next.choices,
             self._inner_env,
         )
-        self.current_full_trees = new_full_trees
-        new_leaves_threaded = st.leaves_threaded + (st.current_focal_leaf,)
-
+        self.current_graph_segments = new_graph_segments
         return (
             MultiLeafState(
-                current_full_trees=new_full_trees,
-                leaves_threaded=new_leaves_threaded,
+                current_graph_segments=new_graph_segments,
+                leaves_threaded=st.leaves_threaded + (st.current_focal_leaf,),
                 current_focal_leaf=st.current_focal_leaf,
                 inner_state=inner_next,
             ),
@@ -614,9 +660,10 @@ class SingleLeafThreadEnv(MultiLeafThreadEnv):
         )
 
     def generate_random_trajectory(
-        self, focal_leaf: int | None = None, seed: int | None = None
+        self,
+        focal_leaf: int | None = None,
+        seed: int | None = None,
     ) -> tuple[MultiLeafState, float, list[int]]:
-        """Generate one random inner trajectory for a single focal leaf."""
         if seed is not None:
             random.seed(seed)
 

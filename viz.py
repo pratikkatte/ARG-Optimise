@@ -6,6 +6,9 @@ from typing import Tuple, Optional, Sequence, Dict, Any
 def _read_attr(state, key, default=None):
     if isinstance(state, dict):
         return state.get(key, default)
+    graph = getattr(state, "graph", None)
+    if graph is not None and hasattr(graph, key):
+        return getattr(graph, key)
     return getattr(state, key, default)
 
 
@@ -27,6 +30,11 @@ def draw_tree_edge_index(
 
     if edge_index is None or num_nodes is None or root is None:
         raise ValueError("draw_tree_edge_index requires edge_index, num_nodes, and root")
+    num_nodes = int(num_nodes)
+    if isinstance(root, torch.Tensor):
+        root = int(root.reshape(-1)[0].item())
+    if isinstance(node_sample_ids, torch.Tensor):
+        node_sample_ids = tuple(int(x) for x in node_sample_ids.reshape(-1).tolist())
 
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 3))

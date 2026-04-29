@@ -3,42 +3,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Sequence, Tuple, Union
 from torch import Tensor
-
-from utils import (
-    SiteBackboneTree,
-    ThreadChoice,
-    _children_from_edge_index,
-    _graph_postorder,
-    _graph_preorder,
-)
+from torch_geometric.data import Data
+from torch_geometric.utils import to_undirected
 
 from gnn_model import GNNStack
+from utils import ThreadChoice
 
 
 class Policy(nn.Module):
-    """
-    Graph policy: encodes unrooted/ordered tree node features, runs a GNN, and scores
-    possible attachment **branch** nodes (child endpoint of each edge + root).
-    """
+    """PyG graph policy for scoring branch/time threading actions."""
 
     def __init__(
         self,
         leaf_names: List[str],
-        device: str,
+        device: Union[str, torch.device],
         time_grid: Sequence[float],
         hidden_dim: int = 64,
         num_layers: int = 2,
+        gnn_type: str = "gcn",
     ) -> None:
         super().__init__()
-        self.device = device
-        self.leaf_names = leaf_names
-        n_leaves = len(leaf_names)
-        self.register_buffer("leaf_features", torch.eye(n_leaves, dtype=torch.float32))
+        requested_device = torch.device(device)
+        if requested_device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"Policy requested device {requested_device}, but CUDA is not available."
+            )
+        self.leaf_names = list(leaf_names)
+        self.time_grid = tuple(float(t) for t in time_grid)
+        self.input_dim = len(self.leaf_names) + 2
+        self.register_buffer("leaf_features", torch.eye(len(self.leaf_names), dtype=torch.float32))
         self.log_Z = nn.Parameter(torch.zeros(()))
-        in_dim = n_leaves
-        self.time_grid = time_grid
         self.gnn = GNNStack(
-            in_dim, hidden_dim, num_layers=num_layers, bias=True, gnn_type="gcn"
+            self.input_dim,
+            hidden_dim,
+            num_layers=num_layers,
+            bias=True,
+            gnn_type=gnn_type,
         )
         self.edge_feature_dim = 4 * hidden_dim + 2
         self.action_edge_head = nn.Sequential(
@@ -48,87 +48,52 @@ class Policy(nn.Module):
             nn.ELU(),
             nn.Linear(hidden_dim, 1),
         )
-        # self.ntips = ntips
-        # self.phylo_model = PHY(data, taxa, pden, subModel, scale=scale, device=self.device)
         self.adversarial_loss = nn.BCEWithLogitsLoss()
+        self.to(requested_device)
+
+    @property
+    def device(self) -> torch.device:
+        return self.leaf_features.device
+
+    def _validate_graph_x(self, graph: Data) -> Tensor:
+        if graph.x is None:
+            raise ValueError("PyG graph is missing x node features")
+        x = graph.x.float()
+        if x.dim() != 2:
+            raise ValueError(f"graph.x must be 2D, got shape {tuple(x.shape)}")
+        if x.shape[1] != self.input_dim:
+            raise ValueError(
+                f"graph.x feature width {x.shape[1]} does not match policy input_dim "
+                f"{self.input_dim}; rebuild graph segments with the same leaf_names."
+            )
+        return x
 
     def node_embedding_site_backbone(
         self,
-        site_tree: SiteBackboneTree,
+        site_graph: Data,
         current_focal_leaf: Optional[int] = None,
     ) -> Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, int]]:
-        """Same as ``node_embedding`` (ete3) but for :class:`SiteBackboneTree` (graph format)."""
         device = self.device
-        n = site_tree.num_nodes
-        nfeat = self.leaf_features.shape[0]
-        if current_focal_leaf is not None and not (
-            0 <= int(current_focal_leaf) < nfeat
-        ):
-            raise ValueError(
-                f"current_focal_leaf must be in [0, {nfeat}), got {current_focal_leaf!r}"
-            )
-        children = _children_from_edge_index(site_tree.edge_index, n)
-        parent = site_tree.parent_of_child
-        node_sample = site_tree.node_sample_ids
-        root = site_tree.root
-        for u in range(n):
-            nch = len(children[u])
-            s = node_sample[u]
-            if s >= 0:
-                if nch != 0:
-                    raise ValueError(f"SiteBackboneTree: leaf {u} must have 0 children, got {nch}")
-            else:
-                if nch != 2:
-                    raise ValueError(
-                        f"SiteBackboneTree: internal node {u} must have 2 children, got {nch}"
-                    )
-        c = torch.zeros(n, device=device)
-        d = torch.zeros(n, nfeat, device=device, dtype=self.leaf_features.dtype)
-        lf = self.leaf_features.to(device)
-        for u in _graph_postorder(root, children):
-            s = node_sample[u]
-            if s >= 0:
-                c[u] = 0.0
-                d[u] = lf[s]
-            else:
-                chs = children[u]
-                child_c = c[chs[0]] + c[chs[1]]
-                child_d = d[chs[0]] + d[chs[1]]
-                c[u] = 1.0 / (3.0 - child_c)
-                d[u] = c[u] * child_d
-        for u in _graph_preorder(root, children):
-            if u == root:
-                continue
-            p = parent[u]
-            d[u] = c[u] * d[p] + d[u]
-        node_features: List[torch.Tensor] = []
-        edge_list: List[List[int]] = []
-        for u in range(n):
-            s = node_sample[u]
-            if u != root:
-                neigh: List[int] = [parent[u]]
-                if s >= 0:
-                    neigh.extend((-1, -1))
-                else:
-                    for v in children[u]:
-                        neigh.append(v)
-            else:
-                neigh = [v for v in children[u]]
-                while len(neigh) < 3:
-                    neigh.append(-1)
-            edge_list.append(neigh)
-            node_features.append(d[u])
-        if current_focal_leaf is not None:
-            focal_node_id = n
-            node_features.append(lf[int(current_focal_leaf)])
-            edge_list.append([-1, -1, -1])
+        x = self._validate_graph_x(site_graph).to(device)
+        edge_index = getattr(site_graph, "message_edge_index", None)
+        if edge_index is None:
+            edge_index = to_undirected(site_graph.edge_index, num_nodes=int(site_graph.num_nodes))
+        edge_index = edge_index.to(device=device, dtype=torch.long)
 
-        edge_index = torch.tensor(edge_list, dtype=torch.long, device=device)
-        stacked_node_features = torch.stack(node_features, dim=0)
         if current_focal_leaf is None:
-            return stacked_node_features, edge_index
-        return stacked_node_features, edge_index, focal_node_id
-    
+            return x, edge_index
+
+        current_focal_leaf = int(current_focal_leaf)
+        if not (0 <= current_focal_leaf < len(self.leaf_names)):
+            raise ValueError(
+                f"current_focal_leaf must be in [0, {len(self.leaf_names)}), got {current_focal_leaf!r}"
+            )
+        focal_x = x.new_zeros((1, self.input_dim))
+        focal_x[0, current_focal_leaf] = 1.0
+        focal_x[0, len(self.leaf_names) + 1] = 1.0
+        focal_node_id = x.shape[0]
+        return torch.cat([x, focal_x], dim=0), edge_index, focal_node_id
+
     def _focal_leaf_feature(
         self,
         current_focal_leaf: int,
@@ -210,42 +175,21 @@ class Policy(nn.Module):
 
     def forward(
         self,
-        site_tree: SiteBackboneTree,
+        site_graph: Data,
         current_focal_leaf: int,
         action_choices: Sequence[ThreadChoice],
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """
-        Run the GNN and score valid attachment actions from edge-style action features.
-
-        Args:
-            site_tree: Local backbone tree in graph form.
-            current_focal_leaf: Index in ``leaf_names`` of the leaf being threaded.
-            action_choices: Valid ``ThreadChoice`` candidates aligned to output rows.
-
-        Returns:
-            - ``action_logits`` — ``(A,)`` logits for ``action_choices``
-            - ``action_probs`` — ``(A,)`` softmax probabilities
-            - ``edge_features`` — ``(A, 4*hidden_dim+2)`` action edge features
-            - ``node_embeddings`` — ``(N + 1, hidden_dim)`` node embeddings from GNN,
-              including the appended isolated focal leaf as the final row
-            - ``leaf_feature`` — ``(num_leaves,)`` one-hot focal leaf indicator
-        """
-
-        if not (0 <= int(current_focal_leaf) < len(self.leaf_names)):
-            raise ValueError(
-                f"current_focal_leaf must be in [0, {len(self.leaf_names)}), got {current_focal_leaf!r}"
-            )
         if len(action_choices) == 0:
             raise ValueError("action_choices must be non-empty")
 
         node_features, edge_index, focal_node_idx = self.node_embedding_site_backbone(
-            site_tree,
+            site_graph,
             current_focal_leaf=current_focal_leaf,
         )
         node_embeddings = self.gnn(node_features, edge_index)
         h_focal = node_embeddings[focal_node_idx]
         leaf_feature = self._focal_leaf_feature(
-            current_focal_leaf,
+            int(current_focal_leaf),
             device=node_embeddings.device,
             dtype=node_embeddings.dtype,
         )
@@ -254,7 +198,7 @@ class Policy(nn.Module):
             device=node_embeddings.device,
             dtype=node_embeddings.dtype,
         )
-        if torch.any(branch_child < 0) or torch.any(branch_child >= site_tree.num_nodes):
+        if torch.any(branch_child < 0) or torch.any(branch_child >= int(site_graph.num_nodes)):
             raise ValueError("branch_child indices in action_choices are out of range")
 
         edge_features = self._build_action_edge_features(
@@ -265,7 +209,6 @@ class Policy(nn.Module):
             is_root=is_root,
             time_grid=self.time_grid,
         )
-
         action_logits = self.action_edge_head(edge_features).squeeze(-1)
         action_probs = F.softmax(action_logits, dim=0)
         return action_logits, action_probs, edge_features, node_embeddings, leaf_feature

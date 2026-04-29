@@ -1,13 +1,149 @@
 import math
 import torch
-from typing import Optional
+from typing import Optional, Sequence
 from utils import (
     ThreadPathState, 
     ThreadChoice,
-    _thread_leaf_into_site_tree_full,
     _binary_site_log_likelihood,
-    _choice_prior_weights
+    _children_from_edge_index,
+    _choice_prior_weights,
+    graph_node_sample_ids,
+    graph_root,
+    thread_leaf_into_graph,
 )
+
+NUC2VEC = {
+    "A": [1.0, 0.0, 0.0, 0.0],
+    "G": [0.0, 1.0, 0.0, 0.0],
+    "C": [0.0, 0.0, 1.0, 0.0],
+    "T": [0.0, 0.0, 0.0, 1.0],
+    "-": [1.0, 1.0, 1.0, 1.0],
+    "?": [1.0, 1.0, 1.0, 1.0],
+    "N": [1.0, 1.0, 1.0, 1.0],
+    "R": [1.0, 1.0, 0.0, 0.0],
+    "Y": [0.0, 0.0, 1.0, 1.0],
+    "S": [0.0, 1.0, 1.0, 0.0],
+    "W": [1.0, 0.0, 0.0, 1.0],
+    "K": [0.0, 1.0, 0.0, 1.0],
+    "M": [1.0, 0.0, 1.0, 0.0],
+    "B": [0.0, 1.0, 1.0, 1.0],
+    "D": [1.0, 1.0, 0.0, 1.0],
+    "H": [1.0, 0.0, 1.0, 1.0],
+    "V": [1.0, 1.0, 1.0, 0.0],
+    ".": [1.0, 1.0, 1.0, 1.0],
+    "U": [0.0, 0.0, 0.0, 1.0],
+}
+
+
+def _jc_decomposition(dtype: torch.dtype = torch.float32) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rate_matrix = torch.full((4, 4), 1.0 / 3.0, dtype=dtype)
+    rate_matrix.fill_diagonal_(-1.0)
+    eigenvalues, eigenvectors = torch.linalg.eigh(rate_matrix)
+    return eigenvalues, eigenvectors, eigenvectors.t()
+
+
+def _jc_transition_matrix(branch_length: float, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    eigenvalues, eigenvectors, eigenvectors_inv = _jc_decomposition(dtype=dtype)
+    branch_d = torch.exp(eigenvalues * float(branch_length))
+    transition = torch.matmul(eigenvectors * branch_d.unsqueeze(0), eigenvectors_inv)
+    return transition.clamp(0.0)
+
+
+def nucleotide_loglikelihood(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    root: int,
+    node_times: torch.Tensor,
+    node_sample_ids: Sequence[int],
+    fasta_sequences: Sequence[str],
+    site_index: int,
+    theta: float,
+    substitution_model: str = "JC",
+) -> float:
+    if substitution_model.upper() != "JC":
+        raise ValueError(
+            "Only the JC substitution model is currently supported for FASTA rewards."
+        )
+
+    children = _children_from_edge_index(edge_index, num_nodes)
+    pden = torch.full((4,), 0.25, dtype=torch.float32)
+    transition_by_child: dict[int, torch.Tensor] = {}
+    for parent, child in edge_index.t().tolist():
+        branch_time = float(node_times[parent].item() - node_times[child].item())
+        branch_length = float(theta) * max(branch_time, 1e-6)
+        transition_by_child[child] = _jc_transition_matrix(branch_length)
+
+    def postorder(node: int) -> torch.Tensor:
+        sample_id = node_sample_ids[node]
+        if sample_id >= 0:
+            base = fasta_sequences[sample_id][site_index].upper()
+            try:
+                return torch.tensor(NUC2VEC[base], dtype=torch.float32)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Unsupported FASTA symbol {base!r} for sample {sample_id} "
+                    f"at site {site_index}"
+                ) from exc
+
+        node_like = torch.ones(4, dtype=torch.float32)
+        for child in children[node]:
+            child_like = postorder(child)
+            contrib = torch.mv(transition_by_child[child], child_like)
+            node_like = node_like * contrib
+        return node_like
+
+    root_like = postorder(root)
+    likelihood = float(torch.dot(pden, root_like).item())
+    return math.log(max(likelihood, 1e-12))
+
+
+def nucleotide_logp_joint(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    root: int,
+    node_times: torch.Tensor,
+    node_sample_ids: Sequence[int],
+    fasta_sequences: Sequence[str],
+    site_index: int,
+    theta: float,
+    substitution_model: str = "JC",
+    scale: float = 0.1,
+) -> float:
+    if scale <= 0.0:
+        raise ValueError("scale must be strictly positive.")
+
+    log_likelihood = nucleotide_loglikelihood(
+        edge_index=edge_index,
+        num_nodes=num_nodes,
+        root=root,
+        node_times=node_times,
+        node_sample_ids=node_sample_ids,
+        fasta_sequences=fasta_sequences,
+        site_index=site_index,
+        theta=theta,
+        substitution_model=substitution_model,
+    )
+    branch_lengths = []
+    for parent, child in edge_index.t().tolist():
+        branch_time = float(node_times[parent].item() - node_times[child].item())
+        branch_lengths.append(max(branch_time, 1e-6))
+    log_prior = -sum(
+        branch_length / scale + math.log(scale) - math.log(branch_length)
+        for branch_length in branch_lengths
+    )
+    return log_prior + log_likelihood
+
+
+def loglikelihood(*args, **kwargs) -> float:
+    return nucleotide_loglikelihood(*args, **kwargs)
+
+
+def logp_joint(*args, **kwargs) -> float:
+    return nucleotide_logp_joint(*args, **kwargs)
+
+
+logp_joing = logp_joint
+
 
 class ARGRewardMixin:
     """
@@ -77,9 +213,9 @@ class ARGRewardMixin:
             raise IndexError(f"site_index {site_index} is out of bounds for sequence length {self.config.sequence_length}")
 
         # Get prior probability for the current choice
-        curr_choices_at_site = self.site_choices[site_index]
+        curr_choices_at_site = self._choices_for_site(site_index)
         curr_prior_weights = _choice_prior_weights(curr_choices_at_site)
-        curr_choice_idx = self.choice_to_index[site_index][curr_choice]
+        curr_choice_idx = self._choice_to_index_for_site(site_index)[curr_choice]
         prior_prob = float(curr_prior_weights[curr_choice_idx].item())
         
         if prev_choice is None:
@@ -87,7 +223,8 @@ class ARGRewardMixin:
             return math.log(max(prior_prob, 1e-12))
         
         # Sequentially Markovian Coalescent (SMC) prior
-        recomb_mass = 1.0 - math.exp(-self.config.recomb_rate)
+        site_distance = float(self.config.site_distance(site_index))
+        recomb_mass = 1.0 - math.exp(-self.config.recomb_rate * site_distance)
         stay_mass = 1.0 - recomb_mass
         
         # Placeholder transition model:
@@ -113,22 +250,35 @@ class ARGRewardMixin:
             raise IndexError(f"site_index {site_index} is out of bounds for sequence length {self.config.sequence_length}")
 
         # 1. Get the local tree and attach the focal lineage at the chosen branch/time.
-        site_tree = self.site_trees[site_index]
-        threaded = _thread_leaf_into_site_tree_full(site_tree, self.focal_leaf, choice)
+        site_graph = self._site_graph_for_site(site_index)
+        threaded = thread_leaf_into_graph(site_graph, self.focal_leaf, choice)
         
+        theta = self.config.mutation_rate
+        if self.config.fasta_sequences is not None:
+            return nucleotide_loglikelihood(
+                edge_index=threaded.edge_index,
+                num_nodes=int(threaded.num_nodes),
+                root=graph_root(threaded),
+                node_times=threaded.node_times,
+                node_sample_ids=graph_node_sample_ids(threaded),
+                fasta_sequences=self.config.fasta_sequences,
+                site_index=site_index,
+                theta=theta,
+                substitution_model=self.config.substitution_model,
+            )
+
         # 2. Read the observed alleles at this site across all leaves.
         site_observation = self.config.geno[:, site_index]
-        
+
         # 3. Evaluate the site likelihood with the binary Felsenstein recursion
         # implemented in utils.py. This is the emission term
         # log P_emit(D_i | T_i union c_i).
-        theta = self.config.mutation_rate
         log_likelihood = _binary_site_log_likelihood(
-            edge_index=threaded["edge_index"],
-            num_nodes=threaded["num_nodes"],
-            root=threaded["root"],
-            node_times=threaded["node_times"],
-            node_sample_ids=threaded["node_sample_ids"],
+            edge_index=threaded.edge_index,
+            num_nodes=int(threaded.num_nodes),
+            root=graph_root(threaded),
+            node_times=threaded.node_times,
+            node_sample_ids=graph_node_sample_ids(threaded),
             site_observation=site_observation,
             theta=theta
         )
