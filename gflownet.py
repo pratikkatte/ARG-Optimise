@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from env import SingleLeafThreadEnv
+from env import ARGweaverThreadEnv, SingleLeafThreadEnv
 from loss import TrajectoryBalanceLoss
 from models import Policy
-from utils import MultiLeafState, ThreadChoice
+from utils import MultiLeafState, ThreadChoice, _choice_prior_weights
+
+
+def _choice_key(choice: ThreadChoice) -> tuple[int, tuple[int, ...], int, bool]:
+    return (
+        choice.branch_child,
+        choice.branch_signature,
+        choice.time_idx,
+        choice.is_root_branch,
+    )
 
 
 @dataclass(frozen=True)
@@ -35,8 +45,11 @@ class Trajectory:
 
     @property
     def recomb_count(self) -> int:
-        inner_state = self.terminal_state.inner_state
-        return 0 if inner_state is None else int(inner_state.recomb_count)
+        recomb_count = 0
+        for prev_choice, curr_choice in zip(self.choices, self.choices[1:]):
+            if _choice_key(prev_choice) != _choice_key(curr_choice):
+                recomb_count += 1
+        return recomb_count
 
     @property
     def total_local_log_reward(self) -> float:
@@ -44,24 +57,108 @@ class Trajectory:
 
 
 class DeterministicBackwardPolicy(nn.Module):
-    """Backward policy for the current unique-parent left-to-right DAG."""
+    """Backward policy for deterministic, unique-parent trajectories."""
 
     def forward(
         self,
-        num_steps: int,
+        steps: int | Sequence[ThreadChoice],
         *,
         reference: Optional[Tensor] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        **_: object,
     ) -> Tensor:
+        num_steps = steps if isinstance(steps, int) else len(steps)
         if num_steps < 0:
             raise ValueError(f"num_steps must be non-negative, got {num_steps}.")
         if reference is not None:
             return reference.new_zeros(())
         return torch.zeros((), device=device, dtype=dtype or torch.float32)
 
-    def sum_log_prob(self, num_steps: int, *, reference: Optional[Tensor] = None) -> Tensor:
-        return self.forward(num_steps, reference=reference)
+    def sum_log_prob(
+        self,
+        steps: int | Sequence[ThreadChoice],
+        *,
+        reference: Optional[Tensor] = None,
+        **kwargs: object,
+    ) -> Tensor:
+        return self.forward(steps, reference=reference, **kwargs)
+
+
+class BiologicalBackwardPolicy(nn.Module):
+    """Bayes-reverse SMC backward policy based on recombination rates."""
+
+    def forward(
+        self,
+        choices: Sequence[ThreadChoice],
+        *,
+        inner_env: ARGweaverThreadEnv,
+        reference: Optional[Tensor] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Tensor:
+        if reference is not None:
+            out_device = reference.device
+            out_dtype = reference.dtype
+        else:
+            out_device = device
+            out_dtype = dtype or torch.float32
+
+        total_log_pb = 0.0
+        for site_index in range(1, len(choices)):
+            total_log_pb += self._step_log_prob(
+                inner_env,
+                site_index=site_index,
+                actual_prev=choices[site_index - 1],
+                curr_choice=choices[site_index],
+            )
+        return torch.tensor(total_log_pb, device=out_device, dtype=out_dtype)
+
+    def sum_log_prob(
+        self,
+        choices: Sequence[ThreadChoice],
+        *,
+        inner_env: ARGweaverThreadEnv,
+        reference: Optional[Tensor] = None,
+    ) -> Tensor:
+        return self.forward(choices, inner_env=inner_env, reference=reference)
+
+    def _step_log_prob(
+        self,
+        inner_env: ARGweaverThreadEnv,
+        *,
+        site_index: int,
+        actual_prev: ThreadChoice,
+        curr_choice: ThreadChoice,
+    ) -> float:
+        prev_choices = inner_env.site_choices[site_index - 1]
+        curr_choices = inner_env.site_choices[site_index]
+        prev_prior = _choice_prior_weights(prev_choices)
+        curr_prior = _choice_prior_weights(curr_choices)
+
+        prev_index = inner_env.choice_to_index[site_index - 1][actual_prev]
+        curr_index = inner_env.choice_to_index[site_index][curr_choice]
+        curr_prior_prob = float(curr_prior[curr_index].item())
+
+        site_distance = float(inner_env.config.site_distance(site_index))
+        recomb_mass = 1.0 - math.exp(-inner_env.config.recomb_rate * site_distance)
+        stay_mass = 1.0 - recomb_mass
+        curr_key = _choice_key(curr_choice)
+
+        log_weights = []
+        for prev_idx, prev_choice in enumerate(prev_choices):
+            trans_prob = recomb_mass * curr_prior_prob
+            if _choice_key(prev_choice) == curr_key:
+                trans_prob += stay_mass
+            log_weights.append(
+                math.log(max(float(prev_prior[prev_idx].item()), 1e-12))
+                + math.log(max(trans_prob, 1e-12))
+            )
+
+        weights_t = torch.tensor(log_weights, dtype=torch.float64)
+        numerator = weights_t[prev_index]
+        denominator = torch.logsumexp(weights_t, dim=0)
+        return float((numerator - denominator).item())
 
 
 class TrajectorySampler:
@@ -71,13 +168,13 @@ class TrajectorySampler:
         self,
         env: SingleLeafThreadEnv,
         forward_policy: Policy,
-        backward_policy: Optional[DeterministicBackwardPolicy] = None,
+        backward_policy: Optional[nn.Module] = None,
         *,
         reset_to_reference: bool = True,
     ) -> None:
         self.env = env
         self.forward_policy = forward_policy
-        self.backward_policy = backward_policy or DeterministicBackwardPolicy()
+        self.backward_policy = backward_policy or BiologicalBackwardPolicy()
         self.reset_to_reference = bool(reset_to_reference)
 
     @property
@@ -187,15 +284,19 @@ class TrajectorySampler:
             sum_log_pf = torch.stack(forward_log_probs).sum()
         else:
             sum_log_pf = self.forward_policy.log_Z.new_zeros(())
-        sum_log_pb = self.backward_policy.sum_log_prob(
-            len(actions), reference=sum_log_pf
-        )
 
         inner_env = self.env._inner_env
-        inner_state = state.inner_state
-        if inner_env is None or inner_state is None:
+        if inner_env is None or state.inner_state is None:
             raise RuntimeError("Terminal single-leaf env is missing its inner state.")
-        log_reward = sum_log_pf.new_tensor(inner_env.compute_log_reward(inner_state))
+        choice_trace = tuple(choices)
+        sum_log_pb = self.backward_policy.sum_log_prob(
+            choice_trace,
+            inner_env=inner_env,
+            reference=sum_log_pf,
+        )
+        log_reward = sum_log_pf.new_tensor(
+            inner_env.compute_log_path_reward(choice_trace)
+        )
 
         return Trajectory(
             focal_leaf=int(state.current_focal_leaf),
@@ -235,6 +336,36 @@ class TrajectorySampler:
         )
 
 
+def estimate_log_reward_center(
+    sampler: TrajectorySampler,
+    *,
+    num_trajectories: int,
+    focal_leaves: Optional[Sequence[int]] = None,
+    temperature: float = 1.0,
+    reset_to_reference: Optional[bool] = True,
+) -> float:
+    """Estimate the constant reward shift that makes initial TB residuals small."""
+    if num_trajectories <= 0:
+        raise ValueError(f"num_trajectories must be positive, got {num_trajectories}.")
+    centers: list[float] = []
+    for sample_idx in range(num_trajectories):
+        focal_leaf = None
+        if focal_leaves:
+            focal_leaf = int(focal_leaves[sample_idx % len(focal_leaves)])
+        trajectory = sampler.sample(
+            focal_leaf=focal_leaf,
+            temperature=temperature,
+            reset_to_reference=reset_to_reference,
+        )
+        center = (
+            trajectory.log_reward
+            - trajectory.sum_log_pf.detach()
+            + trajectory.sum_log_pb.detach()
+        )
+        centers.append(float(center.detach().cpu().item()))
+    return float(sum(centers) / len(centers))
+
+
 class GFlowNetTrainer:
     """Small trainer for single-leaf trajectory-balance updates."""
 
@@ -244,16 +375,18 @@ class GFlowNetTrainer:
         forward_policy: Policy,
         optimizer: torch.optim.Optimizer,
         *,
-        backward_policy: Optional[DeterministicBackwardPolicy] = None,
+        backward_policy: Optional[nn.Module] = None,
         loss_fn: Optional[TrajectoryBalanceLoss] = None,
         sampler: Optional[TrajectorySampler] = None,
         reset_to_reference: bool = True,
+        max_grad_norm: Optional[float] = None,
     ) -> None:
         self.env = env
         self.forward_policy = forward_policy
         self.optimizer = optimizer
-        self.backward_policy = backward_policy or DeterministicBackwardPolicy()
+        self.backward_policy = backward_policy or BiologicalBackwardPolicy()
         self.loss_fn = loss_fn or TrajectoryBalanceLoss()
+        self.max_grad_norm = max_grad_norm
         self.sampler = sampler or TrajectorySampler(
             env,
             forward_policy,
@@ -296,9 +429,22 @@ class GFlowNetTrainer:
 
         self.optimizer.zero_grad()
         loss.backward()
+        grad_norm = None
+        if self.max_grad_norm is not None:
+            grad_norm_t = torch.nn.utils.clip_grad_norm_(
+                self.forward_policy.parameters(),
+                max_norm=float(self.max_grad_norm),
+            )
+            grad_norm = float(grad_norm_t.detach().cpu().item())
         self.optimizer.step()
 
         with torch.no_grad():
+            tb_error = self.loss_fn.tb_error(
+                self.forward_policy.log_Z,
+                sum_log_pf,
+                log_reward,
+                sum_log_pb,
+            )
             lengths = torch.tensor(
                 [traj.length for traj in trajectories], dtype=torch.float32
             )
@@ -306,13 +452,22 @@ class GFlowNetTrainer:
                 [traj.recomb_count for traj in trajectories], dtype=torch.float32
             )
 
-        return {
+        metrics = {
             "loss": float(loss.detach().item()),
             "mean_log_reward": float(log_reward.detach().mean().item()),
+            "mean_centered_log_reward": float(
+                (log_reward.detach() - self.loss_fn.log_reward_center).mean().item()
+            ),
             "mean_sum_log_pf": float(sum_log_pf.detach().mean().item()),
             "mean_sum_log_pb": float(sum_log_pb.detach().mean().item()),
+            "mean_tb_error": float(tb_error.mean().item()),
+            "rms_tb_error": float(tb_error.square().mean().sqrt().item()),
             "mean_trajectory_length": float(lengths.mean().item()),
             "mean_recomb_count": float(recomb_counts.mean().item()),
             "log_Z": float(self.forward_policy.log_Z.detach().item()),
+            "log_reward_center": float(self.loss_fn.log_reward_center),
             "trajectories": trajectories,
         }
+        if grad_norm is not None:
+            metrics["grad_norm"] = grad_norm
+        return metrics

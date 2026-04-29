@@ -23,8 +23,7 @@ class ThreadChoice:
 @dataclass(frozen=True)
 class ThreadPathState:
     site_index: int
-    choices: Tuple[ThreadChoice, ...]
-    recomb_count: int
+    current_choice: Optional[ThreadChoice]
 
 @dataclass(frozen=True)
 class MultiLeafState:
@@ -65,7 +64,7 @@ class ThreadingConfig:
         time_grid,
         mutation_rate,
         recomb_rate,
-        reward_temperature=0.2,
+        reward_temperature=1.0,
         fasta_path=None,
         fasta_sequences: Optional[Sequence[str]] = None,
         leaf_names: Optional[Sequence[str]] = None,
@@ -133,7 +132,7 @@ class ThreadingConfig:
         time_grid,
         mutation_rate,
         recomb_rate,
-        reward_temperature=0.2,
+        reward_temperature=1.0,
         substitution_model="JC",
     ):
         substitution_model = str(substitution_model).upper()
@@ -167,7 +166,7 @@ class ThreadingConfig:
         time_grid,
         mutation_rate,
         recomb_rate,
-        reward_temperature=0.2,
+        reward_temperature=1.0,
         substitution_model="JC",
     ):
         sites = parse_argweaver_sites(sites_path)
@@ -1063,26 +1062,28 @@ def _binary_site_log_likelihood(
         sample_id = node_sample_ids[node]
         if sample_id >= 0:
             state = int(site_values[sample_id])
-            out = torch.zeros(2, dtype=torch.float32)
-            out[state] = 1.0
+            out = torch.full((2,), -torch.inf, dtype=torch.float64)
+            out[state] = 0.0
             return out
 
-        node_like = torch.ones(2, dtype=torch.float32)
+        node_log_like = torch.zeros(2, dtype=torch.float64)
         for child in children[node]:
             branch_length = float(node_times[node].item() - node_times[child].item())
             exp_term = math.exp(-2.0 * theta * max(branch_length, 1e-6))
             p_same = 0.5 + 0.5 * exp_term
             p_diff = 0.5 - 0.5 * exp_term
+            transition = torch.tensor(
+                [[p_same, p_diff], [p_diff, p_same]],
+                dtype=torch.float64,
+            ).clamp_min(torch.finfo(torch.float64).tiny)
             child_like = postorder(child)
-            contrib = torch.empty(2, dtype=torch.float32)
-            contrib[0] = p_same * child_like[0] + p_diff * child_like[1]
-            contrib[1] = p_diff * child_like[0] + p_same * child_like[1]
-            node_like = node_like * contrib
-        return node_like
+            contrib = torch.logsumexp(torch.log(transition) + child_like.unsqueeze(0), dim=1)
+            node_log_like = node_log_like + contrib
+        return node_log_like
 
     root_like = postorder(root)
-    likelihood = 0.5 * float(root_like[0].item()) + 0.5 * float(root_like[1].item())
-    return math.log(max(likelihood, 1e-12))
+    log_root_prior = torch.full((2,), math.log(0.5), dtype=torch.float64)
+    return float(torch.logsumexp(log_root_prior + root_like, dim=0).item())
 
 def compress_thread_path_to_segments(
     thread_path: Sequence[ThreadChoice],

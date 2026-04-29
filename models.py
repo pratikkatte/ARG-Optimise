@@ -30,7 +30,9 @@ class Policy(nn.Module):
             )
         self.leaf_names = list(leaf_names)
         self.time_grid = tuple(float(t) for t in time_grid)
-        self.input_dim = len(self.leaf_names) + 2
+        self.base_input_dim = len(self.leaf_names) + 2
+        self.prev_choice_feature_dim = 2
+        self.input_dim = self.base_input_dim + self.prev_choice_feature_dim
         self.register_buffer("leaf_features", torch.eye(len(self.leaf_names), dtype=torch.float32))
         self.log_Z = nn.Parameter(torch.zeros(()))
         self.gnn = GNNStack(
@@ -61,10 +63,14 @@ class Policy(nn.Module):
         x = graph.x.float()
         if x.dim() != 2:
             raise ValueError(f"graph.x must be 2D, got shape {tuple(x.shape)}")
-        if x.shape[1] != self.input_dim:
+        if x.shape[1] == self.base_input_dim:
+            padding = x.new_zeros((x.shape[0], self.prev_choice_feature_dim))
+            x = torch.cat([x, padding], dim=1)
+        elif x.shape[1] != self.input_dim:
             raise ValueError(
                 f"graph.x feature width {x.shape[1]} does not match policy input_dim "
-                f"{self.input_dim}; rebuild graph segments with the same leaf_names."
+                f"{self.input_dim} or raw width {self.base_input_dim}; rebuild graph "
+                "segments with the same leaf_names."
             )
         return x
 

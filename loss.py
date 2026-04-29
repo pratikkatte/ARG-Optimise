@@ -13,27 +13,17 @@ class TrajectoryBalanceLoss(nn.Module):
     of backward log-probabilities, and `log_R` is the terminal log-reward.
     """
 
-    def forward(
+    def __init__(self, log_reward_center: float = 0.0) -> None:
+        super().__init__()
+        self.log_reward_center = float(log_reward_center)
+
+    def _validate_inputs(
         self,
         log_Z: torch.Tensor,
         sum_log_P_F: torch.Tensor,
         log_R: torch.Tensor,
         sum_log_P_B: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Compute the batched Trajectory Balance objective.
-
-        Args:
-            log_Z: Scalar tensor for `log Z_theta`.
-            sum_log_P_F: Tensor of shape `(batch_size,)` for `sum log P_F`.
-            log_R: Tensor of shape `(batch_size,)` for terminal `log R`.
-            sum_log_P_B: Optional tensor of shape `(batch_size,)` for
-                `sum log P_B`. Defaults to zeros for the deterministic
-                backward policy and backward-compatible callers.
-
-        Returns:
-            The mean squared TB error across the batch.
-        """
         if log_Z.numel() != 1:
             raise ValueError(
                 f"log_Z must contain exactly one element, got shape {tuple(log_Z.shape)}."
@@ -64,6 +54,39 @@ class TrajectoryBalanceLoss(nn.Module):
                 "sum_log_P_B and sum_log_P_F must have identical shapes, "
                 f"got {tuple(sum_log_P_B.shape)} and {tuple(sum_log_P_F.shape)}."
             )
+        return sum_log_P_B
 
-        tb_error = log_Z.reshape(()) + sum_log_P_F - sum_log_P_B - log_R
+    def tb_error(
+        self,
+        log_Z: torch.Tensor,
+        sum_log_P_F: torch.Tensor,
+        log_R: torch.Tensor,
+        sum_log_P_B: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        sum_log_P_B = self._validate_inputs(log_Z, sum_log_P_F, log_R, sum_log_P_B)
+        centered_log_R = log_R - float(self.log_reward_center)
+        return log_Z.reshape(()) + sum_log_P_F - sum_log_P_B - centered_log_R
+
+    def forward(
+        self,
+        log_Z: torch.Tensor,
+        sum_log_P_F: torch.Tensor,
+        log_R: torch.Tensor,
+        sum_log_P_B: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute the batched Trajectory Balance objective.
+
+        Args:
+            log_Z: Scalar tensor for `log Z_theta`.
+            sum_log_P_F: Tensor of shape `(batch_size,)` for `sum log P_F`.
+            log_R: Tensor of shape `(batch_size,)` for terminal `log R`.
+            sum_log_P_B: Optional tensor of shape `(batch_size,)` for
+                `sum log P_B`. Defaults to zeros for the deterministic
+                backward policy and backward-compatible callers.
+
+        Returns:
+            The mean squared TB error across the batch.
+        """
+        tb_error = self.tb_error(log_Z, sum_log_P_F, log_R, sum_log_P_B)
         return tb_error.square().mean()

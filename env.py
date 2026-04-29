@@ -105,6 +105,7 @@ class ARGweaverThreadEnv(ARGRewardMixin):
         self._site_graph_template_cache: dict[int, Data] = {}
         self._choice_cache: dict[int, tuple[ThreadChoice, ...]] = {}
         self._choice_to_index_cache: dict[int, dict[ThreadChoice, int]] = {}
+        self._episode_choices: list[ThreadChoice] = []
         self.site_graphs = _LazySiteGraphSequence(self)
         self.site_trees = self.site_graphs
         self.site_choices = _LazySiteChoicesSequence(self)
@@ -196,8 +197,13 @@ class ARGweaverThreadEnv(ARGRewardMixin):
     def recomb_rate(self):
         return self.config.recomb_rate
 
+    @property
+    def episode_choices(self) -> tuple[ThreadChoice, ...]:
+        return tuple(self._episode_choices)
+
     def reset(self) -> ThreadPathState:
-        return ThreadPathState(site_index=0, choices=tuple(), recomb_count=0)
+        self._episode_choices = []
+        return ThreadPathState(site_index=0, current_choice=None)
 
     def is_terminal(self, st: ThreadPathState) -> bool:
         return st.site_index >= self.config.sequence_length
@@ -208,12 +214,36 @@ class ARGweaverThreadEnv(ARGRewardMixin):
         return list(range(len(self._choices_for_site(st.site_index))))
 
     def _site_tree_for_encoding(self, st: ThreadPathState) -> Data:
-        if self.is_terminal(st):
-            return self._site_graph_for_site(self.config.sequence_length - 1)
-        return self._site_graph_for_site(st.site_index)
+        site_index = self.config.sequence_length - 1 if self.is_terminal(st) else st.site_index
+        graph = self._site_graph_for_site(site_index)
+        return self._with_previous_choice_features(graph, st.current_choice)
 
     def _prev_choice(self, st: ThreadPathState) -> Optional[ThreadChoice]:
-        return st.choices[-1] if st.choices else None
+        return st.current_choice
+
+    def _normalize_choice_time(self, time_value: float) -> float:
+        t_min = float(self.config.time_grid[0])
+        t_max = float(self.config.time_grid[-1])
+        return (float(time_value) - t_min) / (t_max - t_min + 1e-8)
+
+    def _with_previous_choice_features(
+        self,
+        graph: Data,
+        prev_choice: Optional[ThreadChoice],
+    ) -> Data:
+        num_nodes = int(graph.num_nodes)
+        prev_branch = torch.zeros((num_nodes, 1), dtype=torch.float32)
+        prev_time = torch.zeros((num_nodes, 1), dtype=torch.float32)
+        if prev_choice is not None and 0 <= prev_choice.branch_child < num_nodes:
+            prev_branch[prev_choice.branch_child, 0] = 1.0
+            prev_time[prev_choice.branch_child, 0] = self._normalize_choice_time(
+                prev_choice.time_value
+            )
+
+        out = graph.clone()
+        out.x = torch.cat([graph.x.float(), prev_branch, prev_time], dim=1)
+        out.previous_choice = prev_choice
+        return out
 
     def encode(self, st: ThreadPathState, window_size: int = 5) -> Data:
         graph = self._site_tree_for_encoding(st)
@@ -226,13 +256,6 @@ class ARGweaverThreadEnv(ARGRewardMixin):
         max_time = float(self.config.time_grid[-1])
         for node_id, parent_id in enumerate(parent):
             end_times[node_id] = graph.node_times[parent_id] if parent_id != -1 else max_time
-
-        prev_branch = torch.zeros(num_nodes, dtype=torch.float32)
-        prev_time_value = torch.zeros(num_nodes, dtype=torch.float32)
-        prev_choice = self._prev_choice(st)
-        if prev_choice is not None and 0 <= prev_choice.branch_child < num_nodes:
-            prev_branch[prev_choice.branch_child] = 1.0
-            prev_time_value[prev_choice.branch_child] = float(prev_choice.time_value)
 
         curr_site = min(st.site_index, self.config.sequence_length)
         window_end = min(curr_site + window_size, self.config.sequence_length)
@@ -250,8 +273,6 @@ class ARGweaverThreadEnv(ARGRewardMixin):
                 torch.arange(num_nodes, dtype=torch.float32).unsqueeze(-1),
                 torch.tensor(parent, dtype=torch.float32).unsqueeze(-1),
                 end_times.unsqueeze(-1),
-                prev_branch.unsqueeze(-1),
-                prev_time_value.unsqueeze(-1),
                 node_geno,
             ],
             dim=1,
@@ -270,8 +291,9 @@ class ARGweaverThreadEnv(ARGRewardMixin):
         leaf_names: Optional[Sequence[str]] = None,
     ) -> str:
         choice = self._choices_for_site(st.site_index)[action_idx]
-        if st.choices:
-            tag = "[recomb]" if _canonical_choice(choice) != _canonical_choice(st.choices[-1]) else "[stay]"
+        prev_choice = self._prev_choice(st)
+        if prev_choice is not None:
+            tag = "[recomb]" if _canonical_choice(choice) != _canonical_choice(prev_choice) else "[stay]"
         else:
             tag = "[start]"
 
@@ -294,16 +316,19 @@ class ARGweaverThreadEnv(ARGRewardMixin):
             raise ValueError(f"Invalid action index {action_idx} at site {st.site_index}")
 
         choice = self._choices_for_site(st.site_index)[action_idx]
-        prev_choice = st.choices[-1] if st.choices else None
+        if len(self._episode_choices) != st.site_index:
+            raise RuntimeError(
+                "Episode choice trace is out of sync with the Markov state; "
+                "reset the environment before starting a new trajectory."
+            )
+
+        prev_choice = st.current_choice
         local_log_reward = self.compute_log_local_reward(prev_choice, choice, st.site_index)
-        recomb_count = st.recomb_count
-        if st.choices and _canonical_choice(choice) != _canonical_choice(st.choices[-1]):
-            recomb_count += 1
+        self._episode_choices.append(choice)
 
         next_state = ThreadPathState(
             site_index=st.site_index + 1,
-            choices=st.choices + (choice,),
-            recomb_count=recomb_count,
+            current_choice=choice,
         )
         return next_state, local_log_reward, self.is_terminal(next_state)
 
@@ -332,9 +357,10 @@ class ARGweaverThreadEnv(ARGRewardMixin):
         return graph_segments_to_timed_tree_segments(self.reconstruct_local_graphs(path))
 
     def snapshot_state(self, st: ThreadPathState) -> tuple[dict[str, Any], ...]:
-        if not st.choices:
+        path = self.episode_choices[: st.site_index]
+        if not path:
             return tuple()
-        return self.reconstruct_local_trees(st.choices)
+        return self.reconstruct_local_trees(path)
 
     def generate_random_trajectory(
         self, seed: int | None = None
@@ -502,10 +528,11 @@ class MultiLeafThreadEnv:
                 False,
             )
 
+        completed_path = self._inner_env.episode_choices
         new_graph_segments = self._update_graph_segments(
             st.current_graph_segments,
             st.current_focal_leaf,
-            inner_next.choices,
+            completed_path,
             self._inner_env,
         )
         new_leaves_threaded = st.leaves_threaded + (st.current_focal_leaf,)
@@ -641,10 +668,11 @@ class SingleLeafThreadEnv(MultiLeafThreadEnv):
                 False,
             )
 
+        completed_path = self._inner_env.episode_choices
         new_graph_segments = self._update_graph_segments(
             st.current_graph_segments,
             st.current_focal_leaf,
-            inner_next.choices,
+            completed_path,
             self._inner_env,
         )
         self.current_graph_segments = new_graph_segments

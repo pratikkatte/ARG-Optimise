@@ -1,5 +1,6 @@
 import math
 import torch
+from dataclasses import dataclass
 from typing import Optional, Sequence
 from utils import (
     ThreadPathState, 
@@ -35,18 +36,41 @@ NUC2VEC = {
 }
 
 
-def _jc_decomposition(dtype: torch.dtype = torch.float32) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+@dataclass(frozen=True)
+class LocalRewardBreakdown:
+    log_transition: float
+    log_emission: float
+    log_reward: float
+
+    @property
+    def unscaled_log_reward(self) -> float:
+        return self.log_transition + self.log_emission
+
+
+def _jc_decomposition(dtype: torch.dtype = torch.float64) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rate_matrix = torch.full((4, 4), 1.0 / 3.0, dtype=dtype)
     rate_matrix.fill_diagonal_(-1.0)
     eigenvalues, eigenvectors = torch.linalg.eigh(rate_matrix)
     return eigenvalues, eigenvectors, eigenvectors.t()
 
 
-def _jc_transition_matrix(branch_length: float, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def _jc_transition_matrix(branch_length: float, dtype: torch.dtype = torch.float64) -> torch.Tensor:
     eigenvalues, eigenvectors, eigenvectors_inv = _jc_decomposition(dtype=dtype)
     branch_d = torch.exp(eigenvalues * float(branch_length))
     transition = torch.matmul(eigenvectors * branch_d.unsqueeze(0), eigenvectors_inv)
-    return transition.clamp(0.0)
+    return transition.clamp_min(torch.finfo(dtype).tiny)
+
+
+def _iupac_log_mask(base: str) -> torch.Tensor:
+    try:
+        allowed = torch.tensor(NUC2VEC[base], dtype=torch.float64)
+    except KeyError as exc:
+        raise KeyError(base) from exc
+    return torch.where(
+        allowed > 0.0,
+        torch.zeros_like(allowed),
+        torch.full_like(allowed, -torch.inf),
+    )
 
 
 def nucleotide_loglikelihood(
@@ -66,35 +90,35 @@ def nucleotide_loglikelihood(
         )
 
     children = _children_from_edge_index(edge_index, num_nodes)
-    pden = torch.full((4,), 0.25, dtype=torch.float32)
-    transition_by_child: dict[int, torch.Tensor] = {}
+    log_root_prior = torch.full((4,), math.log(0.25), dtype=torch.float64)
+    log_transition_by_child: dict[int, torch.Tensor] = {}
     for parent, child in edge_index.t().tolist():
         branch_time = float(node_times[parent].item() - node_times[child].item())
         branch_length = float(theta) * max(branch_time, 1e-6)
-        transition_by_child[child] = _jc_transition_matrix(branch_length)
+        log_transition_by_child[child] = torch.log(_jc_transition_matrix(branch_length))
 
     def postorder(node: int) -> torch.Tensor:
         sample_id = node_sample_ids[node]
         if sample_id >= 0:
             base = fasta_sequences[sample_id][site_index].upper()
             try:
-                return torch.tensor(NUC2VEC[base], dtype=torch.float32)
+                return _iupac_log_mask(base)
             except KeyError as exc:
                 raise ValueError(
                     f"Unsupported FASTA symbol {base!r} for sample {sample_id} "
                     f"at site {site_index}"
                 ) from exc
 
-        node_like = torch.ones(4, dtype=torch.float32)
+        node_log_like = torch.zeros(4, dtype=torch.float64)
         for child in children[node]:
             child_like = postorder(child)
-            contrib = torch.mv(transition_by_child[child], child_like)
-            node_like = node_like * contrib
-        return node_like
+            log_transition = log_transition_by_child[child]
+            contrib = torch.logsumexp(log_transition + child_like.unsqueeze(0), dim=1)
+            node_log_like = node_log_like + contrib
+        return node_log_like
 
     root_like = postorder(root)
-    likelihood = float(torch.dot(pden, root_like).item())
-    return math.log(max(likelihood, 1e-12))
+    return float(torch.logsumexp(log_root_prior + root_like, dim=0).item())
 
 
 def nucleotide_logp_joint(
@@ -178,19 +202,40 @@ class ARGRewardMixin:
         if self.config.reward_temperature <= 0.0:
             raise ValueError("reward_temperature must be strictly positive.")
 
+        return self.compute_local_reward_breakdown(
+            prev_choice, curr_choice, site_index
+        ).log_reward
+
+    def compute_local_reward_breakdown(
+        self,
+        prev_choice: Optional[ThreadChoice],
+        curr_choice: ThreadChoice,
+        site_index: int,
+    ) -> LocalRewardBreakdown:
+        if self.config.reward_temperature <= 0.0:
+            raise ValueError("reward_temperature must be strictly positive.")
+
         log_trans = self._compute_log_transition(prev_choice, curr_choice, site_index)
         log_emit = self._compute_log_emission(curr_choice, site_index)
-        return (log_trans + log_emit) / self.config.reward_temperature
+        log_reward = (log_trans + log_emit) / self.config.reward_temperature
+        return LocalRewardBreakdown(
+            log_transition=log_trans,
+            log_emission=log_emit,
+            log_reward=log_reward,
+        )
     
-    def compute_log_reward(self, st: ThreadPathState) -> float:
+    def compute_log_path_reward(self, choices: Sequence[ThreadChoice]) -> float:
         """
-        Calculates the unnormalized log-posterior of a completely threaded sequence.
-        The joint probability of the threading path, scaled by the reward temperature (beta).
+        Calculates the unnormalized log-posterior of a complete threading path.
+
+        The Markov state intentionally keeps only the current choice, so complete
+        path rewards are computed from the explicit trajectory trace.
         """
         expected_length = self.config.sequence_length
-        if st.site_index != expected_length or len(st.choices) != expected_length:
+        if len(choices) != expected_length:
             raise ValueError(
-                "State is not terminal. The sequence must be fully threaded to compute reward."
+                "The sequence must be fully threaded to compute reward; "
+                f"got {len(choices)} choices for length {expected_length}."
             )
         if self.config.reward_temperature <= 0.0:
             raise ValueError("reward_temperature must be strictly positive.")
@@ -198,12 +243,22 @@ class ARGRewardMixin:
         total_log_reward = 0.0
         prev_choice = None
 
-        # Iterate through the full threaded path and accumulate the joint log-score.
-        for i, curr_choice in enumerate(st.choices):
+        for i, curr_choice in enumerate(choices):
             total_log_reward += self.compute_log_local_reward(prev_choice, curr_choice, i)
             prev_choice = curr_choice
 
         return total_log_reward
+
+    def compute_log_reward(self, st: ThreadPathState) -> float:
+        """
+        Backward-compatible terminal reward helper using the environment trace.
+        """
+        expected_length = self.config.sequence_length
+        if st.site_index != expected_length:
+            raise ValueError(
+                "State is not terminal. The sequence must be fully threaded to compute reward."
+            )
+        return self.compute_log_path_reward(self.episode_choices)
 
     def _compute_log_transition(self, prev_choice: Optional[ThreadChoice], curr_choice: ThreadChoice, site_index: int) -> float:
         """
