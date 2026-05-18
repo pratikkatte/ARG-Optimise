@@ -29,14 +29,6 @@ class RolloutWorker:
         chosen_action = actions[chosen_idx]
         chosen_log_prior = log_priors[chosen_idx]
         return dict(chosen_action), chosen_log_prior
-        # threshold = self.env.rng.random()
-        # running = 0.0
-        # for action, log_prior in distribution:
-        #     running += 0.0 if log_prior == -math.inf else math.exp(log_prior)
-        #     if threshold <= running:
-        #         return dict(action), log_prior
-        # action, log_prior = distribution[-1]
-        # return dict(action), log_prior
 
     def _rollout_one(self, max_steps=None):
         state = self.env.get_initial_state()
@@ -73,7 +65,19 @@ class RolloutWorker:
 
         return state, trajectory
 
-    def rollout(self, num_trajectories=1, max_steps=100):
+    def rollout(self, generator, num_trajectories=1, max_steps=100):
+        """
+        """
+
+        seq_arrays = self.env.seq_arrays
+
+        # initial tree features
+        tree_features = seq_arrays.unsqueeze(0)
+        tree_features = tree_features.repeat(num_trajectories, 1, 1, 1)
+        input_dict = self.env.prepare_rollout_inputs(tree_features, None, None)
+
+        ret = generator(input_dict)
+
         states = []
         trajectories = []
         for _ in range(num_trajectories):

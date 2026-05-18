@@ -2,6 +2,7 @@ import random
 
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
+from tb_gfn import TBGFlowNetGenerator
 
 def main():
     
@@ -18,8 +19,10 @@ def main():
         fixed_edge_length=0.02,
         rng=random.Random(7),
     )
+    generator = TBGFlowNetGenerator(env)
+
     rollout_worker = RolloutWorker(env, max_steps=50)
-    final_state, trajectory = rollout_worker.rollout()
+    final_state, trajectory = rollout_worker.rollout(generator)
 
     print("Simplified discrete CwR ARG prototype demo")
     print(

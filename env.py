@@ -4,9 +4,20 @@ import numbers
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import torch
 
 import numpy as np
 
+CHARACTERS_MAPS = {
+    'DNA_WITH_GAP': {
+        'A': [1., 0., 0., 0.],
+        'C': [0., 1., 0., 0.],
+        'G': [0., 0., 1., 0.],
+        'T': [0., 0., 0., 1.],
+        '-': [1., 1., 1., 1.],
+        'N': [1., 1., 1., 1.]
+    }
+}
 
 @dataclass
 class ARGLineage:
@@ -85,6 +96,10 @@ class SimpleARGEnvironment:
         seed: Optional[int] = None,
     ):
         self.sequences = list(sequences) if sequences is not None else None
+        self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
+        seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences])
+        self.seq_arrays = torch.nn.Parameter(torch.tensor(seq_arrays), requires_grad=False)
+
         if self.sequences is not None:
             if num_sequences is None:
                 num_sequences = len(self.sequences)
@@ -113,6 +128,12 @@ class SimpleARGEnvironment:
         self.fixed_edge_length = float(fixed_edge_length)
         self.rng = rng if rng is not None else random.Random(seed)
         self.block_indices = np.arange(self.num_blocks)
+
+
+    def seq2array(self, seq):
+        seq = [self.chars_dict[x] for x in seq]
+        data = np.array(seq)
+        return data
 
     def get_initial_state(self):
         active_lineages = []
@@ -494,6 +515,55 @@ class SimpleARGEnvironment:
 
     def compute_smcprime_event_log_prior(self, state, action, rates=None, recomb_weights=None):
         return self.compute_cwr_event_log_prior(state, action, rates, recomb_weights)
+
+    def prepare_rollout_inputs(self, tree_features, input_actions=None, random_spec=None):
+        if len(tree_features.shape) != 4:
+            raise ValueError("tree_features must have shape (batch, active_lineages, sequence_length, channels)")
+
+        inputs = tree_features.float()
+        batch_size, active_lineages, _, _ = inputs.shape
+        batch_input = inputs.reshape(batch_size, active_lineages, -1)
+        batch_nb_seq = torch.full(
+            (batch_size,),
+            active_lineages,
+            dtype=torch.long,
+            device=inputs.device,
+        )
+
+        input_dict = {
+            "batch_input": batch_input,
+            "batch_seq_features": inputs,
+            "batch_nb_seq": batch_nb_seq,
+            "batch_size": batch_size,
+            "batch_traj_idx": torch.arange(batch_size, device=inputs.device),
+            "random_spec": random_spec,
+        }
+
+        if input_actions is not None:
+            event_type_map = {"coal": 0, "recomb": 1}
+            input_dict["input_actions"] = input_actions
+            input_dict["input_event_types"] = torch.tensor(
+                [event_type_map.get(action.get("event_type"), -1) for action in input_actions],
+                dtype=torch.long,
+                device=inputs.device,
+            )
+            input_dict["input_active_lineage_i"] = torch.tensor(
+                [action.get("active_lineage_i", -1) for action in input_actions],
+                dtype=torch.long,
+                device=inputs.device,
+            )
+            input_dict["input_active_lineage_j"] = torch.tensor(
+                [action.get("active_lineage_j", -1) for action in input_actions],
+                dtype=torch.long,
+                device=inputs.device,
+            )
+            input_dict["input_breakpoints"] = torch.tensor(
+                [action.get("breakpoint", -1) for action in input_actions],
+                dtype=torch.long,
+                device=inputs.device,
+            )
+
+        return input_dict
 
     def sample_action_from_prior(self, state):
         try:
