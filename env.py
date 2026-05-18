@@ -103,8 +103,8 @@ class SimpleARGEnvironment:
             raise ValueError("num_sequences is required when sequences are not provided")
         if sequence_length is None:
             raise ValueError("sequence_length or num_blocks is required")
-        if num_blocks != sequence_length:
-            raise ValueError("num_blocks must equal sequence_length")
+        if num_blocks > sequence_length:
+            raise ValueError("num_blocks must be less than or equal to sequence_length")
 
         self.num_sequences = int(num_sequences)
         self.sequence_length = int(sequence_length)
@@ -146,23 +146,6 @@ class SimpleARGEnvironment:
         masks = [lineage.material_mask.astype(int) for lineage in state.active_lineages]
         return np.sum(masks, axis=0)
 
-    def get_active_segments(self, state):
-        """Return block segments carried by each active lineage.
-
-        Segment intervals are half-open block coordinates: ``(start, end)`` means
-        blocks ``start`` through ``end - 1``. In a terminal state, these active
-        segments show the final partition of sequence material.
-        """
-        return [
-            {
-                "node_id": lineage.node_id,
-                "segments": self.mask_to_segments(lineage.material_mask),
-                "blocks": np.flatnonzero(lineage.material_mask).tolist(),
-                "sequences_indices": list(lineage.sequences_indices),
-            }
-            for lineage in state.active_lineages
-        ]
-
     def get_recombination_breakpoints(self, state):
         """Return recombination split metadata recorded in an ARG state."""
         breakpoints_by_event = {}
@@ -187,6 +170,35 @@ class SimpleARGEnvironment:
             event["segments_by_side"][side] = self.mask_to_segments(lineage.material_mask)
             event["blocks_by_side"][side] = np.flatnonzero(lineage.material_mask).tolist()
         return list(breakpoints_by_event.values())
+
+    def get_arg_sequence_segments(self, state):
+        """Return the sequence-wide partition induced by ARG recombinations.
+
+        This reports unique genomic segments for the whole constructed ARG, not
+        the currently active lineage masks. A recombination event creates left
+        and right parent nodes with the same breakpoint, but that breakpoint is
+        counted once in the sequence partition.
+        """
+        recombination_events = self.get_recombination_breakpoints(state)
+        breakpoints = sorted(
+            {
+                event["breakpoint"]
+                for event in recombination_events
+                if event["breakpoint"] is not None
+            }
+        )
+        boundaries = [0] + breakpoints + [self.num_blocks]
+        segments = [
+            (start, end)
+            for start, end in zip(boundaries, boundaries[1:])
+            if start < end
+        ]
+        return {
+            "breakpoints": breakpoints,
+            "segments": segments,
+            "num_segments": len(segments),
+            "recombination_events": recombination_events,
+        }
 
     def mask_to_segments(self, material_mask):
         """Convert a boolean material mask into contiguous half-open segments."""
