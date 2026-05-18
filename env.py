@@ -146,9 +146,6 @@ class SimpleARGEnvironment:
         masks = [lineage.material_mask.astype(int) for lineage in state.active_lineages]
         return np.sum(masks, axis=0)
 
-    def active_count(self, state):
-        return self.get_active_counts(state)
-
     def get_active_segments(self, state):
         """Return block segments carried by each active lineage.
 
@@ -209,6 +206,27 @@ class SimpleARGEnvironment:
     def is_terminal(self, state):
         return bool(np.all(self.get_active_counts(state) == 1))
 
+    def _valid_breakpoints_for_lineage(self, state, active_lineage_i):
+        valid_breakpoints = []
+        for breakpoint in range(1, self.num_blocks):
+            action = {"event_type": "recomb", "active_lineage_i": active_lineage_i, "breakpoint": breakpoint}
+            if self.is_valid_recombination_action(state, action):
+                valid_breakpoints.append(breakpoint)
+        return valid_breakpoints
+
+    def is_valid_coalescent_action(self, state, action):
+        if action.get("event_type") != "coal":
+            return False
+        i = action.get("active_lineage_i")
+        j = action.get("active_lineage_j")
+        if not self._is_active_index(state, i) or not self._is_active_index(state, j):
+            return False
+        if i == j:
+            return False
+        mask_i = state.active_lineages[i].material_mask
+        mask_j = state.active_lineages[j].material_mask
+        return bool(np.any(mask_i & mask_j))
+
     def enumerate_action_options(self, state):
         coal_actions = []
         recomb_weights = []
@@ -233,14 +251,6 @@ class SimpleARGEnvironment:
         state.rates = rates
         return coal_actions, recomb_weights, recomb_actions
 
-    def _valid_breakpoints_for_lineage(self, state, active_lineage_i):
-        valid_breakpoints = []
-        for breakpoint in range(1, self.num_blocks):
-            action = {"event_type": "recomb", "active_lineage_i": active_lineage_i, "breakpoint": breakpoint}
-            if self.is_valid_recombination_action(state, action):
-                valid_breakpoints.append(breakpoint)
-        return valid_breakpoints
-
     def enumerate_actions(self, state, separate_coal_and_recomb=False):
         coal_actions, _, recomb_actions = self.enumerate_action_options(state)
         if separate_coal_and_recomb:
@@ -255,19 +265,6 @@ class SimpleARGEnvironment:
     def enumerate_recombination_actions(self, state):
         _, _, recomb_actions = self.enumerate_action_options(state)
         return recomb_actions
-
-    def is_valid_coalescent_action(self, state, action):
-        if action.get("event_type") != "coal":
-            return False
-        i = action.get("active_lineage_i")
-        j = action.get("active_lineage_j")
-        if not self._is_active_index(state, i) or not self._is_active_index(state, j):
-            return False
-        if i == j:
-            return False
-        mask_i = state.active_lineages[i].material_mask
-        mask_j = state.active_lineages[j].material_mask
-        return bool(np.any(mask_i & mask_j))
 
     def is_coalescence_action_valid(self, state, action):
         return self.is_valid_coalescent_action(state, action)
@@ -407,7 +404,7 @@ class SimpleARGEnvironment:
     def compute_event_probabilities(self, state):
         rates = self.compute_event_rates(state) if state.rates is None else state.rates
         denom = rates["lambda_coal"] + rates["lambda_recomb"]
-        print(denom)
+        
         if denom <= 0:
             return {"coal": 0.0, "recomb": 0.0}
         return {
@@ -415,34 +412,34 @@ class SimpleARGEnvironment:
             "recomb": rates["lambda_recomb"] / denom,
         }
 
-    def compute_action_prior_distribution(self, state):
-        coal_actions, recomb_weights, recomb_actions = self.enumerate_action_options(state)
+    def compute_action_prior_distribution(self, state, event_type=None):
+        coal_actions, recomb_weights, recomb_actions = self.enumerate_action_options(state) if state.action_options is None else state.action_options
         rates = state.rates if state.rates is not None else self.compute_event_rates(state, coal_actions, recomb_weights)
         denom = rates["lambda_coal"] + rates["lambda_recomb"]
         if denom <= 0:
             return []
-
         distribution = []
-        if coal_actions and rates["lambda_coal"] > 0:
-            log_prob = math.log(rates["lambda_coal"] / denom) - math.log(len(coal_actions))
-            distribution.extend((dict(action), log_prob) for action in coal_actions)
-
-        if recomb_actions and rates["lambda_recomb"] > 0:
-            total_weight = sum(weight for _, weight, _ in recomb_weights)
-            if total_weight > 0:
-                weight_by_lineage = {
-                    lineage_i: (weight, valid_breakpoints)
-                    for lineage_i, weight, valid_breakpoints in recomb_weights
-                }
-                log_recomb_event = math.log(rates["lambda_recomb"] / denom)
-                for action in recomb_actions:
-                    weight, valid_breakpoints = weight_by_lineage[action["active_lineage_i"]]
-                    log_prob = (
-                        log_recomb_event
-                        + math.log(weight / total_weight)
-                        - math.log(len(valid_breakpoints))
-                    )
-                    distribution.append((dict(action), log_prob))
+        if event_type == "coal":
+            if coal_actions and rates["lambda_coal"] > 0:
+                log_prob = math.log(rates["lambda_coal"] / denom) - math.log(len(coal_actions))
+                distribution.extend((dict(action), log_prob) for action in coal_actions)
+        else:
+            if recomb_actions and rates["lambda_recomb"] > 0:
+                total_weight = sum(weight for _, weight, _ in recomb_weights)
+                if total_weight > 0:
+                    weight_by_lineage = {
+                        lineage_i: (weight, valid_breakpoints)
+                        for lineage_i, weight, valid_breakpoints in recomb_weights
+                    }
+                    log_recomb_event = math.log(rates["lambda_recomb"] / denom)
+                    for action in recomb_actions:
+                        weight, valid_breakpoints = weight_by_lineage[action["active_lineage_i"]]
+                        log_prob = (
+                            log_recomb_event
+                            + math.log(weight / total_weight)
+                            - math.log(len(valid_breakpoints))
+                        )
+                        distribution.append((dict(action), log_prob))
 
         return distribution
 
@@ -494,13 +491,17 @@ class SimpleARGEnvironment:
 
         return RolloutWorker(self).sample_action_from_prior(state)
 
-    def rollout(self, max_steps=100):
+    def rollout(self, max_steps=100, num_trajectories=1):
         try:
             from .rollout_worker_arg import RolloutWorker
         except ImportError:
             from rollout_worker_arg import RolloutWorker
 
-        return RolloutWorker(self, max_steps=max_steps).rollout()
+        return RolloutWorker(
+            self,
+            max_steps=max_steps,
+            num_trajectories=num_trajectories,
+        ).rollout()
 
     def total_active_material_length(self, state):
         total_blocks = sum(int(lineage.material_mask.sum()) for lineage in state.active_lineages)

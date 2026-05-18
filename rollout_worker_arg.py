@@ -1,4 +1,6 @@
 import math
+import numbers
+import numpy as np
 
 
 class RolloutWorker:
@@ -10,20 +12,33 @@ class RolloutWorker:
         self.verbose = verbose
 
     def sample_action_from_prior(self, state):
-        distribution = self.env.compute_action_prior_distribution(state)
+        
+        probs = self.env.compute_event_probabilities(state)
+
+        chosen_event = np.random.choice(list(probs.keys()), p=list(probs.values()))
+
+        distribution = self.env.compute_action_prior_distribution(state, chosen_event)
         if not distribution:
             return None
+        actions, log_priors = zip(*distribution)
+        priors = np.array(log_priors)
+        max_log = np.max(priors)
+        weights = np.exp(priors - max_log)
+        probs = weights / weights.sum()
+        chosen_idx = np.random.choice(np.arange(len(actions)), p=probs)
+        chosen_action = actions[chosen_idx]
+        chosen_log_prior = log_priors[chosen_idx]
+        return dict(chosen_action), chosen_log_prior
+        # threshold = self.env.rng.random()
+        # running = 0.0
+        # for action, log_prior in distribution:
+        #     running += 0.0 if log_prior == -math.inf else math.exp(log_prior)
+        #     if threshold <= running:
+        #         return dict(action), log_prior
+        # action, log_prior = distribution[-1]
+        # return dict(action), log_prior
 
-        threshold = self.env.rng.random()
-        running = 0.0
-        for action, log_prior in distribution:
-            running += 0.0 if log_prior == -math.inf else math.exp(log_prior)
-            if threshold <= running:
-                return dict(action), log_prior
-        action, log_prior = distribution[-1]
-        return dict(action), log_prior
-
-    def rollout(self, max_steps=None):
+    def _rollout_one(self, max_steps=None):
         state = self.env.get_initial_state()
         trajectory = []
         rollout_steps = self.max_steps if max_steps is None else max_steps
@@ -57,3 +72,12 @@ class RolloutWorker:
                 )
 
         return state, trajectory
+
+    def rollout(self, num_trajectories=1, max_steps=100):
+        states = []
+        trajectories = []
+        for _ in range(num_trajectories):
+            state, trajectory = self._rollout_one(max_steps=max_steps)
+            states.append(state)
+            trajectories.append(trajectory)
+        return states, trajectories
