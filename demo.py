@@ -1,11 +1,13 @@
 import random
-from env import SimpleARGEnvironment    
+
+from env import SimpleARGEnvironment
+from rollout_worker_arg import RolloutWorker
 
 def main():
     
     Ne = 10000
     r_per_bp = 1e-8
-    sequence_length = 1000
+    sequence_length = 8
 
     rho = 4 * Ne * r_per_bp * sequence_length
 
@@ -16,7 +18,8 @@ def main():
         fixed_edge_length=0.02,
         rng=random.Random(7),
     )
-    final_state, trajectory = env.rollout(max_steps=50)
+    rollout_worker = RolloutWorker(env, max_steps=50)
+    final_state, trajectory = rollout_worker.rollout()
 
     print("Simplified discrete CwR ARG prototype demo")
     print(
