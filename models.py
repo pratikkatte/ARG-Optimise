@@ -60,8 +60,17 @@ class ARGModel(nn.Module):
         seq_features = self._get_seq_features(input_dict, batch_input)
         states = input_dict.get("states")
         action_options = input_dict.get("action_options")
+        selected_event_types = input_dict.get("selected_event_types")
+        if selected_event_types is not None and len(selected_event_types) != batch_size:
+            raise ValueError("selected_event_types must have one entry per batch item.")
         candidate_actions = [
-            self._candidate_actions_for_batch_item(input_dict, batch_idx, states, action_options)
+            self._candidate_actions_for_batch_item(
+                input_dict,
+                batch_idx,
+                states,
+                action_options,
+                selected_event_types,
+            )
             for batch_idx in range(batch_size)
         ]
 
@@ -92,7 +101,13 @@ class ARGModel(nn.Module):
             action_indices = self._indices_for_input_actions(input_actions, candidate_actions, device)
             actions = [dict(action) for action in input_actions]
 
-        log_paths_pf = self.compute_log_path_pf({"logits": logits}, action_indices)
+        conditional_log_paths_pf = self.compute_log_path_pf({"logits": logits}, action_indices)
+        log_event_probs = self._event_log_probs_for_batch(
+            input_dict,
+            batch_size,
+            conditional_log_paths_pf,
+        )
+        log_paths_pf = log_event_probs + conditional_log_paths_pf
         return {
             "actions": actions,
             "arg_actions": actions,
@@ -101,6 +116,8 @@ class ARGModel(nn.Module):
             "logits": logits,
             "mask": mask,
             "log_paths_pf": log_paths_pf,
+            "conditional_log_paths_pf": conditional_log_paths_pf,
+            "log_event_probs": log_event_probs,
         }
 
     def sample(self, ret, random_spec):
@@ -462,18 +479,33 @@ class ARGModel(nn.Module):
             device=device,
         )
 
-    def _candidate_actions_for_batch_item(self, input_dict, batch_idx, states, action_options):
+    def _candidate_actions_for_batch_item(
+        self,
+        input_dict,
+        batch_idx,
+        states,
+        action_options,
+        selected_event_types,
+    ):
+        selected_event_type = self._selected_event_type_for_batch_item(
+            selected_event_types,
+            batch_idx,
+        )
         if states is not None:
-            return self._state_candidate_actions(states[batch_idx])
+            return self._state_candidate_actions(states[batch_idx], selected_event_type)
 
         options = self._action_options_for_batch_item(action_options, batch_idx, input_dict["batch_input"].shape[0])
         if options is not None:
-            return self._actions_from_options(options)
+            return self._filter_actions_by_event_type(
+                self._actions_from_options(options),
+                selected_event_type,
+            )
 
         nb_seq = int(input_dict["batch_nb_seq"][batch_idx].item())
-        return self._dense_candidate_actions(nb_seq)
+        return self._dense_candidate_actions(nb_seq, selected_event_type)
 
-    def _state_candidate_actions(self, state):
+    def _state_candidate_actions(self, state, selected_event_type=None):
+        self._validate_selected_event_type(selected_event_type)
         coal_actions, recomb_weights, recomb_actions = self.env.enumerate_action_options(state) if state.action_options is None else state.action_options
         rates = state.rates if state.rates is not None else self.env.compute_event_rates(
             state,
@@ -481,18 +513,21 @@ class ARGModel(nn.Module):
             recomb_weights,
         )
         actions = []
-        if rates["lambda_coal"] > 0:
+        if selected_event_type in (None, "coal") and rates["lambda_coal"] > 0:
             actions.extend(dict(action) for action in coal_actions)
-        if rates["lambda_recomb"] > 0:
+        if selected_event_type in (None, "recomb") and rates["lambda_recomb"] > 0:
             actions.extend(dict(action) for action in recomb_actions)
         return actions
 
-    def _dense_candidate_actions(self, nb_seq):
-        actions = [
-            {"event_type": "coal", "active_lineage_i": i, "active_lineage_j": j}
-            for i, j in itertools.combinations(range(nb_seq), 2)
-        ]
-        if getattr(self.env, "rho", 1.0) > 0:
+    def _dense_candidate_actions(self, nb_seq, selected_event_type=None):
+        self._validate_selected_event_type(selected_event_type)
+        actions = []
+        if selected_event_type in (None, "coal"):
+            actions.extend(
+                {"event_type": "coal", "active_lineage_i": i, "active_lineage_j": j}
+                for i, j in itertools.combinations(range(nb_seq), 2)
+            )
+        if selected_event_type in (None, "recomb") and getattr(self.env, "rho", 1.0) > 0:
             actions.extend(
                 {
                     "event_type": "recomb",
@@ -503,6 +538,40 @@ class ARGModel(nn.Module):
                 for breakpoint in range(1, self.env.num_blocks)
             )
         return actions
+
+    def _selected_event_type_for_batch_item(self, selected_event_types, batch_idx):
+        if selected_event_types is None:
+            return None
+        if torch.is_tensor(selected_event_types):
+            idx_to_event = {idx: event for event, idx in self.EVENT_TO_IDX.items()}
+            selected_event_type = idx_to_event.get(int(selected_event_types[batch_idx].item()))
+        else:
+            selected_event_type = selected_event_types[batch_idx]
+        self._validate_selected_event_type(selected_event_type)
+        return selected_event_type
+
+    def _validate_selected_event_type(self, selected_event_type):
+        if selected_event_type is not None and selected_event_type not in self.EVENT_TO_IDX:
+            raise ValueError(f"Unknown ARG selected_event_type: {selected_event_type}")
+
+    def _filter_actions_by_event_type(self, actions, selected_event_type):
+        self._validate_selected_event_type(selected_event_type)
+        if selected_event_type is None:
+            return actions
+        return [action for action in actions if action.get("event_type") == selected_event_type]
+
+    def _event_log_probs_for_batch(self, input_dict, batch_size, reference):
+        log_event_probs = input_dict.get("log_event_probs")
+        if log_event_probs is None:
+            return reference.new_zeros(batch_size)
+        if torch.is_tensor(log_event_probs):
+            tensor = log_event_probs.to(dtype=reference.dtype, device=reference.device)
+        else:
+            tensor = torch.tensor(log_event_probs, dtype=reference.dtype, device=reference.device)
+        tensor = tensor.reshape(-1)
+        if tensor.numel() != batch_size:
+            raise ValueError("log_event_probs must have one entry per batch item.")
+        return tensor
 
     def _action_options_for_batch_item(self, action_options, batch_idx, batch_size):
         if action_options is None:

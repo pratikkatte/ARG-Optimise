@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import torch
 
@@ -69,6 +71,10 @@ class RolloutWorker:
                 active_states,
                 device=self._generator_device(generator),
             )
+            selected_event_types, log_event_probs = self._sample_event_types(
+                active_states,
+                device=tree_features.device,
+            )
             input_dict = self.env.prepare_rollout_inputs(
                 tree_features,
                 input_actions=None,
@@ -76,6 +82,8 @@ class RolloutWorker:
                 batch_nb_seq=batch_nb_seq,
             )
             input_dict["states"] = active_states
+            input_dict["selected_event_types"] = selected_event_types
+            input_dict["log_event_probs"] = log_event_probs
 
             ret = generator(input_dict)
             actions = ret.get("actions", ret.get("arg_actions"))
@@ -169,32 +177,23 @@ class RolloutWorker:
         generator=None,
         episodes=1,
         random_spec=None,
-        num_trajectories=None,
-        record_diagnostics=False,
         sample_backward=False,
     ):
         """
         Run one or more ARG rollouts.
         """
-        if num_trajectories is not None:
-            episodes = num_trajectories
-        episodes = int(episodes)
-        if episodes < 1:
-            raise ValueError("episodes must be at least 1")
-
         if generator is not None:
             return self._rollout_batch(
                 generator=generator,
                 episodes=episodes,
                 random_spec=random_spec,
-                record_diagnostics=record_diagnostics,
                 sample_backward=sample_backward,
             )
 
         states = []
         trajectories = []
         for _ in range(episodes):
-            state, trajectory = self._rollout_one(record_diagnostics=record_diagnostics)
+            state, trajectory = self._rollout_one()
             states.append(state)
             trajectories.append(trajectory)
 
@@ -204,6 +203,31 @@ class RolloutWorker:
 
     def sample_action_from_prior(self, state):
         return self.env.sample_action_from_prior(state)
+
+    def _sample_event_types(self, states, device=None):
+        selected_event_types = []
+        log_event_probs = []
+        for state in states:
+            probs = self.env.compute_event_probabilities(state)
+            coal_prob = float(probs.get("coal", 0.0))
+            recomb_prob = float(probs.get("recomb", 0.0))
+            if coal_prob <= 0.0 and recomb_prob <= 0.0:
+                raise RuntimeError("ARG rollout reached a non-terminal state with no valid event type.")
+
+            event_types = ["coal", "recomb"]
+            event_probs = [coal_prob, recomb_prob]
+            idx = np.random.choice(len(event_types), p=event_probs)
+            event_type = event_types[idx]
+            event_prob = event_probs[idx]
+
+            selected_event_types.append(event_type)
+            log_event_probs.append(math.log(event_prob))
+        
+        return selected_event_types, torch.tensor(
+            log_event_probs,
+            dtype=torch.float32,
+            device=device,
+        )
 
     def _states_to_padded_tree_features(self, states, device=None):
         lineage_features = [

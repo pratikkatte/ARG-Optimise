@@ -76,6 +76,9 @@ class ARGState:
 class EvolutionModelTorch(torch.nn.Module):
     """Fixed-edge JC69 likelihood model for constructed ARG states."""
 
+    _PROB_FLOOR = 1e-300
+    _NON_FINITE_LOG_LIKELIHOOD = -1e6
+
     def __init__(self, env):
         super().__init__()
         self.env = env
@@ -107,7 +110,7 @@ class EvolutionModelTorch(torch.nn.Module):
                 continue
 
             root_id = self._segment_root_node_id(state, block_start, block_end)
-            root_partials = self._compute_segment_partials(
+            root_partials, root_log_scale = self._compute_segment_partials(
                 state,
                 root_id,
                 block_start,
@@ -118,10 +121,13 @@ class EvolutionModelTorch(torch.nn.Module):
                 transition_matrix,
                 memo={},
             )
-            site_probs = np.maximum(np.sum(root_partials * 0.25, axis=1), 0.0)
-            with np.errstate(divide="ignore"):
-                log_likelihood += float(np.log(site_probs).sum())
+            site_probs = np.sum(root_partials * 0.25, axis=1)
+            site_probs = np.maximum(site_probs, self._PROB_FLOOR)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                log_likelihood += float(np.log(site_probs).sum() + root_log_scale.sum())
 
+        if not math.isfinite(log_likelihood):
+            return self._NON_FINITE_LOG_LIKELIHOOD
         return float(log_likelihood)
 
     def _require_terminal(self, state):
@@ -156,6 +162,20 @@ class EvolutionModelTorch(torch.nn.Module):
             )
         return roots[0]
 
+    def _normalize_leaf_partials(self, partials):
+        """Normalize leaf partials per site (phylo NORMALIZE_LIKELIHOOD behavior)."""
+        normalized = np.full_like(partials, 0.25)
+        row_sums = partials.sum(axis=-1, keepdims=True)
+        np.divide(partials, row_sums, out=normalized, where=row_sums > 0)
+        return normalized
+
+    def _rescale_partials(self, partials, log_scale):
+        scale = partials.max(axis=1)
+        scale = np.maximum(scale, self._PROB_FLOOR)
+        log_scale = log_scale + np.log(scale)
+        partials = partials / scale[:, np.newaxis]
+        return partials, log_scale
+
     def _compute_segment_partials(
         self,
         state,
@@ -173,9 +193,14 @@ class EvolutionModelTorch(torch.nn.Module):
 
         node = state.all_nodes[node_id]
         if node_id < self.env.num_sequences:
-            partials = seq_arrays[node_id, site_start:site_end].copy()
-            memo[node_id] = partials
-            return partials
+            partials = self._normalize_leaf_partials(
+                seq_arrays[node_id, site_start:site_end].copy()
+            )
+            log_scale = np.zeros(site_end - site_start, dtype=float)
+            partials, log_scale = self._rescale_partials(partials, log_scale)
+            result = (partials, log_scale)
+            memo[node_id] = result
+            return result
 
         relevant_children = [
             child_id
@@ -187,8 +212,9 @@ class EvolutionModelTorch(torch.nn.Module):
             raise ValueError(f"ARG node {node_id} has no descendants for the requested segment")
 
         partials = np.ones((site_end - site_start, seq_arrays.shape[-1]), dtype=float)
+        log_scale = np.zeros(site_end - site_start, dtype=float)
         for child_id in relevant_children:
-            child_partials = self._compute_segment_partials(
+            child_partials, child_log_scale = self._compute_segment_partials(
                 state,
                 child_id,
                 block_start,
@@ -199,10 +225,14 @@ class EvolutionModelTorch(torch.nn.Module):
                 transition_matrix,
                 memo,
             )
-            partials *= child_partials @ transition_matrix.T
-
-        memo[node_id] = partials
-        return partials
+            child_partials = np.maximum(child_partials, self._PROB_FLOOR)
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                partials *= child_partials @ transition_matrix.T
+            log_scale += child_log_scale
+            partials, log_scale = self._rescale_partials(partials, log_scale)
+        result = (partials, log_scale)
+        memo[node_id] = result
+        return result
 
     def _edge_covers_segment(self, state, parent_id, child_id, block_start, block_end):
         parent = state.all_nodes[parent_id]
@@ -724,36 +754,58 @@ class SimpleARGEnvironment:
         return trajectories
 
     def sample_action_from_prior(self, state):
-        coal_actions, recomb_weights, _ = self.enumerate_action_options(state)
-        rates = state.rates if state.rates is not None else self.compute_event_rates(
-            state,
-            coal_actions,
-            recomb_weights,
-        )
-        denom = rates["lambda_coal"] + rates["lambda_recomb"]
-        if denom <= 0:
-            return None
+        coal_actions, recomb_weights, _ = self.enumerate_action_options(state) if state.action_options is None else state.action_options
+        # rates = state.rates if state.rates is not None else self.compute_event_rates(
+        #     state,
+        #     coal_actions,
+        #     recomb_weights,
+        # )
+        # denom = rates["lambda_coal"] + rates["lambda_recomb"]
+        # if denom <= 0:
+        #     return None
 
-        coal_prob = rates["lambda_coal"] / denom if coal_actions else 0.0
-        recomb_prob = rates["lambda_recomb"] / denom if recomb_weights else 0.0
+        # coal_prob = rates["lambda_coal"] / denom if coal_actions else 0.0
+        # recomb_prob = rates["lambda_recomb"] / denom if recomb_weights else 0.0
 
-        if coal_prob > 0 and (recomb_prob <= 0 or self.rng.random() < coal_prob):
+        event_probs = self.compute_event_probabilities(state)
+
+        coal_prob = event_probs["coal"]
+        recomb_prob = event_probs["recomb"]
+
+        event_types = ["coal", "recomb"]
+        event_types_chosen = np.random.choice(event_types, p=[coal_prob, recomb_prob])
+        if event_types_chosen == "coal":
             action = dict(coal_actions[self.rng.randrange(len(coal_actions))])
             return action, math.log(coal_prob) - math.log(len(coal_actions))
+        else:
+            sampled = self._sample_recombination_prior_action(recomb_weights)
+            if sampled is None:
+                return None
+            action, lineage_weight, valid_breakpoints = sampled
+            total_weight = sum(weight for _, weight, _ in recomb_weights)
+            log_prior = (
+                math.log(recomb_prob)
+                + math.log(lineage_weight / total_weight)
+                - math.log(len(valid_breakpoints))
+            )
+            return action, log_prior
+        # if coal_prob > 0 and (recomb_prob <= 0 or self.rng.random() < coal_prob):
+        #     action = dict(coal_actions[self.rng.randrange(len(coal_actions))])
+        #     return action, math.log(coal_prob) - math.log(len(coal_actions))
 
-        if recomb_prob <= 0:
-            return None
-        sampled = self._sample_recombination_prior_action(recomb_weights)
-        if sampled is None:
-            return None
-        action, lineage_weight, valid_breakpoints = sampled
-        total_weight = sum(weight for _, weight, _ in recomb_weights)
-        log_prior = (
-            math.log(recomb_prob)
-            + math.log(lineage_weight / total_weight)
-            - math.log(len(valid_breakpoints))
-        )
-        return action, log_prior
+        # if recomb_prob <= 0:
+        #     return None
+        # sampled = self._sample_recombination_prior_action(recomb_weights)
+        # if sampled is None:
+        #     return None
+        # action, lineage_weight, valid_breakpoints = sampled
+        # total_weight = sum(weight for _, weight, _ in recomb_weights)
+        # log_prior = (
+        #     math.log(recomb_prob)
+        #     + math.log(lineage_weight / total_weight)
+        #     - math.log(len(valid_breakpoints))
+        # )
+        # return action, log_prior
 
 
     def compute_action_prior_distribution(self, state, event_type=None):
