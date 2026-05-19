@@ -3,26 +3,33 @@ import random
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
+from utils import load_sequences
 
 def main():
     
     Ne = 10000
     r_per_bp = 1e-8
-    sequence_length = 8
-
+    dataset_path = "../dataset/DS1.pickle"
+    sequences = load_sequences(dataset_path)
+    sequence_length = len(sequences[0])
     rho = 4 * Ne * r_per_bp * sequence_length
 
     env = SimpleARGEnvironment(
-        num_sequences=4,
+
         sequence_length=sequence_length,
         rho=rho,
+        num_sequences=len(sequences),
+        sequences=sequences,
+        num_blocks=10,
         fixed_edge_length=0.02,
         rng=random.Random(7),
     )
     generator = TBGFlowNetGenerator(env)
+    rollout_worker = RolloutWorker(env)
 
-    rollout_worker = RolloutWorker(env, max_steps=50)
-    final_state, trajectory = rollout_worker.rollout(generator)
+    states, trajectories = rollout_worker.rollout(generator)
+    final_state = states[0]
+    trajectory = trajectories[0]
 
     print("Simplified discrete CwR ARG prototype demo")
     print(

@@ -97,8 +97,6 @@ class SimpleARGEnvironment:
     ):
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
-        seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences])
-        self.seq_arrays = torch.nn.Parameter(torch.tensor(seq_arrays), requires_grad=False)
 
         if self.sequences is not None:
             if num_sequences is None:
@@ -128,6 +126,16 @@ class SimpleARGEnvironment:
         self.fixed_edge_length = float(fixed_edge_length)
         self.rng = rng if rng is not None else random.Random(seed)
         self.block_indices = np.arange(self.num_blocks)
+
+        if self.sequences is None:
+            num_chars = len(next(iter(self.chars_dict.values())))
+            seq_arrays = np.zeros(
+                (self.num_sequences, self.sequence_length, num_chars),
+                dtype=float,
+            )
+        else:
+            seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences])
+        self.seq_arrays = torch.nn.Parameter(torch.tensor(seq_arrays), requires_grad=False)
 
 
     def seq2array(self, seq):
@@ -236,6 +244,88 @@ class SimpleARGEnvironment:
             segments.append((start, len(mask)))
         return segments
 
+    def save_to_tree_sequence(self, state, output_path=None):
+        """Convert a terminal ARG state to a tskit TreeSequence.
+
+        The exported topology contains ancestry edges only. Synthetic node times
+        are derived from graph depth because ARG rollout states do not store
+        continuous event times.
+        """
+        if not self.is_terminal(state):
+            raise ValueError("terminal_state_to_tree_sequence requires a terminal ARGState")
+        if self.num_blocks <= 0 or self.sequence_length <= 0:
+            raise ValueError("sequence_length and num_blocks must be positive")
+
+        try:
+            import tskit
+        except ImportError as exc:
+            raise ImportError(
+                "tskit is required to export ARG states to .trees files. "
+                "Install it with `pip install tskit`."
+            ) from exc
+
+        node_times = self._synthetic_tskit_node_times(state)
+        tables = tskit.TableCollection(sequence_length=float(self.sequence_length))
+        sample_node_ids = set(range(self.num_sequences))
+        tskit_node_ids = {}
+
+        for node_id in sorted(state.all_nodes):
+            flags = tskit.NODE_IS_SAMPLE if node_id in sample_node_ids else 0
+            tskit_node_ids[node_id] = tables.nodes.add_row(
+                flags=flags,
+                time=node_times[node_id],
+            )
+
+        for parent_id in sorted(state.all_nodes):
+            parent = state.all_nodes[parent_id]
+            for child_id in parent.children:
+                if child_id not in state.all_nodes:
+                    raise ValueError(f"ARG node {parent_id} references missing child {child_id}")
+                child = state.all_nodes[child_id]
+                material_mask = parent.material_mask & child.material_mask
+                for left_block, right_block in self.mask_to_segments(material_mask):
+                    left = self._block_to_sequence_coordinate(left_block)
+                    right = self._block_to_sequence_coordinate(right_block)
+                    if left < right:
+                        tables.edges.add_row(
+                            left=left,
+                            right=right,
+                            parent=tskit_node_ids[parent_id],
+                            child=tskit_node_ids[child_id],
+                        )
+
+        tables.sort()
+        tree_sequence = tables.tree_sequence()
+        if output_path is not None:
+            tree_sequence.dump(output_path)
+        return tree_sequence
+
+    def _synthetic_tskit_node_times(self, state):
+        if self.fixed_edge_length <= 0:
+            raise ValueError("fixed_edge_length must be positive to export a valid tree sequence")
+
+        node_times = {}
+        sample_node_ids = set(range(self.num_sequences))
+        for node_id in sorted(state.all_nodes):
+            node = state.all_nodes[node_id]
+            if node_id in sample_node_ids:
+                node_times[node_id] = 0.0
+                continue
+            if not node.children:
+                raise ValueError(f"Non-sample ARG node {node_id} has no children")
+            try:
+                child_times = [node_times[child_id] for child_id in node.children]
+            except KeyError as exc:
+                raise ValueError(
+                    "ARG node ids must be topologically ordered so children are created "
+                    "before their parents"
+                ) from exc
+            node_times[node_id] = max(child_times) + self.fixed_edge_length
+        return node_times
+
+    def _block_to_sequence_coordinate(self, block_index):
+        return float(block_index) * float(self.sequence_length) / float(self.num_blocks)
+
     def is_terminal(self, state):
         return bool(np.all(self.get_active_counts(state) == 1))
 
@@ -261,6 +351,8 @@ class SimpleARGEnvironment:
         return bool(np.any(mask_i & mask_j))
 
     def enumerate_action_options(self, state):
+        if state.action_options is not None:
+            return state.action_options[0], state.action_options[1], state.action_options[2]
         coal_actions = []
         recomb_weights = []
         recomb_actions = []
@@ -582,8 +674,7 @@ class SimpleARGEnvironment:
         return RolloutWorker(
             self,
             max_steps=max_steps,
-            num_trajectories=num_trajectories,
-        ).rollout()
+        ).rollout(num_trajectories=num_trajectories)
 
     def total_active_material_length(self, state):
         total_blocks = sum(int(lineage.material_mask.sum()) for lineage in state.active_lineages)

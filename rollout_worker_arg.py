@@ -1,6 +1,5 @@
-import math
-import numbers
 import numpy as np
+import torch
 
 
 class RolloutWorker:
@@ -30,7 +29,7 @@ class RolloutWorker:
         chosen_log_prior = log_priors[chosen_idx]
         return dict(chosen_action), chosen_log_prior
 
-    def _rollout_one(self, max_steps=None):
+    def _rollout_one(self, generator=None, random_spec=None, max_steps=None):
         state = self.env.get_initial_state()
         trajectory = []
         rollout_steps = self.max_steps if max_steps is None else max_steps
@@ -39,11 +38,22 @@ class RolloutWorker:
             if state.is_done:
                 break
 
-            sampled = self.sample_action_from_prior(state)
-            if sampled is None:
-                break
+            if generator is None:
+                sampled = self.sample_action_from_prior(state)
+                if sampled is None:
+                    break
+                action, log_prior = sampled
+            else:
+                tree_features = self._state_to_tree_features(state)
+                input_dict = self.env.prepare_rollout_inputs(tree_features, None, random_spec)
+                input_dict["states"] = [state]
+                ret = generator(input_dict)
+                actions = ret.get("actions", ret.get("arg_actions"))
+                if not actions:
+                    break
+                action = dict(actions[0])
+                log_prior = self.env.compute_cwr_event_log_prior(state, action)
 
-            action, log_prior = sampled
             state = self.env.apply_action(state, action, log_prior)
             trajectory.append(
                 {
@@ -65,23 +75,46 @@ class RolloutWorker:
 
         return state, trajectory
 
-    def rollout(self, generator, num_trajectories=1, max_steps=100):
+    def rollout(self, generator=None, episodes=1, max_steps=100, random_spec=None):
         """
         """
-
-        seq_arrays = self.env.seq_arrays
-
-        # initial tree features
-        tree_features = seq_arrays.unsqueeze(0)
-        tree_features = tree_features.repeat(num_trajectories, 1, 1, 1)
-        input_dict = self.env.prepare_rollout_inputs(tree_features, None, None)
-
-        ret = generator(input_dict)
-
         states = []
         trajectories = []
-        for _ in range(num_trajectories):
-            state, trajectory = self._rollout_one(max_steps=max_steps)
+        for _ in range(episodes):
+            state, trajectory = self._rollout_one(
+                generator=generator,
+                random_spec=random_spec,
+                max_steps=max_steps,
+            )
             states.append(state)
             trajectories.append(trajectory)
         return states, trajectories
+
+    def _state_to_tree_features(self, state):
+        seq_arrays = self.env.seq_arrays.float()
+        lineage_features = []
+
+        for lineage in state.active_lineages:
+            if lineage.sequences_indices:
+                feature = seq_arrays[lineage.sequences_indices].mean(dim=0)
+            else:
+                feature = torch.zeros_like(seq_arrays[0])
+            site_mask = self._material_mask_to_site_mask(lineage.material_mask, feature.device)
+            lineage_features.append(feature * site_mask[:, None])
+
+        return torch.stack(lineage_features, dim=0).unsqueeze(0)
+
+    def _material_mask_to_site_mask(self, material_mask, device):
+        mask = torch.as_tensor(material_mask, dtype=torch.bool, device=device)
+        sequence_length = int(self.env.sequence_length)
+        if len(mask) == sequence_length:
+            return mask.to(dtype=torch.float32)
+
+        site_mask = torch.zeros(sequence_length, dtype=torch.bool, device=device)
+        for block_idx, has_material in enumerate(mask.tolist()):
+            if not has_material:
+                continue
+            start = int(round(block_idx * sequence_length / self.env.num_blocks))
+            end = int(round((block_idx + 1) * sequence_length / self.env.num_blocks))
+            site_mask[start:end] = True
+        return site_mask.to(dtype=torch.float32)
