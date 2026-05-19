@@ -4,6 +4,8 @@ import os
 import pickle
 import random
 
+import wandb
+
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
@@ -43,6 +45,7 @@ def train(
     rollout_worker = RolloutWorker(env)
 
     history = []
+    wandb.init()
     for epoch in range(epochs_num):
         info = train_epoch(epoch, rollout_worker, generator, batch_size=batch_size)
         log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
@@ -51,12 +54,13 @@ def train(
             info['epoch'] = epoch
             info['log_z'] = log_z
             history.append(info)
+            wandb.log({"epoch": epoch, "loss": info["loss"], "logZ": log_z}, step=epoch + 1)
             print(f"Epoch {epoch + 1} loss={info['loss']:.4f} logZ={log_z:.4f}")
 
     os.makedirs(output_path, exist_ok=True)
-    with open(os.path.join(output_path, 'training_history.pkl'), 'wb') as handle:
+    # with open(os.path.join(output_path, 'training_history.pkl'), 'wb') as handle:
         # pickle.dump(history, handle)
-        pass
+    wandb.finish()
     return history
 
 def main():
