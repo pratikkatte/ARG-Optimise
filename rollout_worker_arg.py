@@ -10,36 +10,16 @@ class RolloutWorker:
         self.max_steps = max_steps
         self.verbose = verbose
 
-    def sample_action_from_prior(self, state):
-        
-        probs = self.env.compute_event_probabilities(state)
-
-        chosen_event = np.random.choice(list(probs.keys()), p=list(probs.values()))
-
-        distribution = self.env.compute_action_prior_distribution(state, chosen_event)
-        if not distribution:
-            return None
-        actions, log_priors = zip(*distribution)
-        priors = np.array(log_priors)
-        max_log = np.max(priors)
-        weights = np.exp(priors - max_log)
-        probs = weights / weights.sum()
-        chosen_idx = np.random.choice(np.arange(len(actions)), p=probs)
-        chosen_action = actions[chosen_idx]
-        chosen_log_prior = log_priors[chosen_idx]
-        return dict(chosen_action), chosen_log_prior
-
-    def _rollout_one(self, generator=None, random_spec=None, max_steps=None):
+    def _rollout_one(self, generator=None, random_spec=None):
         state = self.env.get_initial_state()
         trajectory = []
-        rollout_steps = self.max_steps if max_steps is None else max_steps
+        all_log_paths_pf = []
+        step = 0
 
-        for step in range(rollout_steps):
-            if state.is_done:
-                break
-
+        while not state.is_done:
+            step += 1
             if generator is None:
-                sampled = self.sample_action_from_prior(state)
+                sampled = self.env.sample_action_from_prior(state)
                 if sampled is None:
                     break
                 action, log_prior = sampled
@@ -53,11 +33,12 @@ class RolloutWorker:
                     break
                 action = dict(actions[0])
                 log_prior = self.env.compute_cwr_event_log_prior(state, action)
+                all_log_paths_pf.append(ret["log_paths_pf"].reshape(-1)[0])
 
             state = self.env.apply_action(state, action, log_prior)
             trajectory.append(
                 {
-                    "step": step,
+                    "step":step,
                     "action": action,
                     "log_prior": log_prior,
                     "active_lineage_count": len(state.active_lineages),
@@ -72,8 +53,37 @@ class RolloutWorker:
                     "step={step:02d} action={action} log_prior={log_prior:.4f} "
                     "active={active_lineage_count} done={is_done}".format(**trajectory[-1])
                 )
+            step += 1
 
-        return state, trajectory
+        if generator is None:
+            return state, trajectory
+
+        if not state.is_done:
+            raise RuntimeError("ARG rollout ended before reaching a terminal state.")
+        if not all_log_paths_pf:
+            raise RuntimeError("Generator rollout did not produce forward log probabilities.")
+
+        log_paths_pf = torch.stack(all_log_paths_pf)
+        backward = generator.sample_backward_from_arg(state)
+        num_parents = backward["num_parents"]
+        if len(num_parents) != log_paths_pf.shape[0]:
+            raise ValueError(
+                "Backward parent counts must align with forward log probabilities: "
+                f"{len(num_parents)} != {log_paths_pf.shape[0]}"
+            )
+        log_paths_pb = -torch.log(
+            torch.tensor(num_parents, dtype=log_paths_pf.dtype, device=log_paths_pf.device)
+        )
+
+        data = {
+            'log_paths_pf': log_paths_pf,
+            'log_paths_pb': log_paths_pb,
+            'log_rewards': state.log_reward,
+            'states': [state],
+            'backward_actions': backward["forward_actions"],
+            'backward_num_parents': num_parents,
+        }
+        return data, trajectory
 
     def rollout(self, generator=None, episodes=1, max_steps=100, random_spec=None):
         """
@@ -83,8 +93,7 @@ class RolloutWorker:
         for _ in range(episodes):
             state, trajectory = self._rollout_one(
                 generator=generator,
-                random_spec=random_spec,
-                max_steps=max_steps,
+                random_spec=random_spec
             )
             states.append(state)
             trajectories.append(trajectory)

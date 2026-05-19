@@ -50,7 +50,6 @@ class ARGLineage:
             recombination_side=self.recombination_side,
         )
 
-
 @dataclass
 class ARGState:
     active_lineages: List[ARGLineage]
@@ -74,14 +73,165 @@ class ARGState:
             is_done=self.is_done,
         )
 
+class EvolutionModelTorch(torch.nn.Module):
+    """Fixed-edge JC69 likelihood model for constructed ARG states."""
+
+    def __init__(self, env):
+        super().__init__()
+        self.env = env
+
+    def compute_arg_log_likelihood(self, state):
+        """Compute the JC69 sequence log likelihood of a terminal ARG.
+
+        Each marginal segment induced by recombination breakpoints is scored
+        with Felsenstein pruning. All traversed ARG edges use the environment's
+        fixed edge length.
+        """
+
+        self._require_terminal(state)
+
+        if self.env.sequences is None:
+            return 0.0
+
+        if self.env.fixed_edge_length < 0:
+            raise ValueError("fixed_edge_length must be non-negative for likelihood scoring")
+
+        seq_arrays = self._seq_arrays_numpy()
+        transition_matrix = self._jc69_transition_matrix(self.env.fixed_edge_length)
+        log_likelihood = 0.0
+
+        for block_start, block_end in self.env.get_arg_sequence_segments(state)["segments"]:
+            site_start = self._block_to_site(block_start)
+            site_end = self._block_to_site(block_end)
+            if site_start >= site_end:
+                continue
+
+            root_id = self._segment_root_node_id(state, block_start, block_end)
+            root_partials = self._compute_segment_partials(
+                state,
+                root_id,
+                block_start,
+                block_end,
+                site_start,
+                site_end,
+                seq_arrays,
+                transition_matrix,
+                memo={},
+            )
+            site_probs = np.maximum(np.sum(root_partials * 0.25, axis=1), 0.0)
+            with np.errstate(divide="ignore"):
+                log_likelihood += float(np.log(site_probs).sum())
+
+        return float(log_likelihood)
+
+    def _require_terminal(self, state):
+        if not self.env.is_terminal(state):
+            raise ValueError("ARG likelihood and posterior reward require a terminal ARGState")
+
+    def _seq_arrays_numpy(self):
+        return self.env.seq_arrays.detach().cpu().numpy().astype(float, copy=False)
+
+    def _jc69_transition_matrix(self, edge_length):
+        same_prob = 0.25 + 0.75 * math.exp(-4.0 * float(edge_length) / 3.0)
+        diff_prob = 0.25 - 0.25 * math.exp(-4.0 * float(edge_length) / 3.0)
+        transition_matrix = np.full((4, 4), diff_prob, dtype=float)
+        np.fill_diagonal(transition_matrix, same_prob)
+        return transition_matrix
+
+    def _block_to_site(self, block_index):
+        site_fraction = (
+            float(block_index) * float(self.env.sequence_length) / float(self.env.num_blocks)
+        )
+        return int(round(site_fraction))
+
+    def _segment_root_node_id(self, state, block_start, block_end):
+        roots = [
+            lineage.node_id
+            for lineage in state.active_lineages
+            if np.all(lineage.material_mask[block_start:block_end])
+        ]
+        if len(roots) != 1:
+            raise ValueError(
+                "terminal ARG must have exactly one active root covering each sequence segment"
+            )
+        return roots[0]
+
+    def _compute_segment_partials(
+        self,
+        state,
+        node_id,
+        block_start,
+        block_end,
+        site_start,
+        site_end,
+        seq_arrays,
+        transition_matrix,
+        memo,
+    ):
+        if node_id in memo:
+            return memo[node_id]
+
+        node = state.all_nodes[node_id]
+        if node_id < self.env.num_sequences:
+            partials = seq_arrays[node_id, site_start:site_end].copy()
+            memo[node_id] = partials
+            return partials
+
+        relevant_children = [
+            child_id
+            for child_id in node.children
+            if self._edge_covers_segment(state, node_id, child_id, block_start, block_end)
+        ]
+
+        if not relevant_children:
+            raise ValueError(f"ARG node {node_id} has no descendants for the requested segment")
+
+        partials = np.ones((site_end - site_start, seq_arrays.shape[-1]), dtype=float)
+        for child_id in relevant_children:
+            child_partials = self._compute_segment_partials(
+                state,
+                child_id,
+                block_start,
+                block_end,
+                site_start,
+                site_end,
+                seq_arrays,
+                transition_matrix,
+                memo,
+            )
+            partials *= child_partials @ transition_matrix.T
+
+        memo[node_id] = partials
+        return partials
+
+    def _edge_covers_segment(self, state, parent_id, child_id, block_start, block_end):
+        parent = state.all_nodes[parent_id]
+        child = state.all_nodes[child_id]
+        edge_mask = parent.material_mask & child.material_mask
+        return bool(np.any(edge_mask[block_start:block_end]))
+
+
+class ARGReward:
+    """
+    Terminal reward helpers for constructed ARG states.
+    """
+
+    def __init__(self):
+        pass
+
+    def __call__(self, state):
+        return self.compute_terminal_posterior_log_reward(state)
+
+    def compute_terminal_posterior_log_reward(self, log_likelihood):
+        return log_likelihood
 
 class SimpleARGEnvironment:
     """
     Minimal discrete coalescent-with-recombination ARG prototype.
 
-    This intentionally avoids eete3, continuous breakpoints, likelihood scoring, and
-    full continuous coalescent-with-recombination simulation. The placeholder reward
-    is the accumulated log prior of the sampled event trajectory.
+    This intentionally avoids eete3, continuous breakpoints, and full continuous
+    coalescent-with-recombination simulation. Terminal states are rewarded by the
+    sampled event prior plus a fixed-edge JC69 sequence likelihood.
     """
 
     def __init__(
@@ -136,7 +286,8 @@ class SimpleARGEnvironment:
         else:
             seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences])
         self.seq_arrays = torch.nn.Parameter(torch.tensor(seq_arrays), requires_grad=False)
-
+        self.evolution_model = EvolutionModelTorch(self)
+        self.reward_fn = ARGReward()
 
     def seq2array(self, seq):
         seq = [self.chars_dict[x] for x in seq]
@@ -167,6 +318,9 @@ class SimpleARGEnvironment:
             is_done=False,
         )
         state.is_done = self.is_terminal(state)
+        if state.is_done:
+            log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
+            state.log_reward = self.reward_fn(log_likelihood)+state.accumulated_log_prior
         return state
 
     def get_active_counts(self, state):
@@ -300,6 +454,10 @@ class SimpleARGEnvironment:
             tree_sequence.dump(output_path)
         return tree_sequence
 
+    def terminal_state_to_tree_sequence(self, state, output_path=None):
+        """Compatibility wrapper for exporting a terminal ARG as a tree sequence."""
+        return self.save_to_tree_sequence(state, output_path=output_path)
+
     def _synthetic_tskit_node_times(self, state):
         if self.fixed_edge_length <= 0:
             raise ValueError("fixed_edge_length must be positive to export a valid tree sequence")
@@ -325,6 +483,10 @@ class SimpleARGEnvironment:
 
     def _block_to_sequence_coordinate(self, block_index):
         return float(block_index) * float(self.sequence_length) / float(self.num_blocks)
+
+    def compute_arg_log_likelihood(self, state):
+        """Compute the terminal ARG sequence log likelihood under fixed-edge JC69."""
+        return self.evolution_model.compute_arg_log_likelihood(state)
 
     def is_terminal(self, state):
         return bool(np.all(self.get_active_counts(state) == 1))
@@ -440,8 +602,12 @@ class SimpleARGEnvironment:
         next_state.active_lineages.append(parent)
         next_state.max_node_idx = parent.node_id
         next_state.accumulated_log_prior += log_prior
-        next_state.log_reward = next_state.accumulated_log_prior
         next_state.is_done = self.is_terminal(next_state)
+        if next_state.is_done:
+            log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
+            next_state.log_reward = self.reward_fn(log_likelihood)+next_state.accumulated_log_prior
+        else:
+            next_state.log_reward = None
         return next_state
 
     def apply_recombination(self, state, action, log_prior=None):
@@ -498,8 +664,12 @@ class SimpleARGEnvironment:
         next_state.active_lineages.extend([left_parent, right_parent])
         next_state.max_node_idx = right_parent.node_id
         next_state.accumulated_log_prior += log_prior
-        next_state.log_reward = next_state.accumulated_log_prior
         next_state.is_done = self.is_terminal(next_state)
+        if next_state.is_done:
+            log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
+            next_state.log_reward = self.reward_fn(log_likelihood)+next_state.accumulated_log_prior
+        else:
+            next_state.log_reward = None
         return next_state
 
     def apply_action(self, state, action, log_prior=None):
@@ -536,6 +706,36 @@ class SimpleARGEnvironment:
             "coal": rates["lambda_coal"] / denom,
             "recomb": rates["lambda_recomb"] / denom,
         }
+
+    def sample(self, num_trajs):
+        trajectories = []
+        for _ in range(num_trajs):
+            state = self.get_initial_state()
+            while not state.is_done:
+                action, log_prior = self.sample_action_from_prior(state)
+                state = self.apply_action(state, action, log_prior)
+            trajectories.append(state)
+        return trajectories
+
+    def sample_action_from_prior(self, state):
+        
+        probs = self.compute_event_probabilities(state)
+
+        chosen_event = np.random.choice(list(probs.keys()), p=list(probs.values()))
+
+        distribution = self.compute_action_prior_distribution(state, chosen_event)
+        if not distribution:
+            return None
+        actions, log_priors = zip(*distribution)
+        priors = np.array(log_priors)
+        max_log = np.max(priors)
+        weights = np.exp(priors - max_log)
+        probs = weights / weights.sum()
+        chosen_idx = np.random.choice(np.arange(len(actions)), p=probs)
+        chosen_action = actions[chosen_idx]
+        chosen_log_prior = log_priors[chosen_idx]
+        return dict(chosen_action), chosen_log_prior
+
 
     def compute_action_prior_distribution(self, state, event_type=None):
         coal_actions, recomb_weights, recomb_actions = self.enumerate_action_options(state) if state.action_options is None else state.action_options
@@ -656,25 +856,6 @@ class SimpleARGEnvironment:
             )
 
         return input_dict
-
-    def sample_action_from_prior(self, state):
-        try:
-            from .rollout_worker_arg import RolloutWorker
-        except ImportError:
-            from rollout_worker_arg import RolloutWorker
-
-        return RolloutWorker(self).sample_action_from_prior(state)
-
-    def rollout(self, max_steps=100, num_trajectories=1):
-        try:
-            from .rollout_worker_arg import RolloutWorker
-        except ImportError:
-            from rollout_worker_arg import RolloutWorker
-
-        return RolloutWorker(
-            self,
-            max_steps=max_steps,
-        ).rollout(num_trajectories=num_trajectories)
 
     def total_active_material_length(self, state):
         total_blocks = sum(int(lineage.material_mask.sum()) for lineage in state.active_lineages)

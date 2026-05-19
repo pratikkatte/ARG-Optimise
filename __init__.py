@@ -1,3 +1,9 @@
-from .env import ARGLineage, ARGState, SimpleARGEnvironment
+from .env import ARGLineage, ARGReward, ARGState, EvolutionModelTorch, SimpleARGEnvironment
 
-__all__ = ["ARGLineage", "ARGState", "SimpleARGEnvironment"]
+__all__ = [
+    "ARGLineage",
+    "ARGReward",
+    "ARGState",
+    "EvolutionModelTorch",
+    "SimpleARGEnvironment",
+]
