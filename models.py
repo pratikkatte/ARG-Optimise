@@ -1,5 +1,6 @@
 import itertools
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
@@ -147,22 +148,205 @@ class ARGModel(nn.Module):
 
         for batch_idx, actions in enumerate(candidate_actions):
             state = states[batch_idx] if states is not None else None
-            action_features = [
-                self._build_action_feature(
-                    action,
-                    batch_idx,
-                    lineage_reps,
-                    summary_reps,
-                    seq_features,
-                    state,
-                    int(batch_nb_seq[batch_idx].item()),
-                )
-                for action in actions
-            ]
-            features = torch.stack(action_features, dim=0)
+            features = self._batched_action_features(
+                actions,
+                batch_idx,
+                lineage_reps,
+                summary_reps,
+                seq_features,
+                state,
+                int(batch_nb_seq[batch_idx].item()),
+            )
             logits[batch_idx, :len(actions)] = self.action_scorer(features).squeeze(-1)
 
         return logits
+
+    def _batched_action_features(
+        self,
+        actions,
+        batch_idx,
+        lineage_reps,
+        summary_reps,
+        seq_features,
+        state,
+        nb_seq,
+    ):
+        device = lineage_reps.device
+        num_actions = len(actions)
+        embedding_size = lineage_reps.shape[-1]
+
+        event_indices = torch.tensor(
+            [self.EVENT_TO_IDX[action["event_type"]] for action in actions],
+            dtype=torch.long,
+            device=device,
+        )
+        event_rep = self.event_embedding(event_indices)
+        scalar_rep = self.scalar_embedding(
+            self._batched_scalar_features(actions, state, nb_seq, device)
+        )
+
+        primary_rep = lineage_reps.new_zeros(num_actions, embedding_size)
+        secondary_rep = lineage_reps.new_zeros(num_actions, embedding_size)
+        tertiary_rep = lineage_reps.new_zeros(num_actions, embedding_size)
+
+        coal_rows = [
+            (row_idx, action["active_lineage_i"], action["active_lineage_j"])
+            for row_idx, action in enumerate(actions)
+            if action["event_type"] == "coal"
+        ]
+        if coal_rows:
+            rows, left_indices, right_indices = zip(*coal_rows)
+            rows = torch.tensor(rows, dtype=torch.long, device=device)
+            left_indices = torch.tensor(left_indices, dtype=torch.long, device=device)
+            right_indices = torch.tensor(right_indices, dtype=torch.long, device=device)
+            left_rep = lineage_reps[batch_idx, left_indices]
+            right_rep = lineage_reps[batch_idx, right_indices]
+            primary_rep[rows] = left_rep + right_rep
+            secondary_rep[rows] = torch.abs(left_rep - right_rep)
+            tertiary_rep[rows] = left_rep * right_rep
+
+        recomb_rows = [
+            (row_idx, action["active_lineage_i"], action["breakpoint"])
+            for row_idx, action in enumerate(actions)
+            if action["event_type"] == "recomb"
+        ]
+        if recomb_rows:
+            rows, lineage_indices, breakpoints = zip(*recomb_rows)
+            rows = torch.tensor(rows, dtype=torch.long, device=device)
+            lineage_indices = torch.tensor(lineage_indices, dtype=torch.long, device=device)
+            breakpoints = torch.tensor(breakpoints, dtype=torch.long, device=device)
+            primary_rep[rows] = lineage_reps[batch_idx, lineage_indices]
+            left_rep, right_rep = self._batched_split_sequence_reps(
+                seq_features[batch_idx],
+                lineage_indices,
+                breakpoints,
+                nb_seq,
+            )
+            secondary_rep[rows] = left_rep
+            tertiary_rep[rows] = right_rep
+
+        summary_for_actions = summary_reps[batch_idx].expand(num_actions, -1)
+        return torch.cat(
+            [
+                primary_rep,
+                secondary_rep,
+                tertiary_rep,
+                summary_for_actions,
+                event_rep,
+                scalar_rep,
+            ],
+            dim=-1,
+        )
+
+    def _batched_split_sequence_reps(self, batch_seq_features, lineage_indices, breakpoints, nb_seq):
+        seq_len = batch_seq_features.shape[1]
+        weight = self.seq_embedding.weight.view(self.seq_embedding.out_features, seq_len, 4)
+        lineage_features = batch_seq_features[:nb_seq]
+        site_contrib = torch.einsum("nlc,elc->nle", lineage_features, weight)
+        prefix = torch.cat(
+            [
+                site_contrib.new_zeros(site_contrib.shape[0], 1, site_contrib.shape[-1]),
+                torch.cumsum(site_contrib, dim=1),
+            ],
+            dim=1,
+        )
+        site_breakpoints = self._site_breakpoints_tensor(breakpoints, seq_len)
+        left_without_bias = prefix[lineage_indices, site_breakpoints]
+        total_without_bias = prefix[lineage_indices, -1]
+        bias = self.seq_embedding.bias
+        return left_without_bias + bias, total_without_bias - left_without_bias + bias
+
+    def _site_breakpoints_tensor(self, breakpoints, seq_len):
+        if self.env.num_blocks == seq_len:
+            return breakpoints.to(dtype=torch.long)
+        scaled = torch.round(
+            breakpoints.to(dtype=torch.float32)
+            * float(seq_len)
+            / float(self.env.num_blocks)
+        ).to(dtype=torch.long)
+        return scaled.clamp(1, seq_len - 1)
+
+    def _batched_scalar_features(self, actions, state, nb_seq, device):
+        denom_seq = float(max(nb_seq - 1, 1))
+        denom_blocks = float(max(self.env.num_blocks, 1))
+        event_is_recomb = torch.tensor(
+            [1.0 if action["event_type"] == "recomb" else 0.0 for action in actions],
+            dtype=torch.float32,
+            device=device,
+        )
+        active_i = torch.tensor(
+            [action.get("active_lineage_i", 0) for action in actions],
+            dtype=torch.long,
+            device=device,
+        )
+        active_j = torch.tensor(
+            [action.get("active_lineage_j", 0) for action in actions],
+            dtype=torch.long,
+            device=device,
+        )
+        breakpoints = torch.tensor(
+            [action.get("breakpoint", 0) for action in actions],
+            dtype=torch.long,
+            device=device,
+        )
+
+        material_fraction = torch.ones_like(event_is_recomb)
+        overlap_fraction = 1.0 - event_is_recomb
+        left_fraction = torch.ones_like(event_is_recomb)
+        right_fraction = torch.ones_like(event_is_recomb)
+
+        if state is not None:
+            masks = torch.as_tensor(
+                np.stack([lineage.material_mask for lineage in state.active_lineages]),
+                dtype=torch.bool,
+                device=device,
+            )
+            material_counts = masks.sum(dim=1).to(dtype=torch.float32)
+            coal_rows = torch.nonzero(event_is_recomb == 0, as_tuple=False).reshape(-1)
+            if coal_rows.numel() > 0:
+                left_masks = masks[active_i[coal_rows]]
+                right_masks = masks[active_j[coal_rows]]
+                material_fraction[coal_rows] = (left_masks | right_masks).sum(dim=1).float() / denom_blocks
+                overlap_fraction[coal_rows] = (left_masks & right_masks).sum(dim=1).float() / denom_blocks
+                left_fraction[coal_rows] = material_counts[active_i[coal_rows]] / denom_blocks
+                right_fraction[coal_rows] = material_counts[active_j[coal_rows]] / denom_blocks
+
+            recomb_rows = torch.nonzero(event_is_recomb == 1, as_tuple=False).reshape(-1)
+            if recomb_rows.numel() > 0:
+                prefix_counts = torch.cat(
+                    [
+                        torch.zeros(masks.shape[0], 1, dtype=torch.long, device=device),
+                        torch.cumsum(masks.to(dtype=torch.long), dim=1),
+                    ],
+                    dim=1,
+                )
+                recomb_i = active_i[recomb_rows]
+                recomb_breakpoints = breakpoints[recomb_rows]
+                left_counts = prefix_counts[recomb_i, recomb_breakpoints].to(dtype=torch.float32)
+                total_counts = material_counts[recomb_i]
+                material_fraction[recomb_rows] = total_counts / denom_blocks
+                left_fraction[recomb_rows] = left_counts / denom_blocks
+                right_fraction[recomb_rows] = (total_counts - left_counts) / denom_blocks
+        else:
+            recomb_rows = torch.nonzero(event_is_recomb == 1, as_tuple=False).reshape(-1)
+            if recomb_rows.numel() > 0:
+                left_fraction[recomb_rows] = breakpoints[recomb_rows].float() / denom_blocks
+                right_fraction[recomb_rows] = 1.0 - left_fraction[recomb_rows]
+                overlap_fraction[recomb_rows] = 0.0
+
+        return torch.stack(
+            [
+                event_is_recomb,
+                active_i.float() / denom_seq,
+                active_j.float() / denom_seq,
+                breakpoints.float() / denom_blocks,
+                material_fraction,
+                overlap_fraction,
+                left_fraction,
+                right_fraction,
+            ],
+            dim=-1,
+        )
 
     def _build_action_feature(
         self,

@@ -2,7 +2,10 @@ import math
 import numpy as np
 import torch
 
-from models import ARGModel
+try:
+    from .models import ARGModel
+except ImportError:
+    from models import ARGModel
 
 LOSS_FN = {
     'MSE': torch.nn.MSELoss(),
@@ -10,18 +13,21 @@ LOSS_FN = {
 }
 
 class TBGFlowNetGenerator(torch.nn.Module):
-    def __init__(self, env, cfg=None):
+    def __init__(self, env, cfg=None, init_z_sample_count=2):
         super().__init__()
         self.cfg = cfg
         self.env = env
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.init_z_sample_count = int(init_z_sample_count)
+        if self.init_z_sample_count < 1:
+            raise ValueError("init_z_sample_count must be at least 1")
 
         ## Policy model
-        self.arg_model = ARGModel(env, cfg)
+        self.arg_model = ARGModel(env, cfg).to(self.device)
 
         ## Z partition
         with torch.no_grad():
-            trajs = self.env.sample(2) 
+            trajs = self.env.sample(self.init_z_sample_count)
         self.max_reward_seen = np.max([x.log_reward for x in trajs])
         init_z = self.max_reward_seen
         self._Z = torch.nn.Parameter(
@@ -57,8 +63,15 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return self._Z.sum()
 
     def forward(self, input_dict):
+        input_dict = self._move_input_to_device(input_dict)
         ret = self.arg_model(input_dict)
         return ret
+
+    def _move_input_to_device(self, input_dict):
+        moved = {}
+        for key, value in input_dict.items():
+            moved[key] = value.to(self.device) if torch.is_tensor(value) else value
+        return moved
 
     def update_model(self):
         info = {
@@ -104,6 +117,9 @@ class TBGFlowNetGenerator(torch.nn.Module):
             "num_parents": list(reversed(num_parents_by_backward_step)),
             "backward_states": backward_states,
         }
+
+    def count_backward_parents(self, arg_state):
+        return len(self._enumerate_inverse_arg_actions(arg_state))
 
     def _is_initial_arg_state(self, state):
         initial_ids = set(range(self.env.num_sequences))
@@ -282,7 +298,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
     
     def accumulate_loss(self, rollout_outputs, factor=1.0):
         loss = self.get_loss_from_rollout_outputs(rollout_outputs) / factor
-        print(loss)
         loss.backward()
         self.loss = self.loss + loss.detach()
         self.accumulated_batches += 1
