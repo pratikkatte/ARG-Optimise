@@ -9,16 +9,22 @@ try:
 except ImportError:
     from models import ARGModel
 
+try:
+    from .rollout_worker_arg import RolloutWorker
+except ImportError:
+    from rollout_worker_arg import RolloutWorker
+
 LOSS_FN = {
     'MSE': torch.nn.MSELoss(),
     'HUBER': torch.nn.HuberLoss(delta=1.0),
 }
 
 class TBGFlowNetGenerator(torch.nn.Module):
-    def __init__(self, env, cfg=None, init_z_sample_count=2, device=None):
+    def __init__(self, env, cfg=None, init_z_sample_count=2, device=None, verbose=False):
         super().__init__()
         self.cfg = cfg
         self.env = env
+        self.verbose = verbose
         self.device = self._resolve_device(device)
         self.init_z_sample_count = int(init_z_sample_count)
         if self.init_z_sample_count < 1:
@@ -29,7 +35,15 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         ## Z partition
         with torch.no_grad():
-            trajs = self.env.sample(self.init_z_sample_count)
+            if self.verbose:
+                print(
+                    f"Initializing log_Z from {self.init_z_sample_count} prior rollout(s)..."
+                )
+            worker = RolloutWorker(env, verbose=self.verbose)
+            trajs = []
+            for _ in range(self.init_z_sample_count):
+                state, _ = worker._rollout_one()
+                trajs.append(state)
         self.max_reward_seen = np.max([x.log_reward for x in trajs])
         init_z = self.max_reward_seen
         self._Z = torch.nn.Parameter(
@@ -132,6 +146,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.opt.zero_grad()
         self.loss = torch.tensor(0.0, device=self.device)
         self.accumulated_batches = 0
+        if self.verbose:
+            print(
+                "update: loss={loss:.6f} grad_norm={grad_norm:.4f} param_norm={param_norm:.4f}".format(
+                    **info
+                )
+            )
         return info
 
     def sample_backward_from_arg(self, arg_state):
@@ -349,3 +369,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         loss.backward()
         self.loss = self.loss + loss.detach()
         self.accumulated_batches += 1
+        if self.verbose:
+            print(
+                f"accumulated loss={loss.item():.6f} "
+                f"total_loss={self.loss.item():.6f} batches={self.accumulated_batches}"
+            )

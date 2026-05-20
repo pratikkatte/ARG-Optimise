@@ -23,7 +23,7 @@ def read_fasta(filepath):
 def load_sequences(sequences_path):
     if sequences_path.endswith('.fa'):
         key_to_seqs_dict = read_fasta(sequences_path)
-        all_seqs = list(key_to_seqs_dict.values())[0]
+        all_seqs = ["".join(lines) for lines in key_to_seqs_dict.values()]
     elif sequences_path.endswith('.pickle'):
         data = pickle.load(open(sequences_path, 'rb'))
         all_seqs = list(data.values()) if isinstance(data, dict) else data

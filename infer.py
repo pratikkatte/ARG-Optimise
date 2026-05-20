@@ -27,13 +27,17 @@ def run_inference(
     checkpoint,
     output_dir="inferred_args",
     num_args=1,
+    batch_size=1,
     seed=None,
     device="auto",
     random_action_prob=0.0,
     temperature=None,
+    verbose=False,
 ):
     if num_args < 1:
         raise ValueError("num_args must be at least 1")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
     if temperature is not None and random_action_prob != 0.0:
         raise ValueError("temperature and random_action_prob cannot both be set")
 
@@ -49,6 +53,7 @@ def run_inference(
         env,
         init_z_sample_count=metadata["init_z_sample_count"],
         device=device,
+        verbose=verbose,
     )
     generator.load(checkpoint, load_optimizer=False, map_location=generator.device)
     generator.eval()
@@ -57,13 +62,15 @@ def run_inference(
         random_action_prob=random_action_prob,
         temperature=temperature,
     )
-    rollout_worker = RolloutWorker(env)
-    with torch.no_grad():
-        rollout_outputs, trajectories = rollout_worker.rollout(
-            generator,
-            episodes=num_args,
-            random_spec=random_spec,
-        )
+    rollout_worker = RolloutWorker(env, verbose=verbose)
+    rollout_outputs, trajectories = run_batched_rollouts(
+        rollout_worker,
+        generator,
+        num_args=num_args,
+        batch_size=batch_size,
+        random_spec=random_spec,
+        verbose=verbose,
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     manifest = build_manifest(
@@ -109,6 +116,71 @@ def environment_from_metadata(metadata, seed):
         sequences=list(metadata["sequences"]),
         rng=random.Random(seed),
     )
+
+
+def run_batched_rollouts(
+    rollout_worker,
+    generator,
+    num_args,
+    batch_size,
+    random_spec,
+    verbose=False,
+):
+    states = []
+    trajectories = []
+    log_paths_pf_rows = []
+    log_paths_pb_rows = []
+
+    with torch.no_grad():
+        for start in range(0, num_args, batch_size):
+            chunk_size = min(batch_size, num_args - start)
+            end = start + chunk_size
+            if verbose:
+                print(
+                    f"Running ARG rollout chunk {start + 1}-{end} of {num_args} "
+                    f"(batch_size={chunk_size})",
+                    flush=True,
+                )
+            chunk_outputs, chunk_trajectories = rollout_worker.rollout(
+                generator,
+                episodes=chunk_size,
+                random_spec=random_spec,
+            )
+            states.extend(chunk_outputs["states"])
+            trajectories.extend(chunk_trajectories)
+            log_paths_pf_rows.extend(
+                row.detach().cpu() for row in chunk_outputs["log_paths_pf"].unbind(0)
+            )
+            log_paths_pb_rows.extend(
+                row.detach().cpu() for row in chunk_outputs["log_paths_pb"].unbind(0)
+            )
+            del chunk_outputs, chunk_trajectories
+            if generator.device.type == "cuda":
+                torch.cuda.empty_cache()
+            if verbose:
+                print(
+                    f"Completed ARG rollout chunk {start + 1}-{end} of {num_args}",
+                    flush=True,
+                )
+
+    rollout_outputs = {
+        "states": states,
+        "log_paths_pf": _pad_log_path_rows(log_paths_pf_rows),
+        "log_paths_pb": _pad_log_path_rows(log_paths_pb_rows),
+    }
+    return rollout_outputs, trajectories
+
+
+def _pad_log_path_rows(rows):
+    if not rows:
+        return torch.empty(0, 0)
+    max_length = max(row.numel() for row in rows)
+    dtype = rows[0].dtype
+    padded = torch.zeros(len(rows), max_length, dtype=dtype)
+    for row_idx, row in enumerate(rows):
+        if row.numel() > 0:
+            padded[row_idx, : row.numel()] = row
+    return padded
 
 
 def build_random_spec(random_action_prob=0.0, temperature=None):
@@ -174,21 +246,37 @@ def main():
     parser = argparse.ArgumentParser(description="Infer ARGs from a saved ARG GFlowNet checkpoint.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", default="inferred_args")
-    parser.add_argument("--num-args", type=int, default=1)
+    parser.add_argument(
+        "--num-args",
+        "--num-particles",
+        dest="num_args",
+        type=int,
+        default=1,
+        help="Total number of ARGs/particles to generate (default: 1).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of ARG rollouts to process simultaneously on the GPU (default: 1).",
+    )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--random-action-prob", type=float, default=0.0)
     parser.add_argument("--temperature", type=float)
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     manifest = run_inference(
         checkpoint=args.checkpoint,
         output_dir=args.output_dir,
         num_args=args.num_args,
+        batch_size=args.batch_size,
         seed=args.seed,
         device=args.device,
         random_action_prob=args.random_action_prob,
         temperature=args.temperature,
+        verbose=args.verbose,
     )
     print(f"Wrote {manifest['num_args']} ARG tree sequence(s) to {args.output_dir}")
 

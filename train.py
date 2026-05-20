@@ -6,27 +6,18 @@ import random
 import numpy as np
 import torch
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
+import wandb
 
-try:
-    from .env import SimpleARGEnvironment
-    from .rollout_worker_arg import RolloutWorker
-    from .tb_gfn import TBGFlowNetGenerator
-    from .utils import load_sequences
-except ImportError:
-    from env import SimpleARGEnvironment
-    from rollout_worker_arg import RolloutWorker
-    from tb_gfn import TBGFlowNetGenerator
-    from utils import load_sequences
+from env import SimpleARGEnvironment
+from rollout_worker_arg import RolloutWorker
+from tb_gfn import TBGFlowNetGenerator
+from utils import load_sequences
 
 
 DEFAULT_NE = 10000
-DEFAULT_R_PER_BP = 1e-8
+DEFAULT_R_PER_BP = 2e-8
 DEFAULT_FIXED_EDGE_LENGTH = 0.02
-DEFAULT_INIT_Z_SAMPLE_COUNT = 2
+DEFAULT_INIT_Z_SAMPLE_COUNT = 16
 
 
 def seed_everything(seed):
@@ -47,17 +38,19 @@ def train(
     output_path,
     batch_size=1,
     epochs_num=10,
-    dataset_path="../dataset/DS1.pickle",
+    dataset_path="/private/groups/corbettlab/pratik/git/ARG-Optimise_single_env/new_validation/fasta/sim_l1mb_0.fa",
     seed=7,
     init_z_sample_count=DEFAULT_INIT_Z_SAMPLE_COUNT,
+    device="auto",
     use_wandb=True,
 ):
     seed_everything(seed)
 
     sequences = load_sequences(dataset_path)
     sequence_length = len(sequences[0])
-    num_blocks = sequence_length
-    rho = 4 * DEFAULT_NE * DEFAULT_R_PER_BP * sequence_length
+    # num_blocks = sequence_length
+    num_blocks = 10000
+    rho = 4 * DEFAULT_NE * DEFAULT_R_PER_BP * num_blocks
 
     env = SimpleARGEnvironment(
         sequence_length=sequence_length,
@@ -68,8 +61,14 @@ def train(
         fixed_edge_length=DEFAULT_FIXED_EDGE_LENGTH,
         rng=random.Random(seed),
     )
-    generator = TBGFlowNetGenerator(env, init_z_sample_count=init_z_sample_count)
+    generator = TBGFlowNetGenerator(
+        env,
+        init_z_sample_count=init_z_sample_count,
+        device=device,
+        verbose=True,
+    )
     rollout_worker = RolloutWorker(env)
+    print(f"Training on device: {generator.device}")
 
     os.makedirs(output_path, exist_ok=True)
     checkpoints_path = os.path.join(output_path, "checkpoints")
@@ -81,6 +80,7 @@ def train(
     wandb_run = None
     if use_wandb and wandb is not None:
         wandb_run = wandb.init()
+        wandb.config.update({"device": str(generator.device)})
 
     try:
         for epoch in range(epochs_num):
@@ -154,14 +154,21 @@ def build_checkpoint_metadata(
 
 def main():
     parser = argparse.ArgumentParser(description="Train the simplified ARG GFlowNet demo.")
-    parser.add_argument("--output-path", default=".")
-    parser.add_argument("--dataset-path", default="../dataset/DS1.pickle")
+    parser.add_argument("--output-path", default="l1mb_0")
+    parser.add_argument("--dataset-path", default="/private/groups/corbettlab/pratik/git/ARG-Optimise_single_env/new_validation/fasta/sim_l1mb_0.fa")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--no-wandb", action="store_true")
 
     args = parser.parse_args()
+
+    if args.device == "auto":
+        selected_device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        selected_device = args.device
+    print(f"Selected device: {selected_device}")
 
     train(
         args.output_path,
@@ -169,6 +176,7 @@ def main():
         epochs_num=args.epochs,
         dataset_path=args.dataset_path,
         seed=args.seed,
+        device=args.device,
         use_wandb=not args.no_wandb,
     )
 
