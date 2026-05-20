@@ -23,6 +23,7 @@ class ARGModel(nn.Module):
         embedding_size = 32
         hidden_size = 64
         dropout = 0.0
+        self.learn_times = bool(getattr(env, "learn_times", False))
 
         input_size = int(env.sequence_length) * 4
 
@@ -35,6 +36,15 @@ class ARGModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
+        if self.learn_times:
+            self.time_scorer = nn.Sequential(
+                nn.Linear(embedding_size * 6, hidden_size),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_size, env.time_env.bins),
+            )
+        else:
+            self.time_scorer = None
         self.logsoftmax = nn.LogSoftmax(dim=1)
 
     def model_params(self):
@@ -102,12 +112,38 @@ class ARGModel(nn.Module):
             actions = [dict(action) for action in input_actions]
 
         conditional_log_paths_pf = self.compute_log_path_pf({"logits": logits}, action_indices)
+        time_logits = None
+        time_actions = None
+        log_time_pf = conditional_log_paths_pf.new_zeros(batch_size)
+        if self.learn_times:
+            selected_action_features = self._selected_action_features(
+                actions,
+                lineage_reps,
+                summary_reps,
+                seq_features,
+                states,
+                batch_nb_seq,
+            )
+            time_logits = self.time_scorer(selected_action_features)
+            if input_actions is None:
+                time_actions = self.sample_time(time_logits, input_dict.get("random_spec"))
+                for batch_idx, action in enumerate(actions):
+                    action["time_action"] = int(time_actions[batch_idx].detach().cpu().item())
+            else:
+                if any("time_action" not in action for action in actions):
+                    raise ValueError("learnable ARG times require input_actions to include time_action")
+                time_actions = torch.tensor(
+                    [int(action["time_action"]) for action in actions],
+                    dtype=torch.long,
+                    device=device,
+                )
+            log_time_pf = self.compute_log_time_pf(time_logits, time_actions)
         log_event_probs = self._event_log_probs_for_batch(
             input_dict,
             batch_size,
             conditional_log_paths_pf,
         )
-        log_paths_pf = log_event_probs + conditional_log_paths_pf
+        log_paths_pf = log_event_probs + conditional_log_paths_pf + log_time_pf
         return {
             "actions": actions,
             "arg_actions": actions,
@@ -115,6 +151,9 @@ class ARGModel(nn.Module):
             "candidate_actions": candidate_actions,
             "logits": logits,
             "mask": mask,
+            "time_logits": time_logits,
+            "time_actions": time_actions,
+            "log_time_pf": log_time_pf,
             "log_paths_pf": log_paths_pf,
             "conditional_log_paths_pf": conditional_log_paths_pf,
             "log_event_probs": log_event_probs,
@@ -149,6 +188,58 @@ class ARGModel(nn.Module):
         batch_idx = torch.arange(logits.shape[0], device=logits.device)
         log_p = self.logsoftmax(logits)
         return log_p[batch_idx, action_indices]
+
+    def sample_time(self, logits, random_spec):
+        if random_spec is None:
+            random_spec = {"random_action_prob": 0.0}
+
+        if "random_action_prob" in random_spec:
+            time_actions = Categorical(logits=logits).sample()
+            random_p = random_spec["random_action_prob"]
+            if random_p > 0:
+                batch_size, actions_num = logits.shape
+                rand_flag = torch.empty(batch_size, device=logits.device).uniform_(0, 1) <= random_p
+                rand_num = rand_flag.sum().item()
+                if rand_num > 0:
+                    time_actions[rand_flag] = torch.randint(
+                        actions_num,
+                        size=(rand_num,),
+                        device=logits.device,
+                    )
+            return time_actions
+
+        temperature = random_spec["T"]
+        return Categorical(logits=logits / temperature).sample()
+
+    def compute_log_time_pf(self, time_logits, time_actions):
+        batch_idx = torch.arange(time_logits.shape[0], device=time_logits.device)
+        log_p = self.logsoftmax(time_logits)
+        return log_p[batch_idx, time_actions]
+
+    def _selected_action_features(
+        self,
+        actions,
+        lineage_reps,
+        summary_reps,
+        seq_features,
+        states,
+        batch_nb_seq,
+    ):
+        features = []
+        for batch_idx, action in enumerate(actions):
+            state = states[batch_idx] if states is not None else None
+            features.append(
+                self._build_action_feature(
+                    action,
+                    batch_idx,
+                    lineage_reps,
+                    summary_reps,
+                    seq_features,
+                    state,
+                    int(batch_nb_seq[batch_idx].item()),
+                )
+            )
+        return torch.stack(features, dim=0)
 
     def _score_candidates(
         self,

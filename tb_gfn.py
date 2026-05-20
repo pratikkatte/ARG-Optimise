@@ -294,6 +294,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
             "active_lineage_i": active_idx_by_id[child_ids[0]],
             "active_lineage_j": active_idx_by_id[child_ids[1]],
         }
+        if getattr(self.env, "learn_times", False):
+            parent = state.all_nodes[parent_id]
+            child_times = [float(state.all_nodes[child_id].time) for child_id in child_ids]
+            delta_t = float(parent.time) - max(child_times)
+            forward_action["time_action"] = self.env.time_env.delta_to_time_action(delta_t)
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 
@@ -318,6 +323,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
             "active_lineage_i": active_idx_by_id[child_id],
             "breakpoint": inverse_action["breakpoint"],
         }
+        if getattr(self.env, "learn_times", False):
+            child = state.all_nodes[child_id]
+            left_parent = state.all_nodes[left_id]
+            right_parent = state.all_nodes[right_id]
+            event_time = min(float(left_parent.time), float(right_parent.time))
+            delta_t = event_time - float(child.time)
+            forward_action["time_action"] = self.env.time_env.delta_to_time_action(delta_t)
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 

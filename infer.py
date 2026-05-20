@@ -113,6 +113,9 @@ def environment_from_metadata(metadata, seed):
         num_blocks=int(metadata["num_blocks"]),
         rho=float(metadata["rho"]),
         fixed_edge_length=float(metadata["fixed_edge_length"]),
+        learn_times=bool(metadata.get("learn_times", False)),
+        time_increments=metadata.get("time_increments") or None,
+        use_time_prior=bool(metadata.get("use_time_prior", True)),
         sequences=list(metadata["sequences"]),
         rng=random.Random(seed),
     )

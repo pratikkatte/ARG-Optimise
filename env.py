@@ -8,6 +8,8 @@ import torch
 
 import numpy as np
 
+from time_env import TimeEnvCategorical
+
 CHARACTERS_MAPS = {
     'DNA_WITH_GAP': {
         'A': [1., 0., 0., 0.],
@@ -30,6 +32,7 @@ class ARGLineage:
     event_type: Optional[str] = None
     breakpoint: Optional[int] = None
     recombination_side: Optional[str] = None
+    time: float = 0.0
 
     def __post_init__(self):
         self.children = list(self.children)
@@ -48,6 +51,7 @@ class ARGLineage:
             event_type=self.event_type,
             breakpoint=self.breakpoint,
             recombination_side=self.recombination_side,
+            time=float(self.time),
         )
 
 @dataclass
@@ -100,7 +104,6 @@ class EvolutionModelTorch(torch.nn.Module):
             raise ValueError("fixed_edge_length must be non-negative for likelihood scoring")
 
         seq_arrays = self._seq_arrays_numpy()
-        transition_matrix = self._jc69_transition_matrix(self.env.fixed_edge_length)
         log_likelihood = 0.0
 
         for block_start, block_end in self.env.get_arg_sequence_segments(state)["segments"]:
@@ -118,7 +121,6 @@ class EvolutionModelTorch(torch.nn.Module):
                 site_start,
                 site_end,
                 seq_arrays,
-                transition_matrix,
                 memo={},
             )
             site_probs = np.sum(root_partials * 0.25, axis=1)
@@ -185,7 +187,6 @@ class EvolutionModelTorch(torch.nn.Module):
         site_start,
         site_end,
         seq_arrays,
-        transition_matrix,
         memo,
     ):
         if node_id in memo:
@@ -222,9 +223,10 @@ class EvolutionModelTorch(torch.nn.Module):
                 site_start,
                 site_end,
                 seq_arrays,
-                transition_matrix,
                 memo,
             )
+            edge_length = self.env.edge_length_between(state, node_id, child_id)
+            transition_matrix = self._jc69_transition_matrix(edge_length)
             child_partials = np.maximum(child_partials, self._PROB_FLOOR)
             with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
                 partials *= child_partials @ transition_matrix.T
@@ -271,6 +273,9 @@ class SimpleARGEnvironment:
         num_blocks: Optional[int] = None,
         rho: float = 1.0,
         fixed_edge_length: float = 0.02,
+        learn_times: bool = False,
+        time_increments: Optional[Sequence[float]] = None,
+        use_time_prior: bool = True,
         sequences: Optional[Sequence[Any]] = None,
         rng: Optional[random.Random] = None,
         seed: Optional[int] = None,
@@ -304,6 +309,9 @@ class SimpleARGEnvironment:
         self.num_blocks = int(num_blocks)
         self.rho = float(rho)
         self.fixed_edge_length = float(fixed_edge_length)
+        self.learn_times = bool(learn_times)
+        self.use_time_prior = bool(use_time_prior)
+        self.time_env = TimeEnvCategorical(time_increments) if self.learn_times else None
         self.rng = rng if rng is not None else random.Random(seed)
         self.block_indices = np.arange(self.num_blocks)
 
@@ -324,6 +332,51 @@ class SimpleARGEnvironment:
         data = np.array(seq)
         return data
 
+    def edge_length_between(self, state, parent_id, child_id):
+        if not self.learn_times:
+            return self.fixed_edge_length
+
+        parent_time = float(state.all_nodes[parent_id].time)
+        child_time = float(state.all_nodes[child_id].time)
+        edge_length = parent_time - child_time
+        if edge_length <= 0:
+            raise ValueError(
+                f"ARG node times must increase from child to parent: "
+                f"parent={parent_id} time={parent_time}, child={child_id} time={child_time}"
+            )
+        return edge_length
+
+    def _require_time_action(self, action):
+        if not self.learn_times:
+            return None
+        if "time_action" not in action:
+            raise ValueError("learnable ARG times require every action to include time_action")
+        return int(action["time_action"])
+
+    def _delta_t_for_action(self, action):
+        time_action = self._require_time_action(action)
+        if time_action is None:
+            return self.fixed_edge_length
+        return self.time_env.time_action_to_delta(time_action)
+
+    def _with_random_time_action(self, action):
+        action = dict[Any, Any](action)
+        print(action)
+        if self.learn_times and "time_action" not in action:
+            action["time_action"] = self.time_env.generate_random_action()
+        return action
+
+    def compute_waiting_time_log_prior(self, state, action, rates=None):
+        if not self.learn_times or not self.use_time_prior:
+            return 0.0
+        if rates is None:
+            rates = state.rates if state.rates is not None else self.compute_event_rates(state)
+        total_rate = float(rates["lambda_coal"] + rates["lambda_recomb"])
+        if total_rate <= 0:
+            return -math.inf
+        delta_t = self._delta_t_for_action(action)
+        return math.log(total_rate) - total_rate * delta_t
+
     def get_initial_state(self):
         active_lineages = []
         all_nodes = {}
@@ -335,6 +388,7 @@ class SimpleARGEnvironment:
                 material_mask=np.ones(self.num_blocks, dtype=bool),
                 partials=None,
                 sequences_indices=[node_id],
+                time=0.0,
             )
             active_lineages.append(lineage)
             all_nodes[node_id] = lineage
@@ -431,9 +485,9 @@ class SimpleARGEnvironment:
     def save_to_tree_sequence(self, state, output_path=None):
         """Convert a terminal ARG state to a tskit TreeSequence.
 
-        The exported topology contains ancestry edges only. Synthetic node times
-        are derived from graph depth because ARG rollout states do not store
-        continuous event times.
+        The exported topology contains ancestry edges only. In fixed-edge mode,
+        synthetic node times are derived from graph depth. In learnable-time
+        mode, stored ARG node times are exported directly.
         """
         if not self.is_terminal(state):
             raise ValueError("terminal_state_to_tree_sequence requires a terminal ARGState")
@@ -489,6 +543,17 @@ class SimpleARGEnvironment:
         return self.save_to_tree_sequence(state, output_path=output_path)
 
     def _synthetic_tskit_node_times(self, state):
+        if self.learn_times:
+            node_times = {node_id: float(node.time) for node_id, node in state.all_nodes.items()}
+            for parent_id, parent in state.all_nodes.items():
+                for child_id in parent.children:
+                    if node_times[parent_id] <= node_times[child_id]:
+                        raise ValueError(
+                            f"learned ARG node times must satisfy parent > child: "
+                            f"parent={parent_id} child={child_id}"
+                        )
+            return node_times
+
         if self.fixed_edge_length <= 0:
             raise ValueError("fixed_edge_length must be positive to export a valid tree sequence")
 
@@ -615,6 +680,11 @@ class SimpleARGEnvironment:
 
         parent_id = next_state.max_node_idx + 1
         parent_mask = child_i.material_mask | child_j.material_mask
+        if self.learn_times:
+            delta_t = self._delta_t_for_action(action)
+            parent_time = max(float(child_i.time), float(child_j.time)) + delta_t
+        else:
+            parent_time = 0.0
         parent = ARGLineage(
             node_id=parent_id,
             children=[child_i.node_id, child_j.node_id],
@@ -623,6 +693,7 @@ class SimpleARGEnvironment:
             partials=None,
             sequences_indices=sorted(set(child_i.sequences_indices + child_j.sequences_indices)),
             event_type="coal",
+            time=parent_time,
         )
 
         child_i.parents.append(parent.node_id)
@@ -664,6 +735,11 @@ class SimpleARGEnvironment:
 
         left_parent_id = next_state.max_node_idx + 1
         right_parent_id = next_state.max_node_idx + 2
+        if self.learn_times:
+            delta_t = self._delta_t_for_action(action)
+            event_time = float(child.time) + delta_t
+        else:
+            event_time = 0.0
         left_parent = ARGLineage(
             node_id=left_parent_id,
             children=[child.node_id],
@@ -674,6 +750,7 @@ class SimpleARGEnvironment:
             event_type="recomb",
             breakpoint=breakpoint,
             recombination_side="left",
+            time=event_time,
         )
         right_parent = ARGLineage(
             node_id=right_parent_id,
@@ -685,6 +762,7 @@ class SimpleARGEnvironment:
             event_type="recomb",
             breakpoint=breakpoint,
             recombination_side="right",
+            time=event_time,
         )
 
         child.parents = [left_parent.node_id, right_parent.node_id]
@@ -775,20 +853,15 @@ class SimpleARGEnvironment:
         event_types = ["coal", "recomb"]
         event_types_chosen = np.random.choice(event_types, p=[coal_prob, recomb_prob])
         if event_types_chosen == "coal":
-            action = dict(coal_actions[self.rng.randrange(len(coal_actions))])
-            return action, math.log(coal_prob) - math.log(len(coal_actions))
+            action = self._with_random_time_action(coal_actions[self.rng.randrange(len(coal_actions))])
+            return action, self.compute_cwr_event_log_prior(state, action)
         else:
             sampled = self._sample_recombination_prior_action(recomb_weights)
             if sampled is None:
                 return None
-            action, lineage_weight, valid_breakpoints = sampled
-            total_weight = sum(weight for _, weight, _ in recomb_weights)
-            log_prior = (
-                math.log(recomb_prob)
-                + math.log(lineage_weight / total_weight)
-                - math.log(len(valid_breakpoints))
-            )
-            return action, log_prior
+            action, _lineage_weight, _valid_breakpoints = sampled
+            action = self._with_random_time_action(action)
+            return action, self.compute_cwr_event_log_prior(state, action)
         # if coal_prob > 0 and (recomb_prob <= 0 or self.rng.random() < coal_prob):
         #     action = dict(coal_actions[self.rng.randrange(len(coal_actions))])
         #     return action, math.log(coal_prob) - math.log(len(coal_actions))
@@ -851,11 +924,14 @@ class SimpleARGEnvironment:
         denom = rates["lambda_coal"] + rates["lambda_recomb"]
         if denom <= 0:
             return -math.inf
+        wait_log_prior = self.compute_waiting_time_log_prior(state, action, rates)
+        if not math.isfinite(wait_log_prior):
+            return -math.inf
         if action.get("event_type") == "coal":
             if not self.is_valid_coalescent_action(state, action) or not coal_actions:
                 return -math.inf
             action_prob = (rates["lambda_coal"] / denom) / len(coal_actions)
-            return math.log(action_prob) if action_prob > 0 else -math.inf
+            return math.log(action_prob) + wait_log_prior if action_prob > 0 else -math.inf
         if action.get("event_type") == "recomb":
             i = action.get("active_lineage_i")
             breakpoint = action.get("breakpoint")
@@ -880,7 +956,7 @@ class SimpleARGEnvironment:
                     * (weight / total_weight)
                     / len(valid_breakpoints)
                 )
-                return math.log(action_prob) if action_prob > 0 else -math.inf
+                return math.log(action_prob) + wait_log_prior if action_prob > 0 else -math.inf
             return -math.inf
         return -math.inf
 
