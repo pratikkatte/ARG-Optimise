@@ -1,4 +1,6 @@
 import math
+import os
+
 import numpy as np
 import torch
 
@@ -13,11 +15,11 @@ LOSS_FN = {
 }
 
 class TBGFlowNetGenerator(torch.nn.Module):
-    def __init__(self, env, cfg=None, init_z_sample_count=2):
+    def __init__(self, env, cfg=None, init_z_sample_count=2, device=None):
         super().__init__()
         self.cfg = cfg
         self.env = env
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = self._resolve_device(device)
         self.init_z_sample_count = int(init_z_sample_count)
         if self.init_z_sample_count < 1:
             raise ValueError("init_z_sample_count must be at least 1")
@@ -50,6 +52,52 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.loss_fn = LOSS_FN['MSE']
         self.loss = torch.tensor(0.0, device=self.device)
         self.accumulated_batches = 0
+
+    def _resolve_device(self, device):
+        if device is None or device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        resolved = torch.device(device)
+        if resolved.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but CUDA is not available.")
+        return resolved
+
+    def save(self, path, metadata=None):
+        directory = os.path.dirname(os.path.abspath(path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        torch.save(
+            {
+                "generator_state_dict": self.state_dict(),
+                "opt_state_dict": self.opt.state_dict(),
+                "metadata": dict(metadata or {}),
+            },
+            path,
+        )
+
+    def load(self, path, load_optimizer=True, map_location=None):
+        if map_location is None:
+            map_location = self.device
+        checkpoint = self._torch_load(path, map_location=map_location)
+        state_dict = checkpoint.get("generator_state_dict", checkpoint)
+        self.load_state_dict(state_dict)
+        self.to(self.device)
+
+        if load_optimizer and "opt_state_dict" in checkpoint:
+            self.opt.load_state_dict(checkpoint["opt_state_dict"])
+            self._move_optimizer_state_to_device()
+        return checkpoint.get("metadata", {})
+
+    def _move_optimizer_state_to_device(self):
+        for state in self.opt.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(self.device)
+
+    def _torch_load(self, path, map_location=None):
+        try:
+            return torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location=map_location)
 
     def grad_norm(self):
         return math.sqrt(sum(

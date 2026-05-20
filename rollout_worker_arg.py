@@ -177,23 +177,29 @@ class RolloutWorker:
         generator=None,
         episodes=1,
         random_spec=None,
+        record_diagnostics=False,
         sample_backward=False,
+        num_trajectories=None,
     ):
         """
         Run one or more ARG rollouts.
         """
+        if num_trajectories is not None:
+            episodes = num_trajectories
+
         if generator is not None:
             return self._rollout_batch(
                 generator=generator,
                 episodes=episodes,
                 random_spec=random_spec,
+                record_diagnostics=record_diagnostics,
                 sample_backward=sample_backward,
             )
 
         states = []
         trajectories = []
         for _ in range(episodes):
-            state, trajectory = self._rollout_one()
+            state, trajectory = self._rollout_one(record_diagnostics=record_diagnostics)
             states.append(state)
             trajectories.append(trajectory)
 
