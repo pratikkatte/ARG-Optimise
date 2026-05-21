@@ -8,7 +8,8 @@ import torch
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
-from train import seed_everything
+from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_MODEL, DEFAULT_TIME_TAIL_PROBABILITY
+from train import DEFAULT_MU_PER_BP, DEFAULT_NE, seed_everything
 
 
 REQUIRED_METADATA_KEYS = {
@@ -107,6 +108,9 @@ def validate_metadata(metadata):
 
 
 def environment_from_metadata(metadata, seed):
+    time_increments = metadata.get("time_increments")
+    if time_increments == []:
+        time_increments = None
     return SimpleARGEnvironment(
         num_sequences=int(metadata["num_sequences"]),
         sequence_length=int(metadata["sequence_length"]),
@@ -114,7 +118,16 @@ def environment_from_metadata(metadata, seed):
         rho=float(metadata["rho"]),
         fixed_edge_length=float(metadata["fixed_edge_length"]),
         learn_times=bool(metadata.get("learn_times", False)),
-        time_increments=metadata.get("time_increments") or None,
+        time_increments=time_increments,
+        time_model=metadata.get("time_model", DEFAULT_TIME_MODEL),
+        time_bins=int(metadata.get("time_bins", DEFAULT_TIME_BINS)),
+        time_tail_probability=float(
+            metadata.get("time_tail_probability", DEFAULT_TIME_TAIL_PROBABILITY)
+        ),
+        effective_population_size=float(
+            metadata.get("effective_population_size", DEFAULT_NE)
+        ),
+        mutation_rate=float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
         use_time_prior=bool(metadata.get("use_time_prior", True)),
         sequences=list(metadata["sequences"]),
         rng=random.Random(seed),

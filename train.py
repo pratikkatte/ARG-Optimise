@@ -11,12 +11,17 @@ import wandb
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
-from time_env import DEFAULT_TIME_INCREMENTS
+from time_env import (
+    DEFAULT_TIME_BINS,
+    DEFAULT_TIME_MODEL,
+    DEFAULT_TIME_TAIL_PROBABILITY,
+)
 from utils import load_sequences
 
 
 DEFAULT_NE = 10000
 DEFAULT_R_PER_BP = 2e-8
+DEFAULT_MU_PER_BP = 2e-8
 DEFAULT_FIXED_EDGE_LENGTH = 0.02
 DEFAULT_INIT_Z_SAMPLE_COUNT = 16
 
@@ -37,7 +42,7 @@ def train_epoch(epoch_id, rollout_worker, generator, batch_size=1):
 
 def parse_time_increments(value):
     if value is None:
-        return list(DEFAULT_TIME_INCREMENTS)
+        return None
     increments = [float(item.strip()) for item in value.split(",") if item.strip()]
     if not increments:
         raise ValueError("--time-increments must contain at least one positive value")
@@ -59,16 +64,21 @@ def train(
     fixed_edge_length=DEFAULT_FIXED_EDGE_LENGTH,
     learn_times=False,
     time_increments=None,
+    time_model=DEFAULT_TIME_MODEL,
+    time_bins=DEFAULT_TIME_BINS,
+    time_tail_probability=DEFAULT_TIME_TAIL_PROBABILITY,
+    effective_population_size=DEFAULT_NE,
+    mutation_rate=DEFAULT_MU_PER_BP,
     use_time_prior=True,
 ):
     seed_everything(seed)
-    time_increments = list(DEFAULT_TIME_INCREMENTS) if time_increments is None else list(time_increments)
+    time_increments = None if time_increments is None else list(time_increments)
 
     sequences = load_sequences(dataset_path)
     sequence_length = len(sequences[0])
     # num_blocks = sequence_length
     num_blocks = 10000
-    rho = 4 * DEFAULT_NE * DEFAULT_R_PER_BP * num_blocks
+    rho = 4 * float(effective_population_size) * DEFAULT_R_PER_BP * sequence_length
 
     env = SimpleARGEnvironment(
         sequence_length=sequence_length,
@@ -79,6 +89,11 @@ def train(
         fixed_edge_length=fixed_edge_length,
         learn_times=learn_times,
         time_increments=time_increments,
+        time_model=time_model,
+        time_bins=time_bins,
+        time_tail_probability=time_tail_probability,
+        effective_population_size=effective_population_size,
+        mutation_rate=mutation_rate,
         use_time_prior=use_time_prior,
         rng=random.Random(seed),
     )
@@ -104,7 +119,12 @@ def train(
         wandb.config.update({
             "device": str(generator.device),
             "learn_times": bool(learn_times),
-            "time_increments": list(time_increments or []),
+            "time_model": env.time_model,
+            "time_bins": env.time_bins,
+            "time_tail_probability": env.time_tail_probability,
+            "time_increments": list(time_increments) if time_increments is not None else None,
+            "effective_population_size": float(effective_population_size),
+            "mutation_rate": float(mutation_rate),
             "use_time_prior": bool(use_time_prior),
         })
 
@@ -137,6 +157,11 @@ def train(
                     fixed_edge_length=fixed_edge_length,
                     learn_times=learn_times,
                     time_increments=time_increments,
+                    time_model=env.time_model,
+                    time_bins=env.time_bins,
+                    time_tail_probability=env.time_tail_probability,
+                    effective_population_size=effective_population_size,
+                    mutation_rate=mutation_rate,
                     use_time_prior=use_time_prior,
                     seed=seed,
                     init_z_sample_count=init_z_sample_count,
@@ -165,6 +190,11 @@ def build_checkpoint_metadata(
     fixed_edge_length,
     learn_times,
     time_increments,
+    time_model,
+    time_bins,
+    time_tail_probability,
+    effective_population_size,
+    mutation_rate,
     use_time_prior,
     seed,
     init_z_sample_count,
@@ -180,7 +210,12 @@ def build_checkpoint_metadata(
         "rho": float(rho),
         "fixed_edge_length": float(fixed_edge_length),
         "learn_times": bool(learn_times),
-        "time_increments": list(time_increments or []),
+        "time_model": time_model,
+        "time_bins": int(time_bins),
+        "time_tail_probability": float(time_tail_probability),
+        "time_increments": list(time_increments) if time_increments is not None else None,
+        "effective_population_size": float(effective_population_size),
+        "mutation_rate": float(mutation_rate),
         "use_time_prior": bool(use_time_prior),
         "seed": int(seed),
         "init_z_sample_count": int(init_z_sample_count),
@@ -207,9 +242,21 @@ def main():
     parser.add_argument("--learn-times", action="store_true")
     parser.add_argument(
         "--time-increments",
-        default=",".join(str(x) for x in DEFAULT_TIME_INCREMENTS),
-        help="Comma-separated categorical waiting-time increments used with --learn-times.",
+        default=None,
+        help=(
+            "Legacy comma-separated fixed waiting-time increments used with "
+            "--learn-times. Omit to use adaptive exponential time bins."
+        ),
     )
+    parser.add_argument("--time-model", default=DEFAULT_TIME_MODEL)
+    parser.add_argument("--time-bins", type=int, default=DEFAULT_TIME_BINS)
+    parser.add_argument(
+        "--time-tail-probability",
+        type=float,
+        default=DEFAULT_TIME_TAIL_PROBABILITY,
+    )
+    parser.add_argument("--effective-population-size", type=float, default=DEFAULT_NE)
+    parser.add_argument("--mutation-rate", type=float, default=DEFAULT_MU_PER_BP)
     parser.add_argument("--no-time-prior", action="store_true")
 
     args = parser.parse_args()
@@ -233,6 +280,11 @@ def main():
         fixed_edge_length=args.fixed_edge_length,
         learn_times=args.learn_times,
         time_increments=parse_time_increments(args.time_increments),
+        time_model=args.time_model,
+        time_bins=args.time_bins,
+        time_tail_probability=args.time_tail_probability,
+        effective_population_size=args.effective_population_size,
+        mutation_rate=args.mutation_rate,
         use_time_prior=not args.no_time_prior,
     )
 

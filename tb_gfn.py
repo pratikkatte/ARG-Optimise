@@ -211,6 +211,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         for active_idx, lineage in enumerate(state.active_lineages):
             if lineage.event_type != "coal" or len(lineage.children) != 2:
                 continue
+            if not self._is_latest_time_event(state, lineage.node_id):
+                continue
             child_i, child_j = lineage.children
             if (
                 child_i in state.all_nodes
@@ -247,6 +249,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
             child = state.all_nodes[child_id]
             left_parent = state.all_nodes[left_id]
             right_parent = state.all_nodes[right_id]
+            if not self._is_latest_time_event(state, left_id, right_id):
+                continue
             if set(child.parents) != {left_id, right_id}:
                 continue
             if np.any(left_parent.material_mask & right_parent.material_mask):
@@ -264,6 +268,25 @@ class TBGFlowNetGenerator(torch.nn.Module):
             )
 
         return inverse_actions
+
+    def _is_latest_time_event(self, state, *node_ids):
+        if not getattr(self.env, "learn_times", False):
+            return True
+        current_time = float(state.current_time)
+        return all(
+            math.isclose(
+                float(state.all_nodes[node_id].time),
+                current_time,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            for node_id in node_ids
+        )
+
+    def _max_node_time(self, state):
+        if not state.all_nodes:
+            return 0.0
+        return max(float(lineage.time) for lineage in state.all_nodes.values())
 
     def _apply_inverse_arg_action(self, state, inverse_action):
         if inverse_action["event_type"] == "coal":
@@ -287,6 +310,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
             child.parents = [node_id for node_id in child.parents if node_id != parent_id]
             parent_state.active_lineages.append(child)
         parent_state.active_lineages.extend(remaining_lineages)
+        parent_state.total_active_blocks = None
 
         active_idx_by_id = self._active_index_by_node_id(parent_state)
         forward_action = {
@@ -295,10 +319,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
             "active_lineage_j": active_idx_by_id[child_ids[1]],
         }
         if getattr(self.env, "learn_times", False):
-            parent = state.all_nodes[parent_id]
-            child_times = [float(state.all_nodes[child_id].time) for child_id in child_ids]
-            delta_t = float(parent.time) - max(child_times)
-            forward_action["time_action"] = self.env.time_env.delta_to_time_action(delta_t)
+            parent_state.current_time = self._max_node_time(parent_state)
+            delta_t = float(state.current_time) - float(parent_state.current_time)
+            rates = self.env.enumerate_prior_options(parent_state).rates
+            forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 
@@ -316,6 +340,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         child = parent_state.all_nodes[child_id]
         child.parents = []
         parent_state.active_lineages = [child] + remaining_lineages
+        parent_state.total_active_blocks = None
 
         active_idx_by_id = self._active_index_by_node_id(parent_state)
         forward_action = {
@@ -324,12 +349,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
             "breakpoint": inverse_action["breakpoint"],
         }
         if getattr(self.env, "learn_times", False):
-            child = state.all_nodes[child_id]
-            left_parent = state.all_nodes[left_id]
-            right_parent = state.all_nodes[right_id]
-            event_time = min(float(left_parent.time), float(right_parent.time))
-            delta_t = event_time - float(child.time)
-            forward_action["time_action"] = self.env.time_env.delta_to_time_action(delta_t)
+            parent_state.current_time = self._max_node_time(parent_state)
+            delta_t = float(state.current_time) - float(parent_state.current_time)
+            rates = self.env.enumerate_prior_options(parent_state).rates
+            forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 
@@ -338,6 +361,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         parent_state.log_reward = None
         parent_state.action_options = None
         parent_state.rates = None
+        parent_state.prior_options = None
         parent_state.is_done = self.env.is_terminal(parent_state)
 
         log_prior = self.env.compute_cwr_event_log_prior(parent_state, forward_action)
@@ -345,6 +369,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
             parent_state.accumulated_log_prior = child_state.accumulated_log_prior - log_prior
         parent_state.action_options = None
         parent_state.rates = None
+        parent_state.prior_options = None
 
     def _active_index_by_node_id(self, state):
         return {lineage.node_id: idx for idx, lineage in enumerate(state.active_lineages)}
