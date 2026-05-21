@@ -359,12 +359,42 @@ class SimpleARGEnvironment:
             return self.fixed_edge_length
         return self.time_env.time_action_to_delta(time_action)
 
-    def _with_random_time_action(self, action):
-        action = dict[Any, Any](action)
-        print(action)
+    def _with_random_time_action(self, action, rates=None):
+        action = dict(action)
         if self.learn_times and "time_action" not in action:
-            action["time_action"] = self.time_env.generate_random_action()
+            action["time_action"] = self._sample_time_action_from_prior(rates)
+
         return action
+
+    def _sample_time_action_from_prior(self, rates=None):
+        if not self.learn_times:
+            return None
+        if not self.use_time_prior:
+            return self.time_env.generate_random_action()
+        if rates is None:
+            raise ValueError("rates are required to sample learnable ARG times from the prior")
+        total_rate = float(rates["lambda_coal"] + rates["lambda_recomb"])
+        if total_rate <= 0:
+            raise ValueError("waiting-time rate must be positive")
+        return self.time_env.sample_action_from_prior(total_rate, self.rng)
+
+    def _time_action_log_prior_distribution(self, rates):
+        if not self.learn_times:
+            return [(None, 0.0)]
+        if not self.use_time_prior:
+            log_prob = -math.log(self.time_env.bins)
+            return [(time_action, log_prob) for time_action in range(self.time_env.bins)]
+
+        total_rate = float(rates["lambda_coal"] + rates["lambda_recomb"])
+        if total_rate <= 0:
+            return []
+        return [
+            (
+                time_action,
+                self.time_env.time_action_log_probability(time_action, total_rate),
+            )
+            for time_action in range(self.time_env.bins)
+        ]
 
     def compute_waiting_time_log_prior(self, state, action, rates=None):
         if not self.learn_times or not self.use_time_prior:
@@ -374,8 +404,8 @@ class SimpleARGEnvironment:
         total_rate = float(rates["lambda_coal"] + rates["lambda_recomb"])
         if total_rate <= 0:
             return -math.inf
-        delta_t = self._delta_t_for_action(action)
-        return math.log(total_rate) - total_rate * delta_t
+        time_action = self._require_time_action(action)
+        return self.time_env.time_action_log_probability(time_action, total_rate)
 
     def get_initial_state(self):
         active_lineages = []
@@ -833,52 +863,33 @@ class SimpleARGEnvironment:
 
     def sample_action_from_prior(self, state):
         coal_actions, recomb_weights, _ = self.enumerate_action_options(state) if state.action_options is None else state.action_options
-        # rates = state.rates if state.rates is not None else self.compute_event_rates(
-        #     state,
-        #     coal_actions,
-        #     recomb_weights,
-        # )
-        # denom = rates["lambda_coal"] + rates["lambda_recomb"]
-        # if denom <= 0:
-        #     return None
+        rates = state.rates if state.rates is not None else self.compute_event_rates(
+            state,
+            coal_actions,
+            recomb_weights,
+        )
+        denom = rates["lambda_coal"] + rates["lambda_recomb"]
+        if denom <= 0:
+            return None
 
-        # coal_prob = rates["lambda_coal"] / denom if coal_actions else 0.0
-        # recomb_prob = rates["lambda_recomb"] / denom if recomb_weights else 0.0
+        coal_prob = rates["lambda_coal"] / denom if coal_actions else 0.0
+        recomb_prob = rates["lambda_recomb"] / denom if recomb_weights else 0.0
 
-        event_probs = self.compute_event_probabilities(state)
-
-        coal_prob = event_probs["coal"]
-        recomb_prob = event_probs["recomb"]
-
-        event_types = ["coal", "recomb"]
-        event_types_chosen = np.random.choice(event_types, p=[coal_prob, recomb_prob])
-        if event_types_chosen == "coal":
-            action = self._with_random_time_action(coal_actions[self.rng.randrange(len(coal_actions))])
+        if coal_prob > 0 and (recomb_prob <= 0 or self.rng.random() < coal_prob):
+            action = self._with_random_time_action(
+                coal_actions[self.rng.randrange(len(coal_actions))],
+                rates,
+            )
             return action, self.compute_cwr_event_log_prior(state, action)
-        else:
-            sampled = self._sample_recombination_prior_action(recomb_weights)
-            if sampled is None:
-                return None
-            action, _lineage_weight, _valid_breakpoints = sampled
-            action = self._with_random_time_action(action)
-            return action, self.compute_cwr_event_log_prior(state, action)
-        # if coal_prob > 0 and (recomb_prob <= 0 or self.rng.random() < coal_prob):
-        #     action = dict(coal_actions[self.rng.randrange(len(coal_actions))])
-        #     return action, math.log(coal_prob) - math.log(len(coal_actions))
 
-        # if recomb_prob <= 0:
-        #     return None
-        # sampled = self._sample_recombination_prior_action(recomb_weights)
-        # if sampled is None:
-        #     return None
-        # action, lineage_weight, valid_breakpoints = sampled
-        # total_weight = sum(weight for _, weight, _ in recomb_weights)
-        # log_prior = (
-        #     math.log(recomb_prob)
-        #     + math.log(lineage_weight / total_weight)
-        #     - math.log(len(valid_breakpoints))
-        # )
-        # return action, log_prior
+        if recomb_prob <= 0:
+            return None
+        sampled = self._sample_recombination_prior_action(recomb_weights)
+        if sampled is None:
+            return None
+        action, _lineage_weight, _valid_breakpoints = sampled
+        action = self._with_random_time_action(action, rates)
+        return action, self.compute_cwr_event_log_prior(state, action)
 
 
     def compute_action_prior_distribution(self, state, event_type=None):
@@ -887,28 +898,37 @@ class SimpleARGEnvironment:
         denom = rates["lambda_coal"] + rates["lambda_recomb"]
         if denom <= 0:
             return []
+        time_log_probs = self._time_action_log_prior_distribution(rates)
         distribution = []
-        if event_type == "coal":
-            if coal_actions and rates["lambda_coal"] > 0:
-                log_prob = math.log(rates["lambda_coal"] / denom) - math.log(len(coal_actions))
-                distribution.extend((dict(action), log_prob) for action in coal_actions)
-        else:
-            if recomb_actions and rates["lambda_recomb"] > 0:
-                total_weight = sum(weight for _, weight, _ in recomb_weights)
-                if total_weight > 0:
-                    weight_by_lineage = {
-                        lineage_i: (weight, valid_breakpoints)
-                        for lineage_i, weight, valid_breakpoints in recomb_weights
-                    }
-                    log_recomb_event = math.log(rates["lambda_recomb"] / denom)
-                    for action in recomb_actions:
-                        weight, valid_breakpoints = weight_by_lineage[action["active_lineage_i"]]
-                        log_prob = (
-                            log_recomb_event
-                            + math.log(weight / total_weight)
-                            - math.log(len(valid_breakpoints))
-                        )
-                        distribution.append((dict(action), log_prob))
+        if event_type in (None, "coal") and coal_actions and rates["lambda_coal"] > 0:
+            log_action_prob = math.log(rates["lambda_coal"] / denom) - math.log(len(coal_actions))
+            for action in coal_actions:
+                for time_action, log_time_prob in time_log_probs:
+                    timed_action = dict(action)
+                    if time_action is not None:
+                        timed_action["time_action"] = time_action
+                    distribution.append((timed_action, log_action_prob + log_time_prob))
+
+        if event_type in (None, "recomb") and recomb_actions and rates["lambda_recomb"] > 0:
+            total_weight = sum(weight for _, weight, _ in recomb_weights)
+            if total_weight > 0:
+                weight_by_lineage = {
+                    lineage_i: (weight, valid_breakpoints)
+                    for lineage_i, weight, valid_breakpoints in recomb_weights
+                }
+                log_recomb_event = math.log(rates["lambda_recomb"] / denom)
+                for action in recomb_actions:
+                    weight, valid_breakpoints = weight_by_lineage[action["active_lineage_i"]]
+                    log_action_prob = (
+                        log_recomb_event
+                        + math.log(weight / total_weight)
+                        - math.log(len(valid_breakpoints))
+                    )
+                    for time_action, log_time_prob in time_log_probs:
+                        timed_action = dict(action)
+                        if time_action is not None:
+                            timed_action["time_action"] = time_action
+                        distribution.append((timed_action, log_action_prob + log_time_prob))
 
         return distribution
 
