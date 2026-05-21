@@ -1,4 +1,5 @@
 import itertools
+import math
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ class ARGModel(nn.Module):
 
     EVENT_TO_IDX = {"coal": 0, "recomb": 1}
     SCALAR_FEATURES = 8
+    INTERNAL_ACTION_PREFIX = "_"
 
     def __init__(self, env, cfg=None):
         super().__init__()
@@ -101,17 +103,37 @@ class ARGModel(nn.Module):
         if input_actions is None:
             action_indices = self.sample({"logits": logits, "candidate_actions": candidate_actions},
                                          input_dict.get("random_spec"))
+            selected_candidates = [
+                candidate_actions[batch_idx][action_indices[batch_idx].item()]
+                for batch_idx in range(batch_size)
+            ]
             actions = [
-                dict(candidate_actions[batch_idx][action_indices[batch_idx].item()])
+                self._materialize_candidate_action(
+                    selected_candidates[batch_idx],
+                    device,
+                    strip_internal=False,
+                )
                 for batch_idx in range(batch_size)
             ]
         else:
             if len(input_actions) != batch_size:
                 raise ValueError("input_actions length must match batch size.")
             action_indices = self._indices_for_input_actions(input_actions, candidate_actions, device)
-            actions = [dict(action) for action in input_actions]
+            selected_candidates = [
+                candidate_actions[batch_idx][action_indices[batch_idx].item()]
+                for batch_idx in range(batch_size)
+            ]
+            actions = [
+                self._merge_candidate_metadata(dict(action), selected_candidates[batch_idx])
+                for batch_idx, action in enumerate(input_actions)
+            ]
 
         conditional_log_paths_pf = self.compute_log_path_pf({"logits": logits}, action_indices)
+        log_action_detail_pf = self._selected_action_detail_log_pf(
+            candidate_actions,
+            action_indices,
+            conditional_log_paths_pf,
+        )
         time_logits = None
         time_actions = None
         log_time_pf = conditional_log_paths_pf.new_zeros(batch_size)
@@ -138,12 +160,18 @@ class ARGModel(nn.Module):
                     device=device,
                 )
             log_time_pf = self.compute_log_time_pf(time_logits, time_actions)
+        actions = [self._strip_internal_action_keys(action) for action in actions]
         log_event_probs = self._event_log_probs_for_batch(
             input_dict,
             batch_size,
             conditional_log_paths_pf,
         )
-        log_paths_pf = log_event_probs + conditional_log_paths_pf + log_time_pf
+        log_paths_pf = (
+            log_event_probs
+            + conditional_log_paths_pf
+            + log_action_detail_pf
+            + log_time_pf
+        )
         return {
             "actions": actions,
             "arg_actions": actions,
@@ -154,6 +182,7 @@ class ARGModel(nn.Module):
             "time_logits": time_logits,
             "time_actions": time_actions,
             "log_time_pf": log_time_pf,
+            "log_action_detail_pf": log_action_detail_pf,
             "log_paths_pf": log_paths_pf,
             "conditional_log_paths_pf": conditional_log_paths_pf,
             "log_event_probs": log_event_probs,
@@ -265,6 +294,7 @@ class ARGModel(nn.Module):
                 state,
                 int(batch_nb_seq[batch_idx].item()),
             )
+    
             logits[batch_idx, :len(actions)] = self.action_scorer(features).squeeze(-1)
 
         return logits
@@ -313,13 +343,13 @@ class ARGModel(nn.Module):
             secondary_rep[rows] = torch.abs(left_rep - right_rep)
             tertiary_rep[rows] = left_rep * right_rep
 
-        recomb_rows = [
+        dense_recomb_rows = [
             (row_idx, action["active_lineage_i"], action["breakpoint"])
             for row_idx, action in enumerate(actions)
-            if action["event_type"] == "recomb"
+            if action["event_type"] == "recomb" and not action.get("_compact_recomb")
         ]
-        if recomb_rows:
-            rows, lineage_indices, breakpoints = zip(*recomb_rows)
+        if dense_recomb_rows:
+            rows, lineage_indices, breakpoints = zip(*dense_recomb_rows)
             rows = torch.tensor(rows, dtype=torch.long, device=device)
             lineage_indices = torch.tensor(lineage_indices, dtype=torch.long, device=device)
             breakpoints = torch.tensor(breakpoints, dtype=torch.long, device=device)
@@ -332,6 +362,26 @@ class ARGModel(nn.Module):
             )
             secondary_rep[rows] = left_rep
             tertiary_rep[rows] = right_rep
+
+        compact_recomb_rows = [
+            (row_idx, action["active_lineage_i"], action)
+            for row_idx, action in enumerate(actions)
+            if action["event_type"] == "recomb" and action.get("_compact_recomb")
+        ]
+        if compact_recomb_rows:
+            rows, lineage_indices, compact_actions = zip(*compact_recomb_rows)
+            rows = torch.tensor(rows, dtype=torch.long, device=device)
+            lineage_indices = torch.tensor(lineage_indices, dtype=torch.long, device=device)
+            lineage_rep = lineage_reps[batch_idx, lineage_indices]
+            left_fraction = torch.tensor(
+                [self._compact_left_fraction(action) for action in compact_actions],
+                dtype=lineage_rep.dtype,
+                device=device,
+            ).unsqueeze(-1)
+            right_fraction = 1.0 - left_fraction
+            primary_rep[rows] = lineage_rep
+            secondary_rep[rows] = lineage_rep * left_fraction
+            tertiary_rep[rows] = lineage_rep * right_fraction
 
         summary_for_actions = summary_reps[batch_idx].expand(num_actions, -1)
         return torch.cat(
@@ -484,11 +534,16 @@ class ARGModel(nn.Module):
             tertiary_rep = left_rep * right_rep
         elif event_type == "recomb":
             i = action["active_lineage_i"]
-            breakpoint = action["breakpoint"]
             primary_rep = lineage_reps[batch_idx, i]
-            left_input, right_input = self._split_sequence_input(seq_features[batch_idx, i], breakpoint)
-            secondary_rep = self.seq_embedding(left_input)
-            tertiary_rep = self.seq_embedding(right_input)
+            if action.get("_compact_recomb"):
+                left_fraction = self._compact_left_fraction(action)
+                secondary_rep = primary_rep * left_fraction
+                tertiary_rep = primary_rep * (1.0 - left_fraction)
+            else:
+                breakpoint = action["breakpoint"]
+                left_input, right_input = self._split_sequence_input(seq_features[batch_idx, i], breakpoint)
+                secondary_rep = self.seq_embedding(left_input)
+                tertiary_rep = self.seq_embedding(right_input)
         else:
             raise ValueError(f"Unknown ARG action event_type: {event_type}")
 
@@ -597,17 +652,17 @@ class ARGModel(nn.Module):
 
     def _state_candidate_actions(self, state, selected_event_type=None):
         self._validate_selected_event_type(selected_event_type)
-        coal_actions, recomb_weights, recomb_actions = self.env.enumerate_action_options(state) if state.action_options is None else state.action_options
-        rates = state.rates if state.rates is not None else self.env.compute_event_rates(
-            state,
-            coal_actions,
-            recomb_weights,
-        )
+        prior_options = self.env.enumerate_prior_options(state)
+        rates = prior_options.rates
         actions = []
         if selected_event_type in (None, "coal") and rates["lambda_coal"] > 0:
-            actions.extend(dict(action) for action in coal_actions)
+            actions.extend(dict(action) for action in prior_options.coal_actions)
         if selected_event_type in (None, "recomb") and rates["lambda_recomb"] > 0:
-            actions.extend(dict(action) for action in recomb_actions)
+            actions.extend(
+                self._compact_recombination_action(choice)
+                for choice in prior_options.recomb_choices
+                if choice.breakpoint_count > 0
+            )
         return actions
 
     def _dense_candidate_actions(self, nb_seq, selected_event_type=None):
@@ -704,14 +759,27 @@ class ARGModel(nn.Module):
     def _indices_for_input_actions(self, input_actions, candidate_actions, device):
         indices = []
         for batch_idx, action in enumerate(input_actions):
-            normalized_input = self._normalize_action(action)
             for candidate_idx, candidate_action in enumerate(candidate_actions[batch_idx]):
-                if self._normalize_action(candidate_action) == normalized_input:
+                if self._candidate_matches_input_action(candidate_action, action):
                     indices.append(candidate_idx)
                     break
             else:
                 raise ValueError(f"Forced ARG action is not valid for batch item {batch_idx}: {action}")
         return torch.tensor(indices, dtype=torch.long, device=device)
+
+    def _candidate_matches_input_action(self, candidate_action, input_action):
+        if candidate_action.get("_compact_recomb"):
+            if input_action.get("event_type") != "recomb":
+                return False
+            if int(candidate_action["active_lineage_i"]) != int(input_action["active_lineage_i"]):
+                return False
+            breakpoint = int(input_action["breakpoint"])
+            return (
+                int(candidate_action["_breakpoint_span_start"])
+                <= breakpoint
+                <= int(candidate_action["_breakpoint_span_end"])
+            )
+        return self._normalize_action(candidate_action) == self._normalize_action(input_action)
 
     def _normalize_action(self, action):
         event_type = action.get("event_type")
@@ -729,3 +797,70 @@ class ARGModel(nn.Module):
             return input_dict["batch_seq_features"].float()
         batch_size, active_lineages, _ = batch_input.shape
         return batch_input.reshape(batch_size, active_lineages, self.env.sequence_length, 4)
+
+    def _compact_recombination_action(self, choice):
+        breakpoint_count = int(choice.breakpoint_count)
+        breakpoint_start = int(choice.span_start) + 1
+        breakpoint_end = int(choice.span_end)
+        representative_breakpoint = breakpoint_start + (breakpoint_count - 1) // 2
+        return {
+            "event_type": "recomb",
+            "active_lineage_i": int(choice.active_lineage_i),
+            "breakpoint": int(representative_breakpoint),
+            "_compact_recomb": True,
+            "_breakpoint_span_start": breakpoint_start,
+            "_breakpoint_span_end": breakpoint_end,
+            "_breakpoint_count": breakpoint_count,
+        }
+
+    def _materialize_candidate_action(self, candidate_action, device, strip_internal=True):
+        action = dict(candidate_action)
+        if action.get("_compact_recomb"):
+            breakpoint_count = int(action["_breakpoint_count"])
+            if breakpoint_count <= 0:
+                raise ValueError(f"Compact recombination candidate has no valid breakpoints: {action}")
+            offset = int(
+                torch.randint(
+                    breakpoint_count,
+                    size=(),
+                    device=device,
+                ).detach().cpu().item()
+            )
+            action["breakpoint"] = int(action["_breakpoint_span_start"]) + offset
+        if strip_internal:
+            return self._strip_internal_action_keys(action)
+        return action
+
+    def _merge_candidate_metadata(self, action, candidate_action):
+        if not candidate_action.get("_compact_recomb"):
+            return action
+        merged = dict(action)
+        for key, value in candidate_action.items():
+            if key.startswith(self.INTERNAL_ACTION_PREFIX):
+                merged[key] = value
+        return merged
+
+    def _strip_internal_action_keys(self, action):
+        return {
+            key: value
+            for key, value in action.items()
+            if not str(key).startswith(self.INTERNAL_ACTION_PREFIX)
+        }
+
+    def _selected_action_detail_log_pf(self, candidate_actions, action_indices, reference):
+        values = []
+        for batch_idx, actions in enumerate(candidate_actions):
+            candidate = actions[action_indices[batch_idx].item()]
+            if candidate.get("_compact_recomb"):
+                breakpoint_count = int(candidate["_breakpoint_count"])
+                values.append(-math.log(breakpoint_count))
+            else:
+                values.append(0.0)
+        return torch.tensor(values, dtype=reference.dtype, device=reference.device)
+
+    def _compact_left_fraction(self, action):
+        breakpoint = float(action.get("breakpoint", action["_breakpoint_span_start"]))
+        span_start = float(action.get("_breakpoint_span_start", 1)) - 1.0
+        span_end = float(action.get("_breakpoint_span_end", self.env.num_blocks - 1))
+        span_width = max(span_end - span_start, 1.0)
+        return max(0.0, min(1.0, (breakpoint - span_start) / span_width))

@@ -23,8 +23,7 @@ DEFAULT_NE = 10000
 DEFAULT_R_PER_BP = 2e-8
 DEFAULT_MU_PER_BP = 2e-8
 DEFAULT_FIXED_EDGE_LENGTH = 0.02
-DEFAULT_INIT_Z_SAMPLE_COUNT = 16
-
+DEFAULT_INIT_Z_SAMPLE_COUNT = 2
 
 def seed_everything(seed):
     random.seed(seed)
@@ -33,12 +32,10 @@ def seed_everything(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 def train_epoch(epoch_id, rollout_worker, generator, batch_size=1):
     ret, _ = rollout_worker.rollout(generator, episodes=batch_size)
     generator.accumulate_loss(ret)
     return generator.update_model()
-
 
 def parse_time_increments(value):
     if value is None:
@@ -224,8 +221,8 @@ def build_checkpoint_metadata(
 
 def main():
     parser = argparse.ArgumentParser(description="Train the simplified ARG GFlowNet demo.")
-    parser.add_argument("--output-path", default="l1mb_0")
-    parser.add_argument("--dataset-path", default="/private/groups/corbettlab/pratik/git/ARG-Optimise_single_env/new_validation/fasta/sim_l1mb_0.fa")
+    parser.add_argument("--output-path", default="l025mb_0")
+    parser.add_argument("--dataset-path", default="validation/fasta/sim_l25kb_0.fa")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=7)

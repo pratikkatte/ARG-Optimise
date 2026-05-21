@@ -20,16 +20,13 @@ LOSS_FN = {
 }
 
 class TBGFlowNetGenerator(torch.nn.Module):
-    def __init__(self, env, cfg=None, init_z_sample_count=2, device=None, verbose=False):
+    def __init__(self, env, init_z_sample_count, cfg=None, device=None, verbose=False):
         super().__init__()
         self.cfg = cfg
         self.env = env
         self.verbose = verbose
         self.device = self._resolve_device(device)
-        self.init_z_sample_count = int(init_z_sample_count)
-        if self.init_z_sample_count < 1:
-            raise ValueError("init_z_sample_count must be at least 1")
-
+        self.init_z_sample_count = init_z_sample_count
         ## Policy model
         self.arg_model = ARGModel(env, cfg).to(self.device)
 

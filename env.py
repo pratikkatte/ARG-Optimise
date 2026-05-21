@@ -1259,7 +1259,39 @@ class SimpleARGEnvironment:
             "recomb": rates["lambda_recomb"] / denom,
         }
 
-    def sample(self, num_trajs, compute_reward=True):
+    def sample(
+        self,
+        num_trajs,
+        compute_reward=True,
+        generator=None,
+        random_spec=None,
+        record_diagnostics=False,
+        return_trajectories=False,
+    ):
+        """Sample terminal ARG states.
+
+        Without a generator this preserves the prior-only sampler. With a
+        generator, event types are sampled from environment event rates and the
+        model chooses the concrete action through RolloutWorker.
+        """
+        if generator is not None:
+            try:
+                from .rollout_worker_arg import RolloutWorker
+            except ImportError:
+                from rollout_worker_arg import RolloutWorker
+
+            outputs, trajectories = RolloutWorker(self).rollout(
+                generator,
+                episodes=num_trajs,
+                random_spec=random_spec,
+                record_diagnostics=record_diagnostics,
+                compute_reward=compute_reward,
+            )
+            states = outputs["states"]
+            if return_trajectories:
+                return states, trajectories
+            return states
+
         trajectories = []
         for _ in range(num_trajs):
             state = self.get_initial_state()

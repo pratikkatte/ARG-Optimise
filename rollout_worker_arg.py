@@ -17,6 +17,7 @@ class RolloutWorker:
         random_spec=None,
         record_diagnostics=False,
         sample_backward=False,
+        compute_reward=True,
     ):
         if generator is not None:
             data, trajectories = self._rollout_batch(
@@ -25,6 +26,7 @@ class RolloutWorker:
                 random_spec=random_spec,
                 record_diagnostics=record_diagnostics,
                 sample_backward=sample_backward,
+                compute_reward=compute_reward,
             )
             return data, trajectories[0]
 
@@ -39,7 +41,12 @@ class RolloutWorker:
                 raise RuntimeError("ARG prior rollout reached a non-terminal state with no valid action.")
             action, log_prior = sampled
 
-            state = self.env.apply_action(state, action, log_prior)
+            state = self.env.apply_action(
+                state,
+                action,
+                log_prior,
+                compute_reward=compute_reward,
+            )
             trajectory.append(self._trajectory_record(step, action, log_prior, state, record_diagnostics))
 
             if self.verbose:
@@ -57,6 +64,7 @@ class RolloutWorker:
         random_spec=None,
         record_diagnostics=False,
         sample_backward=False,
+        compute_reward=True,
     ):
         states = [self.env.get_initial_state() for _ in range(episodes)]
         trajectories = [[] for _ in range(episodes)]
@@ -100,7 +108,12 @@ class RolloutWorker:
                 log_prior = self.env.compute_cwr_event_log_prior(state, action)
                 log_paths_pf_by_traj[traj_idx].append(log_paths_pf[batch_idx])
 
-                next_state = self.env.apply_action(state, action, log_prior)
+                next_state = self.env.apply_action(
+                    state,
+                    action,
+                    log_prior,
+                    compute_reward=compute_reward,
+                )
                 states[traj_idx] = next_state
                 step_counts[traj_idx] += 1
                 backward_num_parents_by_traj[traj_idx].append(
@@ -158,7 +171,12 @@ class RolloutWorker:
 
         log_paths_pb = self._pad_log_path_vectors(log_paths_pb_vectors, dtype, device)
         log_rewards = torch.tensor(
-            [state.log_reward for state in states],
+            [
+                float(state.log_reward)
+                if state.log_reward is not None
+                else float("nan")
+                for state in states
+            ],
             dtype=dtype,
             device=device,
         )
@@ -180,9 +198,13 @@ class RolloutWorker:
         record_diagnostics=False,
         sample_backward=False,
         num_trajectories=None,
+        compute_reward=True,
     ):
         """
         Run one or more ARG rollouts.
+
+        Passing a generator uses prior event-type sampling plus model action
+        sampling. Omitting it keeps the prior-only rollout path.
         """
         if num_trajectories is not None:
             episodes = num_trajectories
@@ -194,12 +216,16 @@ class RolloutWorker:
                 random_spec=random_spec,
                 record_diagnostics=record_diagnostics,
                 sample_backward=sample_backward,
+                compute_reward=compute_reward,
             )
 
         states = []
         trajectories = []
         for _ in range(episodes):
-            state, trajectory = self._rollout_one(record_diagnostics=record_diagnostics)
+            state, trajectory = self._rollout_one(
+                record_diagnostics=record_diagnostics,
+                compute_reward=compute_reward,
+            )
             states.append(state)
             trajectories.append(trajectory)
 
