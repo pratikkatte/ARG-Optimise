@@ -1,0 +1,32 @@
+# ARG GFN dependencies (Python 3.11+ recommended)
+#
+# Install from this directory:
+#   pip install -r requirements.txt
+#
+# PyTorch: use platform-specific wheels if needed, e.g. CPU-only:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# cyvcf2 and msprime often install more reliably via conda on macOS:
+#   conda install -c conda-forge -c bioconda cyvcf2 msprime tskit tsinfer tsdate
+
+# --- Training & inference (train.py, infer.py, models.py, ...) ---
+numpy
+torch
+wandb
+
+# --- Environment & export (env.py: .trees export via tskit) ---
+tskit
+
+# --- Visualization (viz.py, pg.ipynb) ---
+matplotlib
+
+# --- Validation pipeline (validation/scripts/) ---
+cyvcf2
+msprime
+pandas
+tsdate
+tsinfer
+
+# --- Notebook (pg.ipynb) ---
+ipython
+jupyter
