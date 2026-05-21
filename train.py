@@ -24,6 +24,8 @@ DEFAULT_R_PER_BP = 2e-8
 DEFAULT_MU_PER_BP = 2e-8
 DEFAULT_FIXED_EDGE_LENGTH = 0.02
 DEFAULT_INIT_Z_SAMPLE_COUNT = 2
+DEFAULT_SEQUENCE_ENCODER_BINS = 1024
+MODEL_VERSION = "compact-binned-v1"
 
 def seed_everything(seed):
     random.seed(seed)
@@ -33,8 +35,9 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 def train_epoch(epoch_id, rollout_worker, generator, batch_size=1):
-    ret, _ = rollout_worker.rollout(generator, episodes=batch_size)
-    generator.accumulate_loss(ret)
+    with torch.no_grad():
+        ret, trajectories = rollout_worker.rollout(generator, episodes=batch_size)
+    generator.accumulate_streaming_tb_loss(rollout_worker, ret, trajectories)
     return generator.update_model()
 
 def parse_time_increments(value):
@@ -67,14 +70,24 @@ def train(
     effective_population_size=DEFAULT_NE,
     mutation_rate=DEFAULT_MU_PER_BP,
     use_time_prior=True,
+    num_blocks=None,
+    sequence_encoder_bins=DEFAULT_SEQUENCE_ENCODER_BINS,
+    smoke_test=False,
 ):
     seed_everything(seed)
     time_increments = None if time_increments is None else list(time_increments)
 
     sequences = load_sequences(dataset_path)
     sequence_length = len(sequences[0])
-    # num_blocks = sequence_length
-    num_blocks = 10000
+    if num_blocks is None:
+        num_blocks = min(sequence_length, 256) if smoke_test else sequence_length
+    num_blocks = int(num_blocks)
+    if num_blocks <= 0:
+        raise ValueError("num_blocks must be positive")
+    if num_blocks > sequence_length:
+        raise ValueError("num_blocks must be less than or equal to sequence length")
+    if smoke_test:
+        sequence_encoder_bins = min(int(sequence_encoder_bins), 256)
     rho = 4 * float(effective_population_size) * DEFAULT_R_PER_BP * sequence_length
 
     env = SimpleARGEnvironment(
@@ -97,6 +110,7 @@ def train(
     generator = TBGFlowNetGenerator(
         env,
         init_z_sample_count=init_z_sample_count,
+        cfg={"sequence_encoder_bins": sequence_encoder_bins},
         device=device,
         verbose=init_z_verbose,
     )
@@ -123,6 +137,9 @@ def train(
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
             "use_time_prior": bool(use_time_prior),
+            "num_blocks": int(num_blocks),
+            "sequence_encoder_bins": int(generator.arg_model.sequence_encoder_bins),
+            "model_version": MODEL_VERSION,
         })
 
     try:
@@ -162,6 +179,8 @@ def train(
                     use_time_prior=use_time_prior,
                     seed=seed,
                     init_z_sample_count=init_z_sample_count,
+                    sequence_encoder_bins=generator.arg_model.sequence_encoder_bins,
+                    model_version=MODEL_VERSION,
                 )
                 generator.save(best_checkpoint_path, metadata=metadata)
                 info["best_checkpoint_path"] = best_checkpoint_path
@@ -195,6 +214,8 @@ def build_checkpoint_metadata(
     use_time_prior,
     seed,
     init_z_sample_count,
+    sequence_encoder_bins,
+    model_version,
 ):
     return {
         "epoch": int(epoch),
@@ -216,6 +237,8 @@ def build_checkpoint_metadata(
         "use_time_prior": bool(use_time_prior),
         "seed": int(seed),
         "init_z_sample_count": int(init_z_sample_count),
+        "sequence_encoder_bins": int(sequence_encoder_bins),
+        "model_version": str(model_version),
     }
 
 
@@ -224,8 +247,25 @@ def main():
     parser.add_argument("--output-path", default="l025mb_0")
     parser.add_argument("--dataset-path", default="validation/fasta/sim_l25kb_0.fa")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        default=None,
+        help="Discrete ARG block count. Defaults to the full sequence length.",
+    )
+    parser.add_argument(
+        "--sequence-encoder-bins",
+        type=int,
+        default=DEFAULT_SEQUENCE_ENCODER_BINS,
+        help="Number of sequence bins used by the compact policy encoder.",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run a smallest-memory development configuration.",
+    )
     parser.add_argument(
         "--init-z-sample-count",
         type=int,
@@ -258,6 +298,13 @@ def main():
 
     args = parser.parse_args()
 
+    if args.smoke_test:
+        args.epochs = 1
+        args.batch_size = 1
+        args.init_z_sample_count = 1
+        args.no_wandb = True
+        args.sequence_encoder_bins = min(args.sequence_encoder_bins, 256)
+
     if args.device == "auto":
         selected_device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
@@ -283,6 +330,9 @@ def main():
         effective_population_size=args.effective_population_size,
         mutation_rate=args.mutation_rate,
         use_time_prior=not args.no_time_prior,
+        num_blocks=args.num_blocks,
+        sequence_encoder_bins=args.sequence_encoder_bins,
+        smoke_test=args.smoke_test,
     )
 
 

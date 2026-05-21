@@ -1,9 +1,9 @@
 import itertools
 import math
 
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Categorical
 
 
@@ -18,6 +18,7 @@ class ARGModel(nn.Module):
     EVENT_TO_IDX = {"coal": 0, "recomb": 1}
     SCALAR_FEATURES = 8
     INTERNAL_ACTION_PREFIX = "_"
+    DEFAULT_SEQUENCE_ENCODER_BINS = 1024
 
     def __init__(self, env, cfg=None):
         super().__init__()
@@ -26,10 +27,22 @@ class ARGModel(nn.Module):
         hidden_size = 64
         dropout = 0.0
         self.learn_times = bool(getattr(env, "learn_times", False))
+        self.model_version = "compact-binned-v1"
 
-        input_size = int(env.sequence_length) * 4
+        requested_bins = int(
+            self._cfg_get(cfg, "sequence_encoder_bins", self.DEFAULT_SEQUENCE_ENCODER_BINS)
+        )
+        if requested_bins <= 0:
+            raise ValueError("sequence_encoder_bins must be positive")
+        self.sequence_encoder_bins = min(requested_bins, int(env.sequence_length))
+        input_size = self.sequence_encoder_bins * 4
 
-        self.seq_embedding = nn.Linear(input_size, embedding_size) ## Understand the size
+        self.register_buffer(
+            "binned_seq_arrays",
+            self._build_binned_sequence_features(),
+            persistent=False,
+        )
+        self.seq_embedding = nn.Linear(input_size, embedding_size)
         self.event_embedding = nn.Embedding(len(self.EVENT_TO_IDX), embedding_size)
         self.scalar_embedding = nn.Linear(self.SCALAR_FEATURES, embedding_size)
         self.action_scorer = nn.Sequential(
@@ -49,28 +62,170 @@ class ARGModel(nn.Module):
             self.time_scorer = None
         self.logsoftmax = nn.LogSoftmax(dim=1)
 
+    def _cfg_get(self, cfg, key, default):
+        if cfg is None:
+            return default
+        if isinstance(cfg, dict):
+            return cfg.get(key, default)
+        return getattr(cfg, key, default)
+
+    def _build_binned_sequence_features(self):
+        seq_arrays = self.env.seq_arrays.detach().to(dtype=torch.float32)
+        if seq_arrays.shape[1] == self.sequence_encoder_bins:
+            return seq_arrays.clone()
+        pooled = F.adaptive_avg_pool1d(
+            seq_arrays.permute(0, 2, 1),
+            self.sequence_encoder_bins,
+        )
+        return pooled.permute(0, 2, 1).contiguous()
+
     def model_params(self):
         return list(self.parameters())
 
-    def forward(self, input_dict):
-        batch_input = input_dict["batch_input"].float()
-        batch_nb_seq = input_dict["batch_nb_seq"]
-        batch_size, max_nb_seq, input_size = batch_input.shape
-        device = batch_input.device
+    def _encode_states(self, states, batch_nb_seq=None):
+        device = self.binned_seq_arrays.device
+        dtype = self.binned_seq_arrays.dtype
+        batch_size = len(states)
+        if batch_size == 0:
+            raise ValueError("ARGModel.forward requires at least one state")
 
-        if input_size != self.seq_embedding.in_features:
-            raise ValueError(
-                "batch_input last dimension must match env.sequence_length * 4 "
-                f"({self.seq_embedding.in_features}), got {input_size}"
-            )
+        active_counts = [len(state.active_lineages) for state in states]
+        max_active = max(active_counts)
+        lineage_inputs = self.binned_seq_arrays.new_zeros(
+            batch_size,
+            max_active,
+            self.sequence_encoder_bins,
+            4,
+        )
 
-        lineage_reps = self.seq_embedding(batch_input)
-        valid_mask = torch.arange(max_nb_seq, device=device)[None, :] < batch_nb_seq[:, None]
+        for batch_idx, state in enumerate(states):
+            for lineage_idx, lineage in enumerate(state.active_lineages):
+                if lineage.sequences_indices:
+                    feature = self.binned_seq_arrays[lineage.sequences_indices].mean(dim=0)
+                else:
+                    feature = self.binned_seq_arrays.new_zeros(self.sequence_encoder_bins, 4)
+                weights = self._material_segments_to_bin_weights(
+                    lineage.material_segments,
+                    device=device,
+                    dtype=dtype,
+                )
+                lineage_inputs[batch_idx, lineage_idx] = feature * weights[:, None]
+
+        if batch_nb_seq is None:
+            batch_nb_seq = torch.tensor(active_counts, dtype=torch.long, device=device)
+        else:
+            batch_nb_seq = torch.as_tensor(batch_nb_seq, dtype=torch.long, device=device)
+            if batch_nb_seq.shape != (batch_size,):
+                raise ValueError("batch_nb_seq must have one entry per state")
+
+        flat_inputs = lineage_inputs.reshape(batch_size, max_active, -1)
+        lineage_reps = self.seq_embedding(flat_inputs)
+        valid_mask = torch.arange(max_active, device=device)[None, :] < batch_nb_seq[:, None]
         lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
         summary_reps = lineage_reps.sum(dim=1) / batch_nb_seq.clamp_min(1).unsqueeze(-1)
+        return lineage_reps, summary_reps, lineage_inputs, batch_nb_seq
 
-        seq_features = self._get_seq_features(input_dict, batch_input)
+    def _material_segments_to_bin_weights(self, material_segments, device, dtype):
+        weights = [0.0 for _ in range(self.sequence_encoder_bins)]
+        num_blocks = float(max(int(self.env.num_blocks), 1))
+        bin_width = num_blocks / float(self.sequence_encoder_bins)
+        if bin_width <= 0:
+            return torch.zeros(self.sequence_encoder_bins, dtype=dtype, device=device)
+
+        for segment_start, segment_end in material_segments.segments:
+            start = max(float(segment_start), 0.0)
+            end = min(float(segment_end), num_blocks)
+            if end <= start:
+                continue
+            first_bin = max(0, int(math.floor(start / bin_width)))
+            last_bin = min(self.sequence_encoder_bins - 1, int(math.ceil(end / bin_width)) - 1)
+            for bin_idx in range(first_bin, last_bin + 1):
+                bin_start = float(bin_idx) * bin_width
+                bin_end = bin_start + bin_width
+                overlap = min(end, bin_end) - max(start, bin_start)
+                if overlap > 0:
+                    weights[bin_idx] = min(1.0, weights[bin_idx] + overlap / bin_width)
+        return torch.tensor(weights, dtype=dtype, device=device)
+
+    def _encode_dense_inputs(self, input_dict):
+        if "batch_seq_features" in input_dict:
+            seq_features = input_dict["batch_seq_features"].float()
+        else:
+            batch_input = input_dict["batch_input"].float()
+            batch_size, active_lineages, _ = batch_input.shape
+            if batch_input.shape[-1] == self.seq_embedding.in_features:
+                seq_features = batch_input.reshape(
+                    batch_size,
+                    active_lineages,
+                    self.sequence_encoder_bins,
+                    4,
+                )
+            else:
+                seq_features = batch_input.reshape(
+                    batch_size,
+                    active_lineages,
+                    self.env.sequence_length,
+                    4,
+                )
+
+        batch_size, active_lineages, seq_len, channels = seq_features.shape
+        if channels != 4:
+            raise ValueError(f"Expected 4 sequence channels, got {channels}")
+        if seq_len != self.sequence_encoder_bins:
+            pooled = F.adaptive_avg_pool1d(
+                seq_features.reshape(batch_size * active_lineages, seq_len, channels)
+                .permute(0, 2, 1),
+                self.sequence_encoder_bins,
+            )
+            seq_features = pooled.permute(0, 2, 1).reshape(
+                batch_size,
+                active_lineages,
+                self.sequence_encoder_bins,
+                channels,
+            )
+
+        batch_input = seq_features.reshape(batch_size, active_lineages, -1)
+        if batch_input.shape[-1] != self.seq_embedding.in_features:
+            raise ValueError(
+                "Encoded batch_input last dimension must match sequence_encoder_bins * 4 "
+                f"({self.seq_embedding.in_features}), got {batch_input.shape[-1]}"
+            )
+
+        if "batch_nb_seq" in input_dict:
+            batch_nb_seq = torch.as_tensor(
+                input_dict["batch_nb_seq"],
+                dtype=torch.long,
+                device=batch_input.device,
+            )
+        else:
+            batch_nb_seq = torch.full(
+                (batch_size,),
+                active_lineages,
+                dtype=torch.long,
+                device=batch_input.device,
+            )
+        return batch_input, seq_features, batch_nb_seq
+
+    def forward(self, input_dict):
         states = input_dict.get("states")
+        if states is not None:
+            lineage_reps, summary_reps, seq_features, batch_nb_seq = self._encode_states(
+                states,
+                input_dict.get("batch_nb_seq"),
+            )
+            batch_size, max_nb_seq, _ = lineage_reps.shape
+            device = lineage_reps.device
+        else:
+            batch_input, seq_features, batch_nb_seq = self._encode_dense_inputs(input_dict)
+            batch_size, max_nb_seq, _ = batch_input.shape
+            device = batch_input.device
+            lineage_reps = self.seq_embedding(batch_input)
+            valid_mask = torch.arange(max_nb_seq, device=device)[None, :] < batch_nb_seq[:, None]
+            lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
+            summary_reps = lineage_reps.sum(dim=1) / batch_nb_seq.clamp_min(1).unsqueeze(-1)
+
+        valid_mask = torch.arange(max_nb_seq, device=device)[None, :] < batch_nb_seq[:, None]
+        lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
         action_options = input_dict.get("action_options")
         selected_event_types = input_dict.get("selected_event_types")
         if selected_event_types is not None and len(selected_event_types) != batch_size:
@@ -82,6 +237,7 @@ class ARGModel(nn.Module):
                 states,
                 action_options,
                 selected_event_types,
+                batch_size,
             )
             for batch_idx in range(batch_size)
         ]
@@ -427,84 +583,56 @@ class ARGModel(nn.Module):
     def _batched_scalar_features(self, actions, state, nb_seq, device):
         denom_seq = float(max(nb_seq - 1, 1))
         denom_blocks = float(max(self.env.num_blocks, 1))
-        event_is_recomb = torch.tensor(
-            [1.0 if action["event_type"] == "recomb" else 0.0 for action in actions],
-            dtype=torch.float32,
-            device=device,
-        )
-        active_i = torch.tensor(
-            [action.get("active_lineage_i", 0) for action in actions],
-            dtype=torch.long,
-            device=device,
-        )
-        active_j = torch.tensor(
-            [action.get("active_lineage_j", 0) for action in actions],
-            dtype=torch.long,
-            device=device,
-        )
-        breakpoints = torch.tensor(
-            [action.get("breakpoint", 0) for action in actions],
-            dtype=torch.long,
-            device=device,
-        )
+        rows = []
+        for action in actions:
+            event_type = action["event_type"]
+            event_is_recomb = 1.0 if event_type == "recomb" else 0.0
+            active_i = int(action.get("active_lineage_i", 0))
+            active_j = int(action.get("active_lineage_j", 0))
+            breakpoint = int(action.get("breakpoint", 0))
 
-        material_fraction = torch.ones_like(event_is_recomb)
-        overlap_fraction = 1.0 - event_is_recomb
-        left_fraction = torch.ones_like(event_is_recomb)
-        right_fraction = torch.ones_like(event_is_recomb)
+            material_fraction = 1.0
+            overlap_fraction = 1.0 if event_type == "coal" else 0.0
+            left_fraction = 1.0
+            right_fraction = 1.0
 
-        if state is not None:
-            masks = torch.as_tensor(
-                np.stack([lineage.material_mask for lineage in state.active_lineages]),
-                dtype=torch.bool,
-                device=device,
+            if state is not None:
+                if event_type == "coal":
+                    left_segments = state.active_lineages[active_i].material_segments
+                    right_segments = state.active_lineages[active_j].material_segments
+                    material_fraction = left_segments.union(right_segments).count / denom_blocks
+                    overlap_fraction = (
+                        left_segments.intersection_count(right_segments) / denom_blocks
+                    )
+                    left_fraction = left_segments.count / denom_blocks
+                    right_fraction = right_segments.count / denom_blocks
+                elif event_type == "recomb":
+                    segments = state.active_lineages[active_i].material_segments
+                    left_segments, right_segments = segments.split(breakpoint)
+                    material_fraction = segments.count / denom_blocks
+                    overlap_fraction = 0.0
+                    left_fraction = left_segments.count / denom_blocks
+                    right_fraction = right_segments.count / denom_blocks
+            elif event_type == "recomb":
+                material_fraction = 1.0
+                overlap_fraction = 0.0
+                left_fraction = float(breakpoint) / denom_blocks
+                right_fraction = 1.0 - left_fraction
+
+            rows.append(
+                [
+                    event_is_recomb,
+                    float(active_i) / denom_seq,
+                    float(active_j) / denom_seq,
+                    float(breakpoint) / denom_blocks,
+                    material_fraction,
+                    overlap_fraction,
+                    left_fraction,
+                    right_fraction,
+                ]
             )
-            material_counts = masks.sum(dim=1).to(dtype=torch.float32)
-            coal_rows = torch.nonzero(event_is_recomb == 0, as_tuple=False).reshape(-1)
-            if coal_rows.numel() > 0:
-                left_masks = masks[active_i[coal_rows]]
-                right_masks = masks[active_j[coal_rows]]
-                material_fraction[coal_rows] = (left_masks | right_masks).sum(dim=1).float() / denom_blocks
-                overlap_fraction[coal_rows] = (left_masks & right_masks).sum(dim=1).float() / denom_blocks
-                left_fraction[coal_rows] = material_counts[active_i[coal_rows]] / denom_blocks
-                right_fraction[coal_rows] = material_counts[active_j[coal_rows]] / denom_blocks
 
-            recomb_rows = torch.nonzero(event_is_recomb == 1, as_tuple=False).reshape(-1)
-            if recomb_rows.numel() > 0:
-                prefix_counts = torch.cat(
-                    [
-                        torch.zeros(masks.shape[0], 1, dtype=torch.long, device=device),
-                        torch.cumsum(masks.to(dtype=torch.long), dim=1),
-                    ],
-                    dim=1,
-                )
-                recomb_i = active_i[recomb_rows]
-                recomb_breakpoints = breakpoints[recomb_rows]
-                left_counts = prefix_counts[recomb_i, recomb_breakpoints].to(dtype=torch.float32)
-                total_counts = material_counts[recomb_i]
-                material_fraction[recomb_rows] = total_counts / denom_blocks
-                left_fraction[recomb_rows] = left_counts / denom_blocks
-                right_fraction[recomb_rows] = (total_counts - left_counts) / denom_blocks
-        else:
-            recomb_rows = torch.nonzero(event_is_recomb == 1, as_tuple=False).reshape(-1)
-            if recomb_rows.numel() > 0:
-                left_fraction[recomb_rows] = breakpoints[recomb_rows].float() / denom_blocks
-                right_fraction[recomb_rows] = 1.0 - left_fraction[recomb_rows]
-                overlap_fraction[recomb_rows] = 0.0
-
-        return torch.stack(
-            [
-                event_is_recomb,
-                active_i.float() / denom_seq,
-                active_j.float() / denom_seq,
-                breakpoints.float() / denom_blocks,
-                material_fraction,
-                overlap_fraction,
-                left_fraction,
-                right_fraction,
-            ],
-            dim=-1,
-        )
+        return torch.tensor(rows, dtype=torch.float32, device=device)
 
     def _build_action_feature(
         self,
@@ -590,20 +718,19 @@ class ARGModel(nn.Module):
 
         if state is not None:
             if event_type == "coal":
-                mask_i = state.active_lineages[i].material_mask
-                mask_j = state.active_lineages[j].material_mask
-                union_mask = mask_i | mask_j
-                overlap_mask = mask_i & mask_j
-                material_fraction = float(union_mask.sum()) / denom_blocks
-                overlap_fraction = float(overlap_mask.sum()) / denom_blocks
-                left_fraction = float(mask_i.sum()) / denom_blocks
-                right_fraction = float(mask_j.sum()) / denom_blocks
+                segments_i = state.active_lineages[i].material_segments
+                segments_j = state.active_lineages[j].material_segments
+                material_fraction = segments_i.union(segments_j).count / denom_blocks
+                overlap_fraction = segments_i.intersection_count(segments_j) / denom_blocks
+                left_fraction = segments_i.count / denom_blocks
+                right_fraction = segments_j.count / denom_blocks
             elif event_type == "recomb":
-                mask = state.active_lineages[i].material_mask
-                left_mask, right_mask = self.env._split_mask(mask, breakpoint)
-                material_fraction = float(mask.sum()) / denom_blocks
-                left_fraction = float(left_mask.sum()) / denom_blocks
-                right_fraction = float(right_mask.sum()) / denom_blocks
+                segments = state.active_lineages[i].material_segments
+                left_segments, right_segments = segments.split(breakpoint)
+                material_fraction = segments.count / denom_blocks
+                overlap_fraction = 0.0
+                left_fraction = left_segments.count / denom_blocks
+                right_fraction = right_segments.count / denom_blocks
         elif event_type == "recomb":
             material_fraction = 1.0
             overlap_fraction = 0.0
@@ -632,6 +759,7 @@ class ARGModel(nn.Module):
         states,
         action_options,
         selected_event_types,
+        batch_size,
     ):
         selected_event_type = self._selected_event_type_for_batch_item(
             selected_event_types,
@@ -640,7 +768,7 @@ class ARGModel(nn.Module):
         if states is not None:
             return self._state_candidate_actions(states[batch_idx], selected_event_type)
 
-        options = self._action_options_for_batch_item(action_options, batch_idx, input_dict["batch_input"].shape[0])
+        options = self._action_options_for_batch_item(action_options, batch_idx, batch_size)
         if options is not None:
             return self._filter_actions_by_event_type(
                 self._actions_from_options(options),

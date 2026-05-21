@@ -584,11 +584,14 @@ class SimpleARGEnvironment:
             num_chars = len(next(iter(self.chars_dict.values())))
             seq_arrays = np.zeros(
                 (self.num_sequences, self.sequence_length, num_chars),
-                dtype=float,
+                dtype=np.float32,
             )
         else:
-            seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences])
-        self.seq_arrays = torch.nn.Parameter(torch.tensor(seq_arrays), requires_grad=False)
+            seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences], dtype=np.float32)
+        self.seq_arrays = torch.nn.Parameter(
+            torch.tensor(seq_arrays, dtype=torch.float32),
+            requires_grad=False,
+        )
         self.evolution_model = EvolutionModelTorch(self)
         self.reward_fn = ARGReward()
 
@@ -1480,6 +1483,69 @@ class SimpleARGEnvironment:
                 [action.get("breakpoint", -1) for action in input_actions],
                 dtype=torch.long,
                 device=inputs.device,
+            )
+
+        return input_dict
+
+    def prepare_state_rollout_inputs(
+        self,
+        states,
+        input_actions=None,
+        random_spec=None,
+        batch_nb_seq=None,
+        device=None,
+    ):
+        batch_size = len(states)
+        if batch_size == 0:
+            raise ValueError("states must contain at least one ARGState")
+        if device is None:
+            device = self.seq_arrays.device
+        else:
+            device = torch.device(device)
+
+        if batch_nb_seq is None:
+            batch_nb_seq = torch.tensor(
+                [len(state.active_lineages) for state in states],
+                dtype=torch.long,
+                device=device,
+            )
+        else:
+            batch_nb_seq = torch.as_tensor(batch_nb_seq, dtype=torch.long, device=device)
+            if batch_nb_seq.shape != (batch_size,):
+                raise ValueError("batch_nb_seq must have shape (batch,)")
+
+        input_dict = {
+            "states": list(states),
+            "batch_nb_seq": batch_nb_seq,
+            "batch_size": batch_size,
+            "batch_traj_idx": torch.arange(batch_size, device=device),
+            "random_spec": random_spec,
+        }
+
+        if input_actions is not None:
+            if len(input_actions) != batch_size:
+                raise ValueError("input_actions length must match batch size")
+            event_type_map = {"coal": 0, "recomb": 1}
+            input_dict["input_actions"] = input_actions
+            input_dict["input_event_types"] = torch.tensor(
+                [event_type_map.get(action.get("event_type"), -1) for action in input_actions],
+                dtype=torch.long,
+                device=device,
+            )
+            input_dict["input_active_lineage_i"] = torch.tensor(
+                [action.get("active_lineage_i", -1) for action in input_actions],
+                dtype=torch.long,
+                device=device,
+            )
+            input_dict["input_active_lineage_j"] = torch.tensor(
+                [action.get("active_lineage_j", -1) for action in input_actions],
+                dtype=torch.long,
+                device=device,
+            )
+            input_dict["input_breakpoints"] = torch.tensor(
+                [action.get("breakpoint", -1) for action in input_actions],
+                dtype=torch.long,
+                device=device,
             )
 
         return input_dict

@@ -193,12 +193,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if {lineage.node_id for lineage in state.active_lineages} != initial_ids:
             return False
 
-        full_mask = np.ones(self.env.num_blocks, dtype=bool)
         for node_id in initial_ids:
             lineage = state.all_nodes[node_id]
             if lineage.children or lineage.parents:
                 return False
-            if not np.array_equal(lineage.material_mask, full_mask):
+            if lineage.material_segments.segments != ((0, self.env.num_blocks),):
                 return False
         return True
 
@@ -250,9 +249,9 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 continue
             if set(child.parents) != {left_id, right_id}:
                 continue
-            if np.any(left_parent.material_mask & right_parent.material_mask):
+            if left_parent.material_segments.intersection_count(right_parent.material_segments) > 0:
                 continue
-            if not np.array_equal(left_parent.material_mask | right_parent.material_mask, child.material_mask):
+            if left_parent.material_segments.union(right_parent.material_segments) != child.material_segments:
                 continue
             inverse_actions.append(
                 {
@@ -407,4 +406,75 @@ class TBGFlowNetGenerator(torch.nn.Module):
             print(
                 f"accumulated loss={loss.item():.6f} "
                 f"total_loss={self.loss.item():.6f} batches={self.accumulated_batches}"
+            )
+
+    def accumulate_streaming_tb_loss(self, rollout_worker, rollout_outputs, trajectories, factor=1.0):
+        """Accumulate exact TB gradients without retaining the full rollout graph."""
+        log_paths_pf = rollout_outputs["log_paths_pf"].detach().to(self.device)
+        log_paths_pb = rollout_outputs["log_paths_pb"].detach().to(
+            dtype=log_paths_pf.dtype,
+            device=self.device,
+        )
+        log_rewards = torch.as_tensor(
+            rollout_outputs["log_rewards"],
+            dtype=log_paths_pf.dtype,
+            device=self.device,
+        )
+        log_pf = log_paths_pf.sum(-1)
+        log_pb = log_paths_pb.sum(-1) if log_paths_pb.ndim > 1 else log_paths_pb
+        log_z_value = self.compute_log_Z().detach().to(log_paths_pf)
+        residuals = (log_z_value + log_pf - (log_rewards + log_pb)).detach()
+        batch_size = max(int(residuals.numel()), 1)
+        coefficients = (2.0 / (float(batch_size) * float(factor))) * residuals
+        loss_value = (residuals.pow(2).mean() / float(factor)).detach()
+
+        (coefficients.sum() * self.compute_log_Z()).backward()
+        for traj_idx, trajectory in enumerate(trajectories):
+            coefficient = coefficients[traj_idx].detach()
+            if coefficient.item() == 0.0:
+                continue
+            self._replay_trajectory_for_streaming_gradient(
+                rollout_worker,
+                trajectory,
+                coefficient,
+            )
+
+        self.loss = self.loss + loss_value
+        self.accumulated_batches += 1
+        if self.verbose:
+            print(
+                f"streamed loss={loss_value.item():.6f} "
+                f"total_loss={self.loss.item():.6f} batches={self.accumulated_batches}"
+            )
+
+    def _replay_trajectory_for_streaming_gradient(self, rollout_worker, trajectory, coefficient):
+        state = self.env.get_initial_state()
+        for record in trajectory:
+            action = dict(record["action"])
+            probs = self.env.compute_event_probabilities(state)
+            event_prob = float(probs.get(action["event_type"], 0.0))
+            if event_prob <= 0.0:
+                raise RuntimeError(f"Cannot replay invalid event type from state: {action}")
+            input_dict = self.env.prepare_state_rollout_inputs(
+                [state],
+                input_actions=[action],
+                random_spec=None,
+                device=self.device,
+            )
+            input_dict["selected_event_types"] = [action["event_type"]]
+            input_dict["log_event_probs"] = torch.tensor(
+                [math.log(event_prob)],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            ret = self(input_dict)
+            log_path_pf = ret["log_paths_pf"].reshape(-1)[0]
+            (coefficient * log_path_pf).backward()
+
+            log_prior = self.env.compute_cwr_event_log_prior(state, action)
+            state = self.env.apply_action(
+                state,
+                action,
+                log_prior,
+                compute_reward=False,
             )

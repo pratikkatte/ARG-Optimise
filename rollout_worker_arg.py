@@ -75,21 +75,23 @@ class RolloutWorker:
         unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
         while unfinished:
             active_states = [states[idx] for idx in unfinished]
-            tree_features, batch_nb_seq = self._states_to_padded_tree_features(
-                active_states,
-                device=self._generator_device(generator),
+            device = self._generator_device(generator)
+            batch_nb_seq = torch.tensor(
+                [len(state.active_lineages) for state in active_states],
+                dtype=torch.long,
+                device=device,
             )
             selected_event_types, log_event_probs = self._sample_event_types(
                 active_states,
-                device=tree_features.device,
+                device=device,
             )
-            input_dict = self.env.prepare_rollout_inputs(
-                tree_features,
+            input_dict = self.env.prepare_state_rollout_inputs(
+                active_states,
                 input_actions=None,
                 random_spec=random_spec,
                 batch_nb_seq=batch_nb_seq,
+                device=device,
             )
-            input_dict["states"] = active_states
             input_dict["selected_event_types"] = selected_event_types
             input_dict["log_event_probs"] = log_event_probs
 
@@ -406,9 +408,9 @@ class RolloutWorker:
             right_parent = state.all_nodes[right_id]
             if set(child.parents) != {left_id, right_id}:
                 continue
-            if np.any(left_parent.material_mask & right_parent.material_mask):
+            if left_parent.material_segments.intersection_count(right_parent.material_segments) > 0:
                 continue
-            if not np.array_equal(left_parent.material_mask | right_parent.material_mask, child.material_mask):
+            if left_parent.material_segments.union(right_parent.material_segments) != child.material_segments:
                 continue
             count += 1
 

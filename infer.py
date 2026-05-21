@@ -21,6 +21,8 @@ REQUIRED_METADATA_KEYS = {
     "fixed_edge_length",
     "seed",
     "init_z_sample_count",
+    "sequence_encoder_bins",
+    "model_version",
 }
 
 
@@ -53,6 +55,7 @@ def run_inference(
     generator = TBGFlowNetGenerator(
         env,
         init_z_sample_count=metadata["init_z_sample_count"],
+        cfg={"sequence_encoder_bins": int(metadata["sequence_encoder_bins"])},
         device=device,
         verbose=verbose,
     )
