@@ -28,6 +28,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         device=None,
         verbose=False,
         log_z_lr=0.05,
+        log_z_update="mean",
     ):
         super().__init__()
         self.cfg = cfg
@@ -35,18 +36,25 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.verbose = verbose
         self.device = self._resolve_device(device)
         self.init_z_sample_count = init_z_sample_count
+        self.log_z_update = str(log_z_update)
+        if self.log_z_update not in {"mean", "gradient"}:
+            raise ValueError("log_z_update must be one of: mean, gradient")
         ## Policy model
         self.arg_model = ARGModel(env, cfg).to(self.device)
 
         ## Z partition
-        self._logZ = torch.nn.Parameter(torch.tensor(0.0, device=self.device))
+        self._logZ = torch.nn.Parameter(
+            torch.tensor(0.0, device=self.device),
+            requires_grad=self.log_z_update == "gradient",
+        )
         self.max_reward_seen = float("-inf")
         self._initialize_log_z_from_rollouts()
         model_params = list(self.arg_model.parameters())
         params = [{'params': model_params, 'lr': 0.001}]
-        params.append({'params': [self._logZ], 'lr': float(log_z_lr)})
+        if self.log_z_update == "gradient":
+            params.append({'params': [self._logZ], 'lr': float(log_z_lr)})
 
-        self.gradient_clipping_params = model_params + [self._logZ]
+        self.gradient_clipping_params = model_params
         self.grad_clip = 10.0
         self.opt = torch.optim.Adam(
             params,
@@ -58,6 +66,9 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.loss_fn = LOSS_FN['MSE']
         self.loss = torch.tensor(0.0, device=self.device)
         self.accumulated_batches = 0
+        self.log_z_target_sum = 0.0
+        self.log_z_target_count = 0
+        self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
 
     def _initialize_log_z_from_rollouts(self):
         if self.init_z_sample_count <= 0:
@@ -153,9 +164,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return moved
 
     def update_model(self):
+        if self.log_z_update != "gradient":
+            self._apply_direct_log_z_update()
         info = {
             'grad_norm': self.grad_norm(),
             'param_norm': self.param_norm(),
+            'log_z_target': self.last_log_z_target,
             'loss': self.loss.detach().cpu().item(),
         }
         torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
@@ -163,6 +177,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.opt.zero_grad()
         self.loss = torch.tensor(0.0, device=self.device)
         self.accumulated_batches = 0
+        self.log_z_target_sum = 0.0
+        self.log_z_target_count = 0
         if self.verbose:
             print(
                 "update: loss={loss:.6f} grad_norm={grad_norm:.4f} param_norm={param_norm:.4f}".format(
@@ -170,6 +186,22 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 )
             )
         return info
+
+    def _record_log_z_targets(self, targets):
+        finite_targets = targets[torch.isfinite(targets)]
+        if finite_targets.numel() == 0:
+            return
+        self.log_z_target_sum += float(finite_targets.sum().detach().cpu().item())
+        self.log_z_target_count += int(finite_targets.numel())
+        self.last_log_z_target = (
+            self.log_z_target_sum / max(self.log_z_target_count, 1)
+        )
+
+    def _apply_direct_log_z_update(self):
+        if self.log_z_target_count <= 0:
+            return
+        if self.log_z_update == "mean":
+            self._logZ.data.copy_(self._logZ.detach().new_tensor(self.last_log_z_target))
 
     def sample_backward_from_arg(self, arg_state):
         state = arg_state.clone()
@@ -286,8 +318,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return inverse_actions
 
     def _is_latest_time_event(self, state, *node_ids):
-        if not getattr(self.env, "learn_times", False):
-            return True
         current_time = float(state.current_time)
         return all(
             math.isclose(
@@ -334,11 +364,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
             "active_lineage_i": active_idx_by_id[child_ids[0]],
             "active_lineage_j": active_idx_by_id[child_ids[1]],
         }
-        if getattr(self.env, "learn_times", False):
-            parent_state.current_time = self._max_node_time(parent_state)
-            delta_t = float(state.current_time) - float(parent_state.current_time)
-            rates = self.env.enumerate_prior_options(parent_state).rates
-            forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
+        parent_state.current_time = self._max_node_time(parent_state)
+        delta_t = float(state.current_time) - float(parent_state.current_time)
+        rates = self.env.enumerate_prior_options(parent_state).rates
+        forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 
@@ -364,11 +393,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
             "active_lineage_i": active_idx_by_id[child_id],
             "breakpoint": inverse_action["breakpoint"],
         }
-        if getattr(self.env, "learn_times", False):
-            parent_state.current_time = self._max_node_time(parent_state)
-            delta_t = float(state.current_time) - float(parent_state.current_time)
-            rates = self.env.enumerate_prior_options(parent_state).rates
-            forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
+        parent_state.current_time = self._max_node_time(parent_state)
+        delta_t = float(state.current_time) - float(parent_state.current_time)
+        rates = self.env.enumerate_prior_options(parent_state).rates
+        forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 
@@ -442,13 +470,24 @@ class TBGFlowNetGenerator(torch.nn.Module):
         )
         log_pf = log_paths_pf.sum(-1)
         log_pb = log_paths_pb.sum(-1) if log_paths_pb.ndim > 1 else log_paths_pb
-        log_z_value = self.compute_log_Z().detach().to(log_paths_pf)
+        target_log_z_by_traj = (log_rewards + log_pb - log_pf).detach()
+        self._record_log_z_targets(target_log_z_by_traj)
+        policy_log_z = (
+            target_log_z_by_traj[torch.isfinite(target_log_z_by_traj)].mean()
+            if torch.isfinite(target_log_z_by_traj).any()
+            else self.compute_log_Z().detach().to(log_paths_pf)
+        )
+        if self.log_z_update == "gradient":
+            log_z_value = self.compute_log_Z().detach().to(log_paths_pf)
+        else:
+            log_z_value = policy_log_z.to(log_paths_pf)
         residuals = (log_z_value + log_pf - (log_rewards + log_pb)).detach()
         batch_size = max(int(residuals.numel()), 1)
         coefficients = (2.0 / (float(batch_size) * float(factor))) * residuals
         loss_value = (residuals.pow(2).mean() / float(factor)).detach()
 
-        (coefficients.sum() * self.compute_log_Z()).backward()
+        if self.log_z_update == "gradient":
+            (coefficients.sum() * self.compute_log_Z()).backward()
         for traj_idx, trajectory in enumerate(trajectories):
             coefficient = coefficients[traj_idx].detach()
             self._replay_trajectory_for_streaming_gradient(

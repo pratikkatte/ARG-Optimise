@@ -13,7 +13,6 @@ from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from time_env import (
     DEFAULT_TIME_BINS,
-    DEFAULT_TIME_MODEL,
     DEFAULT_TIME_TAIL_PROBABILITY,
 )
 from utils import load_sequences
@@ -22,15 +21,15 @@ from utils import load_sequences
 DEFAULT_NE = 10000
 DEFAULT_R_PER_BP = 2e-8
 DEFAULT_MU_PER_BP = 2e-8
-DEFAULT_FIXED_EDGE_LENGTH = 0.02
-DEFAULT_INIT_Z_SAMPLE_COUNT = 2
+DEFAULT_INIT_Z_SAMPLE_COUNT = 16
 DEFAULT_SEQUENCE_ENCODER_BINS = 1024
 DEFAULT_BREAKPOINT_MIXTURES = 4
 DEFAULT_LOG_Z_LR = 0.05
+DEFAULT_LOG_Z_UPDATE = "gradient"
 DEFAULT_GRAD_ACCUM_STEPS = 4
 DEFAULT_EVAL_EPISODES = 8
 DEFAULT_EVAL_EVERY = 10
-MODEL_VERSION = "learned-breakpoint-v1"
+MODEL_VERSION = "cwr-event-learned-time-v1"
 
 def seed_everything(seed):
     random.seed(seed)
@@ -39,11 +38,35 @@ def seed_everything(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def train_epoch(epoch_id, rollout_worker, generator, batch_size=1, grad_accum_steps=1):
+def train_epoch(
+    epoch_id,
+    rollout_worker,
+    generator,
+    batch_size=1,
+    grad_accum_steps=1,
+):
     grad_accum_steps = max(int(grad_accum_steps), 1)
+    if getattr(generator, "log_z_update", "gradient") != "gradient":
+        grouped_episodes = max(int(batch_size) * grad_accum_steps, 2)
+        with torch.no_grad():
+            ret, trajectories = rollout_worker.rollout(
+                generator,
+                episodes=grouped_episodes,
+            )
+        generator.accumulate_streaming_tb_loss(
+            rollout_worker,
+            ret,
+            trajectories,
+            factor=1.0,
+        )
+        return generator.update_model()
+
     for _ in range(grad_accum_steps):
         with torch.no_grad():
-            ret, trajectories = rollout_worker.rollout(generator, episodes=batch_size)
+            ret, trajectories = rollout_worker.rollout(
+                generator,
+                episodes=batch_size,
+            )
         generator.accumulate_streaming_tb_loss(
             rollout_worker,
             ret,
@@ -82,6 +105,14 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             residuals = generator.compute_log_Z().detach().to(log_pf) + log_pf - (
                 log_rewards + log_pb
             )
+            initial_state = env.get_initial_state()
+            initial_input = env.prepare_state_rollout_inputs(
+                [initial_state],
+                device=generator.device,
+            )
+            initial_ret = generator(initial_input)
+            initial_event_probs = initial_ret["event_log_probs"][0].exp().detach().cpu()
+            initial_prior_probs = env.compute_event_probabilities(initial_state)
 
         lengths = torch.tensor([len(traj) for traj in trajectories], dtype=torch.float32)
         coal_counts = torch.tensor(
@@ -110,6 +141,11 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             "eval_trajectory_length_mean": float(lengths.mean().item()),
             "eval_coalescence_count_mean": float(coal_counts.mean().item()),
             "eval_recombination_count_mean": float(recomb_counts.mean().item()),
+            "eval_initial_coalescence_prob": float(initial_event_probs[0].item()),
+            "eval_initial_recombination_prob": float(initial_event_probs[1].item()),
+            "eval_initial_prior_recombination_prob": float(
+                initial_prior_probs.get("recomb", 0.0)
+            ),
         }
     finally:
         random.setstate(python_state)
@@ -119,17 +155,6 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             torch.cuda.set_rng_state_all(cuda_states)
         if env_rng_state is not None:
             env.rng.setstate(env_rng_state)
-
-def parse_time_increments(value):
-    if value is None:
-        return None
-    increments = [float(item.strip()) for item in value.split(",") if item.strip()]
-    if not increments:
-        raise ValueError("--time-increments must contain at least one positive value")
-    if any(increment <= 0 for increment in increments):
-        raise ValueError("--time-increments values must all be positive")
-    return increments
-
 
 def train(
     output_path,
@@ -141,20 +166,15 @@ def train(
     init_z_verbose=False,
     device="auto",
     use_wandb=True,
-    fixed_edge_length=DEFAULT_FIXED_EDGE_LENGTH,
-    learn_times=False,
-    time_increments=None,
-    time_model=DEFAULT_TIME_MODEL,
     time_bins=DEFAULT_TIME_BINS,
     time_tail_probability=DEFAULT_TIME_TAIL_PROBABILITY,
     effective_population_size=DEFAULT_NE,
     mutation_rate=DEFAULT_MU_PER_BP,
-    use_time_prior=True,
     recombination_rate=DEFAULT_R_PER_BP,
     breakpoint_policy="learned-bin-mass",
     breakpoint_mixtures=DEFAULT_BREAKPOINT_MIXTURES,
-    reward_mode="posterior",
     log_z_lr=DEFAULT_LOG_Z_LR,
+    log_z_update=DEFAULT_LOG_Z_UPDATE,
     grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
     eval_episodes=DEFAULT_EVAL_EPISODES,
     eval_every=DEFAULT_EVAL_EVERY,
@@ -163,7 +183,6 @@ def train(
     smoke_test=False,
 ):
     seed_everything(seed)
-    time_increments = None if time_increments is None else list(time_increments)
 
     sequences = load_sequences(dataset_path)
     sequence_length = len(sequences[0])
@@ -184,16 +203,10 @@ def train(
         rho=rho,
         num_sequences=len(sequences),
         sequences=sequences,
-        fixed_edge_length=fixed_edge_length,
-        learn_times=learn_times,
-        time_increments=time_increments,
-        time_model=time_model,
         time_bins=time_bins,
         time_tail_probability=time_tail_probability,
         effective_population_size=effective_population_size,
         mutation_rate=mutation_rate,
-        use_time_prior=use_time_prior,
-        reward_mode=reward_mode,
         rng=random.Random(seed),
     )
     generator = TBGFlowNetGenerator(
@@ -207,6 +220,7 @@ def train(
         device=device,
         verbose=init_z_verbose,
         log_z_lr=log_z_lr,
+        log_z_update=log_z_update,
     )
     rollout_worker = RolloutWorker(env)
     print(f"Training on device: {generator.device}")
@@ -223,19 +237,15 @@ def train(
         wandb_run = wandb.init()
         wandb.config.update({
             "device": str(generator.device),
-            "learn_times": bool(learn_times),
-            "time_model": env.time_model,
             "time_bins": env.time_bins,
             "time_tail_probability": env.time_tail_probability,
-            "time_increments": list(time_increments) if time_increments is not None else None,
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
-            "use_time_prior": bool(use_time_prior),
             "recombination_rate": float(recombination_rate),
             "breakpoint_policy": generator.arg_model.breakpoint_policy,
             "breakpoint_mixtures": int(generator.arg_model.breakpoint_mixtures),
-            "reward_mode": env.reward_mode,
             "log_z_lr": float(log_z_lr),
+            "log_z_update": generator.log_z_update,
             "grad_accum_steps": int(grad_accum_steps),
             "eval_episodes": int(eval_episodes),
             "eval_every": int(eval_every),
@@ -290,20 +300,15 @@ def train(
                     sequence_length=sequence_length,
                     num_blocks=num_blocks,
                     rho=rho,
-                    fixed_edge_length=fixed_edge_length,
-                    learn_times=learn_times,
-                    time_increments=time_increments,
-                    time_model=env.time_model,
                     time_bins=env.time_bins,
                     time_tail_probability=env.time_tail_probability,
                     effective_population_size=effective_population_size,
                     mutation_rate=mutation_rate,
-                    use_time_prior=use_time_prior,
                     recombination_rate=recombination_rate,
                     breakpoint_policy=generator.arg_model.breakpoint_policy,
                     breakpoint_mixtures=generator.arg_model.breakpoint_mixtures,
-                    reward_mode=env.reward_mode,
                     log_z_lr=log_z_lr,
+                    log_z_update=generator.log_z_update,
                     grad_accum_steps=grad_accum_steps,
                     eval_episodes=eval_episodes,
                     eval_every=eval_every,
@@ -339,20 +344,15 @@ def build_checkpoint_metadata(
     sequence_length,
     num_blocks,
     rho,
-    fixed_edge_length,
-    learn_times,
-    time_increments,
-    time_model,
     time_bins,
     time_tail_probability,
     effective_population_size,
     mutation_rate,
-    use_time_prior,
     recombination_rate,
     breakpoint_policy,
     breakpoint_mixtures,
-    reward_mode,
     log_z_lr,
+    log_z_update,
     grad_accum_steps,
     eval_episodes,
     eval_every,
@@ -370,20 +370,15 @@ def build_checkpoint_metadata(
         "sequence_length": int(sequence_length),
         "num_blocks": int(num_blocks),
         "rho": float(rho),
-        "fixed_edge_length": float(fixed_edge_length),
-        "learn_times": bool(learn_times),
-        "time_model": time_model,
         "time_bins": int(time_bins),
         "time_tail_probability": float(time_tail_probability),
-        "time_increments": list(time_increments) if time_increments is not None else None,
         "effective_population_size": float(effective_population_size),
         "mutation_rate": float(mutation_rate),
-        "use_time_prior": bool(use_time_prior),
         "recombination_rate": float(recombination_rate),
         "breakpoint_policy": str(breakpoint_policy),
         "breakpoint_mixtures": int(breakpoint_mixtures),
-        "reward_mode": str(reward_mode),
         "log_z_lr": float(log_z_lr),
+        "log_z_update": str(log_z_update),
         "grad_accum_steps": int(grad_accum_steps),
         "eval_episodes": int(eval_episodes),
         "eval_every": int(eval_every),
@@ -399,7 +394,7 @@ def main():
     parser.add_argument("--output-path", default="l025mb_0")
     parser.add_argument("--dataset-path", default="validation/fasta/sim_l25kb_0.fa")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--num-blocks",
@@ -414,55 +409,26 @@ def main():
         help="Number of sequence bins used by the compact policy encoder.",
     )
     parser.add_argument(
-        "--smoke-test",
-        action="store_true",
-        help="Run a smallest-memory development configuration.",
-    )
-    parser.add_argument(
         "--init-z-sample-count",
         type=int,
         default=DEFAULT_INIT_Z_SAMPLE_COUNT,
         help="Number of prior rollouts used to initialize logZ; use 1 for quick smoke tests.",
     )
-    parser.add_argument("--verbose-init", action="store_true")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--no-wandb", action="store_true")
-    parser.add_argument("--fixed-edge-length", type=float, default=DEFAULT_FIXED_EDGE_LENGTH)
-    parser.add_argument("--learn-times", action="store_true")
-    parser.add_argument(
-        "--time-increments",
-        default=None,
-        help=(
-            "Legacy comma-separated fixed waiting-time increments used with "
-            "--learn-times. Omit to use adaptive exponential time bins."
-        ),
-    )
-    parser.add_argument("--time-model", default=DEFAULT_TIME_MODEL)
-    parser.add_argument("--time-bins", type=int, default=DEFAULT_TIME_BINS)
-    parser.add_argument(
-        "--time-tail-probability",
-        type=float,
-        default=DEFAULT_TIME_TAIL_PROBABILITY,
-    )
+    parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--effective-population-size", type=float, default=DEFAULT_NE)
     parser.add_argument("--mutation-rate", type=float, default=DEFAULT_MU_PER_BP)
     parser.add_argument("--recombination-rate", type=float, default=DEFAULT_R_PER_BP)
-    parser.add_argument(
-        "--breakpoint-policy",
-        choices=["learned-bin-mass", "uniform"],
-        default="learned-bin-mass",
-    )
     parser.add_argument(
         "--breakpoint-mixtures",
         type=int,
         default=DEFAULT_BREAKPOINT_MIXTURES,
     )
-    parser.add_argument(
-        "--reward-mode",
-        choices=["posterior", "likelihood-only", "trajectory-prior"],
-        default="posterior",
-    )
     parser.add_argument("--log-z-lr", type=float, default=DEFAULT_LOG_Z_LR)
+    parser.add_argument(
+        "--log-z-update",
+        choices=["mean", "gradient"],
+        default=DEFAULT_LOG_Z_UPDATE,
+    )
     parser.add_argument(
         "--grad-accum-steps",
         type=int,
@@ -470,23 +436,11 @@ def main():
     )
     parser.add_argument("--eval-episodes", type=int, default=DEFAULT_EVAL_EPISODES)
     parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
-    parser.add_argument("--no-time-prior", action="store_true")
 
     args = parser.parse_args()
 
-    if args.smoke_test:
-        args.epochs = 1
-        args.batch_size = 1
-        args.init_z_sample_count = 1
-        args.no_wandb = True
-        args.sequence_encoder_bins = min(args.sequence_encoder_bins, 256)
-        args.grad_accum_steps = 1
-        args.eval_episodes = min(args.eval_episodes, 1)
-
-    if args.device == "auto":
-        selected_device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        selected_device = args.device
+    selected_device = "cuda" if torch.cuda.is_available() else "cpu"
+                
     print(f"Selected device: {selected_device}")
 
     train(
@@ -496,29 +450,23 @@ def main():
         dataset_path=args.dataset_path,
         seed=args.seed,
         init_z_sample_count=args.init_z_sample_count,
-        init_z_verbose=args.verbose_init,
-        device=args.device,
-        use_wandb=not args.no_wandb,
-        fixed_edge_length=args.fixed_edge_length,
-        learn_times=args.learn_times,
-        time_increments=parse_time_increments(args.time_increments),
-        time_model=args.time_model,
-        time_bins=args.time_bins,
-        time_tail_probability=args.time_tail_probability,
+        init_z_verbose=args.verbose,
+        device=selected_device,
+        use_wandb=True,
+        time_bins=DEFAULT_TIME_BINS,
+        time_tail_probability=DEFAULT_TIME_TAIL_PROBABILITY,
         effective_population_size=args.effective_population_size,
         mutation_rate=args.mutation_rate,
-        use_time_prior=not args.no_time_prior,
         recombination_rate=args.recombination_rate,
-        breakpoint_policy=args.breakpoint_policy,
+        breakpoint_policy="learned-bin-mass",
         breakpoint_mixtures=args.breakpoint_mixtures,
-        reward_mode=args.reward_mode,
         log_z_lr=args.log_z_lr,
+        log_z_update=args.log_z_update,
         grad_accum_steps=args.grad_accum_steps,
         eval_episodes=args.eval_episodes,
         eval_every=args.eval_every,
         num_blocks=args.num_blocks,
         sequence_encoder_bins=args.sequence_encoder_bins,
-        smoke_test=args.smoke_test,
     )
 
 

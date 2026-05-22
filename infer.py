@@ -8,7 +8,7 @@ import torch
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
-from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_MODEL, DEFAULT_TIME_TAIL_PROBABILITY
+from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_TAIL_PROBABILITY
 from train import DEFAULT_MU_PER_BP, DEFAULT_NE, seed_everything
 
 
@@ -18,7 +18,6 @@ REQUIRED_METADATA_KEYS = {
     "sequence_length",
     "num_blocks",
     "rho",
-    "fixed_edge_length",
     "seed",
     "init_z_sample_count",
     "sequence_encoder_bins",
@@ -33,7 +32,6 @@ def run_inference(
     batch_size=1,
     seed=None,
     device="auto",
-    random_action_prob=0.0,
     temperature=None,
     verbose=False,
 ):
@@ -41,9 +39,6 @@ def run_inference(
         raise ValueError("num_args must be at least 1")
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
-    if temperature is not None and random_action_prob != 0.0:
-        raise ValueError("temperature and random_action_prob cannot both be set")
-
     checkpoint_data = load_checkpoint(checkpoint, map_location="cpu")
     metadata = checkpoint_data.get("metadata", {})
     validate_metadata(metadata)
@@ -55,17 +50,18 @@ def run_inference(
     generator = TBGFlowNetGenerator(
         env,
         init_z_sample_count=metadata["init_z_sample_count"],
-        cfg={"sequence_encoder_bins": int(metadata["sequence_encoder_bins"])},
+        cfg={
+            "sequence_encoder_bins": int(metadata["sequence_encoder_bins"]),
+            "breakpoint_policy": metadata.get("breakpoint_policy", "learned-bin-mass"),
+            "breakpoint_mixtures": int(metadata.get("breakpoint_mixtures", 4)),
+        },
         device=device,
         verbose=verbose,
     )
     generator.load(checkpoint, load_optimizer=False, map_location=generator.device)
     generator.eval()
 
-    random_spec = build_random_spec(
-        random_action_prob=random_action_prob,
-        temperature=temperature,
-    )
+    random_spec = build_random_spec(temperature=temperature)
     rollout_worker = RolloutWorker(env, verbose=verbose)
     rollout_outputs, trajectories = run_batched_rollouts(
         rollout_worker,
@@ -87,7 +83,6 @@ def run_inference(
         rollout_outputs=rollout_outputs,
         trajectories=trajectories,
     )
-
     manifest_path = os.path.join(output_dir, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
@@ -111,18 +106,11 @@ def validate_metadata(metadata):
 
 
 def environment_from_metadata(metadata, seed):
-    time_increments = metadata.get("time_increments")
-    if time_increments == []:
-        time_increments = None
     return SimpleARGEnvironment(
         num_sequences=int(metadata["num_sequences"]),
         sequence_length=int(metadata["sequence_length"]),
         num_blocks=int(metadata["num_blocks"]),
         rho=float(metadata["rho"]),
-        fixed_edge_length=float(metadata["fixed_edge_length"]),
-        learn_times=bool(metadata.get("learn_times", False)),
-        time_increments=time_increments,
-        time_model=metadata.get("time_model", DEFAULT_TIME_MODEL),
         time_bins=int(metadata.get("time_bins", DEFAULT_TIME_BINS)),
         time_tail_probability=float(
             metadata.get("time_tail_probability", DEFAULT_TIME_TAIL_PROBABILITY)
@@ -131,7 +119,6 @@ def environment_from_metadata(metadata, seed):
             metadata.get("effective_population_size", DEFAULT_NE)
         ),
         mutation_rate=float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
-        use_time_prior=bool(metadata.get("use_time_prior", True)),
         sequences=list(metadata["sequences"]),
         rng=random.Random(seed),
     )
@@ -202,14 +189,12 @@ def _pad_log_path_rows(rows):
     return padded
 
 
-def build_random_spec(random_action_prob=0.0, temperature=None):
+def build_random_spec(temperature=None):
     if temperature is not None:
         if temperature <= 0:
             raise ValueError("temperature must be positive")
         return {"T": float(temperature)}
-    if random_action_prob < 0.0 or random_action_prob > 1.0:
-        raise ValueError("random_action_prob must be between 0 and 1")
-    return {"random_action_prob": float(random_action_prob)}
+    return None
 
 
 def build_manifest(
@@ -281,7 +266,6 @@ def main():
     )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--random-action-prob", type=float, default=0.0)
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -293,7 +277,6 @@ def main():
         batch_size=args.batch_size,
         seed=args.seed,
         device=args.device,
-        random_action_prob=args.random_action_prob,
         temperature=args.temperature,
         verbose=args.verbose,
     )

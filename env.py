@@ -10,7 +10,6 @@ import numpy as np
 
 from time_env import (
     DEFAULT_TIME_BINS,
-    DEFAULT_TIME_MODEL,
     DEFAULT_TIME_TAIL_PROBABILITY,
     TimeEnvCategorical,
 )
@@ -323,18 +322,14 @@ class EvolutionModelTorch(torch.nn.Module):
         """Compute the JC69 sequence log likelihood of a terminal ARG.
 
         Each marginal segment induced by recombination breakpoints is scored
-        with Felsenstein pruning. Fixed-time mode uses ``fixed_edge_length`` as
-        a JC69 branch length. Learnable-time mode stores node times as
-        t/(2Ne), which are converted to substitutions/site before scoring.
+        with Felsenstein pruning. ARG node times store t/(2Ne), which are
+        converted to substitutions/site before scoring.
         """
 
         self._require_terminal(state)
 
         if self.env.sequences is None:
             return 0.0
-
-        if self.env.fixed_edge_length < 0:
-            raise ValueError("fixed_edge_length must be non-negative for likelihood scoring")
 
         seq_arrays = self._seq_arrays_numpy()
         log_likelihood = 0.0
@@ -500,7 +495,7 @@ class SimpleARGEnvironment:
 
     This intentionally avoids eete3, continuous breakpoints, and full continuous
     coalescent-with-recombination simulation. Terminal states are rewarded by the
-    sampled event prior plus a fixed-edge JC69 sequence likelihood.
+    canonical CWR prior plus a learned-time JC69 sequence likelihood.
     """
 
     def __init__(
@@ -509,16 +504,10 @@ class SimpleARGEnvironment:
         sequence_length: Optional[int] = None,
         num_blocks: Optional[int] = None,
         rho: float = 1.0,
-        fixed_edge_length: float = 0.02,
-        learn_times: bool = False,
-        time_increments: Optional[Sequence[float]] = None,
-        time_model: str = DEFAULT_TIME_MODEL,
         time_bins: int = DEFAULT_TIME_BINS,
         time_tail_probability: float = DEFAULT_TIME_TAIL_PROBABILITY,
         effective_population_size: float = 10000.0,
         mutation_rate: float = 2e-8,
-        use_time_prior: bool = True,
-        reward_mode: str = "posterior",
         sequences: Optional[Sequence[Any]] = None,
         rng: Optional[random.Random] = None,
         seed: Optional[int] = None,
@@ -551,38 +540,20 @@ class SimpleARGEnvironment:
         self.sequence_length = int(sequence_length)
         self.num_blocks = int(num_blocks)
         self.rho = float(rho)
-        self.fixed_edge_length = float(fixed_edge_length)
-        self.learn_times = bool(learn_times)
-        self.use_time_prior = bool(use_time_prior)
-        self.reward_mode = str(reward_mode)
-        if self.reward_mode not in {"posterior", "likelihood-only", "trajectory-prior"}:
-            raise ValueError(
-                "reward_mode must be one of: posterior, likelihood-only, trajectory-prior"
-            )
         self.effective_population_size = float(effective_population_size)
         self.mutation_rate = float(mutation_rate)
         if self.effective_population_size <= 0:
             raise ValueError("effective_population_size must be positive")
         if self.mutation_rate < 0:
             raise ValueError("mutation_rate must be non-negative")
-        self.time_model = time_model
         self.time_bins = int(time_bins)
         self.time_tail_probability = float(time_tail_probability)
-        self.time_env = (
-            TimeEnvCategorical(
-                time_increments,
-                bins=self.time_bins,
-                tail_probability=self.time_tail_probability,
-                time_model=self.time_model,
-            )
-            if self.learn_times
-            else None
+        self.time_env = TimeEnvCategorical(
+            bins=self.time_bins,
+            tail_probability=self.time_tail_probability,
         )
-        if self.time_env is not None:
-            self.time_model = self.time_env.time_model
-            self.time_bins = self.time_env.bins
-            if self.time_env.tail_probability is not None:
-                self.time_tail_probability = self.time_env.tail_probability
+        self.time_bins = self.time_env.bins
+        self.time_tail_probability = self.time_env.tail_probability
         self.rng = rng if rng is not None else random.Random(seed)
         self.block_indices = np.arange(self.num_blocks)
 
@@ -607,9 +578,6 @@ class SimpleARGEnvironment:
         return data
 
     def edge_length_between(self, state, parent_id, child_id):
-        if not self.learn_times:
-            return self.fixed_edge_length
-
         parent_time = float(state.all_nodes[parent_id].time)
         child_time = float(state.all_nodes[child_id].time)
         edge_length = parent_time - child_time
@@ -621,8 +589,6 @@ class SimpleARGEnvironment:
         return edge_length
 
     def branch_length_for_likelihood(self, edge_time):
-        if not self.learn_times:
-            return float(edge_time)
         return (
             float(edge_time)
             * 2.0
@@ -631,8 +597,6 @@ class SimpleARGEnvironment:
         )
 
     def _require_time_action(self, action):
-        if not self.learn_times:
-            return None
         if "time_action" not in action:
             raise ValueError("learnable ARG times require every action to include time_action")
         return int(action["time_action"])
@@ -645,8 +609,6 @@ class SimpleARGEnvironment:
 
     def _delta_t_for_action(self, action, rates=None):
         time_action = self._require_time_action(action)
-        if time_action is None:
-            return self.fixed_edge_length
         if rates is None:
             raise ValueError("rates are required to map learnable time actions")
         return self.time_env.time_action_to_delta(
@@ -655,8 +617,6 @@ class SimpleARGEnvironment:
         )
 
     def _time_action_for_delta(self, delta_t, rates=None):
-        if not self.learn_times:
-            return None
         if rates is None:
             raise ValueError("rates are required to recover learnable time actions")
         return self.time_env.delta_to_time_action(
@@ -666,27 +626,17 @@ class SimpleARGEnvironment:
 
     def _with_random_time_action(self, action, rates=None):
         action = dict(action)
-        if self.learn_times and "time_action" not in action:
+        if "time_action" not in action:
             action["time_action"] = self._sample_time_action_from_prior(rates)
 
         return action
 
     def _sample_time_action_from_prior(self, rates=None):
-        if not self.learn_times:
-            return None
-        if not self.use_time_prior:
-            return self.time_env.generate_random_action()
         if rates is None:
             raise ValueError("rates are required to sample learnable ARG times from the prior")
         return self.time_env.sample_action_from_prior(self._total_event_rate(rates), self.rng)
 
     def _time_action_log_prior_distribution(self, rates):
-        if not self.learn_times:
-            return [(None, 0.0)]
-        if not self.use_time_prior:
-            log_prob = -math.log(self.time_env.bins)
-            return [(time_action, log_prob) for time_action in range(self.time_env.bins)]
-
         total_rate = float(rates["lambda_coal"] + rates["lambda_recomb"])
         if total_rate <= 0:
             return []
@@ -699,8 +649,6 @@ class SimpleARGEnvironment:
         ]
 
     def compute_waiting_time_log_prior(self, state, action, rates=None):
-        if not self.learn_times or not self.use_time_prior:
-            return 0.0
         if rates is None:
             rates = state.rates if state.rates is not None else self.compute_event_rates(state)
         total_rate = float(rates["lambda_coal"] + rates["lambda_recomb"])
@@ -825,10 +773,9 @@ class SimpleARGEnvironment:
     def save_to_tree_sequence(self, state, output_path=None):
         """Convert a terminal ARG state to a tskit TreeSequence.
 
-        The exported topology contains ancestry edges only. In fixed-edge mode,
-        synthetic node times are derived from graph depth. In learnable-time
-        mode, stored ARG node times are internal t/(2Ne) values and are exported
-        in generations to match msprime tree sequences.
+        The exported topology contains ancestry edges only. Stored ARG node
+        times are internal t/(2Ne) values and are exported in generations to
+        match msprime tree sequences.
         """
         if not self.is_terminal(state):
             raise ValueError("terminal_state_to_tree_sequence requires a terminal ARGState")
@@ -843,10 +790,9 @@ class SimpleARGEnvironment:
                 "Install it with `pip install tskit`."
             ) from exc
 
-        node_times = self._synthetic_tskit_node_times(state)
+        node_times = self._tskit_node_times(state)
         tables = tskit.TableCollection(sequence_length=float(self.sequence_length))
-        if self.learn_times:
-            tables.time_units = "generations"
+        tables.time_units = "generations"
         sample_node_ids = set(range(self.num_sequences))
         tskit_node_ids = {}
 
@@ -885,62 +831,35 @@ class SimpleARGEnvironment:
         """Compatibility wrapper for exporting a terminal ARG as a tree sequence."""
         return self.save_to_tree_sequence(state, output_path=output_path)
 
-    def _synthetic_tskit_node_times(self, state):
-        if self.learn_times:
-            time_scale = 2.0 * self.effective_population_size
-            node_times = {
-                node_id: float(node.time) * time_scale
-                for node_id, node in state.all_nodes.items()
-            }
-            for parent_id, parent in state.all_nodes.items():
-                for child_id in parent.children:
-                    if node_times[parent_id] <= node_times[child_id]:
-                        raise ValueError(
-                            f"learned ARG node times must satisfy parent > child: "
-                            f"parent={parent_id} child={child_id}"
-                        )
-            return node_times
-
-        if self.fixed_edge_length <= 0:
-            raise ValueError("fixed_edge_length must be positive to export a valid tree sequence")
-
-        node_times = {}
-        sample_node_ids = set(range(self.num_sequences))
-        for node_id in sorted(state.all_nodes):
-            node = state.all_nodes[node_id]
-            if node_id in sample_node_ids:
-                node_times[node_id] = 0.0
-                continue
-            if not node.children:
-                raise ValueError(f"Non-sample ARG node {node_id} has no children")
-            try:
-                child_times = [node_times[child_id] for child_id in node.children]
-            except KeyError as exc:
-                raise ValueError(
-                    "ARG node ids must be topologically ordered so children are created "
-                    "before their parents"
-                ) from exc
-            node_times[node_id] = max(child_times) + self.fixed_edge_length
+    def _tskit_node_times(self, state):
+        time_scale = 2.0 * self.effective_population_size
+        node_times = {
+            node_id: float(node.time) * time_scale
+            for node_id, node in state.all_nodes.items()
+        }
+        for parent_id, parent in state.all_nodes.items():
+            for child_id in parent.children:
+                if node_times[parent_id] <= node_times[child_id]:
+                    raise ValueError(
+                        f"learned ARG node times must satisfy parent > child: "
+                        f"parent={parent_id} child={child_id}"
+                    )
         return node_times
 
     def _block_to_sequence_coordinate(self, block_index):
         return float(block_index) * float(self.sequence_length) / float(self.num_blocks)
 
     def compute_arg_log_likelihood(self, state):
-        """Compute the terminal ARG sequence log likelihood under fixed-edge JC69."""
+        """Compute the terminal ARG sequence log likelihood under learned-time JC69."""
         return self.evolution_model.compute_arg_log_likelihood(state)
 
     def compute_terminal_log_reward(self, state, log_likelihood=None):
-        """Return the configured terminal target for a completed ARG."""
+        """Return the posterior terminal target for a completed ARG."""
         if not self.is_terminal(state):
             raise ValueError("terminal reward requires a terminal ARGState")
         if log_likelihood is None:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
         log_likelihood = self.reward_fn(log_likelihood)
-        if self.reward_mode == "likelihood-only":
-            return float(log_likelihood)
-        if self.reward_mode == "trajectory-prior":
-            return float(log_likelihood + state.accumulated_log_prior)
         return float(log_likelihood + self.compute_canonical_labeled_arg_log_prior(state))
 
     def compute_canonical_labeled_arg_log_prior(self, terminal_state):
@@ -1048,8 +967,6 @@ class SimpleARGEnvironment:
         return action, set(pair_ids)
 
     def _add_canonical_time_action(self, terminal_state, replay_state, node, action):
-        if not self.learn_times:
-            return
         rates = self.enumerate_prior_options(replay_state).rates
         delta_t = float(node.time) - float(replay_state.current_time)
         action["time_action"] = self._time_action_for_delta(delta_t, rates)
@@ -1256,12 +1173,9 @@ class SimpleARGEnvironment:
         parent_id = next_state.max_node_idx + 1
         parent_segments = child_i.material_segments.union(child_j.material_segments)
         overlap_count = child_i.material_segments.intersection_count(child_j.material_segments)
-        if self.learn_times:
-            delta_t = self._delta_t_for_action(action, rates)
-            parent_time = float(state.current_time) + delta_t
-            next_state.current_time = parent_time
-        else:
-            parent_time = 0.0
+        delta_t = self._delta_t_for_action(action, rates)
+        parent_time = float(state.current_time) + delta_t
+        next_state.current_time = parent_time
         parent = ARGLineage(
             node_id=parent_id,
             children=[child_i.node_id, child_j.node_id],
@@ -1305,12 +1219,9 @@ class SimpleARGEnvironment:
 
         left_parent_id = next_state.max_node_idx + 1
         right_parent_id = next_state.max_node_idx + 2
-        if self.learn_times:
-            delta_t = self._delta_t_for_action(action, rates)
-            event_time = float(state.current_time) + delta_t
-            next_state.current_time = event_time
-        else:
-            event_time = 0.0
+        delta_t = self._delta_t_for_action(action, rates)
+        event_time = float(state.current_time) + delta_t
+        next_state.current_time = event_time
         left_parent = ARGLineage(
             node_id=left_parent_id,
             children=[child.node_id],
@@ -1590,13 +1501,7 @@ class SimpleARGEnvironment:
         }
 
         if input_actions is not None:
-            event_type_map = {"coal": 0, "recomb": 1}
             input_dict["input_actions"] = input_actions
-            input_dict["input_event_types"] = torch.tensor(
-                [event_type_map.get(action.get("event_type"), -1) for action in input_actions],
-                dtype=torch.long,
-                device=inputs.device,
-            )
             input_dict["input_active_lineage_i"] = torch.tensor(
                 [action.get("active_lineage_i", -1) for action in input_actions],
                 dtype=torch.long,
@@ -1653,13 +1558,7 @@ class SimpleARGEnvironment:
         if input_actions is not None:
             if len(input_actions) != batch_size:
                 raise ValueError("input_actions length must match batch size")
-            event_type_map = {"coal": 0, "recomb": 1}
             input_dict["input_actions"] = input_actions
-            input_dict["input_event_types"] = torch.tensor(
-                [event_type_map.get(action.get("event_type"), -1) for action in input_actions],
-                dtype=torch.long,
-                device=device,
-            )
             input_dict["input_active_lineage_i"] = torch.tensor(
                 [action.get("active_lineage_i", -1) for action in input_actions],
                 dtype=torch.long,

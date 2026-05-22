@@ -28,7 +28,6 @@ class ARGModel(nn.Module):
         embedding_size = 32
         hidden_size = 64
         dropout = 0.0
-        self.learn_times = bool(getattr(env, "learn_times", False))
         self.model_version = "compact-binned-v1"
         self.breakpoint_policy = str(
             self._cfg_get(cfg, "breakpoint_policy", "learned-bin-mass")
@@ -60,14 +59,6 @@ class ARGModel(nn.Module):
         self.seq_embedding = nn.Linear(input_size, embedding_size)
         self.event_embedding = nn.Embedding(len(self.EVENT_TO_IDX), embedding_size)
         self.scalar_embedding = nn.Linear(self.SCALAR_FEATURES, embedding_size)
-        self.event_type_scorer = nn.Sequential(
-            nn.Linear(embedding_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, len(self.EVENT_TO_IDX)),
-        )
-        nn.init.zeros_(self.event_type_scorer[-1].weight)
-        nn.init.zeros_(self.event_type_scorer[-1].bias)
         self.action_scorer = nn.Sequential(
             nn.Linear(embedding_size * 6, hidden_size),
             nn.ReLU(),
@@ -83,15 +74,12 @@ class ARGModel(nn.Module):
             )
         else:
             self.breakpoint_scorer = None
-        if self.learn_times:
-            self.time_scorer = nn.Sequential(
-                nn.Linear(embedding_size * 6, hidden_size),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_size, env.time_env.bins),
-            )
-        else:
-            self.time_scorer = None
+        self.time_scorer = nn.Sequential(
+            nn.Linear(embedding_size * 6, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, env.time_env.bins),
+        )
         self.logsoftmax = nn.LogSoftmax(dim=1)
 
     def _cfg_get(self, cfg, key, default):
@@ -259,14 +247,15 @@ class ARGModel(nn.Module):
         valid_mask = torch.arange(max_nb_seq, device=device)[None, :] < batch_nb_seq[:, None]
         lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
         action_options = input_dict.get("action_options")
-        forced_event_types = self._forced_event_types_for_batch(input_dict, batch_size)
+        input_actions = input_dict.get("input_actions")
+        if states is None:
+            raise ValueError("CWR event-rate sampling requires state-based rollout inputs.")
         all_candidate_actions = [
             self._candidate_actions_for_batch_item(
                 input_dict,
                 batch_idx,
                 states,
                 action_options,
-                None,
                 batch_size,
             )
             for batch_idx in range(batch_size)
@@ -275,25 +264,21 @@ class ARGModel(nn.Module):
         if any(len(actions) == 0 for actions in all_candidate_actions):
             raise ValueError("ARGModel.forward received a batch item with no candidate actions.")
 
-        event_logits = self._event_type_logits(
-            summary_reps,
-            states,
-            all_candidate_actions,
-        )
-        external_log_event_probs = input_dict.get("log_event_probs")
-        if forced_event_types is None:
-            event_indices = self.sample_event_types(
-                event_logits,
-                input_dict.get("random_spec"),
-            )
-            selected_event_types = [
+        event_log_probs = self._cwr_event_log_probs(states, all_candidate_actions, device, lineage_reps.dtype)
+        if input_actions is None:
+            event_indices = Categorical(logits=event_log_probs).sample()
+            chosen_event_types = [
                 self._event_type_from_index(int(event_idx.detach().cpu().item()))
                 for event_idx in event_indices
             ]
         else:
-            selected_event_types = forced_event_types
+            if len(input_actions) != batch_size:
+                raise ValueError("input_actions length must match batch size.")
+            chosen_event_types = [action.get("event_type") for action in input_actions]
+            for event_type in chosen_event_types:
+                self._validate_selected_event_type(event_type)
             event_indices = torch.tensor(
-                [self.EVENT_TO_IDX[event_type] for event_type in selected_event_types],
+                [self.EVENT_TO_IDX[event_type] for event_type in chosen_event_types],
                 dtype=torch.long,
                 device=device,
             )
@@ -301,7 +286,7 @@ class ARGModel(nn.Module):
         candidate_actions = [
             self._filter_actions_by_event_type(
                 all_candidate_actions[batch_idx],
-                selected_event_types[batch_idx],
+                chosen_event_types[batch_idx],
             )
             for batch_idx in range(batch_size)
         ]
@@ -318,7 +303,6 @@ class ARGModel(nn.Module):
         )
         mask = torch.isneginf(logits)
 
-        input_actions = input_dict.get("input_actions")
         if input_actions is None:
             action_indices = self.sample({"logits": logits, "candidate_actions": candidate_actions},
                                          input_dict.get("random_spec"))
@@ -335,8 +319,6 @@ class ARGModel(nn.Module):
                 for batch_idx in range(batch_size)
             ]
         else:
-            if len(input_actions) != batch_size:
-                raise ValueError("input_actions length must match batch size.")
             action_indices = self._indices_for_input_actions(input_actions, candidate_actions, device)
             selected_candidates = [
                 candidate_actions[batch_idx][action_indices[batch_idx].item()]
@@ -380,43 +362,32 @@ class ARGModel(nn.Module):
                 action_indices,
                 conditional_log_paths_pf,
             )
-        time_logits = None
-        time_actions = None
-        log_time_pf = conditional_log_paths_pf.new_zeros(batch_size)
-        if self.learn_times:
-            selected_action_features = self._selected_action_features(
-                actions,
-                lineage_reps,
-                summary_reps,
-                seq_features,
-                states,
-                batch_nb_seq,
-            )
-            time_logits = self.time_scorer(selected_action_features)
-            if input_actions is None:
-                time_actions = self.sample_time(time_logits, input_dict.get("random_spec"))
-                for batch_idx, action in enumerate(actions):
-                    action["time_action"] = int(time_actions[batch_idx].detach().cpu().item())
-            else:
-                if any("time_action" not in action for action in actions):
-                    raise ValueError("learnable ARG times require input_actions to include time_action")
-                time_actions = torch.tensor(
-                    [int(action["time_action"]) for action in actions],
-                    dtype=torch.long,
-                    device=device,
-                )
-            log_time_pf = self.compute_log_time_pf(time_logits, time_actions)
-        actions = [self._strip_internal_action_keys(action) for action in actions]
-        if external_log_event_probs is None:
-            log_event_probs = self.compute_log_event_pf(event_logits, event_indices)
+        selected_action_features = self._selected_action_features(
+            actions,
+            lineage_reps,
+            summary_reps,
+            seq_features,
+            states,
+            batch_nb_seq,
+        )
+        time_logits = self.time_scorer(selected_action_features)
+        if input_actions is None:
+            time_actions = self.sample_time(time_logits, input_dict.get("random_spec"))
+            for batch_idx, action in enumerate(actions):
+                action["time_action"] = int(time_actions[batch_idx].detach().cpu().item())
         else:
-            log_event_probs = self._event_log_probs_for_batch(
-                input_dict,
-                batch_size,
-                conditional_log_paths_pf,
+            if any("time_action" not in action for action in actions):
+                raise ValueError("learnable ARG times require input_actions to include time_action")
+            time_actions = torch.tensor(
+                [int(action["time_action"]) for action in actions],
+                dtype=torch.long,
+                device=device,
             )
+        log_time_pf = self.compute_log_time_pf(time_logits, time_actions)
+        actions = [self._strip_internal_action_keys(action) for action in actions]
+        log_event_pf = self._event_log_pf(event_log_probs, event_indices)
         log_paths_pf = (
-            log_event_probs
+            log_event_pf
             + conditional_log_paths_pf
             + log_action_detail_pf
             + log_time_pf
@@ -429,68 +400,26 @@ class ARGModel(nn.Module):
             "all_candidate_actions": all_candidate_actions,
             "logits": logits,
             "mask": mask,
-            "event_logits": event_logits,
             "event_indices": event_indices,
-            "selected_event_types": selected_event_types,
+            "chosen_event_types": chosen_event_types,
             "time_logits": time_logits,
             "time_actions": time_actions,
             "log_time_pf": log_time_pf,
             "breakpoint_logits": breakpoint_logits,
             "log_action_detail_pf": log_action_detail_pf,
+            "log_event_pf": log_event_pf,
             "log_paths_pf": log_paths_pf,
             "conditional_log_paths_pf": conditional_log_paths_pf,
-            "log_event_probs": log_event_probs,
+            "event_log_probs": event_log_probs,
         }
 
     def sample(self, ret, random_spec):
         logits = ret["logits"]
-        candidate_actions = ret["candidate_actions"]
         if random_spec is None:
-            random_spec = {"random_action_prob": 0.0}
-
-        if "random_action_prob" in random_spec:
-            action_indices = Categorical(logits=logits).sample()
-            random_p = random_spec["random_action_prob"]
-            if random_p > 0:
-                batch_size = logits.shape[0]
-                rand_flag = torch.empty(batch_size, device=logits.device).uniform_(0, 1) <= random_p
-                for batch_idx in torch.nonzero(rand_flag, as_tuple=False).reshape(-1).tolist():
-                    valid_count = len(candidate_actions[batch_idx])
-                    action_indices[batch_idx] = torch.randint(
-                        valid_count,
-                        size=(),
-                        device=logits.device,
-                    )
-            return action_indices
+            return Categorical(logits=logits).sample()
 
         temperature = random_spec["T"]
         return Categorical(logits=logits / temperature).sample()
-
-    def sample_event_types(self, event_logits, random_spec):
-        if random_spec is None:
-            random_spec = {"random_action_prob": 0.0}
-
-        if "random_action_prob" in random_spec:
-            event_indices = Categorical(logits=event_logits).sample()
-            random_p = random_spec["random_action_prob"]
-            if random_p > 0:
-                batch_size = event_logits.shape[0]
-                rand_flag = torch.empty(batch_size, device=event_logits.device).uniform_(0, 1) <= random_p
-                for batch_idx in torch.nonzero(rand_flag, as_tuple=False).reshape(-1).tolist():
-                    valid_indices = torch.nonzero(
-                        torch.isfinite(event_logits[batch_idx]),
-                        as_tuple=False,
-                    ).reshape(-1)
-                    chosen = torch.randint(
-                        valid_indices.numel(),
-                        size=(),
-                        device=event_logits.device,
-                    )
-                    event_indices[batch_idx] = valid_indices[chosen]
-            return event_indices
-
-        temperature = random_spec["T"]
-        return Categorical(logits=event_logits / temperature).sample()
 
     def compute_log_path_pf(self, ret, action_indices):
         logits = ret["logits"]
@@ -498,29 +427,9 @@ class ARGModel(nn.Module):
         log_p = self.logsoftmax(logits)
         return log_p[batch_idx, action_indices]
 
-    def compute_log_event_pf(self, event_logits, event_indices):
-        batch_idx = torch.arange(event_logits.shape[0], device=event_logits.device)
-        log_p = torch.log_softmax(event_logits, dim=-1)
-        return log_p[batch_idx, event_indices]
-
     def sample_time(self, logits, random_spec):
         if random_spec is None:
-            random_spec = {"random_action_prob": 0.0}
-
-        if "random_action_prob" in random_spec:
-            time_actions = Categorical(logits=logits).sample()
-            random_p = random_spec["random_action_prob"]
-            if random_p > 0:
-                batch_size, actions_num = logits.shape
-                rand_flag = torch.empty(batch_size, device=logits.device).uniform_(0, 1) <= random_p
-                rand_num = rand_flag.sum().item()
-                if rand_num > 0:
-                    time_actions[rand_flag] = torch.randint(
-                        actions_num,
-                        size=(rand_num,),
-                        device=logits.device,
-                    )
-            return time_actions
+            return Categorical(logits=logits).sample()
 
         temperature = random_spec["T"]
         return Categorical(logits=logits / temperature).sample()
@@ -896,52 +805,17 @@ class ARGModel(nn.Module):
         batch_idx,
         states,
         action_options,
-        selected_event_types,
         batch_size,
     ):
-        selected_event_type = self._selected_event_type_for_batch_item(
-            selected_event_types,
-            batch_idx,
-        )
         if states is not None:
-            return self._state_candidate_actions(states[batch_idx], selected_event_type)
+            return self._state_candidate_actions(states[batch_idx])
 
         options = self._action_options_for_batch_item(action_options, batch_idx, batch_size)
         if options is not None:
-            return self._filter_actions_by_event_type(
-                self._actions_from_options(options),
-                selected_event_type,
-            )
+            return self._actions_from_options(options)
 
         nb_seq = int(input_dict["batch_nb_seq"][batch_idx].item())
-        return self._dense_candidate_actions(nb_seq, selected_event_type)
-
-    def _forced_event_types_for_batch(self, input_dict, batch_size):
-        selected_event_types = input_dict.get("selected_event_types")
-        if selected_event_types is not None:
-            if len(selected_event_types) != batch_size:
-                raise ValueError("selected_event_types must have one entry per batch item.")
-            return [
-                self._normalize_event_type_value(selected_event_types, batch_idx)
-                for batch_idx in range(batch_size)
-            ]
-
-        input_actions = input_dict.get("input_actions")
-        if input_actions is None:
-            return None
-        if len(input_actions) != batch_size:
-            raise ValueError("input_actions length must match batch size.")
-        event_types = [action.get("event_type") for action in input_actions]
-        for event_type in event_types:
-            self._validate_selected_event_type(event_type)
-        return event_types
-
-    def _normalize_event_type_value(self, selected_event_types, batch_idx):
-        if torch.is_tensor(selected_event_types):
-            return self._event_type_from_index(int(selected_event_types[batch_idx].item()))
-        event_type = selected_event_types[batch_idx]
-        self._validate_selected_event_type(event_type)
-        return event_type
+        return self._dense_candidate_actions(nb_seq)
 
     def _event_type_from_index(self, event_idx):
         idx_to_event = {idx: event for event, idx in self.EVENT_TO_IDX.items()}
@@ -949,25 +823,25 @@ class ARGModel(nn.Module):
         self._validate_selected_event_type(event_type)
         return event_type
 
-    def _event_type_logits(self, summary_reps, states, candidate_actions):
-        learned_logits = self.event_type_scorer(summary_reps)
-        prior_logits = learned_logits.new_full(learned_logits.shape, float("-inf"))
-
-        for batch_idx, actions in enumerate(candidate_actions):
+    def _cwr_event_log_probs(self, states, candidate_actions, device, dtype):
+        event_log_probs = torch.full(
+            (len(states), len(self.EVENT_TO_IDX)),
+            float("-inf"),
+            dtype=dtype,
+            device=device,
+        )
+        for batch_idx, (state, actions) in enumerate(zip(states, candidate_actions)):
             available_events = {action["event_type"] for action in actions}
-            if states is not None:
-                probs = self.env.compute_event_probabilities(states[batch_idx])
-                for event_type, event_idx in self.EVENT_TO_IDX.items():
-                    probability = float(probs.get(event_type, 0.0))
-                    if event_type in available_events and probability > 0.0:
-                        prior_logits[batch_idx, event_idx] = math.log(probability)
-            else:
-                if available_events:
-                    log_prob = -math.log(len(available_events))
-                    for event_type in available_events:
-                        prior_logits[batch_idx, self.EVENT_TO_IDX[event_type]] = log_prob
+            probabilities = self.env.compute_event_probabilities(state)
+            for event_type, event_idx in self.EVENT_TO_IDX.items():
+                probability = float(probabilities.get(event_type, 0.0))
+                if event_type in available_events and probability > 0.0:
+                    event_log_probs[batch_idx, event_idx] = math.log(probability)
+        return event_log_probs
 
-        return learned_logits + prior_logits
+    def _event_log_pf(self, event_log_probs, event_indices):
+        batch_idx = torch.arange(event_log_probs.shape[0], device=event_log_probs.device)
+        return event_log_probs[batch_idx, event_indices]
 
     def _state_candidate_actions(self, state, selected_event_type=None):
         self._validate_selected_event_type(selected_event_type)
@@ -1004,17 +878,6 @@ class ARGModel(nn.Module):
             )
         return actions
 
-    def _selected_event_type_for_batch_item(self, selected_event_types, batch_idx):
-        if selected_event_types is None:
-            return None
-        if torch.is_tensor(selected_event_types):
-            idx_to_event = {idx: event for event, idx in self.EVENT_TO_IDX.items()}
-            selected_event_type = idx_to_event.get(int(selected_event_types[batch_idx].item()))
-        else:
-            selected_event_type = selected_event_types[batch_idx]
-        self._validate_selected_event_type(selected_event_type)
-        return selected_event_type
-
     def _validate_selected_event_type(self, selected_event_type):
         if selected_event_type is not None and selected_event_type not in self.EVENT_TO_IDX:
             raise ValueError(f"Unknown ARG selected_event_type: {selected_event_type}")
@@ -1024,19 +887,6 @@ class ARGModel(nn.Module):
         if selected_event_type is None:
             return actions
         return [action for action in actions if action.get("event_type") == selected_event_type]
-
-    def _event_log_probs_for_batch(self, input_dict, batch_size, reference):
-        log_event_probs = input_dict.get("log_event_probs")
-        if log_event_probs is None:
-            return reference.new_zeros(batch_size)
-        if torch.is_tensor(log_event_probs):
-            tensor = log_event_probs.to(dtype=reference.dtype, device=reference.device)
-        else:
-            tensor = torch.tensor(log_event_probs, dtype=reference.dtype, device=reference.device)
-        tensor = tensor.reshape(-1)
-        if tensor.numel() != batch_size:
-            raise ValueError("log_event_probs must have one entry per batch item.")
-        return tensor
 
     def _action_options_for_batch_item(self, action_options, batch_idx, batch_size):
         if action_options is None:
