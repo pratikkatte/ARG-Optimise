@@ -25,7 +25,12 @@ DEFAULT_MU_PER_BP = 2e-8
 DEFAULT_FIXED_EDGE_LENGTH = 0.02
 DEFAULT_INIT_Z_SAMPLE_COUNT = 2
 DEFAULT_SEQUENCE_ENCODER_BINS = 1024
-MODEL_VERSION = "compact-binned-v1"
+DEFAULT_BREAKPOINT_MIXTURES = 4
+DEFAULT_LOG_Z_LR = 0.05
+DEFAULT_GRAD_ACCUM_STEPS = 4
+DEFAULT_EVAL_EPISODES = 8
+DEFAULT_EVAL_EVERY = 10
+MODEL_VERSION = "learned-breakpoint-v1"
 
 def seed_everything(seed):
     random.seed(seed)
@@ -34,11 +39,86 @@ def seed_everything(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def train_epoch(epoch_id, rollout_worker, generator, batch_size=1):
-    with torch.no_grad():
-        ret, trajectories = rollout_worker.rollout(generator, episodes=batch_size)
-    generator.accumulate_streaming_tb_loss(rollout_worker, ret, trajectories)
+def train_epoch(epoch_id, rollout_worker, generator, batch_size=1, grad_accum_steps=1):
+    grad_accum_steps = max(int(grad_accum_steps), 1)
+    for _ in range(grad_accum_steps):
+        with torch.no_grad():
+            ret, trajectories = rollout_worker.rollout(generator, episodes=batch_size)
+        generator.accumulate_streaming_tb_loss(
+            rollout_worker,
+            ret,
+            trajectories,
+            factor=grad_accum_steps,
+        )
     return generator.update_model()
+
+
+def evaluate_generator(rollout_worker, generator, episodes, seed):
+    episodes = int(episodes)
+    if episodes <= 0:
+        return {}
+
+    env = rollout_worker.env
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    env_rng_state = env.rng.getstate() if hasattr(env.rng, "getstate") else None
+
+    try:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        if hasattr(env.rng, "seed"):
+            env.rng.seed(seed)
+
+        with torch.no_grad():
+            outputs, trajectories = rollout_worker.rollout(generator, episodes=episodes)
+            log_pf = outputs["log_paths_pf"].sum(-1)
+            log_pb = outputs["log_paths_pb"].sum(-1)
+            log_rewards = outputs["log_rewards"]
+            residuals = generator.compute_log_Z().detach().to(log_pf) + log_pf - (
+                log_rewards + log_pb
+            )
+
+        lengths = torch.tensor([len(traj) for traj in trajectories], dtype=torch.float32)
+        coal_counts = torch.tensor(
+            [
+                sum(1 for record in traj if record["action"].get("event_type") == "coal")
+                for traj in trajectories
+            ],
+            dtype=torch.float32,
+        )
+        recomb_counts = torch.tensor(
+            [
+                sum(1 for record in traj if record["action"].get("event_type") == "recomb")
+                for traj in trajectories
+            ],
+            dtype=torch.float32,
+        )
+        return {
+            "eval_tb_mse": float(residuals.pow(2).mean().detach().cpu().item()),
+            "eval_residual_mean": float(residuals.mean().detach().cpu().item()),
+            "eval_residual_std": float(
+                residuals.std(unbiased=False).detach().cpu().item()
+            ),
+            "eval_log_pf_mean": float(log_pf.mean().detach().cpu().item()),
+            "eval_log_pb_mean": float(log_pb.mean().detach().cpu().item()),
+            "eval_log_reward_mean": float(log_rewards.mean().detach().cpu().item()),
+            "eval_trajectory_length_mean": float(lengths.mean().item()),
+            "eval_coalescence_count_mean": float(coal_counts.mean().item()),
+            "eval_recombination_count_mean": float(recomb_counts.mean().item()),
+        }
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+        if env_rng_state is not None:
+            env.rng.setstate(env_rng_state)
 
 def parse_time_increments(value):
     if value is None:
@@ -70,6 +150,14 @@ def train(
     effective_population_size=DEFAULT_NE,
     mutation_rate=DEFAULT_MU_PER_BP,
     use_time_prior=True,
+    recombination_rate=DEFAULT_R_PER_BP,
+    breakpoint_policy="learned-bin-mass",
+    breakpoint_mixtures=DEFAULT_BREAKPOINT_MIXTURES,
+    reward_mode="posterior",
+    log_z_lr=DEFAULT_LOG_Z_LR,
+    grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
+    eval_episodes=DEFAULT_EVAL_EPISODES,
+    eval_every=DEFAULT_EVAL_EVERY,
     num_blocks=None,
     sequence_encoder_bins=DEFAULT_SEQUENCE_ENCODER_BINS,
     smoke_test=False,
@@ -88,7 +176,7 @@ def train(
         raise ValueError("num_blocks must be less than or equal to sequence length")
     if smoke_test:
         sequence_encoder_bins = min(int(sequence_encoder_bins), 256)
-    rho = 4 * float(effective_population_size) * DEFAULT_R_PER_BP * sequence_length
+    rho = 4 * float(effective_population_size) * float(recombination_rate) * sequence_length
 
     env = SimpleARGEnvironment(
         sequence_length=sequence_length,
@@ -105,14 +193,20 @@ def train(
         effective_population_size=effective_population_size,
         mutation_rate=mutation_rate,
         use_time_prior=use_time_prior,
+        reward_mode=reward_mode,
         rng=random.Random(seed),
     )
     generator = TBGFlowNetGenerator(
         env,
         init_z_sample_count=init_z_sample_count,
-        cfg={"sequence_encoder_bins": sequence_encoder_bins},
+        cfg={
+            "sequence_encoder_bins": sequence_encoder_bins,
+            "breakpoint_policy": breakpoint_policy,
+            "breakpoint_mixtures": breakpoint_mixtures,
+        },
         device=device,
         verbose=init_z_verbose,
+        log_z_lr=log_z_lr,
     )
     rollout_worker = RolloutWorker(env)
     print(f"Training on device: {generator.device}")
@@ -137,6 +231,14 @@ def train(
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
             "use_time_prior": bool(use_time_prior),
+            "recombination_rate": float(recombination_rate),
+            "breakpoint_policy": generator.arg_model.breakpoint_policy,
+            "breakpoint_mixtures": int(generator.arg_model.breakpoint_mixtures),
+            "reward_mode": env.reward_mode,
+            "log_z_lr": float(log_z_lr),
+            "grad_accum_steps": int(grad_accum_steps),
+            "eval_episodes": int(eval_episodes),
+            "eval_every": int(eval_every),
             "num_blocks": int(num_blocks),
             "sequence_encoder_bins": int(generator.arg_model.sequence_encoder_bins),
             "model_version": MODEL_VERSION,
@@ -144,7 +246,13 @@ def train(
 
     try:
         for epoch in range(epochs_num):
-            info = train_epoch(epoch, rollout_worker, generator, batch_size=batch_size)
+            info = train_epoch(
+                epoch,
+                rollout_worker,
+                generator,
+                batch_size=batch_size,
+                grad_accum_steps=grad_accum_steps,
+            )
             log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
             if info is None:
                 continue
@@ -152,11 +260,25 @@ def train(
             info = dict(info)
             info["epoch"] = epoch
             info["log_z"] = log_z
+            should_eval = int(eval_episodes) > 0 and (
+                epoch == 0
+                or int(eval_every) <= 1
+                or (epoch + 1) % int(eval_every) == 0
+            )
+            if should_eval:
+                info.update(
+                    evaluate_generator(
+                        rollout_worker,
+                        generator,
+                        eval_episodes,
+                        seed + 100000 + epoch,
+                    )
+                )
             history.append(info)
             loss = float(info["loss"])
 
             if wandb_run is not None:
-                wandb.log({"epoch": epoch, "loss": loss, "logZ": log_z}, step=epoch + 1)
+                wandb.log(info, step=epoch + 1)
 
             if loss < best_loss:
                 best_loss = loss
@@ -177,6 +299,14 @@ def train(
                     effective_population_size=effective_population_size,
                     mutation_rate=mutation_rate,
                     use_time_prior=use_time_prior,
+                    recombination_rate=recombination_rate,
+                    breakpoint_policy=generator.arg_model.breakpoint_policy,
+                    breakpoint_mixtures=generator.arg_model.breakpoint_mixtures,
+                    reward_mode=env.reward_mode,
+                    log_z_lr=log_z_lr,
+                    grad_accum_steps=grad_accum_steps,
+                    eval_episodes=eval_episodes,
+                    eval_every=eval_every,
                     seed=seed,
                     init_z_sample_count=init_z_sample_count,
                     sequence_encoder_bins=generator.arg_model.sequence_encoder_bins,
@@ -185,7 +315,13 @@ def train(
                 generator.save(best_checkpoint_path, metadata=metadata)
                 info["best_checkpoint_path"] = best_checkpoint_path
 
-            print(f"Epoch {epoch + 1} loss={loss:.4f} logZ={log_z:.4f}")
+            eval_text = ""
+            if "eval_tb_mse" in info:
+                eval_text = (
+                    f" eval_tb_mse={info['eval_tb_mse']:.4f}"
+                    f" eval_residual_mean={info['eval_residual_mean']:.4f}"
+                )
+            print(f"Epoch {epoch + 1} loss={loss:.4f} logZ={log_z:.4f}{eval_text}")
 
         with open(os.path.join(output_path, "training_history.pkl"), "wb") as handle:
             pickle.dump(history, handle)
@@ -212,6 +348,14 @@ def build_checkpoint_metadata(
     effective_population_size,
     mutation_rate,
     use_time_prior,
+    recombination_rate,
+    breakpoint_policy,
+    breakpoint_mixtures,
+    reward_mode,
+    log_z_lr,
+    grad_accum_steps,
+    eval_episodes,
+    eval_every,
     seed,
     init_z_sample_count,
     sequence_encoder_bins,
@@ -235,6 +379,14 @@ def build_checkpoint_metadata(
         "effective_population_size": float(effective_population_size),
         "mutation_rate": float(mutation_rate),
         "use_time_prior": bool(use_time_prior),
+        "recombination_rate": float(recombination_rate),
+        "breakpoint_policy": str(breakpoint_policy),
+        "breakpoint_mixtures": int(breakpoint_mixtures),
+        "reward_mode": str(reward_mode),
+        "log_z_lr": float(log_z_lr),
+        "grad_accum_steps": int(grad_accum_steps),
+        "eval_episodes": int(eval_episodes),
+        "eval_every": int(eval_every),
         "seed": int(seed),
         "init_z_sample_count": int(init_z_sample_count),
         "sequence_encoder_bins": int(sequence_encoder_bins),
@@ -294,6 +446,30 @@ def main():
     )
     parser.add_argument("--effective-population-size", type=float, default=DEFAULT_NE)
     parser.add_argument("--mutation-rate", type=float, default=DEFAULT_MU_PER_BP)
+    parser.add_argument("--recombination-rate", type=float, default=DEFAULT_R_PER_BP)
+    parser.add_argument(
+        "--breakpoint-policy",
+        choices=["learned-bin-mass", "uniform"],
+        default="learned-bin-mass",
+    )
+    parser.add_argument(
+        "--breakpoint-mixtures",
+        type=int,
+        default=DEFAULT_BREAKPOINT_MIXTURES,
+    )
+    parser.add_argument(
+        "--reward-mode",
+        choices=["posterior", "likelihood-only", "trajectory-prior"],
+        default="posterior",
+    )
+    parser.add_argument("--log-z-lr", type=float, default=DEFAULT_LOG_Z_LR)
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=DEFAULT_GRAD_ACCUM_STEPS,
+    )
+    parser.add_argument("--eval-episodes", type=int, default=DEFAULT_EVAL_EPISODES)
+    parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
     parser.add_argument("--no-time-prior", action="store_true")
 
     args = parser.parse_args()
@@ -304,6 +480,8 @@ def main():
         args.init_z_sample_count = 1
         args.no_wandb = True
         args.sequence_encoder_bins = min(args.sequence_encoder_bins, 256)
+        args.grad_accum_steps = 1
+        args.eval_episodes = min(args.eval_episodes, 1)
 
     if args.device == "auto":
         selected_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -330,6 +508,14 @@ def main():
         effective_population_size=args.effective_population_size,
         mutation_rate=args.mutation_rate,
         use_time_prior=not args.no_time_prior,
+        recombination_rate=args.recombination_rate,
+        breakpoint_policy=args.breakpoint_policy,
+        breakpoint_mixtures=args.breakpoint_mixtures,
+        reward_mode=args.reward_mode,
+        log_z_lr=args.log_z_lr,
+        grad_accum_steps=args.grad_accum_steps,
+        eval_episodes=args.eval_episodes,
+        eval_every=args.eval_every,
         num_blocks=args.num_blocks,
         sequence_encoder_bins=args.sequence_encoder_bins,
         smoke_test=args.smoke_test,

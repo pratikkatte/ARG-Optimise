@@ -518,6 +518,7 @@ class SimpleARGEnvironment:
         effective_population_size: float = 10000.0,
         mutation_rate: float = 2e-8,
         use_time_prior: bool = True,
+        reward_mode: str = "posterior",
         sequences: Optional[Sequence[Any]] = None,
         rng: Optional[random.Random] = None,
         seed: Optional[int] = None,
@@ -553,6 +554,11 @@ class SimpleARGEnvironment:
         self.fixed_edge_length = float(fixed_edge_length)
         self.learn_times = bool(learn_times)
         self.use_time_prior = bool(use_time_prior)
+        self.reward_mode = str(reward_mode)
+        if self.reward_mode not in {"posterior", "likelihood-only", "trajectory-prior"}:
+            raise ValueError(
+                "reward_mode must be one of: posterior, likelihood-only, trajectory-prior"
+            )
         self.effective_population_size = float(effective_population_size)
         self.mutation_rate = float(mutation_rate)
         if self.effective_population_size <= 0:
@@ -733,7 +739,7 @@ class SimpleARGEnvironment:
         state.is_done = self.is_terminal(state)
         if state.is_done:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
-            state.log_reward = self.reward_fn(log_likelihood)+state.accumulated_log_prior
+            state.log_reward = self.compute_terminal_log_reward(state, log_likelihood)
         return state
 
     def get_active_counts(self, state):
@@ -924,6 +930,130 @@ class SimpleARGEnvironment:
         """Compute the terminal ARG sequence log likelihood under fixed-edge JC69."""
         return self.evolution_model.compute_arg_log_likelihood(state)
 
+    def compute_terminal_log_reward(self, state, log_likelihood=None):
+        """Return the configured terminal target for a completed ARG."""
+        if not self.is_terminal(state):
+            raise ValueError("terminal reward requires a terminal ARGState")
+        if log_likelihood is None:
+            log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
+        log_likelihood = self.reward_fn(log_likelihood)
+        if self.reward_mode == "likelihood-only":
+            return float(log_likelihood)
+        if self.reward_mode == "trajectory-prior":
+            return float(log_likelihood + state.accumulated_log_prior)
+        return float(log_likelihood + self.compute_canonical_labeled_arg_log_prior(state))
+
+    def compute_canonical_labeled_arg_log_prior(self, terminal_state):
+        """Replay a terminal labeled ARG in node-id order and sum prior log-probs."""
+        if not self.is_terminal(terminal_state):
+            raise ValueError("canonical ARG prior requires a terminal ARGState")
+
+        internal_node_ids = sorted(
+            node_id
+            for node_id in terminal_state.all_nodes
+            if node_id >= self.num_sequences
+        )
+        if not internal_node_ids:
+            return 0.0
+
+        replay_state = self.get_initial_state()
+        replay_state.log_reward = None
+        total_log_prior = 0.0
+        processed = set()
+
+        for node_id in internal_node_ids:
+            if node_id in processed:
+                continue
+            node = terminal_state.all_nodes[node_id]
+            if node.event_type == "coal":
+                action = self._canonical_coalescence_action(terminal_state, replay_state, node)
+                event_node_ids = {node_id}
+            elif node.event_type == "recomb":
+                action, event_node_ids = self._canonical_recombination_action(
+                    terminal_state,
+                    replay_state,
+                    node,
+                )
+            else:
+                raise ValueError(f"Unknown ARG event type in terminal state: {node.event_type}")
+
+            log_prior = self.compute_cwr_event_log_prior(replay_state, action)
+            if not math.isfinite(log_prior):
+                raise ValueError(f"Canonical ARG prior encountered invalid action: {action}")
+            total_log_prior += log_prior
+            replay_state = self.apply_action(
+                replay_state,
+                action,
+                log_prior,
+                compute_reward=False,
+            )
+            processed.update(event_node_ids)
+
+        if not self.is_terminal(replay_state):
+            raise ValueError("canonical ARG replay did not reach a terminal state")
+        return float(total_log_prior)
+
+    def _canonical_coalescence_action(self, terminal_state, replay_state, node):
+        if len(node.children) != 2:
+            raise ValueError(f"Coalescent node {node.node_id} must have exactly two children")
+        active_idx_by_id = {
+            lineage.node_id: idx for idx, lineage in enumerate(replay_state.active_lineages)
+        }
+        try:
+            child_i, child_j = node.children
+            action = {
+                "event_type": "coal",
+                "active_lineage_i": active_idx_by_id[child_i],
+                "active_lineage_j": active_idx_by_id[child_j],
+            }
+        except KeyError as exc:
+            raise ValueError(
+                f"Cannot replay coalescent node {node.node_id}; child is not active"
+            ) from exc
+        self._add_canonical_time_action(terminal_state, replay_state, node, action)
+        return action
+
+    def _canonical_recombination_action(self, terminal_state, replay_state, node):
+        if len(node.children) != 1 or node.breakpoint is None:
+            raise ValueError(f"Recombination node {node.node_id} is missing child/breakpoint")
+        child_id = node.children[0]
+        pair_ids = sorted(
+            other.node_id
+            for other in terminal_state.all_nodes.values()
+            if (
+                other.event_type == "recomb"
+                and other.children == [child_id]
+                and other.breakpoint == node.breakpoint
+                and other.recombination_side in ("left", "right")
+            )
+        )
+        if len(pair_ids) != 2:
+            raise ValueError(
+                f"Recombination event for child {child_id} breakpoint {node.breakpoint} "
+                "must have left and right parents"
+            )
+        active_idx_by_id = {
+            lineage.node_id: idx for idx, lineage in enumerate(replay_state.active_lineages)
+        }
+        if child_id not in active_idx_by_id:
+            raise ValueError(
+                f"Cannot replay recombination node {node.node_id}; child is not active"
+            )
+        action = {
+            "event_type": "recomb",
+            "active_lineage_i": active_idx_by_id[child_id],
+            "breakpoint": int(node.breakpoint),
+        }
+        self._add_canonical_time_action(terminal_state, replay_state, node, action)
+        return action, set(pair_ids)
+
+    def _add_canonical_time_action(self, terminal_state, replay_state, node, action):
+        if not self.learn_times:
+            return
+        rates = self.enumerate_prior_options(replay_state).rates
+        delta_t = float(node.time) - float(replay_state.current_time)
+        action["time_action"] = self._time_action_for_delta(delta_t, rates)
+
     def is_terminal(self, state):
         if state.total_active_blocks is not None:
             result = int(state.total_active_blocks) == self.num_blocks
@@ -1105,9 +1235,7 @@ class SimpleARGEnvironment:
         next_state.is_done = self.is_terminal(next_state)
         if next_state.is_done and compute_reward:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
-            next_state.log_reward = (
-                self.reward_fn(log_likelihood) + next_state.accumulated_log_prior
-            )
+            next_state.log_reward = self.compute_terminal_log_reward(next_state, log_likelihood)
         else:
             next_state.log_reward = None
         return next_state

@@ -20,7 +20,15 @@ LOSS_FN = {
 }
 
 class TBGFlowNetGenerator(torch.nn.Module):
-    def __init__(self, env, init_z_sample_count, cfg=None, device=None, verbose=False):
+    def __init__(
+        self,
+        env,
+        init_z_sample_count,
+        cfg=None,
+        device=None,
+        verbose=False,
+        log_z_lr=0.05,
+    ):
         super().__init__()
         self.cfg = cfg
         self.env = env
@@ -31,27 +39,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.arg_model = ARGModel(env, cfg).to(self.device)
 
         ## Z partition
-        with torch.no_grad():
-            if self.verbose:
-                print(
-                    f"Initializing log_Z from {self.init_z_sample_count} prior rollout(s)..."
-                )
-            worker = RolloutWorker(env, verbose=self.verbose)
-            trajs = []
-            for _ in range(self.init_z_sample_count):
-                state, _ = worker._rollout_one()
-                trajs.append(state)
-        self.max_reward_seen = np.max([x.log_reward for x in trajs])
-        init_z = self.max_reward_seen
-        self._Z = torch.nn.Parameter(
-            torch.ones(256, device=self.device) * init_z / 256,
-            requires_grad=True,
-        )
+        self._logZ = torch.nn.Parameter(torch.tensor(0.0, device=self.device))
+        self.max_reward_seen = float("-inf")
+        self._initialize_log_z_from_rollouts()
         model_params = list(self.arg_model.parameters())
         params = [{'params': model_params, 'lr': 0.001}]
-        params.append({'params': [self._Z], 'lr': 0.001})
+        params.append({'params': [self._logZ], 'lr': float(log_z_lr)})
 
-        self.gradient_clipping_params = model_params
+        self.gradient_clipping_params = model_params + [self._logZ]
         self.grad_clip = 10.0
         self.opt = torch.optim.Adam(
             params,
@@ -63,6 +58,31 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.loss_fn = LOSS_FN['MSE']
         self.loss = torch.tensor(0.0, device=self.device)
         self.accumulated_batches = 0
+
+    def _initialize_log_z_from_rollouts(self):
+        if self.init_z_sample_count <= 0:
+            return
+        if self.verbose:
+            print(
+                f"Initializing scalar logZ from {self.init_z_sample_count} on-policy rollout(s)..."
+            )
+        worker = RolloutWorker(self.env, verbose=self.verbose)
+        with torch.no_grad():
+            outputs, _ = worker.rollout(
+                self,
+                episodes=int(self.init_z_sample_count),
+                compute_reward=True,
+            )
+            log_pf = outputs["log_paths_pf"].sum(-1).to(self.device)
+            log_pb = outputs["log_paths_pb"].sum(-1).to(self.device)
+            log_rewards = outputs["log_rewards"].to(self.device)
+            targets = log_rewards + log_pb - log_pf
+            finite_targets = targets[torch.isfinite(targets)]
+            finite_rewards = log_rewards[torch.isfinite(log_rewards)]
+            if finite_rewards.numel() > 0:
+                self.max_reward_seen = float(finite_rewards.max().detach().cpu().item())
+            if finite_targets.numel() > 0:
+                self._logZ.data.copy_(finite_targets.mean().detach())
 
     def _resolve_device(self, device):
         if device is None or device == "auto":
@@ -119,7 +139,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return math.sqrt(sum(p.norm().item() ** 2 for p in self.gradient_clipping_params))
 
     def compute_log_Z(self):
-        return self._Z.sum()
+        return self._logZ
 
     def forward(self, input_dict):
         input_dict = self._move_input_to_device(input_dict)
@@ -431,8 +451,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
         (coefficients.sum() * self.compute_log_Z()).backward()
         for traj_idx, trajectory in enumerate(trajectories):
             coefficient = coefficients[traj_idx].detach()
-            if coefficient.item() == 0.0:
-                continue
             self._replay_trajectory_for_streaming_gradient(
                 rollout_worker,
                 trajectory,
@@ -459,12 +477,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 [state],
                 input_actions=[action],
                 random_spec=None,
-                device=self.device,
-            )
-            input_dict["selected_event_types"] = [action["event_type"]]
-            input_dict["log_event_probs"] = torch.tensor(
-                [math.log(event_prob)],
-                dtype=torch.float32,
                 device=self.device,
             )
             ret = self(input_dict)

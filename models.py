@@ -19,6 +19,8 @@ class ARGModel(nn.Module):
     SCALAR_FEATURES = 8
     INTERNAL_ACTION_PREFIX = "_"
     DEFAULT_SEQUENCE_ENCODER_BINS = 1024
+    DEFAULT_BREAKPOINT_MIXTURES = 4
+    BREAKPOINT_POLICIES = {"learned-bin-mass", "uniform"}
 
     def __init__(self, env, cfg=None):
         super().__init__()
@@ -28,6 +30,19 @@ class ARGModel(nn.Module):
         dropout = 0.0
         self.learn_times = bool(getattr(env, "learn_times", False))
         self.model_version = "compact-binned-v1"
+        self.breakpoint_policy = str(
+            self._cfg_get(cfg, "breakpoint_policy", "learned-bin-mass")
+        )
+        if self.breakpoint_policy not in self.BREAKPOINT_POLICIES:
+            raise ValueError(
+                "breakpoint_policy must be one of: "
+                + ", ".join(sorted(self.BREAKPOINT_POLICIES))
+            )
+        self.breakpoint_mixtures = int(
+            self._cfg_get(cfg, "breakpoint_mixtures", self.DEFAULT_BREAKPOINT_MIXTURES)
+        )
+        if self.breakpoint_mixtures <= 0:
+            raise ValueError("breakpoint_mixtures must be positive")
 
         requested_bins = int(
             self._cfg_get(cfg, "sequence_encoder_bins", self.DEFAULT_SEQUENCE_ENCODER_BINS)
@@ -45,12 +60,29 @@ class ARGModel(nn.Module):
         self.seq_embedding = nn.Linear(input_size, embedding_size)
         self.event_embedding = nn.Embedding(len(self.EVENT_TO_IDX), embedding_size)
         self.scalar_embedding = nn.Linear(self.SCALAR_FEATURES, embedding_size)
+        self.event_type_scorer = nn.Sequential(
+            nn.Linear(embedding_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, len(self.EVENT_TO_IDX)),
+        )
+        nn.init.zeros_(self.event_type_scorer[-1].weight)
+        nn.init.zeros_(self.event_type_scorer[-1].bias)
         self.action_scorer = nn.Sequential(
             nn.Linear(embedding_size * 6, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
+        if self.breakpoint_policy == "learned-bin-mass":
+            self.breakpoint_scorer = nn.Sequential(
+                nn.Linear(embedding_size * 6, hidden_size),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_size, self.breakpoint_mixtures * 3),
+            )
+        else:
+            self.breakpoint_scorer = None
         if self.learn_times:
             self.time_scorer = nn.Sequential(
                 nn.Linear(embedding_size * 6, hidden_size),
@@ -227,23 +259,54 @@ class ARGModel(nn.Module):
         valid_mask = torch.arange(max_nb_seq, device=device)[None, :] < batch_nb_seq[:, None]
         lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
         action_options = input_dict.get("action_options")
-        selected_event_types = input_dict.get("selected_event_types")
-        if selected_event_types is not None and len(selected_event_types) != batch_size:
-            raise ValueError("selected_event_types must have one entry per batch item.")
-        candidate_actions = [
+        forced_event_types = self._forced_event_types_for_batch(input_dict, batch_size)
+        all_candidate_actions = [
             self._candidate_actions_for_batch_item(
                 input_dict,
                 batch_idx,
                 states,
                 action_options,
-                selected_event_types,
+                None,
                 batch_size,
             )
             for batch_idx in range(batch_size)
         ]
 
-        if any(len(actions) == 0 for actions in candidate_actions):
+        if any(len(actions) == 0 for actions in all_candidate_actions):
             raise ValueError("ARGModel.forward received a batch item with no candidate actions.")
+
+        event_logits = self._event_type_logits(
+            summary_reps,
+            states,
+            all_candidate_actions,
+        )
+        external_log_event_probs = input_dict.get("log_event_probs")
+        if forced_event_types is None:
+            event_indices = self.sample_event_types(
+                event_logits,
+                input_dict.get("random_spec"),
+            )
+            selected_event_types = [
+                self._event_type_from_index(int(event_idx.detach().cpu().item()))
+                for event_idx in event_indices
+            ]
+        else:
+            selected_event_types = forced_event_types
+            event_indices = torch.tensor(
+                [self.EVENT_TO_IDX[event_type] for event_type in selected_event_types],
+                dtype=torch.long,
+                device=device,
+            )
+
+        candidate_actions = [
+            self._filter_actions_by_event_type(
+                all_candidate_actions[batch_idx],
+                selected_event_types[batch_idx],
+            )
+            for batch_idx in range(batch_size)
+        ]
+        if any(len(actions) == 0 for actions in candidate_actions):
+            raise ValueError("Selected ARG event type has no candidate actions.")
 
         logits = self._score_candidates(
             candidate_actions,
@@ -285,11 +348,38 @@ class ARGModel(nn.Module):
             ]
 
         conditional_log_paths_pf = self.compute_log_path_pf({"logits": logits}, action_indices)
-        log_action_detail_pf = self._selected_action_detail_log_pf(
-            candidate_actions,
-            action_indices,
-            conditional_log_paths_pf,
-        )
+        breakpoint_logits = None
+        if self.breakpoint_policy == "learned-bin-mass":
+            breakpoint_feature_actions = self._breakpoint_feature_actions(
+                actions,
+                selected_candidates,
+            )
+            breakpoint_features = self._selected_action_features(
+                breakpoint_feature_actions,
+                lineage_reps,
+                summary_reps,
+                seq_features,
+                states,
+                batch_nb_seq,
+            )
+            breakpoint_logits = self.breakpoint_scorer(breakpoint_features)
+            if input_actions is None:
+                self._sample_learned_breakpoints(
+                    actions,
+                    breakpoint_logits,
+                    input_dict.get("random_spec"),
+                )
+            log_action_detail_pf = self._learned_breakpoint_log_pf(
+                actions,
+                breakpoint_logits,
+                conditional_log_paths_pf,
+            )
+        else:
+            log_action_detail_pf = self._selected_action_detail_log_pf(
+                candidate_actions,
+                action_indices,
+                conditional_log_paths_pf,
+            )
         time_logits = None
         time_actions = None
         log_time_pf = conditional_log_paths_pf.new_zeros(batch_size)
@@ -317,11 +407,14 @@ class ARGModel(nn.Module):
                 )
             log_time_pf = self.compute_log_time_pf(time_logits, time_actions)
         actions = [self._strip_internal_action_keys(action) for action in actions]
-        log_event_probs = self._event_log_probs_for_batch(
-            input_dict,
-            batch_size,
-            conditional_log_paths_pf,
-        )
+        if external_log_event_probs is None:
+            log_event_probs = self.compute_log_event_pf(event_logits, event_indices)
+        else:
+            log_event_probs = self._event_log_probs_for_batch(
+                input_dict,
+                batch_size,
+                conditional_log_paths_pf,
+            )
         log_paths_pf = (
             log_event_probs
             + conditional_log_paths_pf
@@ -333,11 +426,16 @@ class ARGModel(nn.Module):
             "arg_actions": actions,
             "action_indices": action_indices,
             "candidate_actions": candidate_actions,
+            "all_candidate_actions": all_candidate_actions,
             "logits": logits,
             "mask": mask,
+            "event_logits": event_logits,
+            "event_indices": event_indices,
+            "selected_event_types": selected_event_types,
             "time_logits": time_logits,
             "time_actions": time_actions,
             "log_time_pf": log_time_pf,
+            "breakpoint_logits": breakpoint_logits,
             "log_action_detail_pf": log_action_detail_pf,
             "log_paths_pf": log_paths_pf,
             "conditional_log_paths_pf": conditional_log_paths_pf,
@@ -368,11 +466,42 @@ class ARGModel(nn.Module):
         temperature = random_spec["T"]
         return Categorical(logits=logits / temperature).sample()
 
+    def sample_event_types(self, event_logits, random_spec):
+        if random_spec is None:
+            random_spec = {"random_action_prob": 0.0}
+
+        if "random_action_prob" in random_spec:
+            event_indices = Categorical(logits=event_logits).sample()
+            random_p = random_spec["random_action_prob"]
+            if random_p > 0:
+                batch_size = event_logits.shape[0]
+                rand_flag = torch.empty(batch_size, device=event_logits.device).uniform_(0, 1) <= random_p
+                for batch_idx in torch.nonzero(rand_flag, as_tuple=False).reshape(-1).tolist():
+                    valid_indices = torch.nonzero(
+                        torch.isfinite(event_logits[batch_idx]),
+                        as_tuple=False,
+                    ).reshape(-1)
+                    chosen = torch.randint(
+                        valid_indices.numel(),
+                        size=(),
+                        device=event_logits.device,
+                    )
+                    event_indices[batch_idx] = valid_indices[chosen]
+            return event_indices
+
+        temperature = random_spec["T"]
+        return Categorical(logits=event_logits / temperature).sample()
+
     def compute_log_path_pf(self, ret, action_indices):
         logits = ret["logits"]
         batch_idx = torch.arange(logits.shape[0], device=logits.device)
         log_p = self.logsoftmax(logits)
         return log_p[batch_idx, action_indices]
+
+    def compute_log_event_pf(self, event_logits, event_indices):
+        batch_idx = torch.arange(event_logits.shape[0], device=event_logits.device)
+        log_p = torch.log_softmax(event_logits, dim=-1)
+        return log_p[batch_idx, event_indices]
 
     def sample_time(self, logits, random_spec):
         if random_spec is None:
@@ -425,6 +554,15 @@ class ARGModel(nn.Module):
                 )
             )
         return torch.stack(features, dim=0)
+
+    def _breakpoint_feature_actions(self, actions, selected_candidates):
+        feature_actions = []
+        for action, candidate in zip(actions, selected_candidates):
+            feature_action = dict(action)
+            if candidate.get("_compact_recomb"):
+                feature_action["breakpoint"] = int(candidate["breakpoint"])
+            feature_actions.append(feature_action)
+        return feature_actions
 
     def _score_candidates(
         self,
@@ -778,6 +916,59 @@ class ARGModel(nn.Module):
         nb_seq = int(input_dict["batch_nb_seq"][batch_idx].item())
         return self._dense_candidate_actions(nb_seq, selected_event_type)
 
+    def _forced_event_types_for_batch(self, input_dict, batch_size):
+        selected_event_types = input_dict.get("selected_event_types")
+        if selected_event_types is not None:
+            if len(selected_event_types) != batch_size:
+                raise ValueError("selected_event_types must have one entry per batch item.")
+            return [
+                self._normalize_event_type_value(selected_event_types, batch_idx)
+                for batch_idx in range(batch_size)
+            ]
+
+        input_actions = input_dict.get("input_actions")
+        if input_actions is None:
+            return None
+        if len(input_actions) != batch_size:
+            raise ValueError("input_actions length must match batch size.")
+        event_types = [action.get("event_type") for action in input_actions]
+        for event_type in event_types:
+            self._validate_selected_event_type(event_type)
+        return event_types
+
+    def _normalize_event_type_value(self, selected_event_types, batch_idx):
+        if torch.is_tensor(selected_event_types):
+            return self._event_type_from_index(int(selected_event_types[batch_idx].item()))
+        event_type = selected_event_types[batch_idx]
+        self._validate_selected_event_type(event_type)
+        return event_type
+
+    def _event_type_from_index(self, event_idx):
+        idx_to_event = {idx: event for event, idx in self.EVENT_TO_IDX.items()}
+        event_type = idx_to_event.get(int(event_idx))
+        self._validate_selected_event_type(event_type)
+        return event_type
+
+    def _event_type_logits(self, summary_reps, states, candidate_actions):
+        learned_logits = self.event_type_scorer(summary_reps)
+        prior_logits = learned_logits.new_full(learned_logits.shape, float("-inf"))
+
+        for batch_idx, actions in enumerate(candidate_actions):
+            available_events = {action["event_type"] for action in actions}
+            if states is not None:
+                probs = self.env.compute_event_probabilities(states[batch_idx])
+                for event_type, event_idx in self.EVENT_TO_IDX.items():
+                    probability = float(probs.get(event_type, 0.0))
+                    if event_type in available_events and probability > 0.0:
+                        prior_logits[batch_idx, event_idx] = math.log(probability)
+            else:
+                if available_events:
+                    log_prob = -math.log(len(available_events))
+                    for event_type in available_events:
+                        prior_logits[batch_idx, self.EVENT_TO_IDX[event_type]] = log_prob
+
+        return learned_logits + prior_logits
+
     def _state_candidate_actions(self, state, selected_event_type=None):
         self._validate_selected_event_type(selected_event_type)
         prior_options = self.env.enumerate_prior_options(state)
@@ -943,7 +1134,7 @@ class ARGModel(nn.Module):
 
     def _materialize_candidate_action(self, candidate_action, device, strip_internal=True):
         action = dict(candidate_action)
-        if action.get("_compact_recomb"):
+        if action.get("_compact_recomb") and self.breakpoint_policy == "uniform":
             breakpoint_count = int(action["_breakpoint_count"])
             if breakpoint_count <= 0:
                 raise ValueError(f"Compact recombination candidate has no valid breakpoints: {action}")
@@ -958,6 +1149,83 @@ class ARGModel(nn.Module):
         if strip_internal:
             return self._strip_internal_action_keys(action)
         return action
+
+    def _sample_learned_breakpoints(self, actions, breakpoint_logits, random_spec=None):
+        mix_logits, locs, scales = self._breakpoint_distribution_params(breakpoint_logits)
+        for batch_idx, action in enumerate(actions):
+            if not action.get("_compact_recomb"):
+                continue
+            breakpoint_count = int(action["_breakpoint_count"])
+            if breakpoint_count <= 0:
+                raise ValueError(f"Compact recombination candidate has no valid breakpoints: {action}")
+            component = Categorical(logits=mix_logits[batch_idx]).sample()
+            noise = torch.randn((), dtype=locs.dtype, device=locs.device)
+            raw_position = locs[batch_idx, component] + scales[batch_idx, component] * noise
+            normalized = torch.sigmoid(raw_position)
+            offset = int(
+                torch.floor(normalized * float(breakpoint_count))
+                .clamp(0, breakpoint_count - 1)
+                .detach()
+                .cpu()
+                .item()
+            )
+            action["breakpoint"] = int(action["_breakpoint_span_start"]) + offset
+
+    def _breakpoint_distribution_params(self, breakpoint_logits):
+        params = breakpoint_logits.reshape(-1, self.breakpoint_mixtures, 3)
+        mix_logits = params[:, :, 0]
+        locs = params[:, :, 1].clamp(-12.0, 12.0)
+        scales = F.softplus(params[:, :, 2]).clamp_min(1e-3).clamp_max(12.0)
+        return mix_logits, locs, scales
+
+    def _learned_breakpoint_log_pf(self, actions, breakpoint_logits, reference):
+        values = []
+        for batch_idx, action in enumerate(actions):
+            if action.get("_compact_recomb"):
+                values.append(
+                    self._learned_breakpoint_bin_log_prob(
+                        action,
+                        breakpoint_logits[batch_idx],
+                    )
+                )
+            else:
+                values.append(reference.new_tensor(0.0))
+        return torch.stack(values).to(dtype=reference.dtype, device=reference.device)
+
+    def _learned_breakpoint_bin_log_prob(self, action, breakpoint_logits_row):
+        breakpoint_count = int(action["_breakpoint_count"])
+        breakpoint_start = int(action["_breakpoint_span_start"])
+        breakpoint = int(action["breakpoint"])
+        offset = breakpoint - breakpoint_start
+        if offset < 0 or offset >= breakpoint_count:
+            raise ValueError(f"Breakpoint is outside compact candidate span: {action}")
+
+        lower = float(offset) / float(breakpoint_count)
+        upper = float(offset + 1) / float(breakpoint_count)
+        mix_logits, locs, scales = self._breakpoint_distribution_params(
+            breakpoint_logits_row.reshape(1, -1)
+        )
+        mix_logits = mix_logits[0]
+        locs = locs[0]
+        scales = scales[0]
+        standard_normal = torch.distributions.Normal(
+            torch.zeros_like(locs),
+            torch.ones_like(scales),
+        )
+        lower_cdf = self._breakpoint_boundary_cdf(lower, locs, scales, standard_normal)
+        upper_cdf = self._breakpoint_boundary_cdf(upper, locs, scales, standard_normal)
+        component_mass = (upper_cdf - lower_cdf).clamp_min(0.0)
+        mixture_mass = (torch.softmax(mix_logits, dim=-1) * component_mass).sum()
+        return torch.log(mixture_mass.clamp_min(1e-12))
+
+    def _breakpoint_boundary_cdf(self, value, locs, scales, standard_normal):
+        if value <= 0.0:
+            return locs.new_zeros(locs.shape)
+        if value >= 1.0:
+            return locs.new_ones(locs.shape)
+        value_tensor = locs.new_tensor(value).clamp(1e-7, 1.0 - 1e-7)
+        boundary = torch.logit(value_tensor)
+        return standard_normal.cdf((boundary - locs) / scales)
 
     def _merge_candidate_metadata(self, action, candidate_action):
         if not candidate_action.get("_compact_recomb"):

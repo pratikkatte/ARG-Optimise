@@ -1,6 +1,3 @@
-import math
-
-import numpy as np
 import torch
 
 
@@ -81,10 +78,6 @@ class RolloutWorker:
                 dtype=torch.long,
                 device=device,
             )
-            selected_event_types, log_event_probs = self._sample_event_types(
-                active_states,
-                device=device,
-            )
             input_dict = self.env.prepare_state_rollout_inputs(
                 active_states,
                 input_actions=None,
@@ -92,8 +85,6 @@ class RolloutWorker:
                 batch_nb_seq=batch_nb_seq,
                 device=device,
             )
-            input_dict["selected_event_types"] = selected_event_types
-            input_dict["log_event_probs"] = log_event_probs
 
             ret = generator(input_dict)
             actions = ret.get("actions", ret.get("arg_actions"))
@@ -205,8 +196,8 @@ class RolloutWorker:
         """
         Run one or more ARG rollouts.
 
-        Passing a generator uses prior event-type sampling plus model action
-        sampling. Omitting it keeps the prior-only rollout path.
+        Passing a generator lets the model sample over all valid ARG actions.
+        Omitting it keeps the prior-only rollout path.
         """
         if num_trajectories is not None:
             episodes = num_trajectories
@@ -237,31 +228,6 @@ class RolloutWorker:
 
     def sample_action_from_prior(self, state):
         return self.env.sample_action_from_prior(state)
-
-    def _sample_event_types(self, states, device=None):
-        selected_event_types = []
-        log_event_probs = []
-        for state in states:
-            probs = self.env.compute_event_probabilities(state)
-            coal_prob = float(probs.get("coal", 0.0))
-            recomb_prob = float(probs.get("recomb", 0.0))
-            if coal_prob <= 0.0 and recomb_prob <= 0.0:
-                raise RuntimeError("ARG rollout reached a non-terminal state with no valid event type.")
-
-            event_types = ["coal", "recomb"]
-            event_probs = [coal_prob, recomb_prob]
-            idx = np.random.choice(len(event_types), p=event_probs)
-            event_type = event_types[idx]
-            event_prob = event_probs[idx]
-
-            selected_event_types.append(event_type)
-            log_event_probs.append(math.log(event_prob))
-        
-        return selected_event_types, torch.tensor(
-            log_event_probs,
-            dtype=torch.float32,
-            device=device,
-        )
 
     def _states_to_padded_tree_features(self, states, device=None):
         lineage_features = [
