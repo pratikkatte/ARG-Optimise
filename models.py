@@ -25,6 +25,7 @@ class ARGModel(nn.Module):
     def __init__(self, env, cfg=None):
         super().__init__()
         self.env = env
+        self.device = env.device
         embedding_size = 32
         hidden_size = 64
         dropout = 0.0
@@ -93,7 +94,7 @@ class ARGModel(nn.Module):
     def model_params(self):
         return list(self.parameters())
 
-    def _encode_states(self, states, batch_nb_seq=None):
+    def _encode_states(self, states):
         device = self.source_seq_arrays.device
         dtype = self.source_seq_arrays.dtype
         batch_size = len(states)
@@ -101,12 +102,13 @@ class ARGModel(nn.Module):
             raise ValueError("ARGModel.forward requires at least one state")
 
         active_counts = [len(state.active_lineages) for state in states]
-        max_active = max(active_counts)
+        batch_active_lineage_counts = torch.tensor(active_counts, dtype=torch.long, device=device)
+        max_material_segments = max([max([lineage.material_segments.count for lineage in state.active_lineages]) for state in states])
         sequence_length = self.source_seq_arrays.shape[1]
-        lineage_features = self.source_seq_arrays.new_zeros(
+        lineage_seq_features = self.source_seq_arrays.new_zeros(
             batch_size,
-            max_active,
             sequence_length,
+            max_material_segments,
             4,
         )
 
@@ -116,39 +118,28 @@ class ARGModel(nn.Module):
                     feature = self.source_seq_arrays[lineage.sequences_indices].mean(dim=0)
                 else:
                     feature = self.source_seq_arrays.new_zeros(sequence_length, 4)
-                weights = self._material_segments_to_site_weights(
+                weights = self._material_segments_masking(
                     lineage.material_segments,
                     device=device,
                     dtype=dtype,
                 )
-                lineage_features[batch_idx, lineage_idx] = feature * weights[:, None]
+                lineage_seq_features[batch_idx, lineage_idx] = feature * weights[:, None]
 
-        if batch_nb_seq is None:
-            batch_nb_seq = torch.tensor(active_counts, dtype=torch.long, device=device)
+        return self._encode_lineage_features(lineage_seq_features, batch_active_lineage_counts)
 
-        return self._encode_lineage_features(lineage_features, batch_nb_seq)
-
-    def _material_segments_to_site_weights(self, material_segments, device, dtype):
+    def _material_segments_masking(self, material_segments, device, dtype):
         sequence_length = int(self.source_seq_arrays.shape[1])
-        weights = [0.0 for _ in range(sequence_length)]
+        weights = torch.zeros(sequence_length, dtype=torch.float64)  # or float32 if preferred
         num_blocks = float(max(int(self.env.num_blocks), 1))
-        site_width = num_blocks / float(sequence_length)
-        if site_width <= 0:
-            return torch.zeros(sequence_length, dtype=dtype, device=device)
-
+        # site_width = float(sequence_length) / num_blocks
+   
         for segment_start, segment_end in material_segments.segments:
             start = max(float(segment_start), 0.0)
             end = min(float(segment_end), num_blocks)
             if end <= start:
-                continue
-            first_site = max(0, int(math.floor(start / site_width)))
-            last_site = min(sequence_length - 1, int(math.ceil(end / site_width)) - 1)
-            for site_idx in range(first_site, last_site + 1):
-                site_start = float(site_idx) * site_width
-                site_end = site_start + site_width
-                overlap = min(end, site_end) - max(start, site_start)
-                if overlap > 0:
-                    weights[site_idx] = min(1.0, weights[site_idx] + overlap / site_width)
+                raise ValueError("segment end must be greater than start")
+
+            weights[start:end] = 1.0
         return torch.tensor(weights, dtype=dtype, device=device)
 
     def _material_segments_to_bin_weights(self, material_segments, device, dtype):
@@ -161,69 +152,38 @@ class ARGModel(nn.Module):
         )
         return pooled.reshape(-1)
 
-    def _encode_dense_inputs(self, input_dict):
-        seq_features = self._dense_seq_features(input_dict)
-        return self._encode_lineage_features(seq_features, input_dict.get("batch_nb_seq"))
-
-    def _dense_seq_features(self, input_dict):
-        if "batch_seq_features" in input_dict:
-            return input_dict["batch_seq_features"].float()
-
-        batch_input = input_dict["batch_input"].float()
-        if batch_input.dim() != 3:
-            raise ValueError("batch_input must have shape (batch, active_lineages, features)")
-
-        batch_size, active_lineages, feature_size = batch_input.shape
-        if feature_size == self.seq_embedding.in_features:
-            seq_len = self.sequence_encoder_bins
-        elif feature_size == int(self.env.sequence_length) * 4:
-            seq_len = int(self.env.sequence_length)
-        elif feature_size % 4 == 0:
-            seq_len = feature_size // 4
-        else:
-            raise ValueError(
-                "batch_input last dimension must be divisible by 4 or match "
-                f"the encoded input size ({self.seq_embedding.in_features}), got {feature_size}"
-            )
-        return batch_input.reshape(batch_size, active_lineages, seq_len, 4)
-
-    def _encode_lineage_features(self, seq_features, batch_nb_seq=None):
-        device = self.seq_embedding.weight.device
-        seq_features = seq_features.to(device=device, dtype=torch.float32)
+    def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
+        
+        seq_features = lineage_seq_features.to(device=self.device, dtype=torch.float32)
         if seq_features.dim() != 4:
             raise ValueError(
                 "sequence features must have shape "
                 "(batch, active_lineages, sequence_length_or_bins, channels)"
             )
 
-        batch_size, active_lineages, seq_len, channels = seq_features.shape
-        if channels != 4:
-            raise ValueError(f"Expected 4 sequence channels, got {channels}")
+        batch_size, active_lineages, _, _ = seq_features.shape
+        
+        # seq_features = self._pool_sequence_features(seq_features, seq_len, channels)
 
-        if active_lineages <= 0:
-            raise ValueError("sequence features must contain at least one active lineage")
-
-        seq_features = self._pool_sequence_features(seq_features, seq_len, channels)
-
-        batch_input = seq_features.reshape(batch_size, active_lineages, -1)
+        batch_input = lineage_seq_features.reshape(batch_size, active_lineages, -1)
         if batch_input.shape[-1] != self.seq_embedding.in_features:
             raise ValueError(
                 "Encoded batch_input last dimension must match sequence_encoder_bins * 4 "
                 f"({self.seq_embedding.in_features}), got {batch_input.shape[-1]}"
             )
 
-        if batch_nb_seq is not None:
+        if batch_active_lineage_counts is not None:
             batch_nb_seq = torch.as_tensor(batch_nb_seq, dtype=torch.long, device=device)
             if batch_nb_seq.shape != (batch_size,):
                 raise ValueError("batch_nb_seq must have one entry per batch item")
             if torch.any(batch_nb_seq < 0) or torch.any(batch_nb_seq > active_lineages):
                 raise ValueError("batch_nb_seq entries must be between 0 and active_lineages")
         else:
-            batch_nb_seq = torch.full(
+            batch_active_lineage_counts = torch.full(
                 (batch_size,),
                 active_lineages,
                 dtype=torch.long,
-                device=device,
+                device=self.device,
             )
 
         lineage_reps = self.seq_embedding(batch_input)
@@ -252,20 +212,17 @@ class ARGModel(nn.Module):
     def forward(self, input_dict):
         states = input_dict.get("states")
         if states is not None:
+            ## State encoding.
             lineage_reps, summary_reps, seq_features, batch_nb_seq = self._encode_states(
                 states,
                 input_dict.get("batch_nb_seq"),
             )
         else:
-            lineage_reps, summary_reps, seq_features, batch_nb_seq = self._encode_dense_inputs(
-                input_dict
-            )
+            raise ValueError("States are required for the model to run.")
 
         batch_size, max_nb_seq, _ = lineage_reps.shape
-        device = lineage_reps.device
-        valid_mask = torch.arange(max_nb_seq, device=device)[None, :] < batch_nb_seq[:, None]
+        valid_mask = torch.arange(max_nb_seq, device=self.device)[None, :] < batch_nb_seq[:, None]
         lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
-        action_options = input_dict.get("action_options")
         all_candidate_actions = input_dict.get("input_actions")
         if states is None:
             raise ValueError("CWR event-rate sampling requires state-based rollout inputs.")
@@ -294,33 +251,19 @@ class ARGModel(nn.Module):
         )
         mask = torch.isneginf(logits)
 
-        if input_actions is None:
-            action_indices = self.sample({"logits": logits, "candidate_actions": all_candidate_actions},
-                                         input_dict.get("random_spec"))
-            selected_candidates = [
-                all_candidate_actions[batch_idx][action_indices[batch_idx].item()]
-                for batch_idx in range(batch_size)
-            ]
-            actions = [
-                self._materialize_candidate_action(
-                    selected_candidates[batch_idx],
-                    device,
-                    strip_internal=False,
-                )
-                for batch_idx in range(batch_size)
-            ]
-        else:
-            if len(input_actions) != batch_size:
-                raise ValueError("input_actions length must match batch size.")
-            action_indices = self._indices_for_input_actions(input_actions, all_candidate_actions, device)
-            selected_candidates = [
-                all_candidate_actions[batch_idx][action_indices[batch_idx].item()]
-                for batch_idx in range(batch_size)
-            ]
-            actions = [
-                self._merge_candidate_metadata(dict(action), selected_candidates[batch_idx])
-                for batch_idx, action in enumerate(input_actions)
-            ]
+        choosen_actions = self.sample(logits, all_candidate_actions, input_dict.get("random_spec"))
+        # if input_actions is not None:
+        #     if len(input_actions) != batch_size:
+        #         raise ValueError("input_actions length must match batch size.")
+        #     action_indices = self._indices_for_input_actions(input_actions, all_candidate_actions, device)
+        #     selected_candidates = [
+        #         all_candidate_actions[batch_idx][action_indices[batch_idx].item()]
+        #         for batch_idx in range(batch_size)
+        #     ]
+        #     actions = [
+        #         self._merge_candidate_metadata(dict(action), selected_candidates[batch_idx])
+        #         for batch_idx, action in enumerate(input_actions)
+        #     ]
 
         log_action_pf = self.compute_log_path_pf({"logits": logits}, action_indices)
         (
@@ -395,7 +338,7 @@ class ARGModel(nn.Module):
             "event_log_probs": event_log_probs,
         }
 
-    def sample(self, ret, random_spec):
+    def sample(self, ret, random_spec=None):
         logits = ret["logits"]
         if random_spec is None:
             return Categorical(logits=logits).sample()
@@ -405,7 +348,7 @@ class ARGModel(nn.Module):
 
     def compute_log_path_pf(self, ret, action_indices):
         logits = ret["logits"]
-        batch_idx = torch.arange(logits.shape[0], device=logits.device)
+        batch_idx = torch.arange(logits.shape[0], device=self.device)
         log_p = self.logsoftmax(logits)
         return log_p[batch_idx, action_indices]
 
@@ -886,218 +829,6 @@ class ARGModel(nn.Module):
             ],
             dtype=torch.float32,
             device=device,
-        )
-
-    # def _candidate_actions_for_batch_item(
-    #     self,
-    #     input_dict,
-    #     batch_idx,
-    #     states,
-    #     action_options,
-    #     batch_size,
-    # ):
-    #     options = self._action_options_for_batch_item(action_options, batch_idx, batch_size) ## Validating actions
-    #     if options is not None:
-    #         return self._actions_from_options(options)
-
-    #     if states is not None:
-    #         return self._state_candidate_actions(states[batch_idx])
-
-    #     nb_seq = int(input_dict["batch_nb_seq"][batch_idx].item())
-    #     return self._dense_candidate_actions(nb_seq)
-
-    def _event_type_from_index(self, event_idx):
-        idx_to_event = {idx: event for event, idx in self.EVENT_TO_IDX.items()}
-        event_type = idx_to_event.get(int(event_idx))
-        self._validate_selected_event_type(event_type)
-        return event_type
-
-    def _cwr_event_log_probs(self, states, candidate_actions, device, dtype):
-        event_log_probs = torch.full(
-            (len(states), len(self.EVENT_TO_IDX)),
-            float("-inf"),
-            dtype=dtype,
-            device=device,
-        )
-        for batch_idx, (state, actions) in enumerate(zip(states, candidate_actions)):
-            available_events = {action["event_type"] for action in actions}
-            probabilities = self.env.compute_event_probabilities(state)
-            for event_type, event_idx in self.EVENT_TO_IDX.items():
-                probability = float(probabilities.get(event_type, 0.0))
-                if event_type in available_events and probability > 0.0:
-                    event_log_probs[batch_idx, event_idx] = math.log(probability)
-        return event_log_probs
-
-    def _event_log_pf(self, event_log_probs, event_indices):
-        batch_idx = torch.arange(event_log_probs.shape[0], device=event_log_probs.device)
-        return event_log_probs[batch_idx, event_indices]
-
-    # def _state_candidate_actions(self, state, selected_event_type=None):
-    #     self._validate_selected_event_type(selected_event_type)
-    #     if hasattr(self.env, "enumerate_prior_options"):
-    #         prior_options = self.env.enumerate_prior_options(state)
-    #         coal_actions = prior_options.coal_actions
-    #         recomb_actions = prior_options.recomb_choices
-    #         rates = prior_options.rates
-    #     else:
-    #         coal_actions, recomb_actions = self.env.enumerate_actions(state)
-    #         rates = self.env.compute_event_rates((coal_actions, recomb_actions))
-    #     actions = []
-    #     if selected_event_type in (None, "coal") and rates["lambda_coal"] > 0:
-    #         actions.extend(self._candidate_action_from_option(choice) for choice in coal_actions)
-    #     if selected_event_type in (None, "recomb") and rates["lambda_recomb"] > 0:
-    #         actions.extend(
-    #             self._candidate_action_from_option(choice)
-    #             for choice in recomb_actions
-    #             if choice.breakpoint_count > 0
-    #         )
-    #     return actions
-
-    # def _dense_candidate_actions(self, nb_seq, selected_event_type=None):
-    #     self._validate_selected_event_type(selected_event_type)
-    #     actions = []
-    #     if selected_event_type in (None, "coal"):
-    #         actions.extend(
-    #             {"event_type": "coal", "active_lineage_i": i, "active_lineage_j": j}
-    #             for i, j in itertools.combinations(range(nb_seq), 2)
-    #         )
-    #     if selected_event_type in (None, "recomb") and getattr(self.env, "rho", 1.0) > 0:
-    #         actions.extend(
-    #             {
-    #                 "event_type": "recomb",
-    #                 "active_lineage_i": i,
-    #                 "breakpoint": breakpoint,
-    #             }
-    #             for i in range(nb_seq)
-    #             for breakpoint in range(1, self.env.num_blocks)
-    #         )
-    #     return actions
-
-    # def _validate_selected_event_type(self, selected_event_type):
-    #     if selected_event_type is not None and selected_event_type not in self.EVENT_TO_IDX:
-    #         raise ValueError(f"Unknown ARG selected_event_type: {selected_event_type}")
-
-    def _action_options_for_batch_item(self, action_options, batch_idx, batch_size):
-        if action_options is None:
-            return None
-        if (
-            self._looks_like_three_part_action_options_tuple(action_options)
-            or self._looks_like_two_part_action_options_tuple(action_options)
-        ):
-            return action_options
-        if self._looks_like_action_dict_list(action_options):
-            return action_options
-        if isinstance(action_options, (list, tuple)) and len(action_options) == batch_size:
-            return action_options[batch_idx]
-        return action_options
-
-    def _actions_from_options(self, options):
-        if self._looks_like_three_part_action_options_tuple(options):
-            coal_actions, _, recomb_actions = options
-            return [
-                self._candidate_action_from_option(action)
-                for action in list(coal_actions) + list(recomb_actions)
-            ]
-        if self._looks_like_two_part_action_options_tuple(options):
-            coal_actions, recomb_actions = options
-            return [
-                self._candidate_action_from_option(action)
-                for action in list(coal_actions) + list(recomb_actions)
-            ]
-        if isinstance(options, dict):
-            return [self._candidate_action_from_option(options)]
-        if isinstance(options, (list, tuple)):
-            return [self._candidate_action_from_option(action) for action in options]
-        raise ValueError("action_options must contain action dicts or env.enumerate_action_options tuples.")
-
-    def _candidate_action_from_option(self, option):
-        if isinstance(option, dict):
-            action = dict(option)
-        elif hasattr(option, "as_dict"):
-            action = option.as_dict()
-        elif all(hasattr(option, attr) for attr in ("active_lineage_i", "span_start", "span_end", "material_count")):
-            action = {
-                "event_type": "recomb",
-                "active_lineage_i": int(option.active_lineage_i),
-                "material_count": int(option.material_count),
-                "span_start": int(option.span_start),
-                "span_end": int(option.span_end),
-            }
-            if getattr(option, "breakpoint", None) is not None:
-                action["breakpoint"] = int(option.breakpoint)
-            if getattr(option, "time_action", None) is not None:
-                action["time_action"] = int(option.time_action)
-        else:
-            raise ValueError(f"Unsupported ARG action option: {option}")
-
-        return self._normalize_candidate_action(action)
-
-    def _normalize_candidate_action(self, action):
-        event_type = action.get("event_type")
-        self._validate_selected_event_type(event_type)
-        if event_type == "coal":
-            return {
-                "event_type": "coal",
-                "active_lineage_i": int(action["active_lineage_i"]),
-                "active_lineage_j": int(action["active_lineage_j"]),
-            }
-
-        normalized = {
-            "event_type": "recomb",
-            "active_lineage_i": int(action["active_lineage_i"]),
-        }
-        if action.get("breakpoint") is not None:
-            normalized["breakpoint"] = int(action["breakpoint"])
-
-        if "span_start" in action and "span_end" in action:
-            span_start = int(action["span_start"])
-            span_end = int(action["span_end"])
-        elif "_breakpoint_span_start" in action and "_breakpoint_span_end" in action:
-            span_start = int(action["_breakpoint_span_start"]) - 1
-            span_end = int(action["_breakpoint_span_end"])
-        elif "breakpoint" in normalized:
-            span_start = int(normalized["breakpoint"]) - 1
-            span_end = int(normalized["breakpoint"])
-        else:
-            raise ValueError(f"Recombination action option is missing a span: {action}")
-
-        material_count = int(action.get("material_count", max(span_end - span_start + 1, 0)))
-        breakpoint_start = span_start + 1
-        breakpoint_end = span_end
-        normalized.update(
-            {
-                "material_count": material_count,
-                "span_start": span_start,
-                "span_end": span_end,
-                "_breakpoint_span_start": breakpoint_start,
-                "_breakpoint_span_end": breakpoint_end,
-                "_breakpoint_count": max(breakpoint_end - breakpoint_start + 1, 0),
-            }
-        )
-        return normalized
-
-    def _looks_like_three_part_action_options_tuple(self, value):
-        return (
-            isinstance(value, tuple)
-            and len(value) == 3
-            and isinstance(value[0], list)
-            and isinstance(value[1], list)
-            and isinstance(value[2], list)
-        )
-
-    def _looks_like_two_part_action_options_tuple(self, value):
-        return (
-            isinstance(value, tuple)
-            and len(value) == 2
-            and isinstance(value[0], list)
-            and isinstance(value[1], list)
-        )
-
-    def _looks_like_action_dict_list(self, value):
-        return (
-            isinstance(value, (list, tuple))
-            and len(value) > 0
-            and all(isinstance(item, dict) for item in value)
         )
 
     def _indices_for_input_actions(self, input_actions, candidate_actions, device):

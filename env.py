@@ -579,7 +579,7 @@ class SimpleARGEnvironment:
     ):
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
-
+        self.event_types = ["coal", "recomb"]
         self.device = device
 
         if self.sequences is not None:
