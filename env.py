@@ -497,6 +497,46 @@ def action_as_dict(action):
         return result
     raise ValueError(f"Unknown ARG action: {action}")
 
+
+def canonicalize_action(action, active_lineages=None):
+    coal_action = CoalescenceChoice.from_action(action)
+    if coal_action is not None:
+        return coal_action
+
+    recomb_action = RecombinationChoice.from_action(action)
+    if recomb_action is not None:
+        return recomb_action
+
+    if not isinstance(action, dict) or action.get("event_type") != "recomb":
+        raise ValueError(f"Unknown ARG action: {action}")
+
+    active_lineage_i = action.get("active_lineage_i")
+    breakpoint = action.get("breakpoint")
+    if not isinstance(active_lineage_i, numbers.Integral) or not isinstance(breakpoint, numbers.Integral):
+        raise ValueError(f"Invalid recombination action: {action}")
+
+    if active_lineages is None:
+        raise ValueError(
+            "Recombination actions without material metadata require active_lineages"
+        )
+    active_lineage_i = int(active_lineage_i)
+    if not 0 <= active_lineage_i < len(active_lineages):
+        raise ValueError(f"Invalid active lineage index in recombination action: {action}")
+
+    span = active_lineages[active_lineage_i].material_span
+    if span is None:
+        raise ValueError(f"Active lineage has no valid recombination span: {action}")
+    span_start, span_end, material_count = span
+    time_action = action.get("time_action")
+    return RecombinationChoice(
+        active_lineage_i=active_lineage_i,
+        material_count=int(action.get("material_count", material_count)),
+        span_start=int(action.get("span_start", span_start)),
+        span_end=int(action.get("span_end", span_end)),
+        breakpoint=int(breakpoint),
+        time_action=int(time_action) if time_action is not None else None,
+    )
+
 class ARGReward:
     """
     Terminal reward helpers for constructed ARG states.
@@ -535,10 +575,12 @@ class SimpleARGEnvironment:
         sequences: Optional[Sequence[Any]] = None,
         seed: Optional[int] = 7,
         bp_per_blocks: int = 1,
+        device: Optional[torch.device] = 'cpu',
     ):
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
 
+        self.device = device
 
         if self.sequences is not None:
             num_sequences = len(self.sequences)
@@ -803,6 +845,36 @@ class SimpleARGEnvironment:
     def compute_recombination_actions(self, state):
         return list(RecombinationChoice.enumerate_from_active_lineages(state.active_lineages))
 
+    def enumerate_prior_options(self, state):
+        coal_actions, recomb_actions = self.enumerate_actions(state)
+        rates = self.compute_event_rates((coal_actions, recomb_actions))
+        state.rates = rates
+        prior_options = PriorActionOptions(
+            coal_actions=tuple(coal_actions),
+            recomb_choices=tuple(recomb_actions),
+            rates=rates,
+        )
+        state.prior_options = prior_options
+        return prior_options
+
+    def action_options_from_prior_options(self, prior_options):
+        actions = []
+        if prior_options.rates["lambda_coal"] > 0:
+            actions.extend(choice.as_dict() for choice in prior_options.coal_actions)
+        if prior_options.rates["lambda_recomb"] > 0:
+            actions.extend(
+                {
+                    "event_type": "recomb",
+                    "active_lineage_i": int(choice.active_lineage_i),
+                    "material_count": int(choice.material_count),
+                    "span_start": int(choice.span_start),
+                    "span_end": int(choice.span_end),
+                }
+                for choice in prior_options.recomb_choices
+                if choice.breakpoint_count > 0
+            )
+        return actions
+
 
     def is_terminal(self, state):
         if state.total_active_blocks is None:
@@ -812,17 +884,18 @@ class SimpleARGEnvironment:
             # bool(np.all(self.get_active_counts(state) == 1)) ## another way, realtime compute. 
             return result
 
-    def _finalize_transition_state(self, next_state, log_prior):
-        next_state.accumulated_log_prior += log_prior
+    def _finalize_transition_state(self, next_state, log_prior, compute_reward=True):
+        if log_prior is not None:
+            next_state.accumulated_log_prior += log_prior
         next_state.is_done = self.is_terminal(next_state)
-        if next_state.is_done:
+        if next_state.is_done and compute_reward:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
             next_state.log_reward = self.compute_terminal_log_reward(next_state, log_likelihood)
         else:
             next_state.log_reward = None
         return next_state
 
-    def apply_coalescence(self, state, action, log_prior=None):
+    def apply_coalescence(self, state, action, log_prior=None, compute_reward=True):
 
         rates = state.rates
 
@@ -865,9 +938,9 @@ class SimpleARGEnvironment:
         next_state.max_node_idx = parent.node_id
         if next_state.total_active_blocks is not None:
             next_state.total_active_blocks = int(next_state.total_active_blocks) - overlap_count
-        return self._finalize_transition_state(next_state, log_prior)
+        return self._finalize_transition_state(next_state, log_prior, compute_reward=compute_reward)
 
-    def apply_recombination(self, state, action, log_prior=None):
+    def apply_recombination(self, state, action, log_prior=None, compute_reward=True):
         rates = state.rates
 
         # if log_prior is None:
@@ -920,13 +993,25 @@ class SimpleARGEnvironment:
         ]
         next_state.active_lineages.extend([left_parent, right_parent])
         next_state.max_node_idx = right_parent.node_id
-        return self._finalize_transition_state(next_state, log_prior)
+        return self._finalize_transition_state(next_state, log_prior, compute_reward=compute_reward)
 
-    def apply_action(self, state, action, log_prior=None):
+    def apply_action(self, state, action, log_prior=None, compute_reward=True):
+        if isinstance(action, dict):
+            action = canonicalize_action(action, active_lineages=state.active_lineages)
         if isinstance(action, RecombinationChoice):
-            return self.apply_recombination(state, action, log_prior)
+            return self.apply_recombination(
+                state,
+                action,
+                log_prior,
+                compute_reward=compute_reward,
+            )
         elif isinstance(action, CoalescenceChoice):
-            return self.apply_coalescence(state, action, log_prior)
+            return self.apply_coalescence(
+                state,
+                action,
+                log_prior,
+                compute_reward=compute_reward,
+            )
         else:
             raise ValueError(f"Unknown action event_type: {action}")
 
@@ -1046,9 +1131,16 @@ class SimpleARGEnvironment:
     #     action = canonicalize_action(action, active_lineages=state.active_lineages)
     #     return action, self.compute_cwr_event_log_prior(state, action)
 
-    def compute_cwr_event_log_prior(self, state, combined_actions, action):
+    def compute_cwr_event_log_prior(self, state, combined_actions, action=None, rates=None):
+        if action is None:
+            action = combined_actions
+            combined_actions = self.enumerate_actions(state)
         coal_actions, recomb_actions = combined_actions
-        rates = state.rates if state.rates is not None else self.compute_event_rates((coal_actions, recomb_actions))
+        if not isinstance(action, (CoalescenceChoice, RecombinationChoice)):
+            action = canonicalize_action(action, active_lineages=state.active_lineages)
+        if rates is None:
+            rates = state.rates if state.rates is not None else self.compute_event_rates((coal_actions, recomb_actions))
+        state.rates = rates
         
         total_rate = self._total_event_rate(rates)
         recomb_total_weight = sum(choice.material_count for choice in recomb_actions)
@@ -1120,54 +1212,58 @@ class SimpleARGEnvironment:
         states,
         input_actions=None,
         random_spec=None,
-        batch_nb_seq=None,
+        event_types=None,
         device=None,
     ):
         batch_size = len(states)
         if batch_size == 0:
             raise ValueError("states must contain at least one ARGState")
-        if device is None:
-            device = self.seq_arrays.device
-        else:
-            device = torch.device(device)
 
-        if batch_nb_seq is None:
-            batch_nb_seq = torch.tensor(
+        target_device = device if device is not None else self.device
+        batch_nb_seq = torch.tensor(
                 [len(state.active_lineages) for state in states],
                 dtype=torch.long,
-                device=device,
+                device=target_device,
             )
-        else:
-            batch_nb_seq = torch.as_tensor(batch_nb_seq, dtype=torch.long, device=device)
-            if batch_nb_seq.shape != (batch_size,):
-                raise ValueError("batch_nb_seq must have shape (batch,)")
 
+        action_options = []
+        for state in states:
+            prior_options = self.enumerate_prior_options(state)
+            action_options.append(self.action_options_from_prior_options(prior_options))
+        
         input_dict = {
             "states": list(states),
+            "action_options": action_options,
             "batch_nb_seq": batch_nb_seq,
             "batch_size": batch_size,
-            "batch_traj_idx": torch.arange(batch_size, device=device),
+            "batch_traj_idx": torch.arange(batch_size, device=target_device),
             "random_spec": random_spec,
         }
 
         if input_actions is not None:
             if len(input_actions) != batch_size:
                 raise ValueError("input_actions length must match batch size")
+            input_actions = [
+                action_as_dict(
+                    canonicalize_action(action, active_lineages=state.active_lineages)
+                )
+                for action, state in zip(input_actions, states)
+            ]
             input_dict["input_actions"] = input_actions
             input_dict["input_active_lineage_i"] = torch.tensor(
                 [action.get("active_lineage_i", -1) for action in input_actions],
                 dtype=torch.long,
-                device=device,
+                device=target_device,
             )
             input_dict["input_active_lineage_j"] = torch.tensor(
                 [action.get("active_lineage_j", -1) for action in input_actions],
                 dtype=torch.long,
-                device=device,
+                device=target_device,
             )
             input_dict["input_breakpoints"] = torch.tensor(
                 [action.get("breakpoint", -1) for action in input_actions],
                 dtype=torch.long,
-                device=device,
+                device=target_device,
             )
 
         return input_dict

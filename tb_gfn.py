@@ -24,6 +24,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self,
         env,
         init_z_sample_count,
+        cfg=None,
         device=None,
         verbose=False,
         log_z_lr=0.001,
@@ -37,7 +38,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.log_z_update = str(log_z_update)
 
         ## Policy model
-        self.arg_model = ARGModel(env).to(self.device)
+        self.arg_model = ARGModel(env, cfg=cfg).to(self.device)
 
         ## Z partition
         self._logZ = torch.nn.Parameter(
@@ -166,15 +167,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return self._logZ
 
     def forward(self, input_dict):
-        input_dict = self._move_input_to_device(input_dict)
+        # input_dict = self._move_input_to_device(input_dict)
         ret = self.arg_model(input_dict)
         return ret
 
-    def _move_input_to_device(self, input_dict):
-        moved = {}
-        for key, value in input_dict.items():
-            moved[key] = value.to(self.device) if torch.is_tensor(value) else value
-        return moved
 
     def update_model(self):
         if self.log_z_update != "gradient":

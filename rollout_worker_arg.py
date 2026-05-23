@@ -1,6 +1,6 @@
 import torch
-
-from env import SimpleTrajectory, Trajectory, action_as_dict, canonicalize_action
+import numpy as np
+from env import SimpleTrajectory, Trajectory, canonicalize_action
 
 
 class RolloutWorker:
@@ -8,6 +8,7 @@ class RolloutWorker:
 
     def __init__(self, env, verbose=False):
         self.env = env
+        self.device = env.device
         self.verbose = verbose
 
     def _rollout_one(
@@ -87,10 +88,9 @@ class RolloutWorker:
         generate_full_trajectories=True,
     ):
         states = [self.env.get_initial_state() for _ in range(episodes)]
-        if generate_full_trajectories:
-            trajectories = [Trajectory(state) for state in states]
-        else:
-            trajectories = [SimpleTrajectory() for _ in range(episodes)]
+        trajectories = [Trajectory(x) for x in states]
+        
+        
         log_paths_pf_by_traj = [[] for _ in range(episodes)]
         backward_num_parents_by_traj = [[] for _ in range(episodes)]
         step_counts = [0 for _ in range(episodes)]
@@ -103,20 +103,13 @@ class RolloutWorker:
             )
 
         unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
+
         while unfinished:
             active_states = [states[idx] for idx in unfinished]
-            device = self._generator_device(generator)
-            batch_nb_seq = torch.tensor(
-                [len(state.active_lineages) for state in active_states],
-                dtype=torch.long,
-                device=device,
-            )
+            
             input_dict = self.env.prepare_state_rollout_inputs(
                 active_states,
-                input_actions=None,
                 random_spec=random_spec,
-                batch_nb_seq=batch_nb_seq,
-                device=device,
             )
 
             ret = generator(input_dict)
