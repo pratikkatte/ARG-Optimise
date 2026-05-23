@@ -11,6 +11,7 @@ import wandb
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
+from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
 from utils import load_sequences
 
 
@@ -173,6 +174,8 @@ def train(
     eval_episodes=DEFAULT_EVAL_EPISODES,
     eval_every=DEFAULT_EVAL_EVERY,
     num_blocks=None,
+    time_bins=DEFAULT_TIME_BINS,
+    time_delta_bin_width=DEFAULT_TIME_DELTA_BIN_WIDTH,
     sequence_encoder_bins=DEFAULT_SEQUENCE_ENCODER_BINS,
     smoke_test=False,
 ):
@@ -199,8 +202,10 @@ def train(
         bp_per_blocks = bp_per_blocks,
         sequences=sequences,
         recombination_rate=recombination_rate,
-        effective_population_size=effective_population_size,
-        mutation_rate=mutation_rate
+        population_size=effective_population_size,
+        mutation_rate=mutation_rate,
+        time_bins=time_bins,
+        time_delta_bin_width=time_delta_bin_width,
     )
 
     generator = TBGFlowNetGenerator(
@@ -231,8 +236,9 @@ def train(
         wandb_run = wandb.init()
         wandb.config.update({
             "device": str(generator.device),
+            "time_bin_scheme": env.time_bin_scheme,
             "time_bins": env.time_bins,
-            "time_tail_probability": env.time_tail_probability,
+            "time_delta_bin_width": env.time_delta_bin_width,
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
             "recombination_rate": float(recombination_rate),
@@ -293,9 +299,10 @@ def train(
                     sequences=sequences,
                     sequence_length=sequence_length,
                     num_blocks=num_blocks,
-                    rho=rho,
+                    rho=env.rho,
+                    time_bin_scheme=env.time_bin_scheme,
                     time_bins=env.time_bins,
-                    time_tail_probability=env.time_tail_probability,
+                    time_delta_bin_width=env.time_delta_bin_width,
                     effective_population_size=effective_population_size,
                     mutation_rate=mutation_rate,
                     recombination_rate=recombination_rate,
@@ -338,8 +345,9 @@ def build_checkpoint_metadata(
     sequence_length,
     num_blocks,
     rho,
+    time_bin_scheme,
     time_bins,
-    time_tail_probability,
+    time_delta_bin_width,
     effective_population_size,
     mutation_rate,
     recombination_rate,
@@ -364,8 +372,9 @@ def build_checkpoint_metadata(
         "sequence_length": int(sequence_length),
         "num_blocks": int(num_blocks),
         "rho": float(rho),
+        "time_bin_scheme": str(time_bin_scheme),
         "time_bins": int(time_bins),
-        "time_tail_probability": float(time_tail_probability),
+        "time_delta_bin_width": float(time_delta_bin_width),
         "effective_population_size": float(effective_population_size),
         "mutation_rate": float(mutation_rate),
         "recombination_rate": float(recombination_rate),
@@ -430,6 +439,8 @@ def main():
     )
     parser.add_argument("--eval-episodes", type=int, default=DEFAULT_EVAL_EPISODES)
     parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
+    parser.add_argument("--time-bins", type=int, default=DEFAULT_TIME_BINS)
+    parser.add_argument("--time-delta-bin-width", type=float, default=DEFAULT_TIME_DELTA_BIN_WIDTH)
 
     args = parser.parse_args()
 
@@ -458,6 +469,8 @@ def main():
         eval_episodes=args.eval_episodes,
         eval_every=args.eval_every,
         num_blocks=args.num_blocks,
+        time_bins=args.time_bins,
+        time_delta_bin_width=args.time_delta_bin_width,
         sequence_encoder_bins=args.sequence_encoder_bins,
     )
 

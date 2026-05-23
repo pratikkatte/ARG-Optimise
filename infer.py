@@ -1,14 +1,13 @@
 import argparse
 import json
 import os
-import random
 
 import torch
 
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
-from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_TAIL_PROBABILITY
+from time_env import DEFAULT_TIME_BIN_SCHEME
 from train import (
     DEFAULT_LOG_Z_LR,
     DEFAULT_LOG_Z_UPDATE,
@@ -24,6 +23,9 @@ REQUIRED_METADATA_KEYS = {
     "sequence_length",
     "num_blocks",
     "rho",
+    "time_bin_scheme",
+    "time_bins",
+    "time_delta_bin_width",
     "seed",
     "init_z_sample_count",
     "sequence_encoder_bins",
@@ -111,6 +113,11 @@ def validate_metadata(metadata):
             "Checkpoint metadata is missing fields required for inference: "
             + ", ".join(missing)
         )
+    if metadata["time_bin_scheme"] != DEFAULT_TIME_BIN_SCHEME:
+        raise ValueError(
+            "This inference path requires fixed-delta time-bin checkpoints "
+            f"({DEFAULT_TIME_BIN_SCHEME}), got {metadata['time_bin_scheme']!r}."
+        )
 
 
 def environment_from_metadata(metadata, seed):
@@ -119,16 +126,14 @@ def environment_from_metadata(metadata, seed):
         sequence_length=int(metadata["sequence_length"]),
         num_blocks=int(metadata["num_blocks"]),
         rho=float(metadata["rho"]),
-        time_bins=int(metadata.get("time_bins", DEFAULT_TIME_BINS)),
-        time_tail_probability=float(
-            metadata.get("time_tail_probability", DEFAULT_TIME_TAIL_PROBABILITY)
-        ),
-        effective_population_size=float(
+        time_bins=int(metadata["time_bins"]),
+        time_delta_bin_width=float(metadata["time_delta_bin_width"]),
+        population_size=float(
             metadata.get("effective_population_size", DEFAULT_NE)
         ),
         mutation_rate=float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
         sequences=list(metadata["sequences"]),
-        rng=random.Random(seed),
+        seed=seed,
     )
 
 

@@ -32,7 +32,7 @@ class EvolutionModelTorch(torch.nn.Module):
         seq_arrays = self._seq_arrays_numpy()
         log_likelihood = 0.0
 
-        for block_start, block_end in self.env.get_arg_sequence_segments(state)["segments"]:
+        for block_start, block_end in self.get_arg_sequence_segments(state)["segments"]:
             site_start = self._block_to_site(block_start)
             site_end = self._block_to_site(block_end)
             if site_start >= site_end:
@@ -57,6 +57,24 @@ class EvolutionModelTorch(torch.nn.Module):
         if not math.isfinite(log_likelihood):
             return self._NON_FINITE_LOG_LIKELIHOOD
         return float(log_likelihood)
+
+    def get_arg_sequence_segments(self, state):
+        breakpoints = self.env._arg_edge_breakpoints(state)
+        recombination_events = self.env._arg_recombination_events(state, breakpoints)
+
+        boundaries = [0, *sorted(breakpoints), int(self.env.num_blocks)]
+        segments = [
+            (start, end)
+            for start, end in zip(boundaries, boundaries[1:])
+            if start < end
+        ]
+
+        return {
+            "breakpoints": boundaries[1:-1],
+            "segments": segments,
+            "num_segments": len(segments),
+            "recombination_events": recombination_events,
+        }
 
     def _require_terminal(self, state):
         if not self.env.is_terminal(state):
