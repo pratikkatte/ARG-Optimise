@@ -9,7 +9,13 @@ from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_TAIL_PROBABILITY
-from train import DEFAULT_MU_PER_BP, DEFAULT_NE, seed_everything
+from train import (
+    DEFAULT_LOG_Z_LR,
+    DEFAULT_LOG_Z_UPDATE,
+    DEFAULT_MU_PER_BP,
+    DEFAULT_NE,
+    seed_everything,
+)
 
 
 REQUIRED_METADATA_KEYS = {
@@ -57,6 +63,8 @@ def run_inference(
         },
         device=device,
         verbose=verbose,
+        log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
+        log_z_update=metadata.get("log_z_update", DEFAULT_LOG_Z_UPDATE),
     )
     generator.load(checkpoint, load_optimizer=False, map_location=generator.device)
     generator.eval()

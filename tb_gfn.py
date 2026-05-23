@@ -24,37 +24,36 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self,
         env,
         init_z_sample_count,
-        cfg=None,
         device=None,
         verbose=False,
-        log_z_lr=0.05,
-        log_z_update="mean",
+        log_z_lr=0.001,
+        log_z_update="gradient",
     ):
         super().__init__()
-        self.cfg = cfg
         self.env = env
         self.verbose = verbose
-        self.device = self._resolve_device(device)
+        self.device = device
         self.init_z_sample_count = init_z_sample_count
         self.log_z_update = str(log_z_update)
-        if self.log_z_update not in {"mean", "gradient"}:
-            raise ValueError("log_z_update must be one of: mean, gradient")
+
         ## Policy model
-        self.arg_model = ARGModel(env, cfg).to(self.device)
+        self.arg_model = ARGModel(env).to(self.device)
 
         ## Z partition
         self._logZ = torch.nn.Parameter(
             torch.tensor(0.0, device=self.device),
-            requires_grad=self.log_z_update == "gradient",
+            requires_grad=True,
         )
         self.max_reward_seen = float("-inf")
+
         self._initialize_log_z_from_rollouts()
-        model_params = list(self.arg_model.parameters())
-        params = [{'params': model_params, 'lr': 0.001}]
+        self.policy_params = list(self.arg_model.parameters())
+        self.log_z_params = [self._logZ] if self.log_z_update == "gradient" else []
+        params = [{'params': self.policy_params, 'lr': 0.001}]
         if self.log_z_update == "gradient":
             params.append({'params': [self._logZ], 'lr': float(log_z_lr)})
 
-        self.gradient_clipping_params = model_params
+        self.gradient_clipping_params = self.policy_params + self.log_z_params
         self.grad_clip = 10.0
         self.opt = torch.optim.Adam(
             params,
@@ -72,12 +71,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
     def _initialize_log_z_from_rollouts(self):
         if self.init_z_sample_count <= 0:
-            return
+            raise ValueError("init_z_sample_count must be positive")
         if self.verbose:
-            print(
-                f"Initializing scalar logZ from {self.init_z_sample_count} on-policy rollout(s)..."
-            )
+            print(f"Initializing scalar logZ from {self.init_z_sample_count} on-policy rollout(s)...")
+        
         worker = RolloutWorker(self.env, verbose=self.verbose)
+
         with torch.no_grad():
             outputs, _ = worker.rollout(
                 self,
@@ -94,14 +93,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 self.max_reward_seen = float(finite_rewards.max().detach().cpu().item())
             if finite_targets.numel() > 0:
                 self._logZ.data.copy_(finite_targets.mean().detach())
-
-    def _resolve_device(self, device):
-        if device is None or device == "auto":
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        resolved = torch.device(device)
-        if resolved.type == "cuda" and not torch.cuda.is_available():
-            raise ValueError("CUDA device requested but CUDA is not available.")
-        return resolved
 
     def save(self, path, metadata=None):
         directory = os.path.dirname(os.path.abspath(path))
@@ -141,13 +132,35 @@ class TBGFlowNetGenerator(torch.nn.Module):
         except TypeError:
             return torch.load(path, map_location=map_location)
 
-    def grad_norm(self):
+    @staticmethod
+    def _grad_norm(params):
         return math.sqrt(sum(
-            p.grad.norm().item() ** 2 for p in self.gradient_clipping_params if p.grad is not None
+            p.grad.detach().norm().item() ** 2 for p in params if p.grad is not None
         ))
+
+    @staticmethod
+    def _param_norm(params):
+        return math.sqrt(sum(p.detach().norm().item() ** 2 for p in params))
+
+    def grad_norm(self):
+        return self._grad_norm(self.gradient_clipping_params)
     
     def param_norm(self):
-        return math.sqrt(sum(p.norm().item() ** 2 for p in self.gradient_clipping_params))
+        return self._param_norm(self.gradient_clipping_params)
+
+    def policy_grad_norm(self):
+        return self._grad_norm(self.policy_params)
+
+    def policy_param_norm(self):
+        return self._param_norm(self.policy_params)
+
+    def log_z_grad(self):
+        if self._logZ.grad is None:
+            return 0.0
+        return float(self._logZ.grad.detach().cpu().reshape(-1)[0].item())
+
+    def log_z_grad_norm(self):
+        return self._grad_norm([self._logZ])
 
     def compute_log_Z(self):
         return self._logZ
@@ -166,13 +179,25 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def update_model(self):
         if self.log_z_update != "gradient":
             self._apply_direct_log_z_update()
+        raw_grad_norm = self.grad_norm()
+        raw_policy_grad_norm = self.policy_grad_norm()
+        raw_log_z_grad = self.log_z_grad()
+        raw_log_z_grad_norm = self.log_z_grad_norm()
+        torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
         info = {
+            'raw_grad_norm': raw_grad_norm,
             'grad_norm': self.grad_norm(),
+            'raw_policy_grad_norm': raw_policy_grad_norm,
+            'policy_grad_norm': self.policy_grad_norm(),
             'param_norm': self.param_norm(),
+            'policy_param_norm': self.policy_param_norm(),
+            'raw_log_z_grad': raw_log_z_grad,
+            'log_z_grad': self.log_z_grad(),
+            'raw_log_z_grad_norm': raw_log_z_grad_norm,
+            'log_z_grad_norm': self.log_z_grad_norm(),
             'log_z_target': self.last_log_z_target,
             'loss': self.loss.detach().cpu().item(),
         }
-        torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
         self.opt.step()
         self.opt.zero_grad()
         self.loss = torch.tensor(0.0, device=self.device)
@@ -181,7 +206,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.log_z_target_count = 0
         if self.verbose:
             print(
-                "update: loss={loss:.6f} grad_norm={grad_norm:.4f} param_norm={param_norm:.4f}".format(
+                "update: loss={loss:.6f} raw_grad_norm={raw_grad_norm:.4f} "
+                "grad_norm={grad_norm:.4f} param_norm={param_norm:.4f}".format(
                     **info
                 )
             )
@@ -506,8 +532,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
     def _replay_trajectory_for_streaming_gradient(self, rollout_worker, trajectory, coefficient):
         state = self.env.get_initial_state()
-        for record in trajectory:
-            action = dict(record["action"])
+        for action in trajectory.actions:
+            action = dict(action)
             probs = self.env.compute_event_probabilities(state)
             event_prob = float(probs.get(action["event_type"], 0.0))
             if event_prob <= 0.0:

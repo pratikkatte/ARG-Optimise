@@ -849,7 +849,7 @@ class ARGModel(nn.Module):
         rates = prior_options.rates
         actions = []
         if selected_event_type in (None, "coal") and rates["lambda_coal"] > 0:
-            actions.extend(dict(action) for action in prior_options.coal_actions)
+            actions.extend(choice.as_dict() for choice in prior_options.coal_actions)
         if selected_event_type in (None, "recomb") and rates["lambda_recomb"] > 0:
             actions.extend(
                 self._compact_recombination_action(choice)

@@ -11,10 +11,6 @@ import wandb
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
-from time_env import (
-    DEFAULT_TIME_BINS,
-    DEFAULT_TIME_TAIL_PROBABILITY,
-)
 from utils import load_sequences
 
 
@@ -22,11 +18,11 @@ DEFAULT_NE = 10000
 DEFAULT_R_PER_BP = 2e-8
 DEFAULT_MU_PER_BP = 2e-8
 DEFAULT_INIT_Z_SAMPLE_COUNT = 16
-DEFAULT_SEQUENCE_ENCODER_BINS = 1024
+DEFAULT_SEQUENCE_ENCODER_BINS = 2048
 DEFAULT_BREAKPOINT_MIXTURES = 4
-DEFAULT_LOG_Z_LR = 0.05
-DEFAULT_LOG_Z_UPDATE = "gradient"
-DEFAULT_GRAD_ACCUM_STEPS = 4
+DEFAULT_LOG_Z_LR = 1e-3
+DEFAULT_LOG_Z_UPDATE = "gradient" ## mean, gradient
+DEFAULT_GRAD_ACCUM_STEPS = 1
 DEFAULT_EVAL_EPISODES = 8
 DEFAULT_EVAL_EVERY = 10
 MODEL_VERSION = "cwr-event-learned-time-v1"
@@ -117,14 +113,14 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
         lengths = torch.tensor([len(traj) for traj in trajectories], dtype=torch.float32)
         coal_counts = torch.tensor(
             [
-                sum(1 for record in traj if record["action"].get("event_type") == "coal")
+                sum(1 for action in traj.actions if action.get("event_type") == "coal")
                 for traj in trajectories
             ],
             dtype=torch.float32,
         )
         recomb_counts = torch.tensor(
             [
-                sum(1 for record in traj if record["action"].get("event_type") == "recomb")
+                sum(1 for action in traj.actions if action.get("event_type") == "recomb")
                 for traj in trajectories
             ],
             dtype=torch.float32,
@@ -166,8 +162,6 @@ def train(
     init_z_verbose=False,
     device="auto",
     use_wandb=True,
-    time_bins=DEFAULT_TIME_BINS,
-    time_tail_probability=DEFAULT_TIME_TAIL_PROBABILITY,
     effective_population_size=DEFAULT_NE,
     mutation_rate=DEFAULT_MU_PER_BP,
     recombination_rate=DEFAULT_R_PER_BP,
@@ -193,22 +187,22 @@ def train(
         raise ValueError("num_blocks must be positive")
     if num_blocks > sequence_length:
         raise ValueError("num_blocks must be less than or equal to sequence length")
-    if smoke_test:
-        sequence_encoder_bins = min(int(sequence_encoder_bins), 256)
-    rho = 4 * float(effective_population_size) * float(recombination_rate) * sequence_length
+
+
+    bp_per_blocks = 10
+    
 
     env = SimpleARGEnvironment(
         sequence_length=sequence_length,
         num_blocks=num_blocks,
-        rho=rho,
         num_sequences=len(sequences),
+        bp_per_blocks = bp_per_blocks,
         sequences=sequences,
-        time_bins=time_bins,
-        time_tail_probability=time_tail_probability,
+        recombination_rate=recombination_rate,
         effective_population_size=effective_population_size,
-        mutation_rate=mutation_rate,
-        rng=random.Random(seed),
+        mutation_rate=mutation_rate
     )
+
     generator = TBGFlowNetGenerator(
         env,
         init_z_sample_count=init_z_sample_count,
@@ -453,8 +447,6 @@ def main():
         init_z_verbose=args.verbose,
         device=selected_device,
         use_wandb=True,
-        time_bins=DEFAULT_TIME_BINS,
-        time_tail_probability=DEFAULT_TIME_TAIL_PROBABILITY,
         effective_population_size=args.effective_population_size,
         mutation_rate=args.mutation_rate,
         recombination_rate=args.recombination_rate,

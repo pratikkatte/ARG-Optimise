@@ -1,5 +1,7 @@
 import torch
 
+from env import SimpleTrajectory, Trajectory, action_as_dict, canonicalize_action
+
 
 class RolloutWorker:
     """Rollout orchestration for the simplified ARG environment."""
@@ -15,6 +17,7 @@ class RolloutWorker:
         record_diagnostics=False,
         sample_backward=False,
         compute_reward=True,
+        generate_full_trajectories=True,
     ):
         if generator is not None:
             data, trajectories = self._rollout_batch(
@@ -24,12 +27,19 @@ class RolloutWorker:
                 record_diagnostics=record_diagnostics,
                 sample_backward=sample_backward,
                 compute_reward=compute_reward,
+                generate_full_trajectories=generate_full_trajectories,
             )
             return data, trajectories[0]
 
         state = self.env.get_initial_state()
-        trajectory = []
+        if generate_full_trajectories:
+            trajectory = Trajectory(state)
+        else:
+            trajectory = SimpleTrajectory()
         step = 0
+
+        if self.verbose:
+            print("Rolling out 1 prior-only trajectory...")
 
         while not state.is_done:
             step += 1
@@ -38,19 +48,31 @@ class RolloutWorker:
                 raise RuntimeError("ARG prior rollout reached a non-terminal state with no valid action.")
             action, log_prior = sampled
 
-            state = self.env.apply_action(
+            next_state = self.env.apply_action(
                 state,
                 action,
                 log_prior,
                 compute_reward=compute_reward,
             )
-            trajectory.append(self._trajectory_record(step, action, log_prior, state, record_diagnostics))
-
-            if self.verbose:
-                print(
-                    "step={step:02d} action={action} log_prior={log_prior:.4f} "
-                    "active={active_lineage_count} done={is_done}".format(**trajectory[-1])
+            record = self._trajectory_record(step, action, log_prior, next_state, record_diagnostics)
+            if generate_full_trajectories:
+                trajectory.update(next_state, action, log_prior, next_state.is_done, record=record)
+            else:
+                trajectory.update(
+                    action,
+                    log_prior=log_prior,
+                    log_reward=next_state.log_reward,
+                    record=record,
+                    active_lineages=state.active_lineages,
                 )
+            state = next_state
+
+        if self.verbose:
+            log_reward = state.log_reward
+            reward_str = f"{log_reward:.4f}" if log_reward is not None else "None"
+            print(
+                f"Finished prior-only trajectory: {step} steps, log_reward={reward_str}"
+            )
 
         return state, trajectory
 
@@ -62,12 +84,23 @@ class RolloutWorker:
         record_diagnostics=False,
         sample_backward=False,
         compute_reward=True,
+        generate_full_trajectories=True,
     ):
         states = [self.env.get_initial_state() for _ in range(episodes)]
-        trajectories = [[] for _ in range(episodes)]
+        if generate_full_trajectories:
+            trajectories = [Trajectory(state) for state in states]
+        else:
+            trajectories = [SimpleTrajectory() for _ in range(episodes)]
         log_paths_pf_by_traj = [[] for _ in range(episodes)]
         backward_num_parents_by_traj = [[] for _ in range(episodes)]
         step_counts = [0 for _ in range(episodes)]
+        finished_count = 0
+
+        if self.verbose:
+            print(
+                f"Rolling out {episodes} trajectory/trajectories in batch "
+                f"({len([idx for idx, state in enumerate(states) if not state.is_done])} active)..."
+            )
 
         unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
         while unfinished:
@@ -97,7 +130,10 @@ class RolloutWorker:
 
             for batch_idx, traj_idx in enumerate(unfinished):
                 state = states[traj_idx]
-                action = dict(actions[batch_idx])
+                action = canonicalize_action(
+                    actions[batch_idx],
+                    active_lineages=state.active_lineages,
+                )
                 log_prior = self.env.compute_cwr_event_log_prior(state, action)
                 log_paths_pf_by_traj[traj_idx].append(log_paths_pf[batch_idx])
 
@@ -113,23 +149,42 @@ class RolloutWorker:
                     self._count_inverse_arg_actions(next_state)
                 )
 
-                trajectories[traj_idx].append(
-                    self._trajectory_record(
-                        step_counts[traj_idx],
+                record = self._trajectory_record(
+                    step_counts[traj_idx],
+                    action,
+                    log_prior,
+                    next_state,
+                    record_diagnostics,
+                )
+                if generate_full_trajectories:
+                    trajectories[traj_idx].update(
+                        next_state,
                         action,
                         log_prior,
-                        next_state,
-                        record_diagnostics,
+                        next_state.is_done,
+                        record=record,
                     )
-                )
+                else:
+                    trajectories[traj_idx].update(
+                        action,
+                        log_prior=log_prior,
+                        log_reward=next_state.log_reward,
+                        record=record,
+                        active_lineages=state.active_lineages,
+                    )
 
-                if self.verbose:
+                if self.verbose and next_state.is_done:
+                    finished_count += 1
+                    log_reward = next_state.log_reward
+                    reward_str = (
+                        f"{log_reward:.4f}"
+                        if log_reward is not None
+                        else "None"
+                    )
                     print(
-                        "traj={traj_idx} step={step:02d} action={action} log_prior={log_prior:.4f} "
-                        "active={active_lineage_count} done={is_done}".format(
-                            traj_idx=traj_idx,
-                            **trajectories[traj_idx][-1],
-                        )
+                        f"Finished trajectory {traj_idx} "
+                        f"({finished_count}/{episodes}): "
+                        f"{step_counts[traj_idx]} steps, log_reward={reward_str}"
                     )
 
             unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
@@ -192,6 +247,7 @@ class RolloutWorker:
         sample_backward=False,
         num_trajectories=None,
         compute_reward=True,
+        generate_full_trajectories=True,
     ):
         """
         Run one or more ARG rollouts.
@@ -210,6 +266,7 @@ class RolloutWorker:
                 record_diagnostics=record_diagnostics,
                 sample_backward=sample_backward,
                 compute_reward=compute_reward,
+                generate_full_trajectories=generate_full_trajectories,
             )
 
         states = []
@@ -218,6 +275,7 @@ class RolloutWorker:
             state, trajectory = self._rollout_one(
                 record_diagnostics=record_diagnostics,
                 compute_reward=compute_reward,
+                generate_full_trajectories=generate_full_trajectories,
             )
             states.append(state)
             trajectories.append(trajectory)
@@ -316,7 +374,7 @@ class RolloutWorker:
     def _trajectory_record(self, step, action, log_prior, state, record_diagnostics):
         record = {
             "step": step,
-            "action": action,
+            "action": action_as_dict(action),
             "log_prior": log_prior,
             "active_lineage_count": len(state.active_lineages),
             "is_done": state.is_done,
