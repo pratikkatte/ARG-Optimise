@@ -1063,7 +1063,7 @@ class SimpleARGEnvironment:
         else:
             raise ValueError(f"Invalid action: {action}")
 
-        return action_log_prior + wait_log_prior if action_log_prior > 0 else -math.inf
+        return action_log_prior + wait_log_prior
 
     def prepare_rollout_inputs(self, tree_features, input_actions=None, random_spec=None, batch_nb_seq=None):
         if len(tree_features.shape) != 4:
