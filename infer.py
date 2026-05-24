@@ -28,7 +28,6 @@ REQUIRED_METADATA_KEYS = {
     "time_delta_bin_width",
     "seed",
     "init_z_sample_count",
-    "sequence_encoder_bins",
     "model_version",
 }
 
@@ -59,8 +58,7 @@ def run_inference(
         env,
         init_z_sample_count=metadata["init_z_sample_count"],
         cfg={
-            "sequence_encoder_bins": int(metadata["sequence_encoder_bins"]),
-            "breakpoint_policy": metadata.get("breakpoint_policy", "learned-bin-mass"),
+            "breakpoint_policy": metadata.get("breakpoint_policy", "continuous-bin"),
             "breakpoint_mixtures": int(metadata.get("breakpoint_mixtures", 4)),
         },
         device=device,

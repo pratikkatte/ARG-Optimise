@@ -112,124 +112,48 @@ class RolloutWorker:
                 random_spec=random_spec,
             )
 
-            ret = generator(input_dict)
-            actions = ret.get("actions", ret.get("arg_actions"))
-            if actions is None or len(actions) != len(active_states):
-                raise RuntimeError("Generator did not return one ARG action per unfinished batch item.")
-
-            log_paths_pf = ret["log_paths_pf"].reshape(-1)
-            if log_paths_pf.numel() != len(active_states):
-                raise RuntimeError("Generator forward log probabilities do not match unfinished batch size.")
+            total_log_pf, log_probs, choosen_actions = generator(input_dict)
 
             for batch_idx, traj_idx in enumerate(unfinished):
                 state = states[traj_idx]
-                action = canonicalize_action(
-                    actions[batch_idx],
-                    active_lineages=state.active_lineages,
-                )
-                log_prior = self.env.compute_cwr_event_log_prior(state, action)
-                log_paths_pf_by_traj[traj_idx].append(log_paths_pf[batch_idx])
+                coal_actions, recomb_actions = self.enumerate_actions(state)
 
-                next_state = self.env.apply_action(
+                action = choosen_actions[batch_idx]
+                log_paths_pf_by_traj[traj_idx].append(total_log_pf[batch_idx])
+                log_prior = self.compute_cwr_event_log_prior(state, (coal_actions, recomb_actions), action)
+
+                next_state = self.apply_action(
                     state,
                     action,
-                    log_prior,
-                    compute_reward=compute_reward,
+                    log_prior=log_prior,
                 )
                 states[traj_idx] = next_state
-                step_counts[traj_idx] += 1
+                trajectories[traj_idx].update(next_state, action, log_prior=log_prior, done=next_state.is_done)
+
                 backward_num_parents_by_traj[traj_idx].append(
                     self._count_inverse_arg_actions(next_state)
-                )
-
-                record = self._trajectory_record(
-                    step_counts[traj_idx],
-                    action,
-                    log_prior,
-                    next_state,
-                    record_diagnostics,
-                )
-                if generate_full_trajectories:
-                    trajectories[traj_idx].update(
-                        next_state,
-                        action,
-                        log_prior,
-                        next_state.is_done,
-                        record=record,
                     )
-                else:
-                    trajectories[traj_idx].update(
-                        action,
-                        log_prior=log_prior,
-                        log_reward=next_state.log_reward,
-                        record=record,
-                        active_lineages=state.active_lineages,
-                    )
-
-                if self.verbose and next_state.is_done:
-                    finished_count += 1
-                    log_reward = next_state.log_reward
-                    reward_str = (
-                        f"{log_reward:.4f}"
-                        if log_reward is not None
-                        else "None"
-                    )
-                    print(
-                        f"Finished trajectory {traj_idx} "
-                        f"({finished_count}/{episodes}): "
-                        f"{step_counts[traj_idx]} steps, log_reward={reward_str}"
-                    )
-
             unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
 
-        for idx, state in enumerate(states):
-            if not state.is_done:
-                raise RuntimeError(f"ARG rollout ended before batch item {idx} reached a terminal state.")
+        log_paths_pf = self._pad_log_path_lists(log_paths_pf_by_traj, torch.float32, self.device)
 
-        dtype, device = self._log_path_dtype_device(log_paths_pf_by_traj)
-        log_paths_pf = self._pad_log_path_lists(log_paths_pf_by_traj, dtype, device)
+        log_paths_pb = [
+            -torch.log(torch.tensor(num_parents, dtype=torch.float32, device=self.device))
+            for num_parents in backward_num_parents_by_traj
+            ]
+        
+        log_paths_pb = self._pad_log_path_lists(log_paths_pb, torch.float32, self.device)
 
-        log_paths_pb_vectors = []
-        backward_actions = [[] for _ in states]
-        for idx, state in enumerate(states):
-            num_parents = backward_num_parents_by_traj[idx]
-            if sample_backward:
-                backward = generator.sample_backward_from_arg(state)
-                backward_actions[idx] = backward["forward_actions"]
+        log_rewards = torch.tensor([state.log_reward for state in states], dtype=torch.float32, device=self.device)
 
-            if len(num_parents) != len(log_paths_pf_by_traj[idx]):
-                raise ValueError(
-                    "Backward parent counts must align with forward log probabilities: "
-                    f"{len(num_parents)} != {len(log_paths_pf_by_traj[idx])}"
-                )
 
-            if num_parents:
-                log_paths_pb_vectors.append(
-                    -torch.log(torch.tensor(num_parents, dtype=dtype, device=device))
-                )
-            else:
-                log_paths_pb_vectors.append(torch.empty(0, dtype=dtype, device=device))
-
-        log_paths_pb = self._pad_log_path_vectors(log_paths_pb_vectors, dtype, device)
-        log_rewards = torch.tensor(
-            [
-                float(state.log_reward)
-                if state.log_reward is not None
-                else float("nan")
-                for state in states
-            ],
-            dtype=dtype,
-            device=device,
-        )
-
-        return {
+        data = {
             "log_paths_pf": log_paths_pf,
             "log_paths_pb": log_paths_pb,
             "log_rewards": log_rewards,
-            "states": states,
-            "backward_actions": backward_actions,
-            "backward_num_parents": backward_num_parents_by_traj,
-        }, trajectories
+        },
+
+        return data, trajectories
 
     def rollout(
         self,
@@ -386,6 +310,8 @@ class RolloutWorker:
         except (AttributeError, StopIteration):
             return self.env.seq_arrays.device
 
+
+    # TODO: make it compatible with the new action space/data structure.
     def _count_inverse_arg_actions(self, state):
         count = 0
         for lineage in state.active_lineages:

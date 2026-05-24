@@ -565,8 +565,6 @@ class SimpleARGEnvironment:
         num_sequences: Optional[int] = None,
         sequence_length: Optional[int] = None,
         num_blocks: Optional[int] = None,
-        time_bins: int = 32,
-        time_delta_bin_width: float = 0.001,
         population_size: float = 10000.0,
         effective_population_size: Optional[float] = None,
         mutation_rate: float = 2e-8,
@@ -612,10 +610,7 @@ class SimpleARGEnvironment:
         )
 
         ## Time environment
-        self.time_env = TimeEnvFixedDelta(
-            bins=int(time_bins),
-            delta_bin_width=float(time_delta_bin_width),
-        )
+        self.time_env = TimeEnvFixedDelta()
 
         self.rng = random.Random(seed)
 
@@ -1210,61 +1205,24 @@ class SimpleARGEnvironment:
     def prepare_state_rollout_inputs(
         self,
         states,
-        input_actions=None,
-        random_spec=None,
-        event_types=None,
-        device=None,
     ):
         batch_size = len(states)
         if batch_size == 0:
             raise ValueError("states must contain at least one ARGState")
 
-        target_device = device if device is not None else self.device
-        batch_nb_seq = torch.tensor(
-                [len(state.active_lineages) for state in states],
-                dtype=torch.long,
-                device=target_device,
-            )
-
-        action_options = []
+        input_actions = []
         for state in states:
-            prior_options = self.enumerate_prior_options(state)
-            action_options.append(self.action_options_from_prior_options(prior_options))
-        
+            coal_actions, recomb_actions = self.enumerate_actions(state)
+            event_prob = list(self.compute_event_probabilities(state, (coal_actions, recomb_actions)).values())
+            choosen_event_types = self.event_types[np.random.choice(2, p=event_prob)]
+            if choosen_event_types == "coal":
+                input_actions.append(coal_actions)
+            else:
+                input_actions.append(recomb_actions)
         input_dict = {
-            "states": list(states),
-            "action_options": action_options,
-            "batch_nb_seq": batch_nb_seq,
-            "batch_size": batch_size,
-            "batch_traj_idx": torch.arange(batch_size, device=target_device),
-            "random_spec": random_spec,
+            "states": states,
+            input_actions: input_actions,
         }
-
-        if input_actions is not None:
-            if len(input_actions) != batch_size:
-                raise ValueError("input_actions length must match batch size")
-            input_actions = [
-                action_as_dict(
-                    canonicalize_action(action, active_lineages=state.active_lineages)
-                )
-                for action, state in zip(input_actions, states)
-            ]
-            input_dict["input_actions"] = input_actions
-            input_dict["input_active_lineage_i"] = torch.tensor(
-                [action.get("active_lineage_i", -1) for action in input_actions],
-                dtype=torch.long,
-                device=target_device,
-            )
-            input_dict["input_active_lineage_j"] = torch.tensor(
-                [action.get("active_lineage_j", -1) for action in input_actions],
-                dtype=torch.long,
-                device=target_device,
-            )
-            input_dict["input_breakpoints"] = torch.tensor(
-                [action.get("breakpoint", -1) for action in input_actions],
-                dtype=torch.long,
-                device=target_device,
-            )
 
         return input_dict
 

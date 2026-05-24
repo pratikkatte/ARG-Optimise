@@ -4,15 +4,8 @@ import os
 import numpy as np
 import torch
 
-try:
-    from .models import ARGModel
-except ImportError:
-    from models import ARGModel
-
-try:
-    from .rollout_worker_arg import RolloutWorker
-except ImportError:
-    from rollout_worker_arg import RolloutWorker
+from models import ARGModel
+from rollout_worker_arg import RolloutWorker
 
 LOSS_FN = {
     'MSE': torch.nn.MSELoss(),
@@ -28,14 +21,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
         device=None,
         verbose=False,
         log_z_lr=0.001,
-        log_z_update="gradient",
     ):
         super().__init__()
         self.env = env
         self.verbose = verbose
         self.device = device
         self.init_z_sample_count = init_z_sample_count
-        self.log_z_update = str(log_z_update)
 
         ## Policy model
         self.arg_model = ARGModel(env, cfg=cfg).to(self.device)
@@ -47,12 +38,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
         )
         self.max_reward_seen = float("-inf")
 
-        self._initialize_log_z_from_rollouts()
+        # self._initialize_log_z_from_rollouts()
         self.policy_params = list(self.arg_model.parameters())
-        self.log_z_params = [self._logZ] if self.log_z_update == "gradient" else []
+        self.log_z_params = [self._logZ]
         params = [{'params': self.policy_params, 'lr': 0.001}]
-        if self.log_z_update == "gradient":
-            params.append({'params': [self._logZ], 'lr': float(log_z_lr)})
+        params.append({'params': [self._logZ], 'lr': float(log_z_lr)})
 
         self.gradient_clipping_params = self.policy_params + self.log_z_params
         self.grad_clip = 10.0
@@ -171,10 +161,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         ret = self.arg_model(input_dict)
         return ret
 
-
     def update_model(self):
-        if self.log_z_update != "gradient":
-            self._apply_direct_log_z_update()
+
         raw_grad_norm = self.grad_norm()
         raw_policy_grad_norm = self.policy_grad_norm()
         raw_log_z_grad = self.log_z_grad()
@@ -219,11 +207,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
             self.log_z_target_sum / max(self.log_z_target_count, 1)
         )
 
-    def _apply_direct_log_z_update(self):
-        if self.log_z_target_count <= 0:
-            return
-        if self.log_z_update == "mean":
-            self._logZ.data.copy_(self._logZ.detach().new_tensor(self.last_log_z_target))
 
     def sample_backward_from_arg(self, arg_state):
         state = arg_state.clone()
@@ -450,22 +433,16 @@ class TBGFlowNetGenerator(torch.nn.Module):
         )
 
         log_pf = log_paths_pf.sum(-1)
-        log_paths_pb = torch.as_tensor(log_paths_pb, dtype=log_paths_pf.dtype, device=log_paths_pf.device)
-        if log_paths_pb.ndim == 0:
-            log_pb = log_paths_pb.expand_as(log_pf)
-        elif log_paths_pb.shape == log_pf.shape:
-            log_pb = log_paths_pb
-        else:
-            log_pb = log_paths_pb.sum(-1)
+        log_pb = log_paths_pb.sum(-1)
+
         
         log_z = self.compute_log_Z().reshape(-1).to(log_paths_pf)
-        forward_value = log_z + log_pf
-        backward_value = log_rewards + log_pb
-        if backward_value.ndim == 0 and forward_value.ndim > 0:
-            backward_value = backward_value.expand_as(forward_value)
-        elif backward_value.shape != forward_value.shape and backward_value.numel() == forward_value.numel():
-            backward_value = backward_value.reshape_as(forward_value)
-        return self.loss_fn(forward_value, backward_value)
+
+        residuals = log_z + log_pf - (log_rewards + log_pb)
+
+        loss = residuals.pow(2).mean()
+        
+        return loss
     
     def accumulate_loss(self, rollout_outputs, factor=1.0):
         loss = self.get_loss_from_rollout_outputs(rollout_outputs) / factor
@@ -478,20 +455,19 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 f"total_loss={self.loss.item():.6f} batches={self.accumulated_batches}"
             )
 
-    def accumulate_streaming_tb_loss(self, rollout_worker, rollout_outputs, trajectories, factor=1.0):
+    def accumulate_streaming_tb_loss(self,rollout_outputs,):
         """Accumulate exact TB gradients without retaining the full rollout graph."""
         log_paths_pf = rollout_outputs["log_paths_pf"].detach().to(self.device)
-        log_paths_pb = rollout_outputs["log_paths_pb"].detach().to(
-            dtype=log_paths_pf.dtype,
-            device=self.device,
-        )
-        log_rewards = torch.as_tensor(
-            rollout_outputs["log_rewards"],
-            dtype=log_paths_pf.dtype,
-            device=self.device,
-        )
+        log_paths_pb = rollout_outputs["log_paths_pb"].detach().to(device=self.device,)
+        log_rewards = torch.as_tensor(rollout_outputs["log_rewards"], device=self.device)
+
+
         log_pf = log_paths_pf.sum(-1)
-        log_pb = log_paths_pb.sum(-1) if log_paths_pb.ndim > 1 else log_paths_pb
+        log_pb = log_paths_pb.sum(-1)
+
+        log_z = self.compute_log_Z().detach()
+
+
         target_log_z_by_traj = (log_rewards + log_pb - log_pf).detach()
         self._record_log_z_targets(target_log_z_by_traj)
         policy_log_z = (
@@ -499,55 +475,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
             if torch.isfinite(target_log_z_by_traj).any()
             else self.compute_log_Z().detach().to(log_paths_pf)
         )
-        if self.log_z_update == "gradient":
-            log_z_value = self.compute_log_Z().detach().to(log_paths_pf)
-        else:
-            log_z_value = policy_log_z.to(log_paths_pf)
+        
+        log_z_value = self.compute_log_Z().detach().to(log_paths_pf)
+        
         residuals = (log_z_value + log_pf - (log_rewards + log_pb)).detach()
-        batch_size = max(int(residuals.numel()), 1)
-        coefficients = (2.0 / (float(batch_size) * float(factor))) * residuals
-        loss_value = (residuals.pow(2).mean() / float(factor)).detach()
 
-        if self.log_z_update == "gradient":
-            (coefficients.sum() * self.compute_log_Z()).backward()
-        for traj_idx, trajectory in enumerate(trajectories):
-            coefficient = coefficients[traj_idx].detach()
-            self._replay_trajectory_for_streaming_gradient(
-                rollout_worker,
-                trajectory,
-                coefficient,
-            )
+        loss = residuals.pow(2).mean()
 
-        self.loss = self.loss + loss_value
-        self.accumulated_batches += 1
-        if self.verbose:
-            print(
-                f"streamed loss={loss_value.item():.6f} "
-                f"total_loss={self.loss.item():.6f} batches={self.accumulated_batches}"
-            )
-
-    def _replay_trajectory_for_streaming_gradient(self, rollout_worker, trajectory, coefficient):
-        state = self.env.get_initial_state()
-        for action in trajectory.actions:
-            action = dict(action)
-            probs = self.env.compute_event_probabilities(state)
-            event_prob = float(probs.get(action["event_type"], 0.0))
-            if event_prob <= 0.0:
-                raise RuntimeError(f"Cannot replay invalid event type from state: {action}")
-            input_dict = self.env.prepare_state_rollout_inputs(
-                [state],
-                input_actions=[action],
-                random_spec=None,
-                device=self.device,
-            )
-            ret = self(input_dict)
-            log_path_pf = ret["log_paths_pf"].reshape(-1)[0]
-            (coefficient * log_path_pf).backward()
-
-            log_prior = self.env.compute_cwr_event_log_prior(state, action)
-            state = self.env.apply_action(
-                state,
-                action,
-                log_prior,
-                compute_reward=False,
-            )
+        return loss
