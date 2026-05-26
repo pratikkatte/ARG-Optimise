@@ -32,11 +32,6 @@ class ARGModel(nn.Module):
         self.device = env.device
         input_size = int(env.sequence_length) * 4
 
-        self.register_buffer(
-            "source_seq_arrays",
-            self._build_source_sequence_features(),
-            persistent=False,
-        )
         self.seq_embedding = nn.Linear(input_size, embedding_size)
         self.action_scorer = nn.Sequential(
             nn.Linear(embedding_size * 4, hidden_size),
@@ -99,9 +94,9 @@ class ARGModel(nn.Module):
             active_counts, dtype=torch.long, device=self.device,
         )
 
-        sequence_length = self.source_seq_arrays.shape[1]
+        sequence_length = self.env.sequence_length
         max_active_lineages = max(active_counts, default=0)
-        lineage_seq_features = self.source_seq_arrays.new_zeros(
+        lineage_seq_features = self.env.seq_arrays.new_zeros(
             batch_size,
             max_active_lineages,
             sequence_length,
@@ -114,7 +109,7 @@ class ARGModel(nn.Module):
                 weights = self._material_segments_masking(
                     lineage.material_segments,
                     device=self.device,
-                    dtype=self.source_seq_arrays.dtype,
+                    dtype=self.env.seq_arrays.dtype,
                 )
                 masked_feature = feature * weights[:, None]
                 lineage_seq_features[batch_idx, lineage_idx] = (
@@ -143,7 +138,7 @@ class ARGModel(nn.Module):
         return partials
 
     def _material_segments_masking(self, material_segments, device, dtype):
-        sequence_length = int(self.source_seq_arrays.shape[1])
+        sequence_length = int(self.env.sequence_length)
         weights = torch.zeros(sequence_length, dtype=dtype, device=device)
         num_blocks = float(max(int(self.env.num_blocks), 1))
         site_width = num_blocks / float(max(sequence_length, 1))

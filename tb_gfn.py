@@ -258,39 +258,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
             self.log_z_target_sum / max(self.log_z_target_count, 1)
         )
 
-
-    def sample_backward_from_arg(self, arg_state):
-        state = arg_state.clone()
-        reverse_actions = []
-        backward_states = [state.clone()]
-        num_parents_by_backward_step = []
-        log_path_pb = 0.0
-
-        while not self._is_initial_arg_state(state):
-            inverse_actions = self._enumerate_inverse_arg_actions(state)
-            num_parents = len(inverse_actions)
-            if num_parents == 0:
-                raise ValueError("No valid ARG parent states were found for backward sampling.")
-
-            rng = getattr(self.env, "rng", None)
-            if rng is not None and hasattr(rng, "randrange"):
-                inverse_action = inverse_actions[rng.randrange(num_parents)]
-            else:
-                inverse_action = inverse_actions[np.random.randint(num_parents)]
-
-            state, forward_action = self._apply_inverse_arg_action(state, inverse_action)
-            reverse_actions.append(forward_action)
-            num_parents_by_backward_step.append(num_parents)
-            log_path_pb -= math.log(num_parents)
-            backward_states.append(state.clone())
-
-        return {
-            "forward_actions": list(reversed(reverse_actions)),
-            "log_path_pb": log_path_pb,
-            "num_parents": list(reversed(num_parents_by_backward_step)),
-            "backward_states": backward_states,
-        }
-
     def count_backward_parents(self, arg_state):
         return len(self._enumerate_inverse_arg_actions(arg_state))
 
