@@ -988,6 +988,8 @@ class SimpleARGEnvironment:
 
         child_i.parents.append(parent.node_id)
         child_j.parents.append(parent.node_id)
+        child_i.partials = None
+        child_j.partials = None
         next_state.active_lineages[i] = child_i
         next_state.active_lineages[j] = child_j
         next_state.all_nodes[child_i.node_id] = child_i
@@ -1052,6 +1054,7 @@ class SimpleARGEnvironment:
         )
 
         child.parents = [left_parent.node_id, right_parent.node_id]
+        child.partials = None
         next_state.all_nodes[child.node_id] = child
         next_state.all_nodes[left_parent.node_id] = left_parent
         next_state.all_nodes[right_parent.node_id] = right_parent
