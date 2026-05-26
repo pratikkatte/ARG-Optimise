@@ -152,8 +152,7 @@ def train(
     epochs_num=10,
     seed=7,
     init_z_sample_count=DEFAULT_INIT_Z_SAMPLE_COUNT,
-    init_z_verbose=False,
-    use_wandb=False,
+    use_wandb=True,
     effective_population_size=DEFAULT_NE,
     mutation_rate=DEFAULT_MU_PER_BP,
     recombination_rate=DEFAULT_R_PER_BP,
@@ -170,6 +169,7 @@ def train(
     dropout=DEFAULT_DROPOUT,
     breakpoint_hidden_dim=DEFAULT_BREAKPOINT_HIDDEN_DIM,
     breakpoint_dropout=DEFAULT_BREAKPOINT_DROPOUT,
+    verbose=True,
     
 ):
     seed_everything(seed)
@@ -202,7 +202,7 @@ def train(
         env,
         init_z_sample_count=init_z_sample_count,
         device=device,
-        verbose=init_z_verbose,
+        verbose=verbose,
         policy_lr=policy_lr,
         log_z_lr=log_z_lr,
         grad_clip=grad_clip,
@@ -221,7 +221,9 @@ def train(
     history = []
     best_loss = float("inf")
     wandb_run = None
-    if use_wandb and wandb is not None:
+    
+    print(f"use_wandb: {use_wandb}")
+    if use_wandb:
         wandb_run = wandb.init()
         wandb.config.update({
             "device": str(generator.device),
@@ -407,12 +409,12 @@ def main():
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--breakpoint-hidden-dim", type=int, default=DEFAULT_BREAKPOINT_HIDDEN_DIM)
     parser.add_argument("--breakpoint-dropout", type=float, default=DEFAULT_BREAKPOINT_DROPOUT)
-    parser.add_argument("--wandb", action="store_true", default=False)
+    parser.add_argument("--wandb", action="store_true", default=True)
     args = parser.parse_args()
 
     selected_device = "cuda" if torch.cuda.is_available() else "cpu"
                 
-    print(f"Selected device: {selected_device}")
+    print(f"Selected devicesss: {selected_device}")
 
     train(
         dataset_path=args.dataset_path,
@@ -421,7 +423,7 @@ def main():
         epochs_num=args.epochs,
         bp_per_blocks=args.bp_per_blocks,
         init_z_sample_count=args.init_z_sample_count,
-        init_z_verbose=args.verbose,
+        verbose=args.verbose,
         seed=args.seed,
         device=selected_device,
         use_wandb=args.wandb,

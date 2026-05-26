@@ -629,20 +629,27 @@ class SimpleARGEnvironment:
     def get_initial_state(self):
         active_lineages = []
         all_nodes = {}
+        material_segments = MaterialSegments.full(self.num_blocks)
+        material_segments_list = [material_segments] * self.num_sequences
+        partials_list = self._initial_lineages_partials_batch(material_segments_list)
+
+        total_time = 0.0
         for node_id in range(self.num_sequences):
-            material_segments = MaterialSegments.full(self.num_blocks)
+            # Here, each lineage starts at time 0.0
             lineage = ARGLineage(
                 node_id=node_id,
                 children=[],
                 parents=[],
                 material_segments=material_segments,
                 num_blocks=self.num_blocks,
-                partials=self._initial_lineage_partials(node_id, material_segments),
+                partials=partials_list[node_id],
                 sequences_indices=[node_id],
                 time=0.0,
             )
+            total_time += lineage.time
             active_lineages.append(lineage)
             all_nodes[node_id] = lineage
+     
 
         state = ARGState(
             active_lineages=active_lineages,
@@ -663,6 +670,29 @@ class SimpleARGEnvironment:
     def _initial_lineage_partials(self, node_id, material_segments):
         partials = self.seq_arrays[int(node_id)].detach().clone().float()
         return self.evolution_model.mask_partials(partials, material_segments)
+
+    def _initial_lineages_partials_batch(self, material_segments_list):
+        """Initialize tip partials for all sequences in one vectorized pass."""
+        num_lineages = len(material_segments_list)
+        if num_lineages != self.num_sequences:
+            raise ValueError(
+                f"Expected {self.num_sequences} material segment sets, got {num_lineages}"
+            )
+
+        reference_segments = material_segments_list[0]
+        segments_match = all(
+            ms.segments == reference_segments.segments for ms in material_segments_list
+        )
+        if segments_match:
+            partials = self.seq_arrays.detach().clone().float()
+            weights = self.evolution_model.material_site_weights(reference_segments)
+            masked = partials * weights[None, :, None]
+            return [masked[node_id] for node_id in range(num_lineages)]
+
+        return [
+            self._initial_lineage_partials(node_id, material_segments)
+            for node_id, material_segments in enumerate(material_segments_list)
+        ]
 
     def _require_lineage_partials(self, lineage):
         if lineage.partials is None:
@@ -1094,20 +1124,22 @@ class SimpleARGEnvironment:
         return coal_actions, recomb_actions
 
 
-    def sample(self,num_trajs):
+    def sample(self,num_trajs, verbose=True):
         """Sample terminal ARG states.
 
         Without a generator this preserves the prior-only sampler. With a
         generator, event types are sampled from environment event rates and the
         model chooses the concrete action through RolloutWorker.
         """
-
         states = [self.get_initial_state() for _ in range(num_trajs)]
+        print(f"sampling ....")
+
         trajectories = [Trajectory(x) for x in states]
         event_types = ["coal", "recomb"]
         unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
-        
+        print(f"unfinished: {unfinished}")
         while unfinished:
+            print(f"Sampling {len(unfinished)} unfinished trajectories...")
             combined_actions = [[]]*num_trajs
             event_probs = [[]]*num_trajs
             for idx in unfinished:
