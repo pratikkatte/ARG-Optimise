@@ -6,9 +6,12 @@ import random
 import numpy as np
 import torch
 
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
-from env import SimpleARGEnvironment
+from env import SimpleARGEnvironment, action_as_dict
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from utils import load_sequences
@@ -83,25 +86,27 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
                 log_rewards + log_pb
             )
             initial_state = env.get_initial_state()
-            initial_input = env.prepare_state_rollout_inputs(
-                [initial_state],
-                device=generator.device,
-            )
-            initial_ret = generator(initial_input)
-            initial_event_probs = initial_ret["event_log_probs"][0].exp().detach().cpu()
-            initial_prior_probs = env.compute_event_probabilities(initial_state)
+            initial_event_probs = env.compute_event_probabilities(initial_state)
 
         lengths = torch.tensor([len(traj) for traj in trajectories], dtype=torch.float32)
         coal_counts = torch.tensor(
             [
-                sum(1 for action in traj.actions if action.get("event_type") == "coal")
+                sum(
+                    1
+                    for action in traj.actions
+                    if action_as_dict(action).get("event_type") == "coal"
+                )
                 for traj in trajectories
             ],
             dtype=torch.float32,
         )
         recomb_counts = torch.tensor(
             [
-                sum(1 for action in traj.actions if action.get("event_type") == "recomb")
+                sum(
+                    1
+                    for action in traj.actions
+                    if action_as_dict(action).get("event_type") == "recomb"
+                )
                 for traj in trajectories
             ],
             dtype=torch.float32,
@@ -118,11 +123,8 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             "eval_trajectory_length_mean": float(lengths.mean().item()),
             "eval_coalescence_count_mean": float(coal_counts.mean().item()),
             "eval_recombination_count_mean": float(recomb_counts.mean().item()),
-            "eval_initial_coalescence_prob": float(initial_event_probs[0].item()),
-            "eval_initial_recombination_prob": float(initial_event_probs[1].item()),
-            "eval_initial_prior_recombination_prob": float(
-                initial_prior_probs.get("recomb", 0.0)
-            ),
+            "eval_initial_coalescence_prob": float(initial_event_probs.get("coal", 0.0)),
+            "eval_initial_recombination_prob": float(initial_event_probs.get("recomb", 0.0)),
         }
     finally:
         random.setstate(python_state)
@@ -143,7 +145,7 @@ def train(
     seed=7,
     init_z_sample_count=DEFAULT_INIT_Z_SAMPLE_COUNT,
     init_z_verbose=False,
-    use_wandb=True,
+    use_wandb=False,
     effective_population_size=DEFAULT_NE,
     mutation_rate=DEFAULT_MU_PER_BP,
     recombination_rate=DEFAULT_R_PER_BP,
@@ -154,6 +156,7 @@ def train(
     
 ):
     seed_everything(seed)
+    device = torch.device(device)
 
     sequences = load_sequences(dataset_path)
     sequence_length = len(sequences[0])
@@ -192,14 +195,11 @@ def train(
         wandb_run = wandb.init()
         wandb.config.update({
             "device": str(generator.device),
-            "time_bin_scheme": env.time_bin_scheme,
-            "time_bins": env.time_bins,
-            "time_delta_bin_width": env.time_delta_bin_width,
+            **env.time_metadata,
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
             "recombination_rate": float(recombination_rate),
             "log_z_lr": float(log_z_lr),
-            "log_z_update": generator.log_z_update,
             "grad_accum_steps": int(grad_accum_steps),
             "eval_episodes": int(eval_episodes),
             "eval_every": int(eval_every),
@@ -254,12 +254,12 @@ def train(
                     sequences=sequences,
                     sequence_length=sequence_length,
                     bp_per_blocks=bp_per_blocks,
+                    time_metadata=env.time_metadata,
                     rho=env.rho,
                     effective_population_size=effective_population_size,
                     mutation_rate=mutation_rate,
                     recombination_rate=recombination_rate,
                     log_z_lr=log_z_lr,
-                    log_z_update=generator.log_z_update,
                     grad_accum_steps=grad_accum_steps,
                     eval_episodes=eval_episodes,
                     eval_every=eval_every,
@@ -292,16 +292,13 @@ def build_checkpoint_metadata(
     log_z,
     sequences,
     sequence_length,
-    num_blocks,
+    bp_per_blocks,
+    time_metadata,
     rho,
-    time_bin_scheme,
-    time_bins,
-    time_delta_bin_width,
     effective_population_size,
     mutation_rate,
     recombination_rate,
     log_z_lr,
-    log_z_update,
     grad_accum_steps,
     eval_episodes,
     eval_every,
@@ -316,16 +313,13 @@ def build_checkpoint_metadata(
         "sequences": list(sequences),
         "num_sequences": len(sequences),
         "sequence_length": int(sequence_length),
-        "num_blocks": int(num_blocks),
+        "bp_per_blocks": int(bp_per_blocks),
         "rho": float(rho),
-        "time_bin_scheme": str(time_bin_scheme),
-        "time_bins": int(time_bins),
-        "time_delta_bin_width": float(time_delta_bin_width),
+        "time": dict(time_metadata),
         "effective_population_size": float(effective_population_size),
         "mutation_rate": float(mutation_rate),
         "recombination_rate": float(recombination_rate),
         "log_z_lr": float(log_z_lr),
-        "log_z_update": str(log_z_update),
         "grad_accum_steps": int(grad_accum_steps),
         "eval_episodes": int(eval_episodes),
         "eval_every": int(eval_every),
@@ -339,7 +333,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train the simplified ARG GFlowNet demo.")
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--dataset-path",required=True)
-    parser.add_argument("--epochs", required=True)
+    parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument(
         "--bp-per-blocks",
@@ -361,7 +355,7 @@ def main():
     )
     parser.add_argument("--eval-episodes", type=int, default=DEFAULT_EVAL_EPISODES)
     parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
-    parser.add_argument("--wandb", action="store_true", default=True)
+    parser.add_argument("--wandb", action="store_true", default=False)
     args = parser.parse_args()
 
     selected_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -369,10 +363,10 @@ def main():
     print(f"Selected device: {selected_device}")
 
     train(
-        args.output_path,
+        dataset_path=args.dataset_path,
+        output_path=args.output_path,
         batch_size=args.batch_size,
         epochs_num=args.epochs,
-        dataset_path=args.dataset_path,
         bp_per_blocks=args.bp_per_blocks,
         init_z_sample_count=args.init_z_sample_count,
         init_z_verbose=args.verbose,

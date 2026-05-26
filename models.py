@@ -344,7 +344,7 @@ class ARGModel(nn.Module):
 
         counts = torch.tensor(candidate_counts, device=self.device)
         valid = torch.arange(max_candidates, device=self.device).unsqueeze(0) < counts.unsqueeze(1)
-        return logits.masked_fill(~valid, float("-inf")), action_features
+        return logits.masked_fill(~valid, float("-inf")), features
 
     def _select_breakpoints(self, action):
         """
@@ -416,14 +416,20 @@ class ARGModel(nn.Module):
             
         random_spec = input_dict.get("random_spec")
         event = input_dict.get("event")
-        log_event_pf = [ -math.log(event[idx]["probability"]) for idx, event in event.items()]
+        if event is None:
+            raise ValueError("ARGModel.forward requires event probabilities in input_dict['event'].")
+        event_probs = [
+            float(event[idx]["probability"])
+            for idx in range(len(states))
+        ]
+        log_event_pf = torch.log(
+            torch.tensor(event_probs, dtype=torch.float32, device=self.device)
+        )
         
         lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states(states)
 
         
         all_candidate_actions = input_dict.get("input_actions")
-
-        print("batch_active_lineage_counts", batch_active_lineage_counts)
 
 
         if any(len(actions) == 0 for actions in all_candidate_actions):

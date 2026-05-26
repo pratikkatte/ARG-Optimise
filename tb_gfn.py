@@ -25,7 +25,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
         super().__init__()
         self.env = env
         self.verbose = verbose
-        self.device = device
+        self.device = torch.device(device) if device is not None else torch.device(env.device)
+        self.env.device = self.device
+        if hasattr(self.env, "seq_arrays"):
+            self.env.seq_arrays = torch.nn.Parameter(
+                self.env.seq_arrays.detach().to(self.device),
+                requires_grad=False,
+            )
         self.init_z_sample_count = init_z_sample_count
 
         ## Policy model

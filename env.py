@@ -588,7 +588,7 @@ class SimpleARGEnvironment:
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
         self.event_types = ["coal", "recomb"]
-        self.device = device
+        self.device = torch.device(device)
 
         if self.sequences is not None:
             num_sequences = len(self.sequences)
@@ -630,7 +630,7 @@ class SimpleARGEnvironment:
         seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences], dtype=np.float32)
 
         self.seq_arrays = torch.nn.Parameter(
-            torch.tensor(seq_arrays, dtype=torch.float32),
+            torch.tensor(seq_arrays, dtype=torch.float32, device=self.device),
             requires_grad=False,
         )
         
@@ -639,6 +639,14 @@ class SimpleARGEnvironment:
 
         ## Reward function 
         self.reward_fn = ARGReward()
+
+    @property
+    def time_metadata(self):
+        return {
+            "time_bin_scheme": type(self.time_env).__name__,
+            "time_bins": int(self.time_env.bins),
+            "time_delta_bin_width": float(self.time_env.delta_bin_width),
+        }
 
     def seq2array(self, seq):
         seq = [self.chars_dict[x] for x in seq]
