@@ -14,6 +14,7 @@ except ImportError:
 from env import SimpleARGEnvironment, action_as_dict
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
+from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
 from utils import load_sequences
 
 
@@ -21,10 +22,17 @@ DEFAULT_NE = 10000
 DEFAULT_R_PER_BP = 2e-8
 DEFAULT_MU_PER_BP = 2e-8
 DEFAULT_INIT_Z_SAMPLE_COUNT = 16
+DEFAULT_POLICY_LR = 1e-3
 DEFAULT_LOG_Z_LR = 1e-3
+DEFAULT_GRAD_CLIP = 10.0
 DEFAULT_GRAD_ACCUM_STEPS = 1
 DEFAULT_EVAL_EPISODES = 8
 DEFAULT_EVAL_EVERY = 10
+DEFAULT_EMBEDDING_SIZE = 32
+DEFAULT_HIDDEN_SIZE = 64
+DEFAULT_DROPOUT = 0.0
+DEFAULT_BREAKPOINT_HIDDEN_DIM = 128
+DEFAULT_BREAKPOINT_DROPOUT = 0.1
 MODEL_VERSION = "cwr-event-learned-time-v1"
 
 def seed_everything(seed):
@@ -149,10 +157,19 @@ def train(
     effective_population_size=DEFAULT_NE,
     mutation_rate=DEFAULT_MU_PER_BP,
     recombination_rate=DEFAULT_R_PER_BP,
+    policy_lr=DEFAULT_POLICY_LR,
     log_z_lr=DEFAULT_LOG_Z_LR,
+    grad_clip=DEFAULT_GRAD_CLIP,
     grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
     eval_episodes=DEFAULT_EVAL_EPISODES,
     eval_every=DEFAULT_EVAL_EVERY,
+    time_bins=DEFAULT_TIME_BINS,
+    time_delta_bin_width=DEFAULT_TIME_DELTA_BIN_WIDTH,
+    embedding_size=DEFAULT_EMBEDDING_SIZE,
+    hidden_size=DEFAULT_HIDDEN_SIZE,
+    dropout=DEFAULT_DROPOUT,
+    breakpoint_hidden_dim=DEFAULT_BREAKPOINT_HIDDEN_DIM,
+    breakpoint_dropout=DEFAULT_BREAKPOINT_DROPOUT,
     
 ):
     seed_everything(seed)
@@ -170,13 +187,26 @@ def train(
         recombination_rate=recombination_rate,
         population_size=effective_population_size,
         mutation_rate=mutation_rate,
+        time_bins=time_bins,
+        time_delta_bin_width=time_delta_bin_width,
     )
+    model_kwargs = {
+        "embedding_size": int(embedding_size),
+        "hidden_size": int(hidden_size),
+        "dropout": float(dropout),
+        "breakpoint_hidden_dim": int(breakpoint_hidden_dim),
+        "breakpoint_dropout": float(breakpoint_dropout),
+    }
 
     generator = TBGFlowNetGenerator(
         env,
         init_z_sample_count=init_z_sample_count,
         device=device,
+        verbose=init_z_verbose,
+        policy_lr=policy_lr,
         log_z_lr=log_z_lr,
+        grad_clip=grad_clip,
+        model_kwargs=model_kwargs,
     )
     print(f"Generator device: {generator.device}")
 
@@ -199,11 +229,14 @@ def train(
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
             "recombination_rate": float(recombination_rate),
+            "policy_lr": float(policy_lr),
             "log_z_lr": float(log_z_lr),
+            "grad_clip": float(grad_clip),
             "grad_accum_steps": int(grad_accum_steps),
             "eval_episodes": int(eval_episodes),
             "eval_every": int(eval_every),
             "bp_per_blocks": int(bp_per_blocks),
+            **model_kwargs,
             "model_version": MODEL_VERSION,
         })
 
@@ -259,10 +292,13 @@ def train(
                     effective_population_size=effective_population_size,
                     mutation_rate=mutation_rate,
                     recombination_rate=recombination_rate,
+                    policy_lr=policy_lr,
                     log_z_lr=log_z_lr,
+                    grad_clip=grad_clip,
                     grad_accum_steps=grad_accum_steps,
                     eval_episodes=eval_episodes,
                     eval_every=eval_every,
+                    model_kwargs=model_kwargs,
                     seed=seed,
                     init_z_sample_count=init_z_sample_count,
                     model_version=MODEL_VERSION,
@@ -298,10 +334,13 @@ def build_checkpoint_metadata(
     effective_population_size,
     mutation_rate,
     recombination_rate,
+    policy_lr,
     log_z_lr,
+    grad_clip,
     grad_accum_steps,
     eval_episodes,
     eval_every,
+    model_kwargs,
     seed,
     init_z_sample_count,
     model_version,
@@ -319,10 +358,13 @@ def build_checkpoint_metadata(
         "effective_population_size": float(effective_population_size),
         "mutation_rate": float(mutation_rate),
         "recombination_rate": float(recombination_rate),
+        "policy_lr": float(policy_lr),
         "log_z_lr": float(log_z_lr),
+        "grad_clip": float(grad_clip),
         "grad_accum_steps": int(grad_accum_steps),
         "eval_episodes": int(eval_episodes),
         "eval_every": int(eval_every),
+        "model": dict(model_kwargs),
         "seed": int(seed),
         "init_z_sample_count": int(init_z_sample_count),
         "model_version": str(model_version),
@@ -335,6 +377,7 @@ def main():
     parser.add_argument("--dataset-path",required=True)
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--bp-per-blocks",
         type=int,
@@ -346,7 +389,9 @@ def main():
     parser.add_argument("--effective-population-size", type=float, default=DEFAULT_NE)
     parser.add_argument("--mutation-rate", type=float, default=DEFAULT_MU_PER_BP)
     parser.add_argument("--recombination-rate", type=float, default=DEFAULT_R_PER_BP)
+    parser.add_argument("--policy-lr", type=float, default=DEFAULT_POLICY_LR)
     parser.add_argument("--log-z-lr", type=float, default=DEFAULT_LOG_Z_LR)
+    parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP)
     parser.add_argument(
         "--grad-accum-steps",
         type=int,
@@ -355,6 +400,13 @@ def main():
     )
     parser.add_argument("--eval-episodes", type=int, default=DEFAULT_EVAL_EPISODES)
     parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
+    parser.add_argument("--time-bins", type=int, default=DEFAULT_TIME_BINS)
+    parser.add_argument("--time-delta-bin-width", type=float, default=DEFAULT_TIME_DELTA_BIN_WIDTH)
+    parser.add_argument("--embedding-size", type=int, default=DEFAULT_EMBEDDING_SIZE)
+    parser.add_argument("--hidden-size", type=int, default=DEFAULT_HIDDEN_SIZE)
+    parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
+    parser.add_argument("--breakpoint-hidden-dim", type=int, default=DEFAULT_BREAKPOINT_HIDDEN_DIM)
+    parser.add_argument("--breakpoint-dropout", type=float, default=DEFAULT_BREAKPOINT_DROPOUT)
     parser.add_argument("--wandb", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -370,15 +422,25 @@ def main():
         bp_per_blocks=args.bp_per_blocks,
         init_z_sample_count=args.init_z_sample_count,
         init_z_verbose=args.verbose,
+        seed=args.seed,
         device=selected_device,
         use_wandb=args.wandb,
         effective_population_size=args.effective_population_size,
         mutation_rate=args.mutation_rate,
         recombination_rate=args.recombination_rate,
+        policy_lr=args.policy_lr,
         log_z_lr=args.log_z_lr,
+        grad_clip=args.grad_clip,
         grad_accum_steps=args.grad_accum_steps,
         eval_episodes=args.eval_episodes,
         eval_every=args.eval_every,
+        time_bins=args.time_bins,
+        time_delta_bin_width=args.time_delta_bin_width,
+        embedding_size=args.embedding_size,
+        hidden_size=args.hidden_size,
+        dropout=args.dropout,
+        breakpoint_hidden_dim=args.breakpoint_hidden_dim,
+        breakpoint_dropout=args.breakpoint_dropout,
     )
 
 

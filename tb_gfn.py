@@ -5,7 +5,8 @@ import numpy as np
 import torch
 
 from models import ARGModel
-from rollout_worker_arg import RolloutWorker
+from env import RecombinationChoice
+from dataclasses import replace
 
 LOSS_FN = {
     'MSE': torch.nn.MSELoss(),
@@ -20,7 +21,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
         cfg=None,
         device=None,
         verbose=False,
-        log_z_lr=0.001,
+        arg_model_lr=0.001,
+        z_lr=0.001,
+        grad_clip=10.0,
+        model_kwargs=None,
+        policy_lr=None,
+        log_z_lr=None,
     ):
         super().__init__()
         self.env = env
@@ -35,23 +41,36 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.init_z_sample_count = init_z_sample_count
 
         ## Policy model
-        self.arg_model = ARGModel(env).to(self.device)
+        if policy_lr is not None:
+            arg_model_lr = policy_lr
+        if log_z_lr is not None:
+            z_lr = log_z_lr
+        self.arg_model_lr = float(arg_model_lr)
+        self.z_lr = float(z_lr)
+        self.model_kwargs = dict(model_kwargs or {})
+        self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
+        self.time_model = self.arg_model.time_scorer
+        self.breakpoint_model = self.arg_model.breakpoint_scorer
 
         ## Z partition
-        self._logZ = torch.nn.Parameter(
-            torch.tensor(0.0, device=self.device),
-            requires_grad=True,
-        )
         self.max_reward_seen = float("-inf")
+        trajs = env.sample(16)
+        self.max_reward_seen = np.max([x.log_reward for x in trajs])
+        init_Z = self.max_reward_seen
+        self._Z = torch.nn.Parameter(  # in log
+                torch.ones(256, device=self.device) * init_Z / 256, requires_grad=True
+                )
+        
+        self.arg_model_params = list(self.arg_model.parameters())
+        self.policy_params = self.arg_model_params
 
-        # self._initialize_log_z_from_rollouts()
-        self.policy_params = list(self.arg_model.parameters())
-        self.log_z_params = [self._logZ]
-        params = [{'params': self.policy_params, 'lr': 0.001}]
-        params.append({'params': [self._logZ], 'lr': float(log_z_lr)})
+        params = [{'params': self.arg_model_params, 'lr': self.arg_model_lr}]
+        params.append({'params': [self._Z], 'lr': self.z_lr})
 
-        self.gradient_clipping_params = self.policy_params + self.log_z_params
-        self.grad_clip = 10.0
+        # gradient clipping exclude the Z part
+        self.gradient_clipping_params = list(self.arg_model.parameters())
+        self.grad_clip = float(grad_clip)
+
         self.opt = torch.optim.Adam(
             params,
             weight_decay=0.0,
@@ -59,37 +78,29 @@ class TBGFlowNetGenerator(torch.nn.Module):
             amsgrad=True,
         )
 
+        self.scheduler = None
+
         self.loss_fn = LOSS_FN['MSE']
+
+        self.grad_norm = lambda model: math.sqrt(sum(
+            [p.grad.norm().item() ** 2 for p in self.gradient_clipping_params if p.grad is not None]))
+        self.param_norm = lambda model: math.sqrt(sum([p.norm().item() ** 2 for p in self.gradient_clipping_params]))
+
+        # scaler for AMP
+        self.scaler = torch.cuda.amp.GradScaler()
+
+        self.loss = 0
+
         self.loss = torch.tensor(0.0, device=self.device)
         self.accumulated_batches = 0
         self.log_z_target_sum = 0.0
         self.log_z_target_count = 0
         self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
 
-    def _initialize_log_z_from_rollouts(self):
-        if self.init_z_sample_count <= 0:
-            raise ValueError("init_z_sample_count must be positive")
-        if self.verbose:
-            print(f"Initializing scalar logZ from {self.init_z_sample_count} on-policy rollout(s)...")
-        
-        worker = RolloutWorker(self.env, verbose=self.verbose)
 
-        with torch.no_grad():
-            outputs, _ = worker.rollout(
-                self,
-                episodes=int(self.init_z_sample_count),
-                compute_reward=True,
-            )
-            log_pf = outputs["log_paths_pf"].sum(-1).to(self.device)
-            log_pb = outputs["log_paths_pb"].sum(-1).to(self.device)
-            log_rewards = outputs["log_rewards"].to(self.device)
-            targets = log_rewards + log_pb - log_pf
-            finite_targets = targets[torch.isfinite(targets)]
-            finite_rewards = log_rewards[torch.isfinite(log_rewards)]
-            if finite_rewards.numel() > 0:
-                self.max_reward_seen = float(finite_rewards.max().detach().cpu().item())
-            if finite_targets.numel() > 0:
-                self._logZ.data.copy_(finite_targets.mean().detach())
+    def _encode_states(self, states):
+        return self.arg_model._encode_states(states)
+
 
     def save(self, path, metadata=None):
         directory = os.path.dirname(os.path.abspath(path))
@@ -152,55 +163,88 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return self._param_norm(self.policy_params)
 
     def log_z_grad(self):
-        if self._logZ.grad is None:
+        if self._Z.grad is None:
             return 0.0
-        return float(self._logZ.grad.detach().cpu().reshape(-1)[0].item())
+        return float(self._Z.grad.detach().cpu().reshape(-1)[0].item())
 
     def log_z_grad_norm(self):
-        return self._grad_norm([self._logZ])
+        return self._grad_norm([self._Z])
 
-    def compute_log_Z(self):
-        return self._logZ
+    def compute_log_Z(self, scale_key=None):
+        return self._Z.sum()
 
     def forward(self, input_dict):
+
+        states = input_dict.get("states")
+
+        random_spec = input_dict.get("random_spec")
+        
+
+        event = input_dict.get("event")
+        event_probs = [
+            float(event[idx]["probability"])
+            for idx in range(len(states))
+        ]
+        log_event_pf = torch.log(
+            torch.tensor(event_probs, dtype=torch.float32, device=self.device)
+        )
+
+        all_actions = input_dict.get("input_actions")
+
+        lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states(states)
         # input_dict = self._move_input_to_device(input_dict)
-        ret = self.arg_model(input_dict)
-        return ret
+        ret = self.arg_model(all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec)
+
+        log_action_pf, selected_action_indices, choosen_actions, choosen_action_features = ret
+
+        log_p_breakpoints = []
+        for idx, chosen_action in enumerate(choosen_actions):
+            if isinstance(chosen_action, RecombinationChoice):
+                lineage_idx = int(chosen_action.active_lineage_i)
+                lineage_feature = lineage_seq_features[idx, lineage_idx]
+                breakpoint, log_p_breakpoint = self.breakpoint_model(
+                    chosen_action,
+                    lineage_feature,
+                    int(self.env.sequence_length),
+                    int(self.env.num_blocks),
+                    random_spec=random_spec,
+                )
+                choosen_actions[idx] = replace(chosen_action, breakpoint=breakpoint)
+                log_p_breakpoints.append(log_p_breakpoint)
+            else:
+                log_p_breakpoints.append(torch.tensor(0.0, device=self.device))
+
+        log_breakpoint_pf = torch.stack(log_p_breakpoints)
+
+        selected_action_features = torch.stack(choosen_action_features, dim=0)  # shape: [B, F]
+        time_logits = self.time_model(selected_action_features)
+        time_actions = self.time_model.sample(time_logits, random_spec)
+
+        for batch_idx, action in enumerate(choosen_actions):
+            time = int(time_actions[batch_idx].detach().cpu().item())
+            choosen_actions[batch_idx] = replace(action, time_action=time)
+
+        log_time_pf = self.time_model.compute_log_time_pf(time_logits, time_actions)
+
+        total_log_pf = log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
+
+        log_probs = torch.exp(total_log_pf)
+        
+        return total_log_pf, log_probs, choosen_actions
+
 
     def update_model(self):
-
-        raw_grad_norm = self.grad_norm()
-        raw_policy_grad_norm = self.policy_grad_norm()
-        raw_log_z_grad = self.log_z_grad()
-        raw_log_z_grad_norm = self.log_z_grad_norm()
+        
+        info = {'grad_norm': self.grad_norm(self),
+                # 'z_grad_norm': self._Z.grad.norm().item(),
+                'param_norm': self.param_norm(self),
+                'loss': self.loss.detach().cpu().numpy().tolist()}
+        
         torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
-        info = {
-            'raw_grad_norm': raw_grad_norm,
-            'grad_norm': self.grad_norm(),
-            'raw_policy_grad_norm': raw_policy_grad_norm,
-            'policy_grad_norm': self.policy_grad_norm(),
-            'param_norm': self.param_norm(),
-            'policy_param_norm': self.policy_param_norm(),
-            'raw_log_z_grad': raw_log_z_grad,
-            'log_z_grad': self.log_z_grad(),
-            'raw_log_z_grad_norm': raw_log_z_grad_norm,
-            'log_z_grad_norm': self.log_z_grad_norm(),
-            'log_z_target': self.last_log_z_target,
-            'loss': self.loss.detach().cpu().item(),
-        }
         self.opt.step()
         self.opt.zero_grad()
-        self.loss = torch.tensor(0.0, device=self.device)
-        self.accumulated_batches = 0
-        self.log_z_target_sum = 0.0
-        self.log_z_target_count = 0
-        if self.verbose:
-            print(
-                "update: loss={loss:.6f} raw_grad_norm={raw_grad_norm:.4f} "
-                "grad_norm={grad_norm:.4f} param_norm={param_norm:.4f}".format(
-                    **info
-                )
-            )
+        self.loss = 0
+
         return info
 
     def _record_log_z_targets(self, targets):
@@ -450,50 +494,18 @@ class TBGFlowNetGenerator(torch.nn.Module):
         log_pb = log_paths_pb.sum(-1)
 
         
-        log_z = self.compute_log_Z().reshape(-1).to(log_paths_pf)
+        log_z = self.compute_log_Z(None).reshape(-1).to(log_paths_pf)
 
-        residuals = log_z + log_pf - (log_rewards + log_pb)
+        forward_value = log_z + log_pf
+        backward_value = log_rewards + log_pb
 
-        loss = residuals.pow(2).mean()
-        
+        loss = self.loss_fn(forward_value, backward_value)
+
         return loss
+        
     
     def accumulate_loss(self, rollout_outputs, factor=1.0):
-        loss = self.get_loss_from_rollout_outputs(rollout_outputs) / factor
+        loss = self.get_loss_from_rollout_outputs(rollout_outputs)
+        loss = (loss / factor)
         loss.backward()
-        self.loss = self.loss + loss.detach()
-        self.accumulated_batches += 1
-        if self.verbose:
-            print(
-                f"accumulated loss={loss.item():.6f} "
-                f"total_loss={self.loss.item():.6f} batches={self.accumulated_batches}"
-            )
-
-    def accumulate_streaming_tb_loss(self,rollout_outputs,):
-        """Accumulate exact TB gradients without retaining the full rollout graph."""
-        log_paths_pf = rollout_outputs["log_paths_pf"].detach().to(self.device)
-        log_paths_pb = rollout_outputs["log_paths_pb"].detach().to(device=self.device,)
-        log_rewards = torch.as_tensor(rollout_outputs["log_rewards"], device=self.device)
-
-
-        log_pf = log_paths_pf.sum(-1)
-        log_pb = log_paths_pb.sum(-1)
-
-        log_z = self.compute_log_Z().detach()
-
-
-        target_log_z_by_traj = (log_rewards + log_pb - log_pf).detach()
-        self._record_log_z_targets(target_log_z_by_traj)
-        policy_log_z = (
-            target_log_z_by_traj[torch.isfinite(target_log_z_by_traj)].mean()
-            if torch.isfinite(target_log_z_by_traj).any()
-            else self.compute_log_Z().detach().to(log_paths_pf)
-        )
-        
-        log_z_value = self.compute_log_Z().detach().to(log_paths_pf)
-        
-        residuals = (log_z_value + log_pf - (log_rewards + log_pb)).detach()
-
-        loss = residuals.pow(2).mean()
-
-        return loss
+        self.loss += loss 

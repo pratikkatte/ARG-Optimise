@@ -507,52 +507,12 @@ def action_as_dict(action):
         return result
     raise ValueError(f"Unknown ARG action: {action}")
 
-
-def canonicalize_action(action, active_lineages=None):
-    coal_action = CoalescenceChoice.from_action(action)
-    if coal_action is not None:
-        return coal_action
-
-    recomb_action = RecombinationChoice.from_action(action)
-    if recomb_action is not None:
-        return recomb_action
-
-    if not isinstance(action, dict) or action.get("event_type") != "recomb":
-        raise ValueError(f"Unknown ARG action: {action}")
-
-    active_lineage_i = action.get("active_lineage_i")
-    breakpoint = action.get("breakpoint")
-    if not isinstance(active_lineage_i, numbers.Integral) or not isinstance(breakpoint, numbers.Integral):
-        raise ValueError(f"Invalid recombination action: {action}")
-
-    if active_lineages is None:
-        raise ValueError(
-            "Recombination actions without material metadata require active_lineages"
-        )
-    active_lineage_i = int(active_lineage_i)
-    if not 0 <= active_lineage_i < len(active_lineages):
-        raise ValueError(f"Invalid active lineage index in recombination action: {action}")
-
-    span = active_lineages[active_lineage_i].material_span
-    if span is None:
-        raise ValueError(f"Active lineage has no valid recombination span: {action}")
-    span_start, span_end, material_count = span
-    time_action = action.get("time_action")
-    return RecombinationChoice(
-        active_lineage_i=active_lineage_i,
-        material_count=int(action.get("material_count", material_count)),
-        span_start=int(action.get("span_start", span_start)),
-        span_end=int(action.get("span_end", span_end)),
-        breakpoint=int(breakpoint),
-        time_action=int(time_action) if time_action is not None else None,
-    )
-
 class ARGReward:
     """
     Terminal reward helpers for constructed ARG states.
     """
 
-    def __init__(self, C=3000):
+    def __init__(self, C=30000):
         self.C = C
 
     def __call__(self, log_likelihood, accumulated_log_prior):
@@ -584,6 +544,8 @@ class SimpleARGEnvironment:
         seed: Optional[int] = 7,
         bp_per_blocks: int = 1,
         device: Optional[torch.device] = 'cpu',
+        time_bins: Optional[int] = None,
+        time_delta_bin_width: Optional[float] = None,
     ):
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
@@ -620,7 +582,12 @@ class SimpleARGEnvironment:
         )
 
         ## Time environment
-        self.time_env = TimeEnvFixedDelta()
+        time_env_kwargs = {}
+        if time_bins is not None:
+            time_env_kwargs["bins"] = int(time_bins)
+        if time_delta_bin_width is not None:
+            time_env_kwargs["delta_bin_width"] = float(time_delta_bin_width)
+        self.time_env = TimeEnvFixedDelta(**time_env_kwargs)
 
         self.rng = random.Random(seed)
 
@@ -949,18 +916,18 @@ class SimpleARGEnvironment:
             # bool(np.all(self.get_active_counts(state) == 1)) ## another way, realtime compute. 
             return result
 
-    def _finalize_transition_state(self, next_state, log_prior, compute_reward=True):
+    def _finalize_transition_state(self, next_state, log_prior):
         if log_prior is not None:
             next_state.accumulated_log_prior += log_prior
         next_state.is_done = self.is_terminal(next_state)
-        if next_state.is_done and compute_reward:
+        if next_state.is_done:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
             next_state.log_reward = self.compute_terminal_log_reward(next_state, log_likelihood)
         else:
             next_state.log_reward = None
         return next_state
 
-    def apply_coalescence(self, state, action, log_prior=None, compute_reward=True):
+    def apply_coalescence(self, state, action, log_prior=None):
 
         rates = state.rates
         if rates is None:
@@ -1012,9 +979,9 @@ class SimpleARGEnvironment:
         next_state.max_node_idx = parent.node_id
         if next_state.total_active_blocks is not None:
             next_state.total_active_blocks = int(next_state.total_active_blocks) - overlap_count
-        return self._finalize_transition_state(next_state, log_prior, compute_reward=compute_reward)
+        return self._finalize_transition_state(next_state, log_prior)
 
-    def apply_recombination(self, state, action, log_prior=None, compute_reward=True):
+    def apply_recombination(self, state, action, log_prior=None):
         rates = state.rates
         if rates is None:
             rates = self.compute_event_rates(self.enumerate_actions(state))
@@ -1072,24 +1039,21 @@ class SimpleARGEnvironment:
         ]
         next_state.active_lineages.extend([left_parent, right_parent])
         next_state.max_node_idx = right_parent.node_id
-        return self._finalize_transition_state(next_state, log_prior, compute_reward=compute_reward)
+        return self._finalize_transition_state(next_state, log_prior)
 
-    def apply_action(self, state, action, log_prior=None, compute_reward=True):
-        if isinstance(action, dict):
-            action = canonicalize_action(action, active_lineages=state.active_lineages)
+    def apply_action(self, state, action, log_prior=None):
+        
         if isinstance(action, RecombinationChoice):
             return self.apply_recombination(
                 state,
                 action,
-                log_prior,
-                compute_reward=compute_reward,
+                log_prior
             )
         elif isinstance(action, CoalescenceChoice):
             return self.apply_coalescence(
                 state,
                 action,
-                log_prior,
-                compute_reward=compute_reward,
+                log_prior
             )
         else:
             raise ValueError(f"Unknown action event_type: {action}")
@@ -1181,42 +1145,12 @@ class SimpleARGEnvironment:
             unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
         return trajectories
 
-    # def sample_action_from_prior(self, state):
-    #     coal_actions = self.compute_coalescence_actions(state)
-    #     recomb_choices = self.compute_recombination_actions(state)
-    #     rates = self.compute_event_rates((coal_actions, recomb_choices))
-    #     denom = rates["lambda_coal"] + rates["lambda_recomb"]
-    #     if denom <= 0:
-    #         return None
-
-    #     coal_prob = rates["lambda_coal"] / denom if coal_actions else 0.0
-    #     recomb_prob = rates["lambda_recomb"] / denom if recomb_choices else 0.0
-
-    #     if coal_prob > 0 and (recomb_prob <= 0 or self.rng.random() < coal_prob):
-    #         action = self._with_random_time_action(
-    #             coal_actions[self.rng.randrange(len(coal_actions))].as_dict(),
-    #             rates,
-    #         )
-    #         action = canonicalize_action(action, active_lineages=state.active_lineages)
-    #         return action, self.compute_cwr_event_log_prior(state, action)
-
-    #     if recomb_prob <= 0:
-    #         return None
-    #     sampled = self._sample_recombination_prior_action(recomb_choices)
-    #     if sampled is None:
-    #         return None
-    #     action, _lineage_weight, _choice = sampled
-    #     action = self._with_random_time_action(action, rates)
-    #     action = canonicalize_action(action, active_lineages=state.active_lineages)
-    #     return action, self.compute_cwr_event_log_prior(state, action)
-
     def compute_cwr_event_log_prior(self, state, combined_actions, action=None, rates=None):
         if action is None:
             action = combined_actions
             combined_actions = self.enumerate_actions(state)
         coal_actions, recomb_actions = combined_actions
-        if not isinstance(action, (CoalescenceChoice, RecombinationChoice)):
-            action = canonicalize_action(action, active_lineages=state.active_lineages)
+
         if rates is None:
             rates = state.rates if state.rates is not None else self.compute_event_rates((coal_actions, recomb_actions))
         state.rates = rates

@@ -1,110 +1,13 @@
 import math
 
 from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
+from breakpoint_model import BreakpointSplitPositionCNN
+from time_model import TimeModel
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from dataclasses import replace
-
-CHARACTERS_MAPS = {
-    'DNA_WITH_GAP': {
-        'A': [1., 0., 0., 0.],
-        'C': [0., 1., 0., 0.],
-        'G': [0., 0., 1., 0.],
-        'T': [0., 0., 0., 1.],
-        '-': [1., 1., 1., 1.],
-        'N': [1., 1., 1., 1.],
-    }
-}
-
-VOCAB_NAME = 'DNA_WITH_GAP'
-TOKEN_TO_FEATURES = CHARACTERS_MAPS[VOCAB_NAME]
-
-# Stable index <-> token maps derived from CHARACTERS_MAPS insertion order.
-INDEX_TO_TOKEN = {idx: token for idx, token in enumerate(TOKEN_TO_FEATURES.keys())}
-TOKEN_TO_INDEX = {token: idx for idx, token in INDEX_TO_TOKEN.items()}
-TOKEN_FEATURES = torch.tensor(
-    [TOKEN_TO_FEATURES[INDEX_TO_TOKEN[idx]] for idx in range(len(INDEX_TO_TOKEN))],
-    dtype=torch.float32,
-)
-VOCAB_SIZE = len(INDEX_TO_TOKEN)
-
-class ResidualDilatedConvBlock(nn.Module):
-    def __init__(self, hidden_dim, kernel_size=5, dilation=1, dropout=0.1):
-        super().__init__()
-        if kernel_size % 2 != 1:
-            raise ValueError('kernel_size must be odd to preserve length with symmetric padding')
-        padding = dilation * (kernel_size - 1) // 2
-        self.conv = nn.Conv1d(
-            hidden_dim,
-            hidden_dim,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            padding=padding,
-        )
-        self.activation = nn.GELU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # x: [B, C, L]
-        residual = x
-        x = self.conv(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-        return residual + x
-
-class BreakpointSplitPositionCNN(nn.Module):
-    def __init__(
-        self,
-        input_dim=4,
-        hidden_dim=128,
-        dilations=None,
-        dropout=0.1,
-    ):
-        super().__init__()
-        if dilations is None:
-            dilations = [1, 2, 4, 8, 16, 32, 64, 128] * 2
-
-        self.feature_dim = 4
-        self.input_conv = nn.Conv1d(input_dim, hidden_dim, kernel_size=7, padding=3)
-        self.input_activation = nn.GELU()
-
-        self.blocks = nn.ModuleList(
-            ResidualDilatedConvBlock(
-                hidden_dim=hidden_dim,
-                kernel_size=5,
-                dilation=dilation,
-                dropout=dropout,
-            )
-            for dilation in dilations
-        )
-
-        self.scoring_head = nn.Sequential(
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(hidden_dim, 1, kernel_size=1),
-        )
-
-    def forward(self, x):
-        # x: [B, L, 4]
-        if x.ndim != 3:
-            raise ValueError(f'expected input shape [B, L, {self.feature_dim}], got {tuple(x.shape)}')
-        if x.shape[-1] != self.feature_dim:
-            raise ValueError(f'expected final feature dimension {self.feature_dim}, got {x.shape[-1]}')
-        x = x.float().transpose(1, 2)  # [B, 4, L]
-        x = self.input_conv(x)         # [B, C, L]
-        x = self.input_activation(x)
-
-        for block in self.blocks:
-            x = block(x)              # [B, C, L]
-
-        scores = self.scoring_head(x).squeeze(1)  # [B, L]
-
-        # Keep scores for valid split gaps only. Logit i corresponds to split k=i+1.
-        logits = scores[:, :-1].contiguous()      # [B, L - 1]
-        return logits
 
 
 class ARGModel(nn.Module):
@@ -115,13 +18,18 @@ class ARGModel(nn.Module):
     so material-mask constraints are respected.
     """
 
-    def __init__(self, env):
+    def __init__(
+        self,
+        env,
+        embedding_size=32,
+        hidden_size=64,
+        dropout=0.0,
+        breakpoint_hidden_dim=128,
+        breakpoint_dropout=0.1,
+    ):
         super().__init__()
         self.env = env
         self.device = env.device
-        embedding_size = 32
-        hidden_size = 64
-        dropout = 0.0
         input_size = int(env.sequence_length) * 4
 
         self.register_buffer(
@@ -136,13 +44,16 @@ class ARGModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
-        self.breakpoint_scorer = BreakpointSplitPositionCNN().to(self.device)
+        self.breakpoint_scorer = BreakpointSplitPositionCNN(
+            hidden_dim=breakpoint_hidden_dim,
+            dropout=breakpoint_dropout,
+        ).to(self.device)
 
-        self.time_scorer = nn.Sequential(
-            nn.Linear(embedding_size * 4, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, env.time_env.bins),
+        self.time_scorer = TimeModel(
+            embedding_size * 4,
+            hidden_size,
+            dropout,
+            env.time_env.bins,
         )
         self.logsoftmax = nn.LogSoftmax(dim=1)
 
@@ -152,8 +63,33 @@ class ARGModel(nn.Module):
     def model_params(self):
         return list(self.parameters())
 
-    def _encode_states(self, states):
+    def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
+        batch_size, active_lineages, seq_len, channels = lineage_seq_features.shape
+        if seq_len != int(self.env.sequence_length) or channels != 4:
+            raise ValueError(
+                "sequence features must have shape "
+                f"(batch, active_lineages, {int(self.env.sequence_length)}, 4), "
+                f"got {tuple(lineage_seq_features.shape)}"
+            )
 
+        batch_input = lineage_seq_features.reshape(batch_size, active_lineages, -1)
+        if batch_input.shape[-1] != self.seq_embedding.in_features:
+            raise ValueError(
+                "Encoded batch_input last dimension must match sequence_length * 4 "
+                f"({self.seq_embedding.in_features}), got {batch_input.shape[-1]}"
+            )
+
+        batch_input = batch_input.to(device=self.device, dtype=torch.float32)
+        batch_active_lineage_counts = batch_active_lineage_counts.to(device=self.device, dtype=torch.long)
+
+        lineage_reps = self.seq_embedding(batch_input)
+
+        valid_mask = torch.arange(active_lineages, device=self.device)[None, :] < batch_active_lineage_counts[:, None]
+        lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
+        summary_reps = lineage_reps.sum(dim=1) / batch_active_lineage_counts.clamp_min(1).unsqueeze(-1)
+        return lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts
+
+    def _encode_states(self, states):
         batch_size = len(states)
         if batch_size == 0:
             raise ValueError("ARGModel.forward requires at least one state")
@@ -161,7 +97,7 @@ class ARGModel(nn.Module):
         active_counts = [len(state.active_lineages) for state in states]
         batch_active_lineage_counts = torch.tensor(
             active_counts, dtype=torch.long, device=self.device,
-            )
+        )
 
         sequence_length = self.source_seq_arrays.shape[1]
         max_active_lineages = max(active_counts, default=0)
@@ -231,35 +167,6 @@ class ARGModel(nn.Module):
                     )
         return weights
 
-    def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
-        """
-        """
-
-        batch_size, active_lineages, seq_len, channels = lineage_seq_features.shape
-        if seq_len != int(self.env.sequence_length) or channels != 4:
-            raise ValueError(
-                "sequence features must have shape "
-                f"(batch, active_lineages, {int(self.env.sequence_length)}, 4), "
-                f"got {tuple(lineage_seq_features.shape)}"
-            )
-
-        batch_input = lineage_seq_features.reshape(batch_size, active_lineages, -1)
-        if batch_input.shape[-1] != self.seq_embedding.in_features:
-            raise ValueError(
-                "Encoded batch_input last dimension must match sequence_length * 4 "
-                f"({self.seq_embedding.in_features}), got {batch_input.shape[-1]}"
-            )
-
-        batch_input = batch_input.to(device=self.device, dtype=torch.float32)
-        batch_active_lineage_counts = batch_active_lineage_counts.to(device=self.device, dtype=torch.long)
-
-        lineage_reps = self.seq_embedding(batch_input)
-
-        valid_mask = torch.arange(active_lineages, device=self.device)[None, :] < batch_active_lineage_counts[:, None]
-        lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
-        summary_reps = lineage_reps.sum(dim=1) / batch_active_lineage_counts.clamp_min(1).unsqueeze(-1)
-        return lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts
-
     def sample(self, logits, random_spec=None):
         if random_spec is None:
             return Categorical(logits=logits).sample()
@@ -272,13 +179,6 @@ class ARGModel(nn.Module):
         batch_idx = torch.arange(logits.shape[0], device=logits.device)
         log_p = self.logsoftmax(logits)
         return log_p[batch_idx, action_indices]
-
-
-    def compute_log_time_pf(self, time_logits, time_actions):
-        batch_idx = torch.arange(time_logits.shape[0], device=time_logits.device)
-        log_p = self.logsoftmax(time_logits)
-        return log_p[batch_idx, time_actions]
-
 
     def _batched_action_features(self, actions, batch_idx, lineage_reps, summary_reps):
         num_actions = len(actions)
@@ -344,7 +244,8 @@ class ARGModel(nn.Module):
 
         counts = torch.tensor(candidate_counts, device=self.device)
         valid = torch.arange(max_candidates, device=self.device).unsqueeze(0) < counts.unsqueeze(1)
-        return logits.masked_fill(~valid, float("-inf")), features
+        masked_logits = logits.masked_fill(~valid, -1e9)
+        return masked_logits, features
 
     def _select_breakpoints(self, action):
         """
@@ -409,27 +310,9 @@ class ARGModel(nn.Module):
 
 
 
-    def forward(self, input_dict):
-        states = input_dict.get("states")
-        if states is None:
-            raise ValueError("States are required for the model to run.")
-            
-        random_spec = input_dict.get("random_spec")
-        event = input_dict.get("event")
-        if event is None:
-            raise ValueError("ARGModel.forward requires event probabilities in input_dict['event'].")
-        event_probs = [
-            float(event[idx]["probability"])
-            for idx in range(len(states))
-        ]
-        log_event_pf = torch.log(
-            torch.tensor(event_probs, dtype=torch.float32, device=self.device)
-        )
+    def forward(self, all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec):
         
-        lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states(states)
-
-        
-        all_candidate_actions = input_dict.get("input_actions")
+        all_candidate_actions = all_actions
 
 
         if any(len(actions) == 0 for actions in all_candidate_actions):
@@ -441,69 +324,36 @@ class ARGModel(nn.Module):
             summary_reps,
         )
         
-        choosen_action_indices = self.sample(logits, random_spec)
-        selected_action_indices = [
-            int(action_idx.detach().cpu().item())
-            for action_idx in choosen_action_indices
-        ]
+        # Vectorize processing instead of multiple for-loops.
 
-        
+        # Compute lengths of actions per batch and build index tensor
+        action_lengths = [len(actions) for actions in all_candidate_actions]
+        max_len = max(action_lengths)
 
-        choosen_actions = [
-            all_candidate_actions[batch_idx][action_idx]
-            for batch_idx, action_idx in enumerate(selected_action_indices)
-        ]
+        # Create mask for valid actions in logits
+        mask = torch.zeros_like(logits, dtype=torch.bool)
+        for i, n in enumerate(action_lengths):
+            mask[i, :n] = True
 
-        choosen_action_features = [
-            action_features[batch_idx, action_idx]
-            for batch_idx, action_idx in enumerate(selected_action_indices)
-        ]
+        # Build valid logits tensor (invalid entries set to very low value)
+        logits_masked = logits.masked_fill(~mask, float('-inf'))
+
+        # Sample actions in a vectorized way
+        # In case there are -inf rows in invalid entries, Categorical supports this
+        sampled_action_indices = self.sample(logits_masked, random_spec)
+        # sampled_action_indices shape: (batch,)
+
+        # Convert to standard Python ints and collect for indexing
+        selected_action_indices = sampled_action_indices.detach().cpu().tolist()
+
+        # Now, retrieve chosen actions and features in a single loop
+        choosen_actions = []
+        choosen_action_features = []
+        for batch_idx, action_idx in enumerate(selected_action_indices):
+            choosen_actions.append(all_candidate_actions[batch_idx][action_idx])
+            choosen_action_features.append(action_features[batch_idx, action_idx])
 
         # Compute log pf for action scorer (policy) selection
-        log_action_pf = self.compute_log_path_pf(logits, choosen_action_indices)
+        log_action_pf = self.compute_log_path_pf(logits, selected_action_indices)
 
-        # Compute log pf for breakpoints (for recombination actions)
-        log_p_breakpoints = []
-        for idx, chosen_action in enumerate(choosen_actions):
-            if isinstance(chosen_action, RecombinationChoice):
-                lineage_idx = int(chosen_action.active_lineage_i)
-                lineage_feature = lineage_seq_features[idx, lineage_idx]
-                breakpoint, log_p_breakpoint = self._sample_recombination_breakpoint(
-                    chosen_action,
-                    lineage_feature,
-                    random_spec=random_spec,
-                )
-                choosen_actions[idx] = replace(chosen_action, breakpoint=breakpoint)
-                log_p_breakpoints.append(log_p_breakpoint)
-           
-            else:
-                log_p_breakpoints.append(logits.new_zeros(()))
-
-        log_breakpoint_pf = torch.stack(log_p_breakpoints)
-
-        # Score the action features for each chosen action to obtain time logits.
-        # selected_action_features = []
-        # for batch_idx, action_idx in enumerate(selected_action_indices):
-        #     action_features = self._batched_action_features(
-        #         [all_candidate_actions[batch_idx][action_idx]],
-        #         batch_idx,
-        #         lineage_reps,
-        #         summary_reps,
-        #     )
-        #     selected_action_features.append(action_features.squeeze(0))
-
-        selected_action_features = torch.stack(choosen_action_features, dim=0)  # shape: [B, F]
-        time_logits = self.time_scorer(selected_action_features)
-        time_actions = self.sample(time_logits, random_spec)
-
-        for batch_idx, action in enumerate(choosen_actions):
-            time = int(time_actions[batch_idx].detach().cpu().item())
-            choosen_actions[batch_idx] = replace(action, time_action=time)
-
-        log_time_pf = self.compute_log_time_pf(time_logits, time_actions)
-
-        total_log_pf = log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
-
-        log_probs = torch.exp(total_log_pf)
-        
-        return total_log_pf, log_probs, choosen_actions
+        return log_action_pf, selected_action_indices, choosen_actions, choosen_action_features

@@ -1,5 +1,10 @@
 import pickle
+import torch
+def build_scheduler(optimizer, cfg_scheduler):
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=gamma, step_size=step_size)
+    return scheduler
 
+    
 def read_fasta(filepath):
     all_seqs_dict = {}
     with open(filepath, 'r') as file:
