@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from env import SimpleTrajectory, Trajectory, canonicalize_action
+from env import SimpleTrajectory, Trajectory, action_as_dict, canonicalize_action
 
 
 class RolloutWorker:
@@ -82,20 +82,15 @@ class RolloutWorker:
         generator,
         episodes,
         random_spec=None,
-        record_diagnostics=False,
-        sample_backward=False,
-        compute_reward=True,
-        generate_full_trajectories=True,
-    ):
+        ):
+        
         states = [self.env.get_initial_state() for _ in range(episodes)]
         trajectories = [Trajectory(x) for x in states]
         
         
         log_paths_pf_by_traj = [[] for _ in range(episodes)]
         backward_num_parents_by_traj = [[] for _ in range(episodes)]
-        step_counts = [0 for _ in range(episodes)]
-        finished_count = 0
-
+        
         if self.verbose:
             print(
                 f"Rolling out {episodes} trajectory/trajectories in batch "
@@ -142,7 +137,7 @@ class RolloutWorker:
             for num_parents in backward_num_parents_by_traj
             ]
         
-        log_paths_pb = self._pad_log_path_lists(log_paths_pb, torch.float32, self.device)
+        log_paths_pb = self._pad_log_path_vectors(log_paths_pb, torch.float32, self.device)
 
         log_rewards = torch.tensor([state.log_reward for state in states], dtype=torch.float32, device=self.device)
 
@@ -151,7 +146,7 @@ class RolloutWorker:
             "log_paths_pf": log_paths_pf,
             "log_paths_pb": log_paths_pb,
             "log_rewards": log_rewards,
-        },
+        }
 
         return data, trajectories
 
@@ -180,10 +175,6 @@ class RolloutWorker:
                 generator=generator,
                 episodes=episodes,
                 random_spec=random_spec,
-                record_diagnostics=record_diagnostics,
-                sample_backward=sample_backward,
-                compute_reward=compute_reward,
-                generate_full_trajectories=generate_full_trajectories,
             )
 
         states = []
@@ -253,18 +244,24 @@ class RolloutWorker:
         return torch.float32, device
 
     def _state_to_lineage_features(self, state, device=None):
-        seq_arrays = self.env.seq_arrays.float()
-        if device is not None:
-            seq_arrays = seq_arrays.to(device)
         lineage_features = []
 
         for lineage in state.active_lineages:
-            if lineage.sequences_indices:
-                feature = seq_arrays[lineage.sequences_indices].mean(dim=0)
-            else:
-                feature = torch.zeros_like(seq_arrays[0])
-            site_mask = self._material_mask_to_site_mask(lineage.material_mask, feature.device)
-            lineage_features.append(feature * site_mask[:, None])
+            if lineage.partials is None:
+                raise ValueError(
+                    f"Active ARG lineage {lineage.node_id} is missing partials"
+                )
+            feature = lineage.partials
+            if not torch.is_tensor(feature):
+                feature = torch.as_tensor(feature, dtype=torch.float32)
+            feature = feature.float()
+            if device is not None:
+                feature = feature.to(device)
+            feature = self.env.evolution_model.mask_partials(
+                feature,
+                lineage.material_segments,
+            )
+            lineage_features.append(self.env.evolution_model.normalize_partials(feature))
 
         if not lineage_features:
             raise ValueError("Cannot prepare rollout features for a state with no active lineages.")

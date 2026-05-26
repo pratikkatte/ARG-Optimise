@@ -104,6 +104,90 @@ class EvolutionModelTorch(torch.nn.Module):
     def _branch_length_for_likelihood(self, edge_time):
         return float(edge_time) * self._branch_length_scale
 
+    def transition_partials(self, partials, edge_time):
+        """Propagate lineage partials up one ARG branch with the JC69 model."""
+        partials = self._as_partials_tensor(partials)
+        transition_matrix = self._jc69_transition_matrix_torch(
+            edge_time,
+            device=partials.device,
+            dtype=partials.dtype,
+        )
+        return partials @ transition_matrix.T
+
+    def material_site_weights(self, material_segments, device=None, dtype=None):
+        """Map block-coordinate material intervals to per-site model weights."""
+        if dtype is None:
+            dtype = self.env.seq_arrays.dtype
+        if device is None:
+            device = self.env.seq_arrays.device
+
+        sequence_length = int(self.env.sequence_length)
+        num_blocks = float(max(int(self.env.num_blocks), 1))
+        site_width = num_blocks / float(max(sequence_length, 1))
+        weights = torch.zeros(sequence_length, dtype=dtype, device=device)
+
+        for segment_start, segment_end in material_segments.segments:
+            start = max(float(segment_start), 0.0)
+            end = min(float(segment_end), num_blocks)
+            if end <= start:
+                continue
+
+            first_site = max(int(math.floor(start / site_width)), 0)
+            last_site = min(int(math.ceil(end / site_width)), sequence_length)
+            for site_idx in range(first_site, last_site):
+                site_start = site_idx * site_width
+                site_end = site_start + site_width
+                overlap = max(0.0, min(end, site_end) - max(start, site_start))
+                if overlap > 0.0:
+                    weights[site_idx] = torch.clamp(
+                        weights[site_idx] + weights.new_tensor(overlap / site_width),
+                        max=1.0,
+                    )
+        return weights
+
+    def mask_partials(self, partials, material_segments):
+        """Zero out sites where this lineage carries no ancestral material."""
+        partials = self._as_partials_tensor(partials)
+        weights = self.material_site_weights(
+            material_segments,
+            device=partials.device,
+            dtype=partials.dtype,
+        )
+        return partials * weights[:, None]
+
+    def normalize_partials(self, partials):
+        """Normalize carried-site partial rows while keeping no-material rows zero."""
+        partials = self._as_partials_tensor(partials)
+        row_sums = partials.sum(dim=-1, keepdim=True)
+        return torch.where(
+            row_sums > 0,
+            partials / row_sums.clamp_min(1e-12),
+            torch.zeros_like(partials),
+        )
+
+    def _as_partials_tensor(self, partials):
+        if partials is None:
+            raise ValueError("ARGLineage.partials is required")
+        if torch.is_tensor(partials):
+            tensor = partials.to(dtype=torch.float32)
+        else:
+            tensor = torch.as_tensor(partials, dtype=torch.float32, device=self.env.seq_arrays.device)
+        expected_shape = (int(self.env.sequence_length), 4)
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"ARGLineage.partials must have shape {expected_shape}, got {tuple(tensor.shape)}"
+            )
+        return tensor
+
+    def _jc69_transition_matrix_torch(self, edge_time, device, dtype):
+        edge_time = torch.as_tensor(edge_time, dtype=dtype, device=device)
+        branch_length = edge_time * self._branch_length_scale
+        decay = torch.exp(-4.0 * branch_length / 3.0)
+        same_prob = 0.25 + 0.75 * decay
+        diff_prob = 0.25 - 0.25 * decay
+        eye = torch.eye(4, dtype=dtype, device=device)
+        return eye * same_prob + (1.0 - eye) * diff_prob
+
     def _block_to_site(self, block_index):
         site_fraction = (
             float(block_index) * float(self.env.sequence_length) / float(self.env.num_blocks)

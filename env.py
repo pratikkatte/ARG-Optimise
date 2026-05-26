@@ -386,13 +386,20 @@ class ARGLineage:
         )
 
     def clone(self, copy_partials=True, copy_mask=True):
+        if not copy_partials:
+            partials = self.partials
+        elif torch.is_tensor(self.partials):
+            partials = self.partials.clone()
+        else:
+            partials = copy.deepcopy(self.partials)
+
         clone = ARGLineage(
             node_id=self.node_id,
             children=list(self.children),
             parents=list(self.parents),
             material_segments=self.material_segments,
             num_blocks=self.num_blocks,
-            partials=copy.deepcopy(self.partials) if copy_partials else self.partials,
+            partials=partials,
             sequences_indices=list(self.sequences_indices),
             event_type=self.event_type,
             breakpoint=self.breakpoint,
@@ -439,14 +446,17 @@ class Trajectory:
         self.current_state = initial_state.clone()
         self.transitions = []
         self.actions = []
+        self.records = []
         self.log_reward = None
         self.done = False
 
-    def update(self, next_state, action, log_prior, done):
+    def update(self, next_state, action, log_prior, done, record=None):
         self.transitions.append(    
             [self.current_state, next_state.clone(),log_prior, done]
         )
         self.actions.append(action)
+        if record is not None:
+            self.records.append(record)
         self.current_state = next_state.clone()
         self.done = done
         if next_state.log_reward is not None:
@@ -645,13 +655,14 @@ class SimpleARGEnvironment:
         active_lineages = []
         all_nodes = {}
         for node_id in range(self.num_sequences):
+            material_segments = MaterialSegments.full(self.num_blocks)
             lineage = ARGLineage(
                 node_id=node_id,
                 children=[],
                 parents=[],
-                material_segments=MaterialSegments.full(self.num_blocks),
+                material_segments=material_segments,
                 num_blocks=self.num_blocks,
-                partials=None,
+                partials=self._initial_lineage_partials(node_id, material_segments),
                 sequences_indices=[node_id],
                 time=0.0,
             )
@@ -673,6 +684,57 @@ class SimpleARGEnvironment:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
             state.log_reward = self.compute_terminal_log_reward(state, log_likelihood)
         return state
+
+    def _initial_lineage_partials(self, node_id, material_segments):
+        partials = self.seq_arrays[int(node_id)].detach().clone().float()
+        return self.evolution_model.mask_partials(partials, material_segments)
+
+    def _require_lineage_partials(self, lineage):
+        if lineage.partials is None:
+            raise ValueError(f"ARG lineage {lineage.node_id} is missing partials")
+        return self.evolution_model._as_partials_tensor(lineage.partials)
+
+    def _transition_lineage_partials(self, lineage, parent_time):
+        edge_time = float(parent_time) - float(lineage.time)
+        if edge_time <= 0:
+            raise ValueError(
+                f"ARG node times must increase from child to parent: "
+                f"parent_time={parent_time}, child={lineage.node_id} time={lineage.time}"
+            )
+        partials = self._require_lineage_partials(lineage)
+        return self.evolution_model.transition_partials(partials, edge_time)
+
+    def _coalesced_parent_partials(self, child_i, child_j, parent_segments, parent_time):
+        reference = self._require_lineage_partials(child_i)
+        combined = torch.ones_like(reference)
+        has_material = torch.zeros(
+            reference.shape[0],
+            1,
+            dtype=torch.bool,
+            device=reference.device,
+        )
+
+        for child in (child_i, child_j):
+            transitioned = self._transition_lineage_partials(child, parent_time)
+            transitioned = self.evolution_model.normalize_partials(transitioned)
+            weights = self.evolution_model.material_site_weights(
+                child.material_segments,
+                device=transitioned.device,
+                dtype=transitioned.dtype,
+            )
+            child_has_material = weights[:, None] > 0
+            child_partials = transitioned * weights[:, None]
+            combined = torch.where(child_has_material, combined * child_partials, combined)
+            has_material = has_material | child_has_material
+
+        combined = torch.where(has_material, combined, torch.zeros_like(combined))
+        combined = self.evolution_model.mask_partials(combined, parent_segments)
+        return self.evolution_model.normalize_partials(combined)
+
+    def _recombined_parent_partials(self, child, parent_segments, parent_time):
+        transitioned = self._transition_lineage_partials(child, parent_time)
+        masked = self.evolution_model.mask_partials(transitioned, parent_segments)
+        return self.evolution_model.normalize_partials(masked)
 
     def get_active_counts(self, state):
         if not state.active_lineages:
@@ -893,6 +955,9 @@ class SimpleARGEnvironment:
     def apply_coalescence(self, state, action, log_prior=None, compute_reward=True):
 
         rates = state.rates
+        if rates is None:
+            rates = self.compute_event_rates(self.enumerate_actions(state))
+            state.rates = rates
 
         next_state = state.clone()
         i = action.active_lineage_i
@@ -907,13 +972,19 @@ class SimpleARGEnvironment:
         delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
         parent_time = float(state.current_time) + delta_t
         next_state.current_time = parent_time
+        parent_partials = self._coalesced_parent_partials(
+            child_i,
+            child_j,
+            parent_segments,
+            parent_time,
+        )
         parent = ARGLineage(
             node_id=parent_id,
             children=[child_i.node_id, child_j.node_id],
             parents=[],
             material_segments=parent_segments,
             num_blocks=self.num_blocks,
-            partials=None,
+            partials=parent_partials,
             sequences_indices=sorted(set(child_i.sequences_indices + child_j.sequences_indices)),
             event_type="coal",
             time=parent_time,
@@ -937,6 +1008,9 @@ class SimpleARGEnvironment:
 
     def apply_recombination(self, state, action, log_prior=None, compute_reward=True):
         rates = state.rates
+        if rates is None:
+            rates = self.compute_event_rates(self.enumerate_actions(state))
+            state.rates = rates
 
         # if log_prior is None:
         #     log_prior = self.compute_cwr_event_log_prior(state, action, rates=rates)
@@ -952,13 +1026,15 @@ class SimpleARGEnvironment:
 
         event_time = float(state.current_time) + delta_t
         next_state.current_time = event_time
+        left_partials = self._recombined_parent_partials(child, left_segments, event_time)
+        right_partials = self._recombined_parent_partials(child, right_segments, event_time)
         left_parent = ARGLineage(
             node_id=left_parent_id,
             children=[child.node_id],
             parents=[],
             material_segments=left_segments,
             num_blocks=self.num_blocks,
-            partials=None,
+            partials=left_partials,
             sequences_indices=list(child.sequences_indices),
             event_type="recomb",
             breakpoint=breakpoint,
@@ -971,7 +1047,7 @@ class SimpleARGEnvironment:
             parents=[],
             material_segments=right_segments,
             num_blocks=self.num_blocks,
-            partials=None,
+            partials=right_partials,
             sequences_indices=list(child.sequences_indices),
             event_type="recomb",
             breakpoint=breakpoint,
@@ -1152,56 +1228,6 @@ class SimpleARGEnvironment:
 
         return action_log_prior + wait_log_prior
 
-    def prepare_rollout_inputs(self, tree_features, input_actions=None, random_spec=None, batch_nb_seq=None):
-        if len(tree_features.shape) != 4:
-            raise ValueError("tree_features must have shape (batch, active_lineages, sequence_length, channels)")
-
-        inputs = tree_features.float()
-        batch_size, active_lineages, _, _ = inputs.shape
-        batch_input = inputs.reshape(batch_size, active_lineages, -1)
-        if batch_nb_seq is None:
-            batch_nb_seq = torch.full(
-                (batch_size,),
-                active_lineages,
-                dtype=torch.long,
-                device=inputs.device,
-            )
-        else:
-            batch_nb_seq = torch.as_tensor(batch_nb_seq, dtype=torch.long, device=inputs.device)
-            if batch_nb_seq.shape != (batch_size,):
-                raise ValueError("batch_nb_seq must have shape (batch,)")
-            if torch.any(batch_nb_seq < 0) or torch.any(batch_nb_seq > active_lineages):
-                raise ValueError("batch_nb_seq entries must be between 0 and active_lineages")
-
-        input_dict = {
-            "batch_input": batch_input,
-            "batch_seq_features": inputs,
-            "batch_nb_seq": batch_nb_seq,
-            "batch_size": batch_size,
-            "batch_traj_idx": torch.arange(batch_size, device=inputs.device),
-            "random_spec": random_spec,
-        }
-
-        if input_actions is not None:
-            input_dict["input_actions"] = input_actions
-            input_dict["input_active_lineage_i"] = torch.tensor(
-                [action.get("active_lineage_i", -1) for action in input_actions],
-                dtype=torch.long,
-                device=inputs.device,
-            )
-            input_dict["input_active_lineage_j"] = torch.tensor(
-                [action.get("active_lineage_j", -1) for action in input_actions],
-                dtype=torch.long,
-                device=inputs.device,
-            )
-            input_dict["input_breakpoints"] = torch.tensor(
-                [action.get("breakpoint", -1) for action in input_actions],
-                dtype=torch.long,
-                device=inputs.device,
-            )
-
-        return input_dict
-
     def prepare_state_rollout_inputs(
         self,
         states,
@@ -1211,18 +1237,27 @@ class SimpleARGEnvironment:
         if batch_size == 0:
             raise ValueError("states must contain at least one ARGState")
 
+        event = {}
         input_actions = []
-        for state in states:
+        for idx, state in enumerate(states):
             coal_actions, recomb_actions = self.enumerate_actions(state)
             event_prob = list(self.compute_event_probabilities(state, (coal_actions, recomb_actions)).values())
-            choosen_event_types = self.event_types[np.random.choice(2, p=event_prob)]
-            if choosen_event_types == "coal":
+            event_idx = np.random.choice(2, p=event_prob)
+            choosen_event_type = self.event_types[event_idx]
+            if choosen_event_type == "coal":
                 input_actions.append(coal_actions)
             else:
                 input_actions.append(recomb_actions)
+
+            event[idx] = {}
+            event[idx]["event_type"] = choosen_event_type
+            event[idx]["probability"] = event_prob[event_idx]
+
         input_dict = {
             "states": states,
+            "event": event,
             "input_actions": input_actions,
+            "random_spec": random_spec,
         }
 
         return input_dict
