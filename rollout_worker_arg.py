@@ -116,13 +116,13 @@ class RolloutWorker:
 
             for batch_idx, traj_idx in enumerate(unfinished):
                 state = states[traj_idx]
-                coal_actions, recomb_actions = self.enumerate_actions(state)
+                coal_actions, recomb_actions = self.env.enumerate_actions(state)
 
                 action = choosen_actions[batch_idx]
                 log_paths_pf_by_traj[traj_idx].append(total_log_pf[batch_idx])
-                log_prior = self.compute_cwr_event_log_prior(state, (coal_actions, recomb_actions), action)
+                log_prior = self.env.compute_cwr_event_log_prior(state, (coal_actions, recomb_actions), action)
 
-                next_state = self.apply_action(
+                next_state = self.env.apply_action(
                     state,
                     action,
                     log_prior=log_prior,

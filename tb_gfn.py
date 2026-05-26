@@ -29,7 +29,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.init_z_sample_count = init_z_sample_count
 
         ## Policy model
-        self.arg_model = ARGModel(env, cfg=cfg).to(self.device)
+        self.arg_model = ARGModel(env).to(self.device)
 
         ## Z partition
         self._logZ = torch.nn.Parameter(

@@ -1205,6 +1205,7 @@ class SimpleARGEnvironment:
     def prepare_state_rollout_inputs(
         self,
         states,
+        random_spec=None,
     ):
         batch_size = len(states)
         if batch_size == 0:
@@ -1221,7 +1222,7 @@ class SimpleARGEnvironment:
                 input_actions.append(recomb_actions)
         input_dict = {
             "states": states,
-            input_actions: input_actions,
+            "input_actions": input_actions,
         }
 
         return input_dict

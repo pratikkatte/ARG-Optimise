@@ -54,7 +54,6 @@ class ResidualDilatedConvBlock(nn.Module):
         x = self.dropout(x)
         return residual + x
 
-
 class BreakpointSplitPositionCNN(nn.Module):
     def __init__(
         self,
