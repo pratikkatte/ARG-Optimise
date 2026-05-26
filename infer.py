@@ -10,7 +10,7 @@ from tb_gfn import TBGFlowNetGenerator
 from time_env import DEFAULT_TIME_BIN_SCHEME
 from train import (
     DEFAULT_LOG_Z_LR,
-    DEFAULT_LOG_Z_UPDATE,
+    MODEL_VERSION,
     DEFAULT_MU_PER_BP,
     DEFAULT_NE,
     seed_everything,
@@ -64,7 +64,6 @@ def run_inference(
         device=device,
         verbose=verbose,
         log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
-        log_z_update=metadata.get("log_z_update", DEFAULT_LOG_Z_UPDATE),
     )
     generator.load(checkpoint, load_optimizer=False, map_location=generator.device)
     generator.eval()
@@ -115,6 +114,11 @@ def validate_metadata(metadata):
         raise ValueError(
             "This inference path requires fixed-delta time-bin checkpoints "
             f"({DEFAULT_TIME_BIN_SCHEME}), got {metadata['time_bin_scheme']!r}."
+        )
+    if metadata["model_version"] != MODEL_VERSION:
+        raise ValueError(
+            "Checkpoint model_version is incompatible with block-resolution partials: "
+            f"expected {MODEL_VERSION!r}, got {metadata['model_version']!r}."
         )
 
 

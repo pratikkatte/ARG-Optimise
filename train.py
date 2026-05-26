@@ -33,7 +33,7 @@ DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_HIDDEN_DIM = 128
 DEFAULT_BREAKPOINT_DROPOUT = 0.1
-MODEL_VERSION = "cwr-event-learned-time-v1"
+MODEL_VERSION = "cwr-event-learned-time-block-partials-v1"
 
 def seed_everything(seed):
     random.seed(seed)
@@ -354,9 +354,11 @@ def build_checkpoint_metadata(
         "sequences": list(sequences),
         "num_sequences": len(sequences),
         "sequence_length": int(sequence_length),
+        "num_blocks": int(sequence_length // bp_per_blocks),
         "bp_per_blocks": int(bp_per_blocks),
         "rho": float(rho),
         "time": dict(time_metadata),
+        **dict(time_metadata),
         "effective_population_size": float(effective_population_size),
         "mutation_rate": float(mutation_rate),
         "recombination_rate": float(recombination_rate),

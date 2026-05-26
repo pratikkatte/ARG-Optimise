@@ -570,8 +570,25 @@ class SimpleARGEnvironment:
 
         seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences], dtype=np.float32)
 
+        block_seq_arrays = np.empty(
+            (self.num_sequences, self.num_blocks, seq_arrays.shape[-1]),
+            dtype=np.float32,
+        )
+        for block_idx in range(self.num_blocks):
+            site_start = int(round(block_idx * self.sequence_length / self.num_blocks))
+            site_end = int(round((block_idx + 1) * self.sequence_length / self.num_blocks))
+            if site_end <= site_start:
+                raise ValueError(
+                    "num_blocks must not create empty block intervals for sequence_length"
+                )
+            block_seq_arrays[:, block_idx, :] = seq_arrays[:, site_start:site_end, :].mean(axis=1)
+
         self.seq_arrays = torch.nn.Parameter(
             torch.tensor(seq_arrays, dtype=torch.float32, device=self.device),
+            requires_grad=False,
+        )
+        self.block_seq_arrays = torch.nn.Parameter(
+            torch.tensor(block_seq_arrays, dtype=torch.float32, device=self.device),
             requires_grad=False,
         )
         
@@ -642,7 +659,7 @@ class SimpleARGEnvironment:
         return state
 
     def _initial_lineage_partials(self, node_id, material_segments):
-        partials = self.seq_arrays[int(node_id)].detach().clone().float()
+        partials = self.block_seq_arrays[int(node_id)].detach().clone().float()
         return self.evolution_model.mask_partials(partials, material_segments)
 
     def _initial_lineages_partials_batch(self, material_segments_list):

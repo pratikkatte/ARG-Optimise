@@ -4,6 +4,7 @@ import random
 
 DEFAULT_TIME_BINS = 32
 DEFAULT_TIME_DELTA_BIN_WIDTH = 0.001
+DEFAULT_TIME_BIN_SCHEME = "TimeEnvFixedDelta"
 
 class TimeEnvFixedDelta:
     """Fixed-width delta-time helper for bottom-up ARG construction.

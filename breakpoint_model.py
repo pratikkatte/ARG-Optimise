@@ -84,9 +84,8 @@ class BreakpointSplitPositionCNN(nn.Module):
     def _breakpoint_logit_indices(self, sequence_length, num_blocks, breakpoints, device):
         indices = []
         for breakpoint in breakpoints:
-            site_split = int(round(float(breakpoint) * sequence_length / num_blocks))
-            site_split = min(max(site_split, 1), sequence_length - 1)
-            indices.append(site_split - 1)
+            index = min(max(int(breakpoint), 1), int(num_blocks) - 1) - 1
+            indices.append(index)
         return torch.tensor(indices, dtype=torch.long, device=device)
 
     def forward(self, valid_breakpoints, lineage_seq_feature, sequence_length, num_blocks, random_spec):

@@ -180,18 +180,12 @@ class RolloutWorker:
 
     def _material_mask_to_site_mask(self, material_mask, device):
         mask = torch.as_tensor(material_mask, dtype=torch.bool, device=device)
-        sequence_length = int(self.env.sequence_length)
-        if len(mask) == sequence_length:
+        num_blocks = int(self.env.num_blocks)
+        if len(mask) == num_blocks:
             return mask.to(dtype=torch.float32)
-
-        site_mask = torch.zeros(sequence_length, dtype=torch.bool, device=device)
-        for block_idx, has_material in enumerate(mask.tolist()):
-            if not has_material:
-                continue
-            start = int(round(block_idx * sequence_length / self.env.num_blocks))
-            end = int(round((block_idx + 1) * sequence_length / self.env.num_blocks))
-            site_mask[start:end] = True
-        return site_mask.to(dtype=torch.float32)
+        raise ValueError(
+            f"material mask must have length {num_blocks}, got {len(mask)}"
+        )
 
     def _trajectory_record(self, step, action, log_prior, state, record_diagnostics):
         record = {

@@ -39,7 +39,7 @@ class EvolutionModelTorch(torch.nn.Module):
             return cached
 
         weights = torch.ones(
-            int(self.env.sequence_length),
+            int(self.env.num_blocks),
             dtype=dtype,
             device=device,
         )
@@ -145,35 +145,29 @@ class EvolutionModelTorch(torch.nn.Module):
         return partials @ transition_matrix.T
 
     def material_site_weights(self, material_segments, device=None, dtype=None):
-        """Map block-coordinate material intervals to per-site model weights."""
+        """Map block-coordinate material intervals to block-row model weights."""
         if dtype is None:
-            dtype = self.env.seq_arrays.dtype
+            dtype = self.env.block_seq_arrays.dtype
         if device is None:
-            device = self.env.seq_arrays.device
+            device = self.env.block_seq_arrays.device
 
         num_blocks = int(self.env.num_blocks)
         if material_segments.segments == ((0, num_blocks),):
             return self._full_material_site_weights(device, dtype)
 
-        sequence_length = int(self.env.sequence_length)
-        num_blocks_f = float(max(num_blocks, 1))
-        site_starts, site_ends, site_width = self._site_interval_grid(device, dtype)
-        weights = torch.zeros(sequence_length, dtype=dtype, device=device)
+        weights = torch.zeros(num_blocks, dtype=dtype, device=device)
 
         for segment_start, segment_end in material_segments.segments:
-            start = max(float(segment_start), 0.0)
-            end = min(float(segment_end), num_blocks_f)
+            start = max(int(segment_start), 0)
+            end = min(int(segment_end), num_blocks)
             if end <= start:
                 continue
-
-            overlap = (site_ends.clamp(max=end) - site_starts.clamp(min=start)).clamp(min=0.0)
-            segment_weights = (overlap / site_width).clamp(max=1.0)
-            weights = torch.clamp(weights + segment_weights, max=1.0)
+            weights[start:end] = 1.0
 
         return weights
 
     def mask_partials(self, partials, material_segments):
-        """Zero out sites where this lineage carries no ancestral material."""
+        """Zero out blocks where this lineage carries no ancestral material."""
         partials = self._as_partials_tensor(partials)
         weights = self.material_site_weights(
             material_segments,
@@ -198,8 +192,8 @@ class EvolutionModelTorch(torch.nn.Module):
         if torch.is_tensor(partials):
             tensor = partials.to(dtype=torch.float32)
         else:
-            tensor = torch.as_tensor(partials, dtype=torch.float32, device=self.env.seq_arrays.device)
-        expected_shape = (int(self.env.sequence_length), 4)
+            tensor = torch.as_tensor(partials, dtype=torch.float32, device=self.env.block_seq_arrays.device)
+        expected_shape = (int(self.env.num_blocks), 4)
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(
                 f"ARGLineage.partials must have shape {expected_shape}, got {tuple(tensor.shape)}"

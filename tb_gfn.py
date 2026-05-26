@@ -39,6 +39,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 self.env.seq_arrays.detach().to(self.device),
                 requires_grad=False,
             )
+        if hasattr(self.env, "block_seq_arrays"):
+            self.env.block_seq_arrays = torch.nn.Parameter(
+                self.env.block_seq_arrays.detach().to(self.device),
+                requires_grad=False,
+            )
         self.init_z_sample_count = init_z_sample_count
 
         ## Policy model

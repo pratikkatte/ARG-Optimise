@@ -1,5 +1,3 @@
-import math
-
 from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
 from breakpoint_model import BreakpointSplitPositionCNN
 from time_model import TimeModel
@@ -30,7 +28,7 @@ class ARGModel(nn.Module):
         super().__init__()
         self.env = env
         self.device = env.device
-        input_size = int(env.sequence_length) * 4
+        input_size = int(env.num_blocks) * 4
 
         self.seq_embedding = nn.Linear(input_size, embedding_size)
         self.action_scorer = nn.Sequential(
@@ -53,24 +51,24 @@ class ARGModel(nn.Module):
         self.logsoftmax = nn.LogSoftmax(dim=1)
 
     def _build_source_sequence_features(self):
-        return self.env.seq_arrays.detach().to(dtype=torch.float32).clone()
+        return self.env.block_seq_arrays.detach().to(dtype=torch.float32).clone()
 
     def model_params(self):
         return list(self.parameters())
 
     def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
         batch_size, active_lineages, seq_len, channels = lineage_seq_features.shape
-        if seq_len != int(self.env.sequence_length) or channels != 4:
+        if seq_len != int(self.env.num_blocks) or channels != 4:
             raise ValueError(
                 "sequence features must have shape "
-                f"(batch, active_lineages, {int(self.env.sequence_length)}, 4), "
+                f"(batch, active_lineages, {int(self.env.num_blocks)}, 4), "
                 f"got {tuple(lineage_seq_features.shape)}"
             )
 
         batch_input = lineage_seq_features.reshape(batch_size, active_lineages, -1)
         if batch_input.shape[-1] != self.seq_embedding.in_features:
             raise ValueError(
-                "Encoded batch_input last dimension must match sequence_length * 4 "
+                "Encoded batch_input last dimension must match num_blocks * 4 "
                 f"({self.seq_embedding.in_features}), got {batch_input.shape[-1]}"
             )
 
@@ -94,12 +92,12 @@ class ARGModel(nn.Module):
             active_counts, dtype=torch.long, device=self.device,
         )
 
-        sequence_length = self.env.sequence_length
+        num_blocks = self.env.num_blocks
         max_active_lineages = max(active_counts, default=0)
-        lineage_seq_features = self.env.seq_arrays.new_zeros(
+        lineage_seq_features = self.env.block_seq_arrays.new_zeros(
             batch_size,
             max_active_lineages,
-            sequence_length,
+            num_blocks,
             4,
         )
 
@@ -109,7 +107,7 @@ class ARGModel(nn.Module):
                 weights = self._material_segments_masking(
                     lineage.material_segments,
                     device=self.device,
-                    dtype=self.env.seq_arrays.dtype,
+                    dtype=self.env.block_seq_arrays.dtype,
                 )
                 masked_feature = feature * weights[:, None]
                 lineage_seq_features[batch_idx, lineage_idx] = (
@@ -129,7 +127,7 @@ class ARGModel(nn.Module):
             partials = partials.to(device=self.device, dtype=torch.float32)
         else:
             partials = torch.as_tensor(partials, device=self.device, dtype=torch.float32)
-        expected_shape = (int(self.env.sequence_length), 4)
+        expected_shape = (int(self.env.num_blocks), 4)
         if tuple(partials.shape) != expected_shape:
             raise ValueError(
                 f"Active ARG lineage {lineage.node_id} partials must have shape "
@@ -138,28 +136,15 @@ class ARGModel(nn.Module):
         return partials
 
     def _material_segments_masking(self, material_segments, device, dtype):
-        sequence_length = int(self.env.sequence_length)
-        weights = torch.zeros(sequence_length, dtype=dtype, device=device)
-        num_blocks = float(max(int(self.env.num_blocks), 1))
-        site_width = num_blocks / float(max(sequence_length, 1))
+        num_blocks = int(self.env.num_blocks)
+        weights = torch.zeros(num_blocks, dtype=dtype, device=device)
 
         for segment_start, segment_end in material_segments.segments:
-            start = max(float(segment_start), 0.0)
-            end = min(float(segment_end), num_blocks)
+            start = max(int(segment_start), 0)
+            end = min(int(segment_end), num_blocks)
             if end <= start:
                 continue
-
-            first_site = max(int(math.floor(start / site_width)), 0)
-            last_site = min(int(math.ceil(end / site_width)), sequence_length)
-            for site_idx in range(first_site, last_site):
-                site_start = site_idx * site_width
-                site_end = site_start + site_width
-                overlap = max(0.0, min(end, site_end) - max(start, site_start))
-                if overlap > 0.0:
-                    weights[site_idx] = torch.clamp(
-                        weights[site_idx] + weights.new_tensor(overlap / site_width),
-                        max=1.0,
-                    )
+            weights[start:end] = 1.0
         return weights
 
     def sample(self, logits, random_spec=None):
@@ -254,13 +239,11 @@ class ARGModel(nn.Module):
         return list(range(int(action.span_start) + 1, int(action.span_end) + 1))
 
     def _breakpoint_logit_indices(self, breakpoints, device):
-        sequence_length = int(self.env.sequence_length)
         num_blocks = int(self.env.num_blocks)
         indices = []
         for breakpoint in breakpoints:
-            site_split = int(round(float(breakpoint) * sequence_length / num_blocks))
-            site_split = min(max(site_split, 1), sequence_length - 1)
-            indices.append(site_split - 1)
+            index = min(max(int(breakpoint), 1), num_blocks - 1) - 1
+            indices.append(index)
         return torch.tensor(indices, dtype=torch.long, device=device)
 
     def _sample_recombination_breakpoint(self, action, lineage_seq_feature, random_spec=None):
