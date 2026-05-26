@@ -261,39 +261,45 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def _enumerate_inverse_arg_actions(self, state):
         inverse_actions = []
 
-        for active_idx, lineage in enumerate(state.active_lineages):
-            if lineage.event_type != "coal" or len(lineage.children) != 2:
-                continue
-            if not self._is_latest_time_event(state, lineage.node_id):
-                continue
-            child_i, child_j = lineage.children
+        # Use one loop to collect both coal and recomb candidates efficiently
+        # Prepare coal candidates in a single pass with a list comprehension
+        coal_candidates = [
+            (active_idx, lineage)
+            for active_idx, lineage in enumerate(state.active_lineages)
             if (
-                child_i in state.all_nodes
-                and child_j in state.all_nodes
-                and lineage.node_id in state.all_nodes[child_i].parents
-                and lineage.node_id in state.all_nodes[child_j].parents
-            ):
-                inverse_actions.append(
-                    {
-                        "event_type": "coal",
-                        "active_idx": active_idx,
-                        "parent_id": lineage.node_id,
-                        "child_ids": (child_i, child_j),
-                    }
-                )
+                lineage.event_type == "coal"
+                and len(lineage.children) == 2
+                and self._is_latest_time_event(state, lineage.node_id)
+                and lineage.children[0] in state.all_nodes
+                and lineage.children[1] in state.all_nodes
+                and lineage.node_id in state.all_nodes[lineage.children[0]].parents
+                and lineage.node_id in state.all_nodes[lineage.children[1]].parents
+            )
+        ]
+        for active_idx, lineage in coal_candidates:
+            child_i, child_j = lineage.children
+            inverse_actions.append(
+                {
+                    "event_type": "coal",
+                    "active_idx": active_idx,
+                    "parent_id": lineage.node_id,
+                    "child_ids": (child_i, child_j),
+                }
+            )
 
+        # Prepare recomb_by_event using a single pass with a dictionary
         recomb_by_event = {}
         for active_idx, lineage in enumerate(state.active_lineages):
             if (
-                lineage.event_type != "recomb"
-                or len(lineage.children) != 1
-                or lineage.breakpoint is None
-                or lineage.recombination_side not in ("left", "right")
+                lineage.event_type == "recomb"
+                and len(lineage.children) == 1
+                and lineage.breakpoint is not None
+                and lineage.recombination_side in ("left", "right")
             ):
-                continue
-            key = (lineage.children[0], lineage.breakpoint)
-            recomb_by_event.setdefault(key, {})[lineage.recombination_side] = (active_idx, lineage.node_id)
+                key = (lineage.children[0], lineage.breakpoint)
+                recomb_by_event.setdefault(key, {})[lineage.recombination_side] = (active_idx, lineage.node_id)
 
+        # We can iterate efficiently over recomb_by_event rather than collecting in a list
         for (child_id, breakpoint), sides in recomb_by_event.items():
             if "left" not in sides or "right" not in sides or child_id not in state.all_nodes:
                 continue
@@ -302,14 +308,16 @@ class TBGFlowNetGenerator(torch.nn.Module):
             child = state.all_nodes[child_id]
             left_parent = state.all_nodes[left_id]
             right_parent = state.all_nodes[right_id]
-            if not self._is_latest_time_event(state, left_id, right_id):
+
+            # Fast short-circuit checks, in a single conditional
+            if (
+                not self._is_latest_time_event(state, left_id, right_id)
+                or set(child.parents) != {left_id, right_id}
+                or left_parent.material_segments.intersection_count(right_parent.material_segments) > 0
+                or left_parent.material_segments.union(right_parent.material_segments) != child.material_segments
+            ):
                 continue
-            if set(child.parents) != {left_id, right_id}:
-                continue
-            if left_parent.material_segments.intersection_count(right_parent.material_segments) > 0:
-                continue
-            if left_parent.material_segments.union(right_parent.material_segments) != child.material_segments:
-                continue
+
             inverse_actions.append(
                 {
                     "event_type": "recomb",

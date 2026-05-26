@@ -126,7 +126,7 @@ class RolloutWorker:
                 trajectories[traj_idx].update(next_state, action, log_prior=log_prior, done=next_state.is_done)
 
                 backward_num_parents_by_traj[traj_idx].append(
-                    self._count_inverse_arg_actions(next_state)
+                    generator.count_backward_parents(next_state)
                     )
             unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
 
@@ -306,54 +306,3 @@ class RolloutWorker:
             return next(generator.parameters()).device
         except (AttributeError, StopIteration):
             return self.env.seq_arrays.device
-
-
-    # TODO: make it compatible with the new action space/data structure.
-    def _count_inverse_arg_actions(self, state):
-        count = 0
-        for lineage in state.active_lineages:
-            if lineage.event_type != "coal" or len(lineage.children) != 2:
-                continue
-            child_i, child_j = lineage.children
-            if (
-                child_i in state.all_nodes
-                and child_j in state.all_nodes
-                and lineage.node_id in state.all_nodes[child_i].parents
-                and lineage.node_id in state.all_nodes[child_j].parents
-            ):
-                count += 1
-
-        recomb_by_event = {}
-        for active_idx, lineage in enumerate(state.active_lineages):
-            if (
-                lineage.event_type != "recomb"
-                or len(lineage.children) != 1
-                or lineage.breakpoint is None
-                or lineage.recombination_side not in ("left", "right")
-            ):
-                continue
-            key = (lineage.children[0], lineage.breakpoint)
-            recomb_by_event.setdefault(key, {})[lineage.recombination_side] = (
-                active_idx,
-                lineage.node_id,
-            )
-
-        for (child_id, _), sides in recomb_by_event.items():
-            if "left" not in sides or "right" not in sides or child_id not in state.all_nodes:
-                continue
-            _, left_id = sides["left"]
-            _, right_id = sides["right"]
-            child = state.all_nodes[child_id]
-            left_parent = state.all_nodes[left_id]
-            right_parent = state.all_nodes[right_id]
-            if set(child.parents) != {left_id, right_id}:
-                continue
-            if left_parent.material_segments.intersection_count(right_parent.material_segments) > 0:
-                continue
-            if left_parent.material_segments.union(right_parent.material_segments) != child.material_segments:
-                continue
-            count += 1
-
-        if count <= 0:
-            raise ValueError("No valid ARG parent states were found for backward probability.")
-        return count

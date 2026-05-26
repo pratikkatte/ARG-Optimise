@@ -552,14 +552,14 @@ class ARGReward:
     Terminal reward helpers for constructed ARG states.
     """
 
-    def __init__(self):
-        pass
+    def __init__(self, C=3000):
+        self.C = C
 
-    def __call__(self, state):
-        return self.compute_terminal_posterior_log_reward(state)
+    def __call__(self, log_likelihood, accumulated_log_prior):
+        return self.compute_terminal_posterior_log_reward(log_likelihood, accumulated_log_prior)
 
-    def compute_terminal_posterior_log_reward(self, log_likelihood):
-        return log_likelihood
+    def compute_terminal_posterior_log_reward(self, log_likelihood, accumulated_log_prior):
+        return float(self.C + log_likelihood + accumulated_log_prior)
 
 class SimpleARGEnvironment:
     """
@@ -893,8 +893,8 @@ class SimpleARGEnvironment:
             raise ValueError("terminal reward requires a terminal ARGState")
         if log_likelihood is None:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
-        log_likelihood = self.reward_fn(log_likelihood)
-        return float(log_likelihood + state.accumulated_log_prior)
+        log_reward = self.reward_fn(log_likelihood, state.accumulated_log_prior)
+        return log_reward
 
     def compute_coalescence_actions(self, state):
         return list(CoalescenceChoice.enumerate_from_active_lineages(state.active_lineages))
