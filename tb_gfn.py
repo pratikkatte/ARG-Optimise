@@ -55,8 +55,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         ## Z partition
         self.max_reward_seen = float("-inf")
-        trajs = env.sample(16, verbose=verbose)
-        self.max_reward_seen = np.max([x.log_reward for x in trajs])
+        log_rewards = env.sample_log_rewards(self.init_z_sample_count, verbose=verbose)
+        self.max_reward_seen = float(np.max(log_rewards))
         init_Z = self.max_reward_seen
         self._Z = torch.nn.Parameter(  # in log
                 torch.ones(256, device=self.device) * init_Z / 256, requires_grad=True

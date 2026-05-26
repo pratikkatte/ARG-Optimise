@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from env import SimpleTrajectory, Trajectory, action_as_dict
+from env import SimpleTrajectory, action_as_dict
 
 
 class RolloutWorker:
@@ -11,72 +11,6 @@ class RolloutWorker:
         self.device = env.device
         self.verbose = verbose
 
-    def _rollout_one(
-        self,
-        generator=None,
-        random_spec=None,
-        record_diagnostics=False,
-        sample_backward=False,
-        compute_reward=True,
-        generate_full_trajectories=True,
-    ):
-        if generator is not None:
-            data, trajectories = self._rollout_batch(
-                generator=generator,
-                episodes=1,
-                random_spec=random_spec,
-                record_diagnostics=record_diagnostics,
-                sample_backward=sample_backward,
-                compute_reward=compute_reward,
-                generate_full_trajectories=generate_full_trajectories,
-            )
-            return data, trajectories[0]
-
-        state = self.env.get_initial_state()
-        if generate_full_trajectories:
-            trajectory = Trajectory(state)
-        else:
-            trajectory = SimpleTrajectory()
-        step = 0
-
-        if self.verbose:
-            print("Rolling out 1 prior-only trajectory...")
-
-        while not state.is_done:
-            step += 1
-            sampled = self.env.sample_action_from_prior(state)
-            if sampled is None:
-                raise RuntimeError("ARG prior rollout reached a non-terminal state with no valid action.")
-            action, log_prior = sampled
-
-            next_state = self.env.apply_action(
-                state,
-                action,
-                log_prior,
-                compute_reward=compute_reward,
-            )
-            record = self._trajectory_record(step, action, log_prior, next_state, record_diagnostics)
-            if generate_full_trajectories:
-                trajectory.update(next_state, action, log_prior, next_state.is_done, record=record)
-            else:
-                trajectory.update(
-                    action,
-                    log_prior=log_prior,
-                    log_reward=next_state.log_reward,
-                    record=record,
-                    active_lineages=state.active_lineages,
-                )
-            state = next_state
-
-        if self.verbose:
-            log_reward = state.log_reward
-            reward_str = f"{log_reward:.4f}" if log_reward is not None else "None"
-            print(
-                f"Finished prior-only trajectory: {step} steps, log_reward={reward_str}"
-            )
-
-        return state, trajectory
-
     def _rollout_batch(
         self,
         generator,
@@ -85,7 +19,7 @@ class RolloutWorker:
         ):
         
         states = [self.env.get_initial_state() for _ in range(episodes)]
-        trajectories = [Trajectory(x) for x in states]
+        trajectories = [SimpleTrajectory() for _ in states]
         
         
         log_paths_pf_by_traj = [[] for _ in range(episodes)]
@@ -123,7 +57,11 @@ class RolloutWorker:
                     log_prior=log_prior,
                 )
                 states[traj_idx] = next_state
-                trajectories[traj_idx].update(next_state, action, log_prior=log_prior, done=next_state.is_done)
+                trajectories[traj_idx].update(
+                    action,
+                    log_prior=log_prior,
+                    log_reward=next_state.log_reward,
+                )
 
                 backward_num_parents_by_traj[traj_idx].append(
                     generator.count_backward_parents(next_state)
@@ -155,45 +93,15 @@ class RolloutWorker:
         generator=None,
         episodes=1,
         random_spec=None,
-        record_diagnostics=False,
-        sample_backward=False,
-        num_trajectories=None,
-        compute_reward=True,
-        generate_full_trajectories=True,
     ):
-        """
-        Run one or more ARG rollouts.
-
-        Passing a generator lets the model sample over all valid ARG actions.
-        Omitting it keeps the prior-only rollout path.
-        """
-        if num_trajectories is not None:
-            episodes = num_trajectories
-
-        if generator is not None:
-            return self._rollout_batch(
-                generator=generator,
-                episodes=episodes,
-                random_spec=random_spec,
-            )
-
-        states = []
-        trajectories = []
-        for _ in range(episodes):
-            state, trajectory = self._rollout_one(
-                record_diagnostics=record_diagnostics,
-                compute_reward=compute_reward,
-                generate_full_trajectories=generate_full_trajectories,
-            )
-            states.append(state)
-            trajectories.append(trajectory)
-
-        if episodes == 1:
-            return states[0], trajectories[0]
-        return states, trajectories
-
-    def sample_action_from_prior(self, state):
-        return self.env.sample_action_from_prior(state)
+        """Run one or more model-guided ARG rollouts."""
+        if generator is None:
+            raise ValueError("Generator is required for rollout")
+        return self._rollout_batch(
+            generator=generator,
+            episodes=episodes,
+            random_spec=random_spec,
+        )
 
     def _states_to_padded_tree_features(self, states, device=None):
         lineage_features = [

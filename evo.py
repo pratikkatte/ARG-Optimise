@@ -15,6 +15,36 @@ class EvolutionModelTorch(torch.nn.Module):
         self._branch_length_scale = (
             2.0 * float(env.population_size) * float(env.mutation_rate)
         )
+        self._site_grid_cache = {}
+        self._full_material_weights_cache = {}
+
+    def _site_interval_grid(self, device, dtype):
+        key = (device, dtype)
+        cached = self._site_grid_cache.get(key)
+        if cached is not None:
+            return cached
+
+        sequence_length = int(self.env.sequence_length)
+        num_blocks = float(max(int(self.env.num_blocks), 1))
+        site_width = num_blocks / float(max(sequence_length, 1))
+        sites = torch.arange(sequence_length, device=device, dtype=dtype)
+        grid = (sites * site_width, sites * site_width + site_width, site_width)
+        self._site_grid_cache[key] = grid
+        return grid
+
+    def _full_material_site_weights(self, device, dtype):
+        key = (device, dtype)
+        cached = self._full_material_weights_cache.get(key)
+        if cached is not None:
+            return cached
+
+        weights = torch.ones(
+            int(self.env.sequence_length),
+            dtype=dtype,
+            device=device,
+        )
+        self._full_material_weights_cache[key] = weights
+        return weights
 
     def compute_arg_log_likelihood(self, state):
         """Compute the JC69 sequence log likelihood of a terminal ARG.
@@ -121,28 +151,25 @@ class EvolutionModelTorch(torch.nn.Module):
         if device is None:
             device = self.env.seq_arrays.device
 
+        num_blocks = int(self.env.num_blocks)
+        if material_segments.segments == ((0, num_blocks),):
+            return self._full_material_site_weights(device, dtype)
+
         sequence_length = int(self.env.sequence_length)
-        num_blocks = float(max(int(self.env.num_blocks), 1))
-        site_width = num_blocks / float(max(sequence_length, 1))
+        num_blocks_f = float(max(num_blocks, 1))
+        site_starts, site_ends, site_width = self._site_interval_grid(device, dtype)
         weights = torch.zeros(sequence_length, dtype=dtype, device=device)
 
         for segment_start, segment_end in material_segments.segments:
             start = max(float(segment_start), 0.0)
-            end = min(float(segment_end), num_blocks)
+            end = min(float(segment_end), num_blocks_f)
             if end <= start:
                 continue
 
-            first_site = max(int(math.floor(start / site_width)), 0)
-            last_site = min(int(math.ceil(end / site_width)), sequence_length)
-            for site_idx in range(first_site, last_site):
-                site_start = site_idx * site_width
-                site_end = site_start + site_width
-                overlap = max(0.0, min(end, site_end) - max(start, site_start))
-                if overlap > 0.0:
-                    weights[site_idx] = torch.clamp(
-                        weights[site_idx] + weights.new_tensor(overlap / site_width),
-                        max=1.0,
-                    )
+            overlap = (site_ends.clamp(max=end) - site_starts.clamp(min=start)).clamp(min=0.0)
+            segment_weights = (overlap / site_width).clamp(max=1.0)
+            weights = torch.clamp(weights + segment_weights, max=1.0)
+
         return weights
 
     def mask_partials(self, partials, material_segments):

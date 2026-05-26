@@ -424,8 +424,11 @@ class ARGState:
     total_active_blocks: Optional[int] = None
     current_time: float = 0.0
 
-    def clone(self):
-        all_nodes = {node_id: lineage.clone() for node_id, lineage in self.all_nodes.items()}
+    def clone(self, copy_partials=False):
+        all_nodes = {
+            node_id: lineage.clone(copy_partials=copy_partials)
+            for node_id, lineage in self.all_nodes.items()
+        }
         active_lineages = [all_nodes[lineage.node_id] for lineage in self.active_lineages]
         return ARGState(
             active_lineages=active_lineages,
@@ -437,38 +440,6 @@ class ARGState:
             total_active_blocks=self.total_active_blocks,
             current_time=float(self.current_time),
         )
-
-
-class Trajectory:
-    """Full rollout history with cloned ARG states at each step."""
-
-    def __init__(self, initial_state):
-        self.current_state = initial_state.clone()
-        self.transitions = []
-        self.actions = []
-        self.records = []
-        self.log_reward = None
-        self.done = False
-
-    def update(self, next_state, action, log_prior, done, record=None):
-        self.transitions.append(    
-            [self.current_state, next_state.clone(),log_prior, done]
-        )
-        self.actions.append(action)
-        if record is not None:
-            self.records.append(record)
-        self.current_state = next_state.clone()
-        self.done = done
-        if next_state.log_reward is not None:
-            self.log_reward = next_state.log_reward
-
-    def update_reward(self, log_reward):
-        if self.transitions:
-            self.transitions[-1][3] = log_reward
-        self.log_reward = log_reward
-
-    def __len__(self):
-        return len(self.transitions)
 
 
 class SimpleTrajectory:
@@ -486,6 +457,9 @@ class SimpleTrajectory:
         self.log_reward = log_reward
         if record is not None:
             self.records.append(record)
+
+    def __len__(self):
+        return len(self.actions)
 
 
 def action_as_dict(action):
@@ -684,10 +658,10 @@ class SimpleARGEnvironment:
             ms.segments == reference_segments.segments for ms in material_segments_list
         )
         if segments_match:
-            partials = self.seq_arrays.detach().clone().float()
-            weights = self.evolution_model.material_site_weights(reference_segments)
-            masked = partials * weights[None, :, None]
-            return [masked[node_id] for node_id in range(num_lineages)]
+            return [
+                self._initial_lineage_partials(node_id, reference_segments)
+                for node_id in range(num_lineages)
+            ]
 
         return [
             self._initial_lineage_partials(node_id, material_segments)
@@ -964,7 +938,7 @@ class SimpleARGEnvironment:
             rates = self.compute_event_rates(self.enumerate_actions(state))
             state.rates = rates
 
-        next_state = state.clone()
+        next_state = state.clone(copy_partials=False)
         i = action.active_lineage_i
         j = action.active_lineage_j
 
@@ -1019,7 +993,7 @@ class SimpleARGEnvironment:
 
         # if log_prior is None:
         #     log_prior = self.compute_cwr_event_log_prior(state, action, rates=rates)
-        next_state = state.clone()
+        next_state = state.clone(copy_partials=False)
         current_lineage_idx = action.active_lineage_i
         breakpoint = action.breakpoint
         child = next_state.active_lineages[current_lineage_idx].clone(copy_partials=False, copy_mask=False)
@@ -1124,58 +1098,47 @@ class SimpleARGEnvironment:
         return coal_actions, recomb_actions
 
 
-    def sample(self,num_trajs, verbose=True):
-        """Sample terminal ARG states.
-
-        Without a generator this preserves the prior-only sampler. With a
-        generator, event types are sampled from environment event rates and the
-        model chooses the concrete action through RolloutWorker.
-        """
-        states = [self.get_initial_state() for _ in range(num_trajs)]
-        print(f"sampling ....")
-
-        trajectories = [Trajectory(x) for x in states]
+    def _sample_prior_step(self, state):
+        """Sample one prior coalescence/recombination action and its log prior."""
         event_types = ["coal", "recomb"]
-        unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
-        print(f"unfinished: {unfinished}")
-        while unfinished:
-            print(f"Sampling {len(unfinished)} unfinished trajectories...")
-            combined_actions = [[]]*num_trajs
-            event_probs = [[]]*num_trajs
-            for idx in unfinished:
-                combined_actions[idx] = self.enumerate_actions(states[idx])
-                event_probs[idx] = list(self.compute_event_probabilities(states[idx], combined_actions[idx]).values())
+        combined_actions = self.enumerate_actions(state)
+        event_probs = list(self.compute_event_probabilities(state, combined_actions).values())
+        chosen_event = event_types[np.random.choice(2, p=event_probs)]
 
-            choosen_event_types = [event_types[np.random.choice(2, p=event_probs[idx])] for idx in unfinished]
-            choosen_actions = []
-            for idx, choosen_event in zip(unfinished, choosen_event_types):
-                coal_actions, recomb_actions = combined_actions[idx]
-                if choosen_event == "coal":
-                    choosen_action = self.rng.choice(coal_actions)
-                else:
-                    choosen_action = self.rng.choice(recomb_actions)
-                    
-                    ## choose breakpoint.
-                    breakpoint = self.rng.choice(range(choosen_action.span_start + 1, choosen_action.span_end + 1))
-                    choosen_action = replace(choosen_action, breakpoint=breakpoint)
+        coal_actions, recomb_actions = combined_actions
+        if chosen_event == "coal":
+            chosen_action = self.rng.choice(coal_actions)
+        else:
+            prior_result = self._sample_recombination_prior_action(recomb_actions)
+            if prior_result is None:
+                raise ValueError("No valid recombination actions to sample")
+            action_dict, _, selected = prior_result
+            chosen_action = replace(
+                selected,
+                breakpoint=action_dict["breakpoint"],
+            )
 
-                ## Choose Time.
-                time_action = self.time_env.sample_action_from_prior(self._total_event_rate(states[idx].rates), self.rng)
-                choosen_action = replace(choosen_action, time_action=time_action)
-                    
-                choosen_actions.append(choosen_action)
-     
-                log_prior = self.compute_cwr_event_log_prior(states[idx], combined_actions[idx], choosen_action)
+        time_action = self.time_env.sample_action_from_prior(
+            self._total_event_rate(state.rates), self.rng
+        )
+        chosen_action = replace(chosen_action, time_action=time_action)
+        log_prior = self.compute_cwr_event_log_prior(state, combined_actions, chosen_action)
+        return chosen_action, log_prior
 
-                next_state = self.apply_action(
-                    states[idx],
-                    choosen_action,
-                    log_prior=log_prior,
+    def sample_log_rewards(self, num_trajs, verbose=True):
+        """Sample prior rollouts sequentially and return terminal log rewards."""
+        log_rewards = []
+        for traj_idx in range(num_trajs):
+            if verbose:
+                print(
+                    f"Sampling prior trajectory {traj_idx + 1}/{num_trajs} for log Z init..."
                 )
-                states[idx] = next_state
-                trajectories[idx].update(next_state, choosen_action, log_prior=log_prior, done=next_state.is_done)
-            unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
-        return trajectories
+            state = self.get_initial_state()
+            while not state.is_done:
+                action, log_prior = self._sample_prior_step(state)
+                state = self.apply_action(state, action, log_prior=log_prior)
+            log_rewards.append(state.log_reward)
+        return log_rewards
 
     def compute_cwr_event_log_prior(self, state, combined_actions, action=None, rates=None):
         if action is None:
