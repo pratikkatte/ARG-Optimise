@@ -33,7 +33,11 @@ DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_HIDDEN_DIM = 128
 DEFAULT_BREAKPOINT_DROPOUT = 0.1
-MODEL_VERSION = "cwr-event-learned-time-block-partials-v1"
+DEFAULT_TRANSFORMER_DEPTH = 6
+DEFAULT_TRANSFORMER_HEADS = 4
+DEFAULT_TRANSFORMER_MLP_RATIO = 2.0
+DEFAULT_ATTENTION_DROPOUT = 0.0
+MODEL_VERSION = "cwr-event-transformer-block-partials-v1"
 
 def seed_everything(seed):
     random.seed(seed)
@@ -169,6 +173,10 @@ def train(
     dropout=DEFAULT_DROPOUT,
     breakpoint_hidden_dim=DEFAULT_BREAKPOINT_HIDDEN_DIM,
     breakpoint_dropout=DEFAULT_BREAKPOINT_DROPOUT,
+    transformer_depth=DEFAULT_TRANSFORMER_DEPTH,
+    transformer_heads=DEFAULT_TRANSFORMER_HEADS,
+    transformer_mlp_ratio=DEFAULT_TRANSFORMER_MLP_RATIO,
+    attention_dropout=DEFAULT_ATTENTION_DROPOUT,
     verbose=True,
     
 ):
@@ -196,6 +204,10 @@ def train(
         "dropout": float(dropout),
         "breakpoint_hidden_dim": int(breakpoint_hidden_dim),
         "breakpoint_dropout": float(breakpoint_dropout),
+        "transformer_depth": int(transformer_depth),
+        "transformer_heads": int(transformer_heads),
+        "transformer_mlp_ratio": float(transformer_mlp_ratio),
+        "attention_dropout": float(attention_dropout),
     }
 
     generator = TBGFlowNetGenerator(
@@ -411,6 +423,10 @@ def main():
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--breakpoint-hidden-dim", type=int, default=DEFAULT_BREAKPOINT_HIDDEN_DIM)
     parser.add_argument("--breakpoint-dropout", type=float, default=DEFAULT_BREAKPOINT_DROPOUT)
+    parser.add_argument("--transformer-depth", type=int, default=DEFAULT_TRANSFORMER_DEPTH)
+    parser.add_argument("--transformer-heads", type=int, default=DEFAULT_TRANSFORMER_HEADS)
+    parser.add_argument("--transformer-mlp-ratio", type=float, default=DEFAULT_TRANSFORMER_MLP_RATIO)
+    parser.add_argument("--attention-dropout", type=float, default=DEFAULT_ATTENTION_DROPOUT)
     parser.add_argument("--wandb", action="store_true", default=True)
     args = parser.parse_args()
 
@@ -445,6 +461,10 @@ def main():
         dropout=args.dropout,
         breakpoint_hidden_dim=args.breakpoint_hidden_dim,
         breakpoint_dropout=args.breakpoint_dropout,
+        transformer_depth=args.transformer_depth,
+        transformer_heads=args.transformer_heads,
+        transformer_mlp_ratio=args.transformer_mlp_ratio,
+        attention_dropout=args.attention_dropout,
     )
 
 

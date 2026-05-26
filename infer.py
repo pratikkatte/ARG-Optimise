@@ -64,6 +64,7 @@ def run_inference(
         device=device,
         verbose=verbose,
         log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
+        model_kwargs=dict(metadata.get("model", {})),
     )
     generator.load(checkpoint, load_optimizer=False, map_location=generator.device)
     generator.eval()
