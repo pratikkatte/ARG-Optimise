@@ -27,6 +27,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         model_kwargs=None,
         policy_lr=None,
         log_z_lr=None,
+        initialize_z_from_prior=True,
     ):
         super().__init__()
         print(f"verbose: {verbose}")
@@ -60,9 +61,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         ## Z partition
         self.max_reward_seen = float("-inf")
-        log_rewards = env.sample_log_rewards(self.init_z_sample_count, verbose=verbose)
-        self.max_reward_seen = float(np.max(log_rewards))
-        init_Z = self.max_reward_seen
+        if initialize_z_from_prior:
+            log_rewards = env.sample_log_rewards(self.init_z_sample_count, verbose=verbose)
+            self.max_reward_seen = float(np.max(log_rewards))
+            init_Z = self.max_reward_seen
+        else:
+            self.max_reward_seen = 0.0
+            init_Z = 0.0
         self._Z = torch.nn.Parameter(  # in log
                 torch.ones(256, device=self.device) * init_Z / 256, requires_grad=True
                 )
@@ -124,10 +129,15 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def load(self, path, load_optimizer=True, map_location=None):
         if map_location is None:
             map_location = self.device
-        checkpoint = self._torch_load(path, map_location=map_location)
+        checkpoint = (
+            path
+            if isinstance(path, dict)
+            else self._torch_load(path, map_location=map_location)
+        )
         state_dict = checkpoint.get("generator_state_dict", checkpoint)
         self.load_state_dict(state_dict)
         self.to(self.device)
+        self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
 
         if load_optimizer and "opt_state_dict" in checkpoint:
             self.opt.load_state_dict(checkpoint["opt_state_dict"])

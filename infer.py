@@ -53,7 +53,12 @@ def run_inference(
     inference_seed = int(metadata["seed"] if seed is None else seed)
     seed_everything(inference_seed)
 
-    env = environment_from_metadata(metadata, seed=inference_seed)
+    resolved_device = resolve_device(device)
+    env = environment_from_metadata(
+        metadata,
+        seed=inference_seed,
+        device=resolved_device,
+    )
     generator = TBGFlowNetGenerator(
         env,
         init_z_sample_count=metadata["init_z_sample_count"],
@@ -61,12 +66,13 @@ def run_inference(
             "breakpoint_policy": metadata.get("breakpoint_policy", "continuous-bin"),
             "breakpoint_mixtures": int(metadata.get("breakpoint_mixtures", 4)),
         },
-        device=device,
+        device=resolved_device,
         verbose=verbose,
         log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
         model_kwargs=dict(metadata.get("model", {})),
+        initialize_z_from_prior=False,
     )
-    generator.load(checkpoint, load_optimizer=False, map_location=generator.device)
+    generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
     generator.eval()
 
     random_spec = build_random_spec(temperature=temperature)
@@ -104,6 +110,15 @@ def load_checkpoint(path, map_location=None):
         return torch.load(path, map_location=map_location)
 
 
+def resolve_device(device):
+    if device is None or device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested for inference but is not available.")
+    return resolved
+
+
 def validate_metadata(metadata):
     missing = sorted(REQUIRED_METADATA_KEYS - set(metadata))
     if missing:
@@ -123,21 +138,24 @@ def validate_metadata(metadata):
         )
 
 
-def environment_from_metadata(metadata, seed):
-    return SimpleARGEnvironment(
-        num_sequences=int(metadata["num_sequences"]),
-        sequence_length=int(metadata["sequence_length"]),
-        num_blocks=int(metadata["num_blocks"]),
-        rho=float(metadata["rho"]),
-        time_bins=int(metadata["time_bins"]),
-        time_delta_bin_width=float(metadata["time_delta_bin_width"]),
-        population_size=float(
+def environment_from_metadata(metadata, seed, device=None):
+    env_kwargs = {
+        "num_sequences": int(metadata["num_sequences"]),
+        "sequence_length": int(metadata["sequence_length"]),
+        "num_blocks": int(metadata["num_blocks"]),
+        "rho": float(metadata["rho"]),
+        "time_bins": int(metadata["time_bins"]),
+        "time_delta_bin_width": float(metadata["time_delta_bin_width"]),
+        "population_size": float(
             metadata.get("effective_population_size", DEFAULT_NE)
         ),
-        mutation_rate=float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
-        sequences=list(metadata["sequences"]),
-        seed=seed,
-    )
+        "mutation_rate": float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
+        "sequences": list(metadata["sequences"]),
+        "seed": seed,
+    }
+    if device is not None:
+        env_kwargs["device"] = device
+    return SimpleARGEnvironment(**env_kwargs)
 
 
 def run_batched_rollouts(
@@ -167,6 +185,7 @@ def run_batched_rollouts(
                 generator,
                 episodes=chunk_size,
                 random_spec=random_spec,
+                return_states=True,
             )
             states.extend(chunk_outputs["states"])
             trajectories.extend(chunk_trajectories)

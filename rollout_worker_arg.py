@@ -16,6 +16,7 @@ class RolloutWorker:
         generator,
         episodes,
         random_spec=None,
+        return_states=False,
         ):
         
         states = [self.env.get_initial_state() for _ in range(episodes)]
@@ -85,6 +86,8 @@ class RolloutWorker:
             "log_paths_pb": log_paths_pb,
             "log_rewards": log_rewards,
         }
+        if return_states:
+            data["states"] = states
 
         return data, trajectories
 
@@ -93,6 +96,7 @@ class RolloutWorker:
         generator=None,
         episodes=1,
         random_spec=None,
+        return_states=False,
     ):
         """Run one or more model-guided ARG rollouts."""
         if generator is None:
@@ -101,6 +105,7 @@ class RolloutWorker:
             generator=generator,
             episodes=episodes,
             random_spec=random_spec,
+            return_states=return_states,
         )
 
     def _states_to_padded_tree_features(self, states, device=None):
