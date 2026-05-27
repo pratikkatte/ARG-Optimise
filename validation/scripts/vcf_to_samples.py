@@ -16,14 +16,14 @@ def add_diploid_sites(vcf, samples):
             raise ValueError("Unphased at", pos)
         alleles = [variant.REF] + variant.ALT
         ancestral = variant.INFO.get("AA", variant.REF)
-        ordered = [ancestral] + list(set(alleles) - {ancestral})
-        allele_index = {i: ordered.index(a) for i, a in enumerate(alleles)}
+        ordered = [ancestral] + [allele for allele in alleles if allele != ancestral]
+        allele_index = {i: ordered.index(allele) for i, allele in enumerate(alleles)}
         genotypes = [
             allele_index[old]
             for row in variant.genotypes
             for old in row[0:2]
         ]
-        samples.add_site(pos, genotypes=genotypes, alleles=alleles)
+        samples.add_site(pos, genotypes=genotypes, alleles=ordered, ancestral_allele=0)
 
 vcf = cyvcf2.VCF(vcf_path)
 seq_len = vcf.seqlens[0]
