@@ -223,6 +223,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
                     lineage_feature,
                     int(self.env.sequence_length),
                     int(self.env.num_blocks),
+                    action_context=choosen_action_features[idx],
                     random_spec=random_spec,
                 )
                 choosen_actions[idx] = replace(chosen_action, breakpoint=breakpoint)

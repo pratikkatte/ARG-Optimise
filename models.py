@@ -166,6 +166,10 @@ class ARGModel(nn.Module):
         time_hidden_size=256,
         time_layers=3,
         time_dropout=0.0,
+        breakpoint_gap_hidden_size=256,
+        breakpoint_gap_layers=3,
+        breakpoint_gap_dropout=0.0,
+        breakpoint_use_position_features=True,
     ):
         super().__init__()
         self.env = env
@@ -197,6 +201,11 @@ class ARGModel(nn.Module):
         self.breakpoint_scorer = BreakpointSplitPositionCNN(
             hidden_dim=breakpoint_hidden_dim,
             dropout=breakpoint_dropout,
+            action_context_dim=embedding_size * 4,
+            gap_hidden_dim=breakpoint_gap_hidden_size,
+            gap_layers=breakpoint_gap_layers,
+            gap_dropout=breakpoint_gap_dropout,
+            use_position_features=breakpoint_use_position_features,
         ).to(self.device)
 
         self.time_scorer = TimeModel(
@@ -413,23 +422,16 @@ class ARGModel(nn.Module):
             indices.append(index)
         return torch.tensor(indices, dtype=torch.long, device=device)
 
-    def _sample_recombination_breakpoint(self, action, lineage_seq_feature, random_spec=None):
-        valid_breakpoints = self._valid_breakpoints_for_action(action)
-        if not valid_breakpoints:
-            raise ValueError(f"Recombination action has no valid breakpoints: {action}")
+    def _sample_recombination_breakpoint(self, action, lineage_seq_feature, action_context, random_spec=None):
+        return self.breakpoint_scorer(
+            action,
+            lineage_seq_feature,
+            int(self.env.sequence_length),
+            int(self.env.num_blocks),
+            action_context,
+            random_spec=random_spec,
+        )
 
-        bp_logits = self.breakpoint_scorer(lineage_seq_feature.unsqueeze(0))[0]
-        logit_indices = self._breakpoint_logit_indices(valid_breakpoints, bp_logits.device)
-        valid_logits = bp_logits[logit_indices]
-        if random_spec is not None and "T" in random_spec:
-            sample_logits = valid_logits / random_spec["T"]
-        else:
-            sample_logits = valid_logits
-        local_idx = Categorical(logits=sample_logits).sample()
-        breakpoint = int(valid_breakpoints[int(local_idx.detach().cpu().item())])
-        log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
-        return breakpoint, log_p
-    
     def _event_log_probs_from_action_logits(self, candidate_actions, logits):
         event_log_probs = logits.new_full(
             (len(candidate_actions), len(self.env.event_types)),

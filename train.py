@@ -40,7 +40,11 @@ DEFAULT_ATTENTION_DROPOUT = 0.0
 DEFAULT_TIME_HIDDEN_SIZE = 256
 DEFAULT_TIME_LAYERS = 3
 DEFAULT_TIME_DROPOUT = 0.0
-MODEL_VERSION = "cwr-event-transformer-block-partials-v2"
+DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE = 256
+DEFAULT_BREAKPOINT_GAP_LAYERS = 3
+DEFAULT_BREAKPOINT_GAP_DROPOUT = 0.0
+DEFAULT_BREAKPOINT_USE_POSITION_FEATURES = True
+MODEL_VERSION = "cwr-event-transformer-block-partials-v3"
 
 def seed_everything(seed):
     random.seed(seed)
@@ -214,6 +218,10 @@ def train(
         "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
         "time_layers": int(DEFAULT_TIME_LAYERS),
         "time_dropout": float(DEFAULT_TIME_DROPOUT),
+        "breakpoint_gap_hidden_size": int(DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE),
+        "breakpoint_gap_layers": int(DEFAULT_BREAKPOINT_GAP_LAYERS),
+        "breakpoint_gap_dropout": float(DEFAULT_BREAKPOINT_GAP_DROPOUT),
+        "breakpoint_use_position_features": bool(DEFAULT_BREAKPOINT_USE_POSITION_FEATURES),
     }
 
     generator = TBGFlowNetGenerator(

@@ -34,12 +34,21 @@ class BreakpointSplitPositionCNN(nn.Module):
         hidden_dim=128,
         dilations=None,
         dropout=0.1,
+        action_context_dim=128,
+        gap_hidden_dim=256,
+        gap_layers=3,
+        gap_dropout=0.0,
+        use_position_features=True,
     ):
         super().__init__()
         if dilations is None:
             dilations = [1, 2, 4, 8, 16, 32, 64, 128] * 2
 
         self.feature_dim = 4
+        self.hidden_dim = int(hidden_dim)
+        self.action_context_dim = int(action_context_dim)
+        self.use_position_features = bool(use_position_features)
+        self.position_feature_dim = 3 if self.use_position_features else 0
         self.input_conv = nn.Conv1d(input_dim, hidden_dim, kernel_size=7, padding=3)
         self.input_activation = nn.GELU()
 
@@ -53,16 +62,42 @@ class BreakpointSplitPositionCNN(nn.Module):
             for dilation in dilations
         )
 
-        self.scoring_head = nn.Sequential(
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(hidden_dim, 1, kernel_size=1),
+        self.gap_scorer = self._build_gap_scorer(
+            input_dim=self.hidden_dim + self.action_context_dim + self.position_feature_dim,
+            hidden_dim=int(gap_hidden_dim),
+            layers=int(gap_layers),
+            dropout=float(gap_dropout),
         )
 
-    def breakpoint_scorer(self, x):
-        """
-        """
+    def _build_gap_scorer(self, input_dim, hidden_dim, layers, dropout):
+        if layers < 0:
+            raise ValueError(f"gap_layers must be non-negative, got {layers}")
+        if layers == 0:
+            scorer = nn.Sequential(nn.Linear(input_dim, 1))
+        else:
+            modules = [
+                nn.Linear(input_dim, hidden_dim),
+                nn.Dropout(dropout),
+                nn.ReLU(),
+            ]
+            for _ in range(layers - 1):
+                modules.extend([
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.Dropout(dropout),
+                    nn.ReLU(),
+                ])
+            modules.append(nn.Linear(hidden_dim, 1))
+            scorer = nn.Sequential(*modules)
+        scorer.apply(self._init_mlp_weights)
+        return scorer
+
+    def _init_mlp_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def gap_features(self, x):
         # x: [B, L, 4]
         if x.ndim != 3:
             raise ValueError(f'expected input shape [B, L, {self.feature_dim}], got {tuple(x.shape)}')
@@ -75,11 +110,11 @@ class BreakpointSplitPositionCNN(nn.Module):
         for block in self.blocks:
             x = block(x)              # [B, C, L]
 
-        scores = self.scoring_head(x).squeeze(1)  # [B, L]
+        # Keep features for valid split gaps only. Gap row i corresponds to breakpoint k=i+1.
+        return x.transpose(1, 2)[:, :-1].contiguous()
 
-        # Keep scores for valid split gaps only. Logit i corresponds to split k=i+1.
-        logits = scores[:, :-1].contiguous()      # [B, L - 1]
-        return logits
+    def breakpoint_scorer(self, x):
+        return self.gap_features(x)
 
     def _breakpoint_logit_indices(self, sequence_length, num_blocks, breakpoints, device):
         indices = []
@@ -88,24 +123,108 @@ class BreakpointSplitPositionCNN(nn.Module):
             indices.append(index)
         return torch.tensor(indices, dtype=torch.long, device=device)
 
-    def forward(self, valid_breakpoints, lineage_seq_feature, sequence_length, num_blocks, random_spec):
-        """
-        """
-        valid_breakpoints = list(range(
+    def _valid_breakpoints_list(self, valid_breakpoints):
+        return list(range(
             int(valid_breakpoints.span_start) + 1,
             int(valid_breakpoints.span_end) + 1,
         )) if hasattr(valid_breakpoints, "span_start") else list(valid_breakpoints)
+
+    def _prepare_action_context(self, action_context, device, dtype):
+        if action_context is None:
+            raise ValueError("action_context is required for breakpoint scoring")
+        if torch.is_tensor(action_context):
+            action_context = action_context.to(device=device, dtype=dtype)
+        else:
+            action_context = torch.as_tensor(action_context, device=device, dtype=dtype)
+        if action_context.ndim == 2 and action_context.shape[0] == 1:
+            action_context = action_context[0]
+        if action_context.ndim != 1:
+            raise ValueError(f"expected 1D action_context, got shape {tuple(action_context.shape)}")
+        if action_context.shape[0] != self.action_context_dim:
+            raise ValueError(
+                f"expected action_context dim {self.action_context_dim}, got {action_context.shape[0]}"
+            )
+        return action_context
+
+    def _position_features(self, valid_breakpoints, num_blocks, device, dtype):
+        breakpoints = torch.tensor(valid_breakpoints, dtype=dtype, device=device)
+        max_gap_count = max(int(num_blocks) - 1, 1)
+        absolute_position = breakpoints / float(max(int(num_blocks), 1))
+
+        min_bp = float(min(valid_breakpoints))
+        max_bp = float(max(valid_breakpoints))
+        relative_denominator = max(max_bp - min_bp, 1.0)
+        relative_position = (breakpoints - min_bp) / relative_denominator
+
+        span_width = torch.full_like(
+            absolute_position,
+            fill_value=float(len(valid_breakpoints)) / float(max_gap_count),
+        )
+        return torch.stack([absolute_position, relative_position, span_width], dim=1)
+
+    def valid_breakpoint_logits(
+        self,
+        valid_breakpoints,
+        lineage_seq_feature,
+        sequence_length,
+        num_blocks,
+        action_context,
+    ):
+        valid_breakpoints = self._valid_breakpoints_list(valid_breakpoints)
         if not valid_breakpoints:
             raise ValueError("Recombination action has no valid breakpoints")
 
-        bp_logits = self.breakpoint_scorer(lineage_seq_feature.unsqueeze(0))[0]
+        if lineage_seq_feature.ndim == 2:
+            lineage_seq_feature = lineage_seq_feature.unsqueeze(0)
+        elif lineage_seq_feature.ndim != 3 or lineage_seq_feature.shape[0] != 1:
+            raise ValueError(
+                "lineage_seq_feature must have shape [L, 4] or [1, L, 4], "
+                f"got {tuple(lineage_seq_feature.shape)}"
+            )
+
+        gap_features = self.gap_features(lineage_seq_feature)[0]
         logit_indices = self._breakpoint_logit_indices(
             sequence_length,
             num_blocks,
             valid_breakpoints,
-            bp_logits.device,
+            gap_features.device,
         )
-        valid_logits = bp_logits[logit_indices]
+        valid_gap_features = gap_features[logit_indices]
+        action_context = self._prepare_action_context(
+            action_context,
+            valid_gap_features.device,
+            valid_gap_features.dtype,
+        ).expand(len(valid_breakpoints), -1)
+        scorer_inputs = [valid_gap_features, action_context]
+        if self.use_position_features:
+            scorer_inputs.append(
+                self._position_features(
+                    valid_breakpoints,
+                    num_blocks,
+                    valid_gap_features.device,
+                    valid_gap_features.dtype,
+                )
+            )
+        scorer_input = torch.cat(scorer_inputs, dim=1)
+        return self.gap_scorer(scorer_input).squeeze(-1)
+
+    def forward(
+        self,
+        valid_breakpoints,
+        lineage_seq_feature,
+        sequence_length,
+        num_blocks,
+        action_context,
+        random_spec=None,
+    ):
+        valid_breakpoints = self._valid_breakpoints_list(valid_breakpoints)
+        valid_logits = self.valid_breakpoint_logits(
+            valid_breakpoints,
+            lineage_seq_feature,
+            sequence_length,
+            num_blocks,
+            action_context,
+        )
         if random_spec is not None and "T" in random_spec:
             sample_logits = valid_logits / random_spec["T"]
         else:
@@ -115,5 +234,3 @@ class BreakpointSplitPositionCNN(nn.Module):
         breakpoint = int(valid_breakpoints[int(local_idx.detach().cpu().item())])
         log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
         return breakpoint, log_p
-
-        
