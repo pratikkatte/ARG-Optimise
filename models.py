@@ -163,6 +163,9 @@ class ARGModel(nn.Module):
         transformer_heads=4,
         transformer_mlp_ratio=2.0,
         attention_dropout=0.0,
+        time_hidden_size=256,
+        time_layers=3,
+        time_dropout=0.0,
     ):
         super().__init__()
         self.env = env
@@ -198,9 +201,10 @@ class ARGModel(nn.Module):
 
         self.time_scorer = TimeModel(
             embedding_size * 4,
-            hidden_size,
-            dropout,
+            time_hidden_size,
+            time_dropout,
             env.time_env.bins,
+            layers=time_layers,
         )
         self.logsoftmax = nn.LogSoftmax(dim=1)
 

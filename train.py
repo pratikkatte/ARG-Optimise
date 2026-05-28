@@ -37,7 +37,10 @@ DEFAULT_TRANSFORMER_DEPTH = 6
 DEFAULT_TRANSFORMER_HEADS = 4
 DEFAULT_TRANSFORMER_MLP_RATIO = 2.0
 DEFAULT_ATTENTION_DROPOUT = 0.0
-MODEL_VERSION = "cwr-event-transformer-block-partials-v1"
+DEFAULT_TIME_HIDDEN_SIZE = 256
+DEFAULT_TIME_LAYERS = 3
+DEFAULT_TIME_DROPOUT = 0.0
+MODEL_VERSION = "cwr-event-transformer-block-partials-v2"
 
 def seed_everything(seed):
     random.seed(seed)
@@ -208,6 +211,9 @@ def train(
         "transformer_heads": int(transformer_heads),
         "transformer_mlp_ratio": float(transformer_mlp_ratio),
         "attention_dropout": float(attention_dropout),
+        "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
+        "time_layers": int(DEFAULT_TIME_LAYERS),
+        "time_dropout": float(DEFAULT_TIME_DROPOUT),
     }
 
     generator = TBGFlowNetGenerator(
