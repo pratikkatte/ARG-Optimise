@@ -38,6 +38,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         breakpoint_gap_layers=3,
         breakpoint_gap_dropout=0.0,
         breakpoint_use_position_features=True,
+        embedding_size=32,
+        time_hidden_size=256,
+        time_dropout=0.0,
+        breakpoint_dropout=0.1,
 
     ):
         super().__init__()
@@ -113,14 +117,22 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 torch.ones(256, device=self.device) * init_Z / 256, requires_grad=True
                 )
         
-        self.arg_model_params = list(self.arg_model.parameters())
+        self.arg_model_params = (
+            list(self.arg_model.parameters()) +
+            list(self.time_model.parameters()) +
+            list(self.breakpoint_model.parameters())
+        )
         self.policy_params = self.arg_model_params
 
         params = [{'params': self.arg_model_params, 'lr': self.arg_model_lr}]
         params.append({'params': [self._Z], 'lr': self.z_lr})
 
         # gradient clipping exclude the Z part
-        self.gradient_clipping_params = list(self.arg_model.parameters())
+        self.gradient_clipping_params = (
+            list(self.arg_model.parameters()) +
+            list(self.time_model.parameters()) +
+            list(self.breakpoint_model.parameters())
+        )
         self.grad_clip = float(grad_clip)
 
         self.opt = torch.optim.Adam(

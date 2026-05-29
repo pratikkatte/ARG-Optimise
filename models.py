@@ -154,22 +154,12 @@ class ARGModel(nn.Module):
     def __init__(
         self,
         env,
-        embedding_size=32,
+       
         hidden_size=64,
-        dropout=0.0,
-        breakpoint_hidden_dim=128,
-        breakpoint_dropout=0.1,
         transformer_depth=6,
         transformer_heads=4,
         transformer_mlp_ratio=2.0,
         attention_dropout=0.0,
-        time_hidden_size=256,
-        time_layers=3,
-        time_dropout=0.0,
-        breakpoint_gap_hidden_size=256,
-        breakpoint_gap_layers=3,
-        breakpoint_gap_dropout=0.0,
-        breakpoint_use_position_features=True,
     ):
         super().__init__()
         self.env = env
