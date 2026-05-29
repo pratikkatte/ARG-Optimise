@@ -23,8 +23,8 @@ from converter import tree_sequence_to_arg_state
 DEFAULT_NE = 10000
 DEFAULT_R_PER_BP = 2e-8
 DEFAULT_MU_PER_BP = 2e-8
-DEFAULT_INIT_Z_SAMPLE_COUNT = 16
-DEFAULT_POLICY_LR = 1e-3
+DEFAULT_INIT_Z_SAMPLE_COUNT = 100
+DEFAULT_POLICY_LR = 3e-4
 DEFAULT_LOG_Z_LR = 1e-3
 DEFAULT_GRAD_CLIP = 10.0
 DEFAULT_GRAD_ACCUM_STEPS = 1
@@ -466,12 +466,12 @@ def main():
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--dataset-path",required=True)
     parser.add_argument("--epochs", type=int, required=True)
-    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--bp-per-blocks",
         type=int,
-        default=1,
+        default=10,
         help="Number of bp per block",
     )
     parser.add_argument("--init-z-sample-count", type=int, default=DEFAULT_INIT_Z_SAMPLE_COUNT)
