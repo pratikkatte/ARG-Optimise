@@ -11,11 +11,13 @@ try:
 except ImportError:
     wandb = None
 
+import tskit
 from env import SimpleARGEnvironment, action_as_dict
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
 from utils import load_sequences
+from converter import tree_sequence_to_arg_state
 
 
 DEFAULT_NE = 10000
@@ -59,18 +61,31 @@ def train_epoch(
     generator,
     batch_size=1,
     grad_accum_steps=1,
+    base_state=None,
+    refine_window_start=None,
+    refine_window_end=None,
 ):
     grad_accum_steps = max(int(grad_accum_steps), 1)
 
-    for _ in range(grad_accum_steps):
-        ret, trajectories = rollout_worker.rollout(
-            generator,
-            episodes=batch_size,
-        )
-        generator.accumulate_loss(
-            ret,
-            factor=grad_accum_steps,
-        )
+    if base_state is not None:
+        for _ in range(grad_accum_steps):
+            for _ in range(batch_size):
+                generator.accumulate_refinement_loss(
+                    base_state,
+                    factor=grad_accum_steps * batch_size,
+                    window_start=refine_window_start,
+                    window_end=refine_window_end,
+                )
+    else:
+        for _ in range(grad_accum_steps):
+            ret, trajectories = rollout_worker.rollout(
+                generator,
+                episodes=batch_size,
+            )
+            generator.accumulate_loss(
+                ret,
+                factor=grad_accum_steps,
+            )
 
     return generator.update_model()
 
@@ -185,7 +200,9 @@ def train(
     transformer_mlp_ratio=DEFAULT_TRANSFORMER_MLP_RATIO,
     attention_dropout=DEFAULT_ATTENTION_DROPOUT,
     verbose=True,
-    
+    refine_trees_path=None,
+    refine_window_start=None,
+    refine_window_end=None,
 ):
     seed_everything(seed)
     device = torch.device(device)
@@ -205,6 +222,13 @@ def train(
         time_bins=time_bins,
         time_delta_bin_width=time_delta_bin_width,
     )
+
+    base_state = None
+    if refine_trees_path is not None:
+        if refine_window_start is None or refine_window_end is None:
+            raise ValueError("Both refine_window_start and refine_window_end must be provided if refine_trees_path is set.")
+        ts = tskit.load(refine_trees_path)
+        base_state = tree_sequence_to_arg_state(ts, env)
     model_kwargs = {
         "embedding_size": int(embedding_size),
         "hidden_size": int(hidden_size),
@@ -276,6 +300,9 @@ def train(
                 generator,
                 batch_size=batch_size,
                 grad_accum_steps=grad_accum_steps,
+                base_state=base_state,
+                refine_window_start=refine_window_start,
+                refine_window_end=refine_window_end,
             )
             log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
             if info is None:
@@ -442,6 +469,9 @@ def main():
     parser.add_argument("--transformer-mlp-ratio", type=float, default=DEFAULT_TRANSFORMER_MLP_RATIO)
     parser.add_argument("--attention-dropout", type=float, default=DEFAULT_ATTENTION_DROPOUT)
     parser.add_argument("--wandb", action="store_true", default=True)
+    parser.add_argument("--refine-trees-path", type=str, default=None, help="Path to tskit tree sequence file to refine")
+    parser.add_argument("--refine-window-start", type=int, default=None, help="Specific window start block to optimize")
+    parser.add_argument("--refine-window-end", type=int, default=None, help="Specific window end block to optimize")
     args = parser.parse_args()
 
     selected_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -479,6 +509,9 @@ def main():
         transformer_heads=args.transformer_heads,
         transformer_mlp_ratio=args.transformer_mlp_ratio,
         attention_dropout=args.attention_dropout,
+        refine_trees_path=args.refine_trees_path,
+        refine_window_start=args.refine_window_start,
+        refine_window_end=args.refine_window_end,
     )
 
 

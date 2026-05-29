@@ -1298,3 +1298,239 @@ class SimpleARGEnvironment:
 
     def _is_active_index(self, state, idx):
         return isinstance(idx, numbers.Integral) and 0 <= idx < len(state.active_lineages)
+
+    def delete_genomic_window(self, state, window_start, window_end):
+        """
+        Delete all ancestral nodes in state that carry material inside the window [window_start, window_end) (in blocks),
+        update parent/child relationships, rebuild partials topologically, and return the updated ARGState.
+        """
+        window_start = int(window_start)
+        window_end = int(window_end)
+        if window_start >= window_end:
+            raise ValueError("window_start must be less than window_end")
+            
+        # 1. Identify nodes to delete (nodes with material in window, excluding samples)
+        deletion_set = set()
+        window_seg = MaterialSegments(((window_start, window_end),))
+        
+        for node_id, lineage in state.all_nodes.items():
+            if node_id < self.num_sequences:
+                continue
+            if lineage.material_segments.intersection_count(window_seg) > 0:
+                deletion_set.add(node_id)
+                
+        # 2. Recursively find all ancestors of the deleted nodes to delete them too
+        to_check = list(deletion_set)
+        while to_check:
+            node_id = to_check.pop()
+            lineage = state.all_nodes[node_id]
+            for p in lineage.parents:
+                if p not in deletion_set:
+                    deletion_set.add(p)
+                    to_check.append(p)
+                    
+        # 3. Clone state and delete the nodes
+        new_state = state.clone(copy_partials=True)
+        for node_id in deletion_set:
+            new_state.all_nodes.pop(node_id, None)
+            
+        # 4. Update parent and child lists for remaining nodes
+        for lineage in new_state.all_nodes.values():
+            lineage.parents = [p for p in lineage.parents if p not in deletion_set]
+            lineage.children = [c for c in lineage.children if c not in deletion_set]
+            
+        # 5. Determine new active lineages (remaining nodes with no parents)
+        new_state.active_lineages = [
+            lineage for lineage in new_state.all_nodes.values()
+            if len(lineage.parents) == 0
+        ]
+        
+        # 6. Recompute partials bottom-up
+        sorted_nodes = sorted(
+            new_state.all_nodes.values(),
+            key=lambda l: (l.time, l.node_id)
+        )
+        
+        # Reset partials for all remaining nodes to None first, except samples
+        for lineage in sorted_nodes:
+            if lineage.node_id >= self.num_sequences:
+                lineage.partials = None
+                
+        # Now recompute bottom-up
+        for lineage in sorted_nodes:
+            nid = lineage.node_id
+            if nid < self.num_sequences:
+                lineage.partials = self._initial_lineage_partials(nid, lineage.material_segments)
+            else:
+                if lineage.event_type == "coal":
+                    child_i = new_state.all_nodes[lineage.children[0]]
+                    child_j = new_state.all_nodes[lineage.children[1]]
+                    lineage.partials = self._coalesced_parent_partials(
+                        child_i,
+                        child_j,
+                        lineage.material_segments,
+                        lineage.time
+                    )
+                elif lineage.event_type == "recomb":
+                    child = new_state.all_nodes[lineage.children[0]]
+                    lineage.partials = self._recombined_parent_partials(
+                        child,
+                        lineage.material_segments,
+                        lineage.time
+                    )
+                else:
+                    raise ValueError(f"Unknown event type: {lineage.event_type} for node {nid}")
+                    
+        # 7. Update other state fields
+        new_state.max_node_idx = max(new_state.all_nodes.keys()) if new_state.all_nodes else -1
+        new_state.current_time = max((l.time for l in new_state.active_lineages), default=0.0)
+        new_state.total_active_blocks = sum(l.material_count for l in new_state.active_lineages)
+        new_state.is_done = self.is_terminal(new_state)
+        new_state.log_reward = None
+        new_state.rates = None
+        new_state.prior_options = None
+        new_state.action_options = None
+        
+        if new_state.is_done:
+            log_likelihood = self.evolution_model.compute_arg_log_likelihood(new_state)
+            new_state.log_reward = self.compute_terminal_log_reward(new_state, log_likelihood)
+            
+        return new_state
+
+    def reconstruct_prefix_trajectory(self, state):
+        """
+        Reconstruct the chronological sequence of states and actions that leads from
+        get_initial_state() to the partial `state`.
+        """
+        recomb_events = []
+        coal_events = []
+        
+        sorted_nodes = sorted(
+            state.all_nodes.values(),
+            key=lambda l: (l.time, l.node_id)
+        )
+        
+        processed_recomb_children = set()
+        for lineage in sorted_nodes:
+            if lineage.node_id < self.num_sequences:
+                continue
+            if lineage.event_type == "recomb":
+                child_id = lineage.children[0]
+                if child_id not in processed_recomb_children:
+                    processed_recomb_children.add(child_id)
+                    recomb_events.append({
+                        'event_type': 'recomb',
+                        'child_id': child_id,
+                        'breakpoint': lineage.breakpoint,
+                        'time': lineage.time
+                    })
+            elif lineage.event_type == "coal":
+                coal_events.append({
+                    'event_type': 'coal',
+                    'ts_node_id': lineage.node_id,
+                    'children': lineage.children,
+                    'time': lineage.time
+                })
+                
+        events = recomb_events + coal_events
+        events.sort(key=lambda x: x['time'])
+        
+        curr_state = self.get_initial_state()
+        prefix_states = [curr_state.clone(copy_partials=True)]
+        prefix_actions = []
+        
+        node_id_to_ts_node = {i: i for i in range(self.num_sequences)}
+        
+        for event in events:
+            if event['event_type'] == 'recomb':
+                bp = event['breakpoint']
+                target_idx = None
+                for idx, l in enumerate(curr_state.active_lineages):
+                    if node_id_to_ts_node.get(l.node_id) == event['child_id']:
+                        if l.material_segments.covers_interval(bp - 1, bp + 1):
+                            target_idx = idx
+                            break
+                if target_idx is None:
+                    for idx, l in enumerate(curr_state.active_lineages):
+                        if node_id_to_ts_node.get(l.node_id) == event['child_id']:
+                            target_idx = idx
+                            break
+                if target_idx is None:
+                    raise ValueError(f"Prefix reconstruction failed: child_id={event['child_id']} not found in active lineages.")
+                    
+                lineage = curr_state.active_lineages[target_idx]
+                rates = self.compute_event_rates(self.enumerate_actions(curr_state))
+                curr_state.rates = rates
+                delta_t = max(0.0, event['time'] - curr_state.current_time)
+                time_action = self.time_env.delta_to_time_action(delta_t, self._total_event_rate(rates))
+                
+                action = RecombinationChoice(
+                    active_lineage_i=target_idx,
+                    material_count=lineage.material_count,
+                    span_start=lineage.material_segments.span_start,
+                    span_end=lineage.material_segments.span_end,
+                    time_action=time_action,
+                    breakpoint=bp
+                )
+                
+                combined_actions = self.enumerate_actions(curr_state)
+                log_prior = self.compute_cwr_event_log_prior(curr_state, combined_actions, action)
+                curr_state = self.apply_action(curr_state, action, log_prior=log_prior)
+                
+                prefix_states.append(curr_state.clone(copy_partials=True))
+                prefix_actions.append(action)
+                
+                parent_id_1 = curr_state.max_node_idx - 1
+                parent_id_2 = curr_state.max_node_idx
+                node_id_to_ts_node[parent_id_1] = event['child_id']
+                node_id_to_ts_node[parent_id_2] = event['child_id']
+                
+            elif event['event_type'] == 'coal':
+                children_ts_ids = set(event['children'])
+                active_indices = [
+                    idx for idx, lineage in enumerate(curr_state.active_lineages)
+                    if node_id_to_ts_node.get(lineage.node_id) in children_ts_ids
+                ]
+                
+                while len(active_indices) > 1:
+                    found_pair = False
+                    for idx1 in range(len(active_indices)):
+                        for idx2 in range(idx1 + 1, len(active_indices)):
+                            i = active_indices[idx1]
+                            j = active_indices[idx2]
+                            if curr_state.active_lineages[i].material_segments.overlaps(curr_state.active_lineages[j].material_segments):
+                                if i > j:
+                                    i, j = j, i
+                                
+                                rates = self.compute_event_rates(self.enumerate_actions(curr_state))
+                                curr_state.rates = rates
+                                delta_t = max(0.0, event['time'] - curr_state.current_time)
+                                time_action = self.time_env.delta_to_time_action(delta_t, self._total_event_rate(rates))
+                                
+                                action = CoalescenceChoice(
+                                    active_lineage_i=i,
+                                    active_lineage_j=j,
+                                    time_action=time_action
+                                )
+                                
+                                combined_actions = self.enumerate_actions(curr_state)
+                                log_prior = self.compute_cwr_event_log_prior(curr_state, combined_actions, action)
+                                curr_state = self.apply_action(curr_state, action, log_prior=log_prior)
+                                
+                                prefix_states.append(curr_state.clone(copy_partials=True))
+                                prefix_actions.append(action)
+                                
+                                node_id_to_ts_node[curr_state.max_node_idx] = event['ts_node_id']
+                                
+                                active_indices = [
+                                    idx for idx, lineage in enumerate(curr_state.active_lineages)
+                                    if node_id_to_ts_node.get(lineage.node_id) in children_ts_ids
+                                ]
+                                found_pair = True
+                                break
+                        if found_pair:
+                            break
+                    if not found_pair:
+                        break
+
+        return prefix_states[:-1], prefix_actions

@@ -17,9 +17,13 @@ class RolloutWorker:
         episodes,
         random_spec=None,
         return_states=False,
+        starting_state=None,
         ):
         
-        states = [self.env.get_initial_state() for _ in range(episodes)]
+        if starting_state is not None:
+            states = [starting_state.clone(copy_partials=True) for _ in range(episodes)]
+        else:
+            states = [self.env.get_initial_state() for _ in range(episodes)]
         trajectories = [SimpleTrajectory() for _ in states]
         
         
@@ -97,6 +101,7 @@ class RolloutWorker:
         episodes=1,
         random_spec=None,
         return_states=False,
+        starting_state=None,
     ):
         """Run one or more model-guided ARG rollouts."""
         if generator is None:
@@ -106,6 +111,7 @@ class RolloutWorker:
             episodes=episodes,
             random_spec=random_spec,
             return_states=return_states,
+            starting_state=starting_state,
         )
 
     def _states_to_padded_tree_features(self, states, device=None):

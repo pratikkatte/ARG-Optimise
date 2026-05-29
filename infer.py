@@ -4,9 +4,11 @@ import os
 
 import torch
 
+import tskit
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
+from converter import tree_sequence_to_arg_state
 from time_env import DEFAULT_TIME_BIN_SCHEME
 from train import (
     DEFAULT_LOG_Z_LR,
@@ -41,6 +43,9 @@ def run_inference(
     device="auto",
     temperature=None,
     verbose=False,
+    refine_trees_path=None,
+    refine_window_start=None,
+    refine_window_end=None,
 ):
     if num_args < 1:
         raise ValueError("num_args must be at least 1")
@@ -75,6 +80,14 @@ def run_inference(
     generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
     generator.eval()
 
+    starting_state = None
+    if refine_trees_path is not None:
+        if refine_window_start is None or refine_window_end is None:
+            raise ValueError("Both refine_window_start and refine_window_end must be provided if refine_trees_path is set.")
+        ts = tskit.load(refine_trees_path)
+        base_state = tree_sequence_to_arg_state(ts, env)
+        starting_state = env.delete_genomic_window(base_state, refine_window_start, refine_window_end)
+
     random_spec = build_random_spec(temperature=temperature)
     rollout_worker = RolloutWorker(env, verbose=verbose)
     rollout_outputs, trajectories = run_batched_rollouts(
@@ -84,6 +97,7 @@ def run_inference(
         batch_size=batch_size,
         random_spec=random_spec,
         verbose=verbose,
+        starting_state=starting_state,
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -165,6 +179,7 @@ def run_batched_rollouts(
     batch_size,
     random_spec,
     verbose=False,
+    starting_state=None,
 ):
     states = []
     trajectories = []
@@ -186,6 +201,7 @@ def run_batched_rollouts(
                 episodes=chunk_size,
                 random_spec=random_spec,
                 return_states=True,
+                starting_state=starting_state,
             )
             states.extend(chunk_outputs["states"])
             trajectories.extend(chunk_trajectories)
@@ -303,6 +319,9 @@ def main():
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--refine-trees-path", type=str, default=None, help="Path to tskit tree sequence file to refine")
+    parser.add_argument("--refine-window-start", type=int, default=None, help="Specific window start block to optimize")
+    parser.add_argument("--refine-window-end", type=int, default=None, help="Specific window end block to optimize")
     args = parser.parse_args()
 
     manifest = run_inference(
@@ -314,6 +333,9 @@ def main():
         device=args.device,
         temperature=args.temperature,
         verbose=args.verbose,
+        refine_trees_path=args.refine_trees_path,
+        refine_window_start=args.refine_window_start,
+        refine_window_end=args.refine_window_end,
     )
     print(f"Wrote {manifest['num_args']} ARG tree sequence(s) to {args.output_dir}")
 
