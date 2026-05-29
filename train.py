@@ -79,6 +79,15 @@ def current_lr_info(generator):
         info["lr_log_z"] = float(param_groups[1]["lr"])
     return info
 
+
+def _as_list(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
 def train_epoch(
     epoch_id,
     rollout_worker,
@@ -86,8 +95,7 @@ def train_epoch(
     batch_size=1,
     grad_accum_steps=1,
     terminal_state=None,
-    refine_window_start=None,
-    refine_window_end=None,
+    refine_window_ranges=None,
 ):
     grad_accum_steps = max(int(grad_accum_steps), 1)
     base_generator = unwrap_generator(generator)
@@ -97,9 +105,8 @@ def train_epoch(
             terminal_state=terminal_state,
             generator=generator,
             episodes=batch_size,
-            window_start=refine_window_start,
-            window_end=refine_window_end
-            )
+            window_ranges=refine_window_ranges,
+        )
 
         base_generator.accumulate_loss(
             ret,
@@ -112,7 +119,7 @@ def train_epoch(
     info.update(current_lr_info(base_generator))
     return info
 
-def evaluate_generator(terminal_state, refine_window_start, refine_window_end, rollout_worker, generator, eval_episodes, seed):
+def evaluate_generator(terminal_state, refine_window_ranges, rollout_worker, generator, eval_episodes, seed):
     episodes = int(eval_episodes)
     if episodes <= 0:
         return {}
@@ -135,7 +142,12 @@ def evaluate_generator(terminal_state, refine_window_start, refine_window_end, r
             env.rng.seed(seed)
 
         with torch.no_grad():
-            outputs, trajectories = rollout_worker.rollout(terminal_state=terminal_state, generator=generator, episodes=episodes, window_start=refine_window_start, window_end=refine_window_end)
+            outputs, trajectories = rollout_worker.rollout(
+                terminal_state=terminal_state,
+                generator=generator,
+                episodes=episodes,
+                window_ranges=refine_window_ranges,
+            )
             log_pf = outputs["log_paths_pf"].sum(-1)
             log_pb = outputs["log_paths_pb"].sum(-1)
             log_rewards = outputs["log_rewards"]
@@ -255,32 +267,31 @@ def train(
         time_delta_bin_width=time_delta_bin_width,
     )
 
-    refine_window_start_blocks = None
-    refine_window_end_blocks = None
+    refine_window_ranges_blocks = None
     terminal_state = None
     if refine_trees_path is not None:
         if refine_window_start is None or refine_window_end is None:
             raise ValueError("Both refine_window_start and refine_window_end must be provided if refine_trees_path is set.")
-        
-        if ddp:
-            hardcoded_windows = {
-                0: (1000, 10000),     # Rank 0 processes 
-                1: (10001, 20000),   # Rank 1 processes 
-            }
-            
-            my_start, my_end = hardcoded_windows.get(rank, (refine_window_start, refine_window_end))
-            print(f"[Rank {rank}] Refining hardcoded window [{my_start}, {my_end})")
-            
-            # window_length = refine_window_end - refine_window_start
-            # chunk_size = window_length // world_size
-            # my_start = refine_window_start + rank * chunk_size
-            # my_end = my_start + chunk_size if rank < world_size - 1 else refine_window_end
-            # print(f"[Rank {rank}] Refining split window [{my_start}, {my_end}) (original [{refine_window_start}, {refine_window_end}])")
-            refine_window_start = my_start
-            refine_window_end = my_end
 
-        refine_window_start_blocks = refine_window_start // bp_per_blocks
-        refine_window_end_blocks = refine_window_end // bp_per_blocks
+        refine_window_starts = _as_list(refine_window_start)
+        refine_window_ends = _as_list(refine_window_end)
+        if len(refine_window_starts) != len(refine_window_ends):
+            raise ValueError("refine_window_start and refine_window_end must have the same number of values.")
+        if len(refine_window_starts) == 0:
+            raise ValueError("At least one refine window must be provided.")
+
+        refine_window_ranges_blocks = []
+        for start, end in zip(refine_window_starts, refine_window_ends):
+            if start >= end:
+                raise ValueError("Each refine window start must be less than its end.")
+            start_block = int(start) // bp_per_blocks
+            end_block = int(end) // bp_per_blocks
+            if start_block >= end_block:
+                raise ValueError("Each refine window must cover at least one block.")
+            refine_window_ranges_blocks.append((start_block, end_block))
+
+        if rank == 0:
+            print(f"Refining {len(refine_window_ranges_blocks)} window(s): {refine_window_ranges_blocks}")
         ts = tskit.load(refine_trees_path)
         terminal_state = tree_sequence_to_arg_state(ts, env)
     model_kwargs = {
@@ -381,8 +392,7 @@ def train(
                 batch_size=batch_size,
                 grad_accum_steps=grad_accum_steps,
                 terminal_state=terminal_state,
-                refine_window_start=refine_window_start_blocks,
-                refine_window_end=refine_window_end_blocks,
+                refine_window_ranges=refine_window_ranges_blocks,
             )
             base_generator = unwrap_generator(generator)
             log_z = base_generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
@@ -402,8 +412,7 @@ def train(
                 info.update(
                     evaluate_generator(
                         terminal_state=terminal_state,
-                        refine_window_start=refine_window_start_blocks,
-                        refine_window_end=refine_window_end_blocks,
+                        refine_window_ranges=refine_window_ranges_blocks,
                         rollout_worker=rollout_worker,
                         generator=generator,
                         eval_episodes=eval_episodes,
@@ -588,8 +597,8 @@ def main():
     parser.add_argument("--wandb", action="store_true", default=True)
     parser.add_argument("--no-wandb", action="store_false", dest="wandb", help="Disable WandB logging")
     parser.add_argument("--refine-trees-path", type=str, default=None, help="Path to tskit tree sequence file to refine")
-    parser.add_argument("--refine-window-start", type=int, default=None, help="Specific window start block to optimize")
-    parser.add_argument("--refine-window-end", type=int, default=None, help="Specific window end block to optimize")
+    parser.add_argument("--refine-window-start", type=int, nargs="+", default=None, help="One or more window start positions to optimize")
+    parser.add_argument("--refine-window-end", type=int, nargs="+", default=None, help="One or more window end positions to optimize")
     parser.add_argument("--ddp", action="store_true", help="Enable distributed data parallel (DDP) training")
     args = parser.parse_args()
 

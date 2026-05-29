@@ -32,6 +32,26 @@ class RolloutWorker:
             "return_states": return_states,
         })
 
+    def _build_refine_candidate(self, terminal_state, window_start, window_end):
+        base_state = self.env.delete_genomic_window(terminal_state, window_start, window_end)
+        prefix_states, prefix_actions = self.env.reconstruct_prefix_trajectory(base_state)
+        log_pfs = []
+        backward_num_parents_by_traj = []
+
+        for t in range(len(prefix_actions)):
+            s_curr = prefix_states[t]
+            s_next = prefix_states[t + 1] if t + 1 < len(prefix_states) else base_state
+            act = prefix_actions[t]
+
+            combined_actions = self.env.enumerate_actions(s_curr)
+            log_pf = self.env.compute_cwr_event_log_prior(s_curr, combined_actions, act)
+            log_pfs.append(torch.tensor(log_pf, dtype=torch.float32, device=self.device))
+
+            num_parents = self.env.count_backward_parents(s_next)
+            backward_num_parents_by_traj.append(num_parents)
+
+        return base_state, log_pfs, backward_num_parents_by_traj
+
     def rollout(
         self,
         terminal_state=None,
@@ -41,6 +61,7 @@ class RolloutWorker:
         return_states=False,
         window_start=0,
         window_end=None,
+        window_ranges=None,
     ):
         """Run one or more model-guided ARG rollouts."""
 
@@ -51,34 +72,39 @@ class RolloutWorker:
         log_pfs = []
         backward_num_parents_by_traj = []
 
-        if window_start is not None and window_end is not None and terminal_state is not None:
-            start = window_start
-            end = window_end
-            base_state = self.env.delete_genomic_window(terminal_state, start, end)
-            prefix_states, prefix_actions = self.env.reconstruct_prefix_trajectory(base_state)
+        if terminal_state is not None:
+            if window_ranges is None and window_start is not None and window_end is not None:
+                window_ranges = [(window_start, window_end)]
 
-            ## calculate pfs and pbs from initial state to partial state. 
-            for t in range(len(prefix_actions)):
-                s_curr = prefix_states[t]
-                s_next = prefix_states[t+1] if t + 1 < len(prefix_states) else base_state
-                act = prefix_actions[t]
-                
-                combined_actions = self.env.enumerate_actions(s_curr)
-                log_pf = self.env.compute_cwr_event_log_prior(s_curr, combined_actions, act)
-                log_pfs.append(torch.tensor(log_pf, dtype=torch.float32, device=self.device))
-                
-                num_parents = self.env.count_backward_parents(s_next)
-                # log_pb = -torch.log(torch.tensor(num_parents, dtype=torch.float32, device=self.device))
-                backward_num_parents_by_traj.append(num_parents)
+            if window_ranges is not None:
+                if len(window_ranges) == 0:
+                    raise ValueError("window_ranges must contain at least one window.")
+
+                candidate_states = []
+                candidate_log_pfs = []
+                candidate_backward_num_parents = []
+                for start, end in window_ranges:
+                    base_state, prefix_log_pfs, prefix_backward_num_parents = (
+                        self._build_refine_candidate(terminal_state, start, end)
+                    )
+                    candidate_states.append(base_state)
+                    candidate_log_pfs.append(prefix_log_pfs)
+                    candidate_backward_num_parents.append(prefix_backward_num_parents)
+
+                if len(candidate_states) == 1:
+                    base_state = candidate_states[0]
+                    log_pfs = candidate_log_pfs[0]
+                    backward_num_parents_by_traj = candidate_backward_num_parents[0]
+                else:
+                    base_state = candidate_states
+                    log_pfs = candidate_log_pfs
+                    backward_num_parents_by_traj = candidate_backward_num_parents
+            else:
+                base_state = self.env.get_initial_state()
 
         else:
-            start = 0
-            end = self.env.num_blocks
             base_state = self.env.get_initial_state()
-        
 
-
-        
         return self._rollout_batch(
             generator=generator,
             base_state=base_state,

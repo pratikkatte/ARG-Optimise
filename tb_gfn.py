@@ -314,16 +314,37 @@ class TBGFlowNetGenerator(torch.nn.Module):
         random_spec=None,
         return_states=False,
     ):
-        states = [base_state.clone(copy_partials=True) for _ in range(episodes)]
-        if log_pfs is not None and backward_num_parents_by_traj is not None:
-            log_paths_pf_by_traj = [log_pfs.copy() for _ in range(episodes)]
-            backward_num_parents_by_traj = [
-                backward_num_parents_by_traj.copy()
-                for _ in range(episodes)
+        if isinstance(base_state, list):
+            if len(base_state) == 0:
+                raise ValueError("base_state list must contain at least one state.")
+            candidate_indices = torch.randint(len(base_state), (episodes,)).tolist()
+            states = [
+                base_state[candidate_idx].clone(copy_partials=True)
+                for candidate_idx in candidate_indices
             ]
+            if log_pfs is not None and backward_num_parents_by_traj is not None:
+                log_paths_pf_by_traj = [
+                    log_pfs[candidate_idx].copy()
+                    for candidate_idx in candidate_indices
+                ]
+                backward_num_parents_by_traj = [
+                    backward_num_parents_by_traj[candidate_idx].copy()
+                    for candidate_idx in candidate_indices
+                ]
+            else:
+                log_paths_pf_by_traj = [[] for _ in range(episodes)]
+                backward_num_parents_by_traj = [[] for _ in range(episodes)]
         else:
-            log_paths_pf_by_traj = [[] for _ in range(episodes)]
-            backward_num_parents_by_traj = [[] for _ in range(episodes)]
+            states = [base_state.clone(copy_partials=True) for _ in range(episodes)]
+            if log_pfs is not None and backward_num_parents_by_traj is not None:
+                log_paths_pf_by_traj = [log_pfs.copy() for _ in range(episodes)]
+                backward_num_parents_by_traj = [
+                    backward_num_parents_by_traj.copy()
+                    for _ in range(episodes)
+                ]
+            else:
+                log_paths_pf_by_traj = [[] for _ in range(episodes)]
+                backward_num_parents_by_traj = [[] for _ in range(episodes)]
 
         trajectories = [SimpleTrajectory() for _ in states]
         unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
