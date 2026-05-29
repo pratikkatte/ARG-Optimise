@@ -1480,10 +1480,19 @@ class SimpleARGEnvironment:
                 prefix_states.append(curr_state.clone(copy_partials=True))
                 prefix_actions.append(action)
                 
+                target_left_parent_id = None
+                target_right_parent_id = None
+                for n_id, n in state.all_nodes.items():
+                    if n.event_type == "recomb" and n.children and n.children[0] == event['child_id'] and n.breakpoint == bp:
+                        if n.recombination_side == "left":
+                            target_left_parent_id = n_id
+                        elif n.recombination_side == "right":
+                            target_right_parent_id = n_id
+
                 parent_id_1 = curr_state.max_node_idx - 1
                 parent_id_2 = curr_state.max_node_idx
-                node_id_to_ts_node[parent_id_1] = event['child_id']
-                node_id_to_ts_node[parent_id_2] = event['child_id']
+                node_id_to_ts_node[parent_id_1] = target_left_parent_id
+                node_id_to_ts_node[parent_id_2] = target_right_parent_id
                 
             elif event['event_type'] == 'coal':
                 children_ts_ids = set(event['children'])
