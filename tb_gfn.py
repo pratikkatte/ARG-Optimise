@@ -62,10 +62,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
         if self.ddp:
             from torch.nn.parallel import DistributedDataParallel as DDP
+            device_ids = [self.device.index] if self.device.type == "cuda" else None
+            output_device = self.device.index if self.device.type == "cuda" else None
             self.arg_model = DDP(
                 self.arg_model,
-                device_ids=[self.local_rank] if torch.cuda.is_available() else None,
-                output_device=self.local_rank if torch.cuda.is_available() else None,
+                device_ids=device_ids,
+                output_device=output_device,
                 find_unused_parameters=True,
             )
         self.time_model = self.arg_model.module.time_scorer if self.ddp else self.arg_model.time_scorer
