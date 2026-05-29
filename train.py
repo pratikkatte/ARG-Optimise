@@ -16,7 +16,7 @@ from env import SimpleARGEnvironment, action_as_dict
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
-from utils import load_sequences
+from utils import build_cosine_lr_scheduler, load_sequences
 from converter import tree_sequence_to_arg_state
 
 
@@ -26,6 +26,8 @@ DEFAULT_MU_PER_BP = 2e-8
 DEFAULT_INIT_Z_SAMPLE_COUNT = 100
 DEFAULT_POLICY_LR = 3e-4
 DEFAULT_LOG_Z_LR = 1e-3
+DEFAULT_USE_LR_SCHEDULER = True
+DEFAULT_LR_MIN_FACTOR = 0.1
 DEFAULT_GRAD_CLIP = 10.0
 DEFAULT_GRAD_ACCUM_STEPS = 4
 DEFAULT_EVAL_EPISODES = 16
@@ -59,6 +61,24 @@ def seed_everything(seed):
 def unwrap_generator(generator):
     return generator.module if hasattr(generator, "module") else generator
 
+
+def lr_min_factor_arg(value):
+    factor = float(value)
+    if factor < 0.0 or factor > 1.0:
+        raise argparse.ArgumentTypeError("--lr-min-factor must be between 0.0 and 1.0")
+    return factor
+
+
+def current_lr_info(generator):
+    base_generator = unwrap_generator(generator)
+    param_groups = base_generator.opt.param_groups
+    info = {}
+    if len(param_groups) > 0:
+        info["lr_policy"] = float(param_groups[0]["lr"])
+    if len(param_groups) > 1:
+        info["lr_log_z"] = float(param_groups[1]["lr"])
+    return info
+
 def train_epoch(
     epoch_id,
     rollout_worker,
@@ -86,7 +106,11 @@ def train_epoch(
             factor=grad_accum_steps,
         )
 
-    return base_generator.update_model()
+    info = base_generator.update_model()
+    if base_generator.scheduler is not None:
+        base_generator.scheduler.step()
+    info.update(current_lr_info(base_generator))
+    return info
 
 def evaluate_generator(terminal_state, refine_window_start, refine_window_end, rollout_worker, generator, eval_episodes, seed):
     episodes = int(eval_episodes)
@@ -183,6 +207,8 @@ def train(
     recombination_rate=DEFAULT_R_PER_BP,
     policy_lr=DEFAULT_POLICY_LR,
     log_z_lr=DEFAULT_LOG_Z_LR,
+    use_lr_scheduler=DEFAULT_USE_LR_SCHEDULER,
+    lr_min_factor=DEFAULT_LR_MIN_FACTOR,
     grad_clip=DEFAULT_GRAD_CLIP,
     grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
     eval_episodes=DEFAULT_EVAL_EPISODES,
@@ -209,6 +235,9 @@ def train(
 ):
     seed_everything(seed + rank)
     device = torch.device(device)
+    lr_min_factor = float(lr_min_factor)
+    if lr_min_factor < 0.0 or lr_min_factor > 1.0:
+        raise ValueError("lr_min_factor must be between 0.0 and 1.0")
 
     sequences = load_sequences(dataset_path)
     sequence_length = len(sequences[0])
@@ -296,6 +325,14 @@ def train(
             find_unused_parameters=True,
         )
     base_generator = unwrap_generator(generator)
+    if use_lr_scheduler:
+        base_generator.scheduler = build_cosine_lr_scheduler(
+            base_generator.opt,
+            total_steps=max(int(epochs_num) - 1, 1),
+            min_factor=lr_min_factor,
+        )
+    else:
+        base_generator.scheduler = None
     if rank == 0:
         print(f"Generator device: {base_generator.device}")
 
@@ -323,6 +360,9 @@ def train(
             "recombination_rate": float(recombination_rate),
             "policy_lr": float(policy_lr),
             "log_z_lr": float(log_z_lr),
+            "use_lr_scheduler": bool(use_lr_scheduler),
+            "lr_scheduler_type": "cosine" if use_lr_scheduler else "none",
+            "lr_min_factor": float(lr_min_factor),
             "grad_clip": float(grad_clip),
             "grad_accum_steps": int(grad_accum_steps),
             "eval_episodes": int(eval_episodes),
@@ -398,6 +438,8 @@ def train(
                     recombination_rate=recombination_rate,
                     policy_lr=policy_lr,
                     log_z_lr=log_z_lr,
+                    use_lr_scheduler=use_lr_scheduler,
+                    lr_min_factor=lr_min_factor,
                     grad_clip=grad_clip,
                     grad_accum_steps=grad_accum_steps,
                     eval_episodes=eval_episodes,
@@ -442,6 +484,8 @@ def build_checkpoint_metadata(
     recombination_rate,
     policy_lr,
     log_z_lr,
+    use_lr_scheduler,
+    lr_min_factor,
     grad_clip,
     grad_accum_steps,
     eval_episodes,
@@ -468,6 +512,9 @@ def build_checkpoint_metadata(
         "recombination_rate": float(recombination_rate),
         "policy_lr": float(policy_lr),
         "log_z_lr": float(log_z_lr),
+        "use_lr_scheduler": bool(use_lr_scheduler),
+        "lr_scheduler_type": "cosine" if use_lr_scheduler else "none",
+        "lr_min_factor": float(lr_min_factor),
         "grad_clip": float(grad_clip),
         "grad_accum_steps": int(grad_accum_steps),
         "eval_episodes": int(eval_episodes),
@@ -499,6 +546,25 @@ def main():
     parser.add_argument("--recombination-rate", type=float, default=DEFAULT_R_PER_BP)
     parser.add_argument("--policy-lr", type=float, default=DEFAULT_POLICY_LR)
     parser.add_argument("--log-z-lr", type=float, default=DEFAULT_LOG_Z_LR)
+    parser.add_argument(
+        "--lr-scheduler",
+        action="store_true",
+        default=DEFAULT_USE_LR_SCHEDULER,
+        dest="use_lr_scheduler",
+        help="Enable cosine LR decay for policy and logZ optimizer groups",
+    )
+    parser.add_argument(
+        "--no-lr-scheduler",
+        action="store_false",
+        dest="use_lr_scheduler",
+        help="Disable LR scheduling and keep fixed optimizer learning rates",
+    )
+    parser.add_argument(
+        "--lr-min-factor",
+        type=lr_min_factor_arg,
+        default=DEFAULT_LR_MIN_FACTOR,
+        help="Final LR as a fraction of the initial LR for cosine scheduling",
+    )
     parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP)
     parser.add_argument(
         "--grad-accum-steps",
@@ -576,6 +642,8 @@ def main():
             recombination_rate=args.recombination_rate,
             policy_lr=args.policy_lr,
             log_z_lr=args.log_z_lr,
+            use_lr_scheduler=args.use_lr_scheduler,
+            lr_min_factor=args.lr_min_factor,
             grad_clip=args.grad_clip,
             grad_accum_steps=args.grad_accum_steps,
             eval_episodes=args.eval_episodes,

@@ -1,8 +1,21 @@
 import pickle
+import math
+
 import torch
-def build_scheduler(optimizer, cfg_scheduler):
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=gamma, step_size=step_size)
-    return scheduler
+
+
+def build_cosine_lr_scheduler(optimizer, total_steps, min_factor=0.1):
+    total_steps = max(int(total_steps), 1)
+    min_factor = float(min_factor)
+    if min_factor < 0.0 or min_factor > 1.0:
+        raise ValueError("min_factor must be between 0.0 and 1.0")
+
+    def lr_lambda(step):
+        progress = min(max(float(step) / total_steps, 0.0), 1.0)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     
 def read_fasta(filepath):
