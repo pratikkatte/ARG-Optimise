@@ -2,7 +2,7 @@ import cyvcf2
 import tsinfer
 from pathlib import Path
 
-simpref = "l1mb"   # -> ../../vcf/sim_l1mb_0.vcf  (no trailing underscore)
+simpref = "l25kb"   # -> ../../vcf/sim_l1mb_0.vcf  (no trailing underscore)
 vcf_path = f"../vcf/sim_{simpref}_0.vcf"
 samples_path = f"../vcf/sim_{simpref}_0.samples"
 
