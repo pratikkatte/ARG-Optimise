@@ -84,9 +84,12 @@ def run_inference(
     if refine_trees_path is not None:
         if refine_window_start is None or refine_window_end is None:
             raise ValueError("Both refine_window_start and refine_window_end must be provided if refine_trees_path is set.")
+        bp_per_blocks = env.sequence_length // env.num_blocks
+        refine_window_start_blocks = refine_window_start // bp_per_blocks
+        refine_window_end_blocks = refine_window_end // bp_per_blocks
         ts = tskit.load(refine_trees_path)
         base_state = tree_sequence_to_arg_state(ts, env)
-        starting_state = env.delete_genomic_window(base_state, refine_window_start, refine_window_end)
+        starting_state = env.delete_genomic_window(base_state, refine_window_start_blocks, refine_window_end_blocks)
 
     random_spec = build_random_spec(temperature=temperature)
     rollout_worker = RolloutWorker(env, verbose=verbose)

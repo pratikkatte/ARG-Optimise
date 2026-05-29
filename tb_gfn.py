@@ -245,9 +245,9 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         total_log_pf = log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
 
-        log_probs = torch.exp(total_log_pf)
+        probs = torch.exp(total_log_pf)
         
-        return total_log_pf, log_probs, choosen_actions
+        return total_log_pf, probs, choosen_actions
 
 
     def update_model(self):
@@ -381,91 +381,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
             return 0.0
         return max(float(lineage.time) for lineage in state.all_nodes.values())
 
-    def _apply_inverse_arg_action(self, state, inverse_action):
-        if inverse_action["event_type"] == "coal":
-            return self._apply_inverse_coalescence(state, inverse_action)
-        if inverse_action["event_type"] == "recomb":
-            return self._apply_inverse_recombination(state, inverse_action)
-        raise ValueError(f"Unknown inverse ARG action: {inverse_action}")
-
-    def _apply_inverse_coalescence(self, state, inverse_action):
-        parent_state = state.clone()
-        parent_id = inverse_action["parent_id"]
-        child_ids = inverse_action["child_ids"]
-
-        remaining_lineages = [
-            lineage for lineage in parent_state.active_lineages if lineage.node_id != parent_id
-        ]
-        parent_state.all_nodes.pop(parent_id)
-        parent_state.active_lineages = []
-        for child_id in child_ids:
-            child = parent_state.all_nodes[child_id]
-            child.parents = [node_id for node_id in child.parents if node_id != parent_id]
-            parent_state.active_lineages.append(child)
-        parent_state.active_lineages.extend(remaining_lineages)
-        parent_state.total_active_blocks = None
-
-        active_idx_by_id = self._active_index_by_node_id(parent_state)
-        forward_action = {
-            "event_type": "coal",
-            "active_lineage_i": active_idx_by_id[child_ids[0]],
-            "active_lineage_j": active_idx_by_id[child_ids[1]],
-        }
-        parent_state.current_time = self._max_node_time(parent_state)
-        delta_t = float(state.current_time) - float(parent_state.current_time)
-        rates = self.env.enumerate_prior_options(parent_state).rates
-        forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
-        self._finalize_backward_parent_state(parent_state, state, forward_action)
-        return parent_state, forward_action
-
-    def _apply_inverse_recombination(self, state, inverse_action):
-        parent_state = state.clone()
-        left_id, right_id = inverse_action["parent_ids"]
-        child_id = inverse_action["child_id"]
-
-        remaining_lineages = [
-            lineage for lineage in parent_state.active_lineages if lineage.node_id not in (left_id, right_id)
-        ]
-        parent_state.all_nodes.pop(left_id)
-        parent_state.all_nodes.pop(right_id)
-
-        child = parent_state.all_nodes[child_id]
-        child.parents = []
-        parent_state.active_lineages = [child] + remaining_lineages
-        parent_state.total_active_blocks = None
-
-        active_idx_by_id = self._active_index_by_node_id(parent_state)
-        forward_action = {
-            "event_type": "recomb",
-            "active_lineage_i": active_idx_by_id[child_id],
-            "breakpoint": inverse_action["breakpoint"],
-        }
-        parent_state.current_time = self._max_node_time(parent_state)
-        delta_t = float(state.current_time) - float(parent_state.current_time)
-        rates = self.env.enumerate_prior_options(parent_state).rates
-        forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
-        self._finalize_backward_parent_state(parent_state, state, forward_action)
-        return parent_state, forward_action
-
-    def _finalize_backward_parent_state(self, parent_state, child_state, forward_action):
-        parent_state.max_node_idx = max(parent_state.all_nodes) if parent_state.all_nodes else -1
-        parent_state.log_reward = None
-        parent_state.action_options = None
-        parent_state.rates = None
-        parent_state.prior_options = None
-        parent_state.is_done = self.env.is_terminal(parent_state)
-
-        log_prior = self.env.compute_cwr_event_log_prior(parent_state, forward_action)
-        if math.isfinite(log_prior):
-            parent_state.accumulated_log_prior = child_state.accumulated_log_prior - log_prior
-        parent_state.action_options = None
-        parent_state.rates = None
-        parent_state.prior_options = None
-
     def _active_index_by_node_id(self, state):
         return {lineage.node_id: idx for idx, lineage in enumerate(state.active_lineages)}
 
     def get_loss_from_rollout_outputs(self, rollout_outputs):
+        """
+        Compute the Trajectory Balance loss from rollout outputs.
+        """
         log_paths_pf = rollout_outputs['log_paths_pf']
         log_paths_pb = rollout_outputs['log_paths_pb']
         log_rewards = torch.as_tensor(
@@ -473,11 +395,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
             dtype=log_paths_pf.dtype,
             device=log_paths_pf.device,
         )
-
+        
         log_pf = log_paths_pf.sum(-1)
         log_pb = log_paths_pb.sum(-1)
 
-        
         log_z = self.compute_log_Z(None).reshape(-1).to(log_paths_pf)
 
         forward_value = log_z + log_pf
@@ -487,152 +408,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         return loss
         
-    
     def accumulate_loss(self, rollout_outputs, factor=1.0):
         loss = self.get_loss_from_rollout_outputs(rollout_outputs)
         loss = (loss / factor)
         loss.backward()
         self.loss += loss 
-
-    def _evaluate_state_action_log_pf(self, state, action):
-        """
-        Evaluate the forward log probability of a specific action taken in a state.
-        """
-        import math
-        from env import CoalescenceChoice, RecombinationChoice
-        import torch.nn.functional as F
-        
-        coal_candidates, recomb_candidates = self.env.enumerate_actions(state)
-        event_probs = list(self.env.compute_event_probabilities(state, (coal_candidates, recomb_candidates)).values())
-        
-        if isinstance(action, CoalescenceChoice):
-            candidates = coal_candidates
-            event_prob = event_probs[0]
-        else:
-            candidates = recomb_candidates
-            event_prob = event_probs[1]
-            
-        log_event_pf = math.log(max(1e-9, event_prob))
-        
-        lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states([state])
-        
-        logits, action_features = self.arg_model._score_candidates(
-            [candidates],
-            lineage_reps,
-            summary_reps,
-        )
-        
-        taken_idx = -1
-        for c_idx, cand in enumerate(candidates):
-            if isinstance(action, CoalescenceChoice) and isinstance(cand, CoalescenceChoice):
-                if cand.active_lineage_i == action.active_lineage_i and cand.active_lineage_j == action.active_lineage_j:
-                    taken_idx = c_idx
-                    break
-            elif isinstance(action, RecombinationChoice) and isinstance(cand, RecombinationChoice):
-                if cand.active_lineage_i == action.active_lineage_i:
-                    taken_idx = c_idx
-                    break
-                    
-        if taken_idx == -1:
-            raise ValueError(f"Prefix action {action} not found in candidate options.")
-            
-        log_action_pf = self.arg_model.compute_log_path_pf(logits, [taken_idx])[0]
-        
-        log_breakpoint_pf = torch.tensor(0.0, device=self.device)
-        if isinstance(action, RecombinationChoice):
-            lineage_idx = int(action.active_lineage_i)
-            lineage_feature = lineage_seq_features[0, lineage_idx]
-            action_context = action_features[0, taken_idx]
-            
-            valid_logits = self.breakpoint_model.valid_breakpoint_logits(
-                candidates[taken_idx],
-                lineage_feature,
-                int(self.env.sequence_length),
-                int(self.env.num_blocks),
-                action_context,
-            )
-            
-            valid_bps = list(range(int(candidates[taken_idx].span_start) + 1, int(candidates[taken_idx].span_end) + 1))
-            bp_idx = valid_bps.index(action.breakpoint)
-            log_breakpoint_pf = F.log_softmax(valid_logits, dim=0)[bp_idx]
-            
-        selected_action_feature = action_features[0, taken_idx].unsqueeze(0)
-        time_logits = self.time_model(selected_action_feature)
-        time_action = torch.tensor([action.time_action], dtype=torch.long, device=self.device)
-        log_time_pf = self.time_model.compute_log_time_pf(time_logits, time_action)[0]
-        
-        return log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
-
-    def accumulate_refinement_loss(self, base_state, window_size_blocks=None, factor=1.0, window_start=None, window_end=None):
-        """
-        Refine a base_state (terminal state) by deleting a genomic window, reconstructing the prefix,
-        rolling out the suffix, and accumulating the Trajectory Balance loss.
-        """
-        import random
-        from env import RecombinationChoice, CoalescenceChoice
-        import torch.nn.functional as F
-        
-        num_blocks = self.env.num_blocks
-        if window_start is not None and window_end is not None:
-            start = window_start
-            end = window_end
-        else:
-            if window_size_blocks is None:
-                raise ValueError("Either (window_start, window_end) or window_size_blocks must be provided.")
-            start = random.randint(0, num_blocks - window_size_blocks)
-            end = start + window_size_blocks
-            
-        pruned_state = self.env.delete_genomic_window(base_state, start, end)
-        
-        prefix_states, prefix_actions = self.env.reconstruct_prefix_trajectory(pruned_state)
-        
-        prefix_log_pfs = []
-        prefix_log_pbs = []
-        
-        for t in range(len(prefix_actions)):
-            s_curr = prefix_states[t]
-            s_next = prefix_states[t+1] if t + 1 < len(prefix_states) else pruned_state
-            act = prefix_actions[t]
-            
-            log_pf = self._evaluate_state_action_log_pf(s_curr, act)
-            prefix_log_pfs.append(log_pf)
-            
-            num_parents = self.count_backward_parents(s_next)
-            log_pb = -torch.log(torch.tensor(num_parents, dtype=torch.float32, device=self.device))
-            prefix_log_pbs.append(log_pb)
-            
-        suffix_log_pfs = []
-        suffix_log_pbs = []
-        
-        state = pruned_state.clone(copy_partials=True)
-        while not state.is_done:
-            input_dict = self.env.prepare_state_rollout_inputs([state])
-            total_log_pf, log_probs, chosen_actions = self(input_dict)
-            action = chosen_actions[0]
-            
-            coal_actions, recomb_actions = self.env.enumerate_actions(state)
-            log_prior = self.env.compute_cwr_event_log_prior(state, (coal_actions, recomb_actions), action)
-            
-            next_state = self.env.apply_action(state, action, log_prior=log_prior)
-            
-            suffix_log_pfs.append(total_log_pf[0])
-            num_parents = self.count_backward_parents(next_state)
-            suffix_log_pbs.append(-torch.log(torch.tensor(num_parents, dtype=torch.float32, device=self.device)))
-            
-            state = next_state
-            
-        all_log_pfs = prefix_log_pfs + suffix_log_pfs
-        all_log_pbs = prefix_log_pbs + suffix_log_pbs
-        
-        log_pf_sum = torch.stack(all_log_pfs).sum() if all_log_pfs else torch.tensor(0.0, device=self.device)
-        log_pb_sum = torch.stack(all_log_pbs).sum() if all_log_pbs else torch.tensor(0.0, device=self.device)
-        
-        log_reward = torch.as_tensor(state.log_reward, dtype=log_pf_sum.dtype, device=self.device)
-        log_z = self.compute_log_Z(None).reshape(-1).to(log_pf_sum)[0]
-        
-        loss = (log_z + log_pf_sum - log_reward - log_pb_sum).pow(2)
-        loss = loss / factor
-        loss.backward()
-        
-        self.loss += loss
-        return loss.item()

@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from env import SimpleTrajectory, action_as_dict
 
+import random
 
 class RolloutWorker:
     """Rollout orchestration for the simplified ARG environment."""
@@ -15,20 +16,22 @@ class RolloutWorker:
         self,
         generator,
         episodes,
+        base_state=None,
+        log_pfs=None,
+        backward_num_parents_by_traj=None,
         random_spec=None,
         return_states=False,
-        starting_state=None,
         ):
         
-        if starting_state is not None:
-            states = [starting_state.clone(copy_partials=True) for _ in range(episodes)]
+        states = [base_state.clone(copy_partials=True) for _ in range(episodes)]
+        if log_pfs is not None and backward_num_parents_by_traj is not None:
+            log_paths_pf_by_traj = [log_pfs.copy() for _ in range(episodes)]
+            backward_num_parents_by_traj = [backward_num_parents_by_traj.copy() for _ in range(episodes)]
         else:
-            states = [self.env.get_initial_state() for _ in range(episodes)]
+            log_paths_pf_by_traj = [[] for _ in range(episodes)]
+            backward_num_parents_by_traj = [[] for _ in range(episodes)]
+
         trajectories = [SimpleTrajectory() for _ in states]
-        
-        
-        log_paths_pf_by_traj = [[] for _ in range(episodes)]
-        backward_num_parents_by_traj = [[] for _ in range(episodes)]
         
         if self.verbose:
             print(
@@ -46,7 +49,7 @@ class RolloutWorker:
                 random_spec=random_spec,
             )
 
-            total_log_pf, log_probs, choosen_actions = generator(input_dict)
+            total_log_pf, probs, choosen_actions = generator(input_dict)
 
             for batch_idx, traj_idx in enumerate(unfinished):
                 state = states[traj_idx]
@@ -97,22 +100,61 @@ class RolloutWorker:
 
     def rollout(
         self,
+        terminal_state=None,
         generator=None,
         episodes=1,
         random_spec=None,
         return_states=False,
-        starting_state=None,
+        window_start=0,
+        window_end=None,
     ):
         """Run one or more model-guided ARG rollouts."""
+
         if generator is None:
             raise ValueError("Generator is required for rollout")
+
+
+        log_pfs = []
+        backward_num_parents_by_traj = []
+
+        if window_start is not None and window_end is not None and terminal_state is not None:
+            start = window_start
+            end = window_end
+            base_state = self.env.delete_genomic_window(terminal_state, start, end)
+            prefix_states, prefix_actions = self.env.reconstruct_prefix_trajectory(base_state)
+
+            ## calculate pfs and pbs from initial state to partial state. 
+            for t in range(len(prefix_actions)):
+                s_curr = prefix_states[t]
+                s_next = prefix_states[t+1] if t + 1 < len(prefix_states) else base_state
+                act = prefix_actions[t]
+                
+                combined_actions = self.env.enumerate_actions(s_curr)
+                log_pf = self.env.compute_cwr_event_log_prior(s_curr, combined_actions, act)
+                log_pfs.append(torch.tensor(log_pf, dtype=torch.float32, device=self.device))
+                
+                num_parents = generator.count_backward_parents(s_next)
+                # log_pb = -torch.log(torch.tensor(num_parents, dtype=torch.float32, device=self.device))
+                backward_num_parents_by_traj.append(num_parents)
+
+        else:
+            start = 0
+            end = self.env.num_blocks
+            base_state = self.env.get_initial_state()
+        
+
+
+        
         return self._rollout_batch(
             generator=generator,
+            base_state=base_state,
+            log_pfs=log_pfs,
+            backward_num_parents_by_traj=backward_num_parents_by_traj,
             episodes=episodes,
             random_spec=random_spec,
             return_states=return_states,
-            starting_state=starting_state,
         )
+        
 
     def _states_to_padded_tree_features(self, states, device=None):
         lineage_features = [

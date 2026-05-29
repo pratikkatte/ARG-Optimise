@@ -1145,6 +1145,41 @@ class SimpleARGEnvironment:
         log_prior = self.compute_cwr_event_log_prior(state, combined_actions, chosen_action)
         return chosen_action, log_prior
 
+    def evaluate_state_action_log_pf(self, state, action):
+
+        coal_candidates, recomb_candidates = self.enumerate_actions(state)
+        event_probs = list(self.compute_event_probabilities(state, (coal_candidates, recomb_candidates)).values())
+
+        event_pf = float(event_probs[0]) if isinstance(action, CoalescenceChoice) else float(event_probs[1])
+        event_log_pf = np.log(event_pf)
+
+        coal_candidates_probs = np.array([act.probability(state) for act in coal_candidates])
+        coal_probs = coal_candidates_probs / np.sum(coal_candidates_probs)
+
+        recomb_candidates_probs = np.array([act.probability(state) for act in recomb_candidates])
+        recomb_probs = recomb_candidates_probs / np.sum(recomb_candidates_probs)
+
+        if isinstance(action, CoalescenceChoice):
+            coal_action_idx = coal_candidates.index(action)
+            action_prob = float(coal_probs[coal_action_idx])
+            action_log_pf = np.log(action_prob)
+            breakpoint_log_pf = 0.0
+        else:
+            recomb_action_idx = recomb_candidates.index(action)
+            action_prob = float(recomb_probs[recomb_action_idx])
+            action_log_pf = np.log(action_prob)
+
+            breakpoint_prob = float(action.probability(state))
+            breakpoint_log_pf = np.log(breakpoint_prob)
+
+        time_action = action.time_action
+        time_prob = self.time_env.time_action_probability(time_action, self._total_event_rate(state.rates))
+        time_log_pf = np.log(time_prob)
+
+        total_log_pf = event_log_pf + action_log_pf + breakpoint_log_pf + time_log_pf
+        probs = np.exp(total_log_pf)
+        return total_log_pf, probs
+
     def sample_log_rewards(self, num_trajs, verbose=True):
         """Sample prior rollouts sequentially and return terminal log rewards."""
         log_rewards = []
@@ -1161,7 +1196,7 @@ class SimpleARGEnvironment:
         return log_rewards
 
     def compute_cwr_event_log_prior(self, state, combined_actions, action=None, rates=None):
-        if action is None:
+        if action and state is None:
             action = combined_actions
             combined_actions = self.enumerate_actions(state)
         coal_actions, recomb_actions = combined_actions

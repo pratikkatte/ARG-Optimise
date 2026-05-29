@@ -61,37 +61,30 @@ def train_epoch(
     generator,
     batch_size=1,
     grad_accum_steps=1,
-    base_state=None,
+    terminal_state=None,
     refine_window_start=None,
     refine_window_end=None,
 ):
     grad_accum_steps = max(int(grad_accum_steps), 1)
+    
+    for _ in range(grad_accum_steps):
+        ret, trajectories = rollout_worker.rollout(
+            terminal_state=terminal_state,
+            generator=generator,
+            episodes=batch_size,
+            window_start=refine_window_start,
+            window_end=refine_window_end
+            )
 
-    if base_state is not None:
-        for _ in range(grad_accum_steps):
-            for _ in range(batch_size):
-                generator.accumulate_refinement_loss(
-                    base_state,
-                    factor=grad_accum_steps * batch_size,
-                    window_start=refine_window_start,
-                    window_end=refine_window_end,
-                )
-    else:
-        for _ in range(grad_accum_steps):
-            ret, trajectories = rollout_worker.rollout(
-                generator,
-                episodes=batch_size,
-            )
-            generator.accumulate_loss(
-                ret,
-                factor=grad_accum_steps,
-            )
+        generator.accumulate_loss(
+            ret,
+            factor=grad_accum_steps,
+        )
 
     return generator.update_model()
 
-
-def evaluate_generator(rollout_worker, generator, episodes, seed):
-    episodes = int(episodes)
+def evaluate_generator(terminal_state, refine_window_start, refine_window_end, rollout_worker, generator, eval_episodes, seed):
+    episodes = int(eval_episodes)
     if episodes <= 0:
         return {}
 
@@ -112,15 +105,15 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             env.rng.seed(seed)
 
         with torch.no_grad():
-            outputs, trajectories = rollout_worker.rollout(generator, episodes=episodes)
+            outputs, trajectories = rollout_worker.rollout(terminal_state=terminal_state, generator=generator, episodes=episodes, window_start=refine_window_start, window_end=refine_window_end)
             log_pf = outputs["log_paths_pf"].sum(-1)
             log_pb = outputs["log_paths_pb"].sum(-1)
             log_rewards = outputs["log_rewards"]
             residuals = generator.compute_log_Z().detach().to(log_pf) + log_pf - (
                 log_rewards + log_pb
             )
-            initial_state = env.get_initial_state()
-            initial_event_probs = env.compute_event_probabilities(initial_state)
+            # initial_state = env.get_initial_state()
+            # initial_event_probs = env.compute_event_probabilities(initial_state)
 
         lengths = torch.tensor([len(traj) for traj in trajectories], dtype=torch.float32)
         coal_counts = torch.tensor(
@@ -157,8 +150,8 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             "eval_trajectory_length_mean": float(lengths.mean().item()),
             "eval_coalescence_count_mean": float(coal_counts.mean().item()),
             "eval_recombination_count_mean": float(recomb_counts.mean().item()),
-            "eval_initial_coalescence_prob": float(initial_event_probs.get("coal", 0.0)),
-            "eval_initial_recombination_prob": float(initial_event_probs.get("recomb", 0.0)),
+            # "eval_initial_coalescence_prob": float(initial_event_probs.get("coal", 0.0)),
+            # "eval_initial_recombination_prob": float(initial_event_probs.get("recomb", 0.0)),
         }
     finally:
         random.setstate(python_state)
@@ -223,12 +216,16 @@ def train(
         time_delta_bin_width=time_delta_bin_width,
     )
 
-    base_state = None
+    refine_window_start_blocks = None
+    refine_window_end_blocks = None
+    terminal_state = None
     if refine_trees_path is not None:
         if refine_window_start is None or refine_window_end is None:
             raise ValueError("Both refine_window_start and refine_window_end must be provided if refine_trees_path is set.")
+        refine_window_start_blocks = refine_window_start // bp_per_blocks
+        refine_window_end_blocks = refine_window_end // bp_per_blocks
         ts = tskit.load(refine_trees_path)
-        base_state = tree_sequence_to_arg_state(ts, env)
+        terminal_state = tree_sequence_to_arg_state(ts, env)
     model_kwargs = {
         "embedding_size": int(embedding_size),
         "hidden_size": int(hidden_size),
@@ -300,9 +297,9 @@ def train(
                 generator,
                 batch_size=batch_size,
                 grad_accum_steps=grad_accum_steps,
-                base_state=base_state,
-                refine_window_start=refine_window_start,
-                refine_window_end=refine_window_end,
+                terminal_state=terminal_state,
+                refine_window_start=refine_window_start_blocks,
+                refine_window_end=refine_window_end_blocks,
             )
             log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
             if info is None:
@@ -316,15 +313,17 @@ def train(
                 or int(eval_every) <= 1
                 or (epoch + 1) % int(eval_every) == 0
             )
-
-            ## TODO: Check this implementation of evaluation
+            
             if should_eval:
                 info.update(
                     evaluate_generator(
-                        rollout_worker,
-                        generator,
-                        eval_episodes,
-                        seed + 100000 + epoch,
+                        terminal_state=terminal_state,
+                        refine_window_start=refine_window_start_blocks,
+                        refine_window_end=refine_window_end_blocks,
+                        rollout_worker=rollout_worker,
+                        generator=generator,
+                        eval_episodes=eval_episodes,
+                        seed=seed + 100000 + epoch,
                     )
                 )
             history.append(info)
