@@ -498,8 +498,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def accumulate_loss(self, rollout_outputs, factor=1.0):
         loss = self.get_loss_from_rollout_outputs(rollout_outputs)
         loss = (loss / factor)
-        loss.backward()
-        self.loss += loss 
+        if torch.isfinite(loss):
+            loss.backward()
+            self.loss += loss
+        else:
+            print(f"Warning: Non-finite loss encountered in accumulate_loss: {loss.item()}. Skipping backward pass.")
 
     def _evaluate_state_action_log_pf(self, state, action):
         """
@@ -647,7 +650,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         
         loss = (log_z + log_pf_sum - log_reward - log_pb_sum).pow(2)
         loss = loss / factor
-        loss.backward()
-        
-        self.loss += loss
-        return loss.item()
+        if torch.isfinite(loss):
+            loss.backward()
+            self.loss += loss
+            return loss.item()
+        else:
+            print(f"Warning: Non-finite loss encountered in accumulate_refinement_loss: {loss.item()}. Skipping backward pass.")
+            return 0.0
