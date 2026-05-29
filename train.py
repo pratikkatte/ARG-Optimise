@@ -523,8 +523,10 @@ def main():
         world_size = dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-            selected_device = f"cuda:{local_rank}"
+            device_count = torch.cuda.device_count()
+            device_id = local_rank % device_count if device_count > 0 else 0
+            torch.cuda.set_device(device_id)
+            selected_device = f"cuda:{device_id}"
         else:
             selected_device = "cpu"
     else:
