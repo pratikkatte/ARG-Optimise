@@ -72,24 +72,42 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.arg_model_lr = float(arg_model_lr)
         self.z_lr = float(z_lr)
         self.model_kwargs = dict(model_kwargs or {})
-        self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
-        if self.ddp:
-            from torch.nn.parallel import DistributedDataParallel as DDP
-            device_ids = [self.device.index] if self.device.type == "cuda" else None
-            output_device = self.device.index if self.device.type == "cuda" else None
-            self.arg_model = DDP(
-                self.arg_model,
-                device_ids=device_ids,
-                output_device=output_device,
-                find_unused_parameters=True,
+        embedding_size = int(self.model_kwargs.get("embedding_size", embedding_size))
+        arg_model_kwargs = {
+            "embedding_size": embedding_size,
+            "hidden_size": int(self.model_kwargs.get("hidden_size", 64)),
+            "dropout": float(self.model_kwargs.get("dropout", 0.0)),
+            "transformer_depth": int(self.model_kwargs.get("transformer_depth", 6)),
+            "transformer_heads": int(self.model_kwargs.get("transformer_heads", 4)),
+            "transformer_mlp_ratio": float(self.model_kwargs.get("transformer_mlp_ratio", 2.0)),
+            "attention_dropout": float(self.model_kwargs.get("attention_dropout", 0.0)),
+        }
+        self.arg_model = ARGModel(env, **arg_model_kwargs).to(self.device)
+        time_hidden_size = int(self.model_kwargs.get("time_hidden_size", time_hidden_size))
+        time_layers = int(self.model_kwargs.get("time_layers", time_layers))
+        time_dropout = float(self.model_kwargs.get("time_dropout", time_dropout))
+        breakpoint_hidden_dim = int(self.model_kwargs.get("breakpoint_hidden_dim", breakpoint_hidden_dim))
+        breakpoint_dropout = float(self.model_kwargs.get("breakpoint_dropout", breakpoint_dropout))
+        breakpoint_gap_hidden_size = int(
+            self.model_kwargs.get("breakpoint_gap_hidden_size", breakpoint_gap_hidden_size)
+        )
+        breakpoint_gap_layers = int(self.model_kwargs.get("breakpoint_gap_layers", breakpoint_gap_layers))
+        breakpoint_gap_dropout = float(
+            self.model_kwargs.get("breakpoint_gap_dropout", breakpoint_gap_dropout)
+        )
+        breakpoint_use_position_features = bool(
+            self.model_kwargs.get(
+                "breakpoint_use_position_features",
+                breakpoint_use_position_features,
             )
+        )
         self.time_model = TimeModel(
             embedding_size * 4,
             time_hidden_size,
             time_dropout,
             env.time_env.bins,
             layers=time_layers,
-        )
+        ).to(self.device)
 
         self.breakpoint_model = BreakpointSplitPositionCNN(
             hidden_dim=breakpoint_hidden_dim,
@@ -100,9 +118,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
             gap_dropout=breakpoint_gap_dropout,
             use_position_features=breakpoint_use_position_features,
         ).to(self.device)
-
-        # self.time_model = self.arg_model.module.time_scorer if self.ddp else self.arg_model.time_scorer
-        # self.breakpoint_model = self.arg_model.module.breakpoint_scorer if self.ddp else self.arg_model.breakpoint_scorer
 
         ## Z partition
         self.max_reward_seen = float("-inf")
@@ -163,8 +178,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
 
     def _encode_states(self, states):
-        model = self.arg_model.module if self.ddp else self.arg_model
-        return model._encode_states(states)
+        return self.arg_model._encode_states(states)
 
 
     def save(self, path, metadata=None):
@@ -272,7 +286,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         probs = torch.exp(total_log_pf)
         
-        return total_log_pf, probs, choosen_actions
+        return total_log_pf, probs, choosen_actions, self.compute_log_Z()
 
 
     def update_model(self):
@@ -282,11 +296,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 'param_norm': self.param_norm(self),
                 'loss': self.loss.detach().cpu().numpy().tolist()}
         
-        if self.ddp and self._Z.grad is not None:
-            import torch.distributed as dist
-            dist.all_reduce(self._Z.grad, op=dist.ReduceOp.SUM)
-            self._Z.grad.data /= dist.get_world_size()
-
         torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
         self.opt.step()
         self.opt.zero_grad()
@@ -309,7 +318,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         log_pf = log_paths_pf.sum(-1)
         log_pb = log_paths_pb.sum(-1)
 
-        log_z = self.compute_log_Z(None).reshape(-1).to(log_paths_pf)
+        log_z = rollout_outputs.get("log_z")
+        if log_z is None:
+            log_z = self.compute_log_Z(None)
+        log_z = log_z.reshape(-1).to(log_paths_pf)
 
         forward_value = log_z + log_pf
         backward_value = log_rewards + log_pb

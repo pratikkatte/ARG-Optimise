@@ -1,6 +1,4 @@
 from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
-from breakpoint_model import BreakpointSplitPositionCNN
-from time_model import TimeModel
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -154,8 +152,9 @@ class ARGModel(nn.Module):
     def __init__(
         self,
         env,
-       
+        embedding_size=32,
         hidden_size=64,
+        dropout=0.0,
         transformer_depth=6,
         transformer_heads=4,
         transformer_mlp_ratio=2.0,
@@ -187,23 +186,6 @@ class ARGModel(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
-        )
-        self.breakpoint_scorer = BreakpointSplitPositionCNN(
-            hidden_dim=breakpoint_hidden_dim,
-            dropout=breakpoint_dropout,
-            action_context_dim=embedding_size * 4,
-            gap_hidden_dim=breakpoint_gap_hidden_size,
-            gap_layers=breakpoint_gap_layers,
-            gap_dropout=breakpoint_gap_dropout,
-            use_position_features=breakpoint_use_position_features,
-        ).to(self.device)
-
-        self.time_scorer = TimeModel(
-            embedding_size * 4,
-            time_hidden_size,
-            time_dropout,
-            env.time_env.bins,
-            layers=time_layers,
         )
         self.logsoftmax = nn.LogSoftmax(dim=1)
 
@@ -411,16 +393,6 @@ class ARGModel(nn.Module):
             index = min(max(int(breakpoint), 1), num_blocks - 1) - 1
             indices.append(index)
         return torch.tensor(indices, dtype=torch.long, device=device)
-
-    def _sample_recombination_breakpoint(self, action, lineage_seq_feature, action_context, random_spec=None):
-        return self.breakpoint_scorer(
-            action,
-            lineage_seq_feature,
-            int(self.env.sequence_length),
-            int(self.env.num_blocks),
-            action_context,
-            random_spec=random_spec,
-        )
 
     def _event_log_probs_from_action_logits(self, candidate_actions, logits):
         event_log_probs = logits.new_full(

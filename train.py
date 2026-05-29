@@ -55,6 +55,10 @@ def seed_everything(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+
+def unwrap_generator(generator):
+    return generator.module if hasattr(generator, "module") else generator
+
 def train_epoch(
     epoch_id,
     rollout_worker,
@@ -66,6 +70,7 @@ def train_epoch(
     refine_window_end=None,
 ):
     grad_accum_steps = max(int(grad_accum_steps), 1)
+    base_generator = unwrap_generator(generator)
     
     for _ in range(grad_accum_steps):
         ret, trajectories = rollout_worker.rollout(
@@ -76,18 +81,19 @@ def train_epoch(
             window_end=refine_window_end
             )
 
-        generator.accumulate_loss(
+        base_generator.accumulate_loss(
             ret,
             factor=grad_accum_steps,
         )
 
-    return generator.update_model()
+    return base_generator.update_model()
 
 def evaluate_generator(terminal_state, refine_window_start, refine_window_end, rollout_worker, generator, eval_episodes, seed):
     episodes = int(eval_episodes)
     if episodes <= 0:
         return {}
 
+    base_generator = unwrap_generator(generator)
     env = rollout_worker.env
     python_state = random.getstate()
     numpy_state = np.random.get_state()
@@ -109,7 +115,7 @@ def evaluate_generator(terminal_state, refine_window_start, refine_window_end, r
             log_pf = outputs["log_paths_pf"].sum(-1)
             log_pb = outputs["log_paths_pb"].sum(-1)
             log_rewards = outputs["log_rewards"]
-            residuals = generator.compute_log_Z().detach().to(log_pf) + log_pf - (
+            residuals = base_generator.compute_log_Z().detach().to(log_pf) + log_pf - (
                 log_rewards + log_pb
             )
             # initial_state = env.get_initial_state()
@@ -279,12 +285,23 @@ def train(
         ddp=ddp,
         local_rank=local_rank,
     )
+    if ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        device_ids = [device.index] if device.type == "cuda" else None
+        output_device = device.index if device.type == "cuda" else None
+        generator = DDP(
+            generator,
+            device_ids=device_ids,
+            output_device=output_device,
+            find_unused_parameters=True,
+        )
+    base_generator = unwrap_generator(generator)
     if rank == 0:
-        print(f"Generator device: {generator.device}")
+        print(f"Generator device: {base_generator.device}")
 
     rollout_worker = RolloutWorker(env)
     if rank == 0:
-        print(f"Training on device: {generator.device}")
+        print(f"Training on device: {base_generator.device}")
 
     os.makedirs(output_path, exist_ok=True)
     checkpoints_path = os.path.join(output_path, "checkpoints")
@@ -299,7 +316,7 @@ def train(
     if use_wandb and rank == 0 and wandb is not None:
         wandb_run = wandb.init()
         wandb.config.update({
-            "device": str(generator.device),
+            "device": str(base_generator.device),
             **env.time_metadata,
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
@@ -327,7 +344,8 @@ def train(
                 refine_window_start=refine_window_start_blocks,
                 refine_window_end=refine_window_end_blocks,
             )
-            log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
+            base_generator = unwrap_generator(generator)
+            log_z = base_generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
             if info is None:
                 continue
 
@@ -389,7 +407,7 @@ def train(
                     init_z_sample_count=init_z_sample_count,
                     model_version=MODEL_VERSION,
                 )
-                generator.save(best_checkpoint_path, metadata=metadata)
+                base_generator.save(best_checkpoint_path, metadata=metadata)
                 info["best_checkpoint_path"] = best_checkpoint_path
 
             eval_text = ""

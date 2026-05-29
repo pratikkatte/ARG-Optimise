@@ -30,6 +30,7 @@ class RolloutWorker:
         else:
             log_paths_pf_by_traj = [[] for _ in range(episodes)]
             backward_num_parents_by_traj = [[] for _ in range(episodes)]
+        log_z_terms = []
 
         trajectories = [SimpleTrajectory() for _ in states]
         
@@ -49,7 +50,8 @@ class RolloutWorker:
                 random_spec=random_spec,
             )
 
-            total_log_pf, probs, choosen_actions = generator(input_dict)
+            total_log_pf, probs, choosen_actions, log_z = generator(input_dict)
+            log_z_terms.append(log_z.reshape(()))
 
             for batch_idx, traj_idx in enumerate(unfinished):
                 state = states[traj_idx]
@@ -72,7 +74,7 @@ class RolloutWorker:
                 )
 
                 backward_num_parents_by_traj[traj_idx].append(
-                    generator.count_backward_parents(next_state)
+                    self.env.count_backward_parents(next_state)
                     )
             unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
 
@@ -93,6 +95,8 @@ class RolloutWorker:
             "log_paths_pb": log_paths_pb,
             "log_rewards": log_rewards,
         }
+        if log_z_terms:
+            data["log_z"] = torch.stack(log_z_terms).mean()
         if return_states:
             data["states"] = states
 
@@ -133,7 +137,7 @@ class RolloutWorker:
                 log_pf = self.env.compute_cwr_event_log_prior(s_curr, combined_actions, act)
                 log_pfs.append(torch.tensor(log_pf, dtype=torch.float32, device=self.device))
                 
-                num_parents = generator.count_backward_parents(s_next)
+                num_parents = self.env.count_backward_parents(s_next)
                 # log_pb = -torch.log(torch.tensor(num_parents, dtype=torch.float32, device=self.device))
                 backward_num_parents_by_traj.append(num_parents)
 
