@@ -658,6 +658,93 @@ class SimpleARGEnvironment:
             state.log_reward = self.compute_terminal_log_reward(state, log_likelihood)
         return state
 
+    def _is_latest_time_event(self, state, *node_ids):
+        current_time = float(state.current_time)
+        return all(
+            math.isclose(
+                float(state.all_nodes[node_id].time),
+                current_time,
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            for node_id in node_ids
+        )
+        
+    def _enumerate_inverse_arg_actions(self, state):
+        inverse_actions = []
+
+        # Use one loop to collect both coal and recomb candidates efficiently
+        # Prepare coal candidates in a single pass with a list comprehension
+        coal_candidates = [
+            (active_idx, lineage)
+            for active_idx, lineage in enumerate(state.active_lineages)
+            if (
+                lineage.event_type == "coal"
+                and len(lineage.children) == 2
+                and self._is_latest_time_event(state, lineage.node_id)
+                and lineage.children[0] in state.all_nodes
+                and lineage.children[1] in state.all_nodes
+                and lineage.node_id in state.all_nodes[lineage.children[0]].parents
+                and lineage.node_id in state.all_nodes[lineage.children[1]].parents
+            )
+        ]
+        for active_idx, lineage in coal_candidates:
+            child_i, child_j = lineage.children
+            inverse_actions.append(
+                {
+                    "event_type": "coal",
+                    "active_idx": active_idx,
+                    "parent_id": lineage.node_id,
+                    "child_ids": (child_i, child_j),
+                }
+            )
+
+        # Prepare recomb_by_event using a single pass with a dictionary
+        recomb_by_event = {}
+        for active_idx, lineage in enumerate(state.active_lineages):
+            if (
+                lineage.event_type == "recomb"
+                and len(lineage.children) == 1
+                and lineage.breakpoint is not None
+                and lineage.recombination_side in ("left", "right")
+            ):
+                key = (lineage.children[0], lineage.breakpoint)
+                recomb_by_event.setdefault(key, {})[lineage.recombination_side] = (active_idx, lineage.node_id)
+
+        # We can iterate efficiently over recomb_by_event rather than collecting in a list
+        for (child_id, breakpoint), sides in recomb_by_event.items():
+            if "left" not in sides or "right" not in sides or child_id not in state.all_nodes:
+                continue
+            left_idx, left_id = sides["left"]
+            right_idx, right_id = sides["right"]
+            child = state.all_nodes[child_id]
+            left_parent = state.all_nodes[left_id]
+            right_parent = state.all_nodes[right_id]
+
+            # Fast short-circuit checks, in a single conditional
+            if (
+                not self._is_latest_time_event(state, left_id, right_id)
+                or set(child.parents) != {left_id, right_id}
+                or left_parent.material_segments.intersection_count(right_parent.material_segments) > 0
+                or left_parent.material_segments.union(right_parent.material_segments) != child.material_segments
+            ):
+                continue
+
+            inverse_actions.append(
+                {
+                    "event_type": "recomb",
+                    "active_indices": (left_idx, right_idx),
+                    "parent_ids": (left_id, right_id),
+                    "child_id": child_id,
+                    "breakpoint": breakpoint,
+                }
+            )
+
+        return inverse_actions
+    
+    def count_backward_parents(self, arg_state):
+        return len(self._enumerate_inverse_arg_actions(arg_state))
+
     def _initial_lineage_partials(self, node_id, material_segments):
         partials = self.block_seq_arrays[int(node_id)].detach().clone().float()
         return self.evolution_model.mask_partials(partials, material_segments)

@@ -7,6 +7,8 @@ import torch
 from models import ARGModel
 from env import RecombinationChoice
 from dataclasses import replace
+from breakpoint_model import BreakpointSplitPositionCNN
+from time_model import TimeModel
 
 LOSS_FN = {
     'MSE': torch.nn.MSELoss(),
@@ -30,6 +32,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
         initialize_z_from_prior=True,
         ddp=False,
         local_rank=0,
+        time_layers=3,
+        breakpoint_hidden_dim=128,
+        breakpoint_gap_hidden_size=256,
+        breakpoint_gap_layers=3,
+        breakpoint_gap_dropout=0.0,
+        breakpoint_use_position_features=True,
+
     ):
         super().__init__()
         print(f"verbose: {verbose}")
@@ -70,8 +79,26 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 output_device=output_device,
                 find_unused_parameters=True,
             )
-        self.time_model = self.arg_model.module.time_scorer if self.ddp else self.arg_model.time_scorer
-        self.breakpoint_model = self.arg_model.module.breakpoint_scorer if self.ddp else self.arg_model.breakpoint_scorer
+        self.time_model = TimeModel(
+            embedding_size * 4,
+            time_hidden_size,
+            time_dropout,
+            env.time_env.bins,
+            layers=time_layers,
+        )
+
+        self.breakpoint_model = BreakpointSplitPositionCNN(
+            hidden_dim=breakpoint_hidden_dim,
+            dropout=breakpoint_dropout,
+            action_context_dim=embedding_size * 4,
+            gap_hidden_dim=breakpoint_gap_hidden_size,
+            gap_layers=breakpoint_gap_layers,
+            gap_dropout=breakpoint_gap_dropout,
+            use_position_features=breakpoint_use_position_features,
+        ).to(self.device)
+
+        # self.time_model = self.arg_model.module.time_scorer if self.ddp else self.arg_model.time_scorer
+        # self.breakpoint_model = self.arg_model.module.breakpoint_scorer if self.ddp else self.arg_model.breakpoint_scorer
 
         ## Z partition
         self.max_reward_seen = float("-inf")
@@ -171,36 +198,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         except TypeError:
             return torch.load(path, map_location=map_location)
 
-    @staticmethod
-    def _grad_norm(params):
-        return math.sqrt(sum(
-            p.grad.detach().norm().item() ** 2 for p in params if p.grad is not None
-        ))
-
-    @staticmethod
-    def _param_norm(params):
-        return math.sqrt(sum(p.detach().norm().item() ** 2 for p in params))
-
-    def grad_norm(self):
-        return self._grad_norm(self.gradient_clipping_params)
     
-    def param_norm(self):
-        return self._param_norm(self.gradient_clipping_params)
-
-    def policy_grad_norm(self):
-        return self._grad_norm(self.policy_params)
-
-    def policy_param_norm(self):
-        return self._param_norm(self.policy_params)
-
-    def log_z_grad(self):
-        if self._Z.grad is None:
-            return 0.0
-        return float(self._Z.grad.detach().cpu().reshape(-1)[0].item())
-
-    def log_z_grad_norm(self):
-        return self._grad_norm([self._Z])
-
     def compute_log_Z(self, scale_key=None):
         return self._Z.sum()
 
@@ -283,126 +281,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.loss = torch.tensor(0.0, device=self.device)
 
         return info
-
-    def _record_log_z_targets(self, targets):
-        finite_targets = targets[torch.isfinite(targets)]
-        if finite_targets.numel() == 0:
-            return
-        self.log_z_target_sum += float(finite_targets.sum().detach().cpu().item())
-        self.log_z_target_count += int(finite_targets.numel())
-        self.last_log_z_target = (
-            self.log_z_target_sum / max(self.log_z_target_count, 1)
-        )
-
-    def count_backward_parents(self, arg_state):
-        return len(self._enumerate_inverse_arg_actions(arg_state))
-
-    def _is_initial_arg_state(self, state):
-        initial_ids = set(range(self.env.num_sequences))
-        if set(state.all_nodes) != initial_ids:
-            return False
-        if {lineage.node_id for lineage in state.active_lineages} != initial_ids:
-            return False
-
-        for node_id in initial_ids:
-            lineage = state.all_nodes[node_id]
-            if lineage.children or lineage.parents:
-                return False
-            if lineage.material_segments.segments != ((0, self.env.num_blocks),):
-                return False
-        return True
-
-    def _enumerate_inverse_arg_actions(self, state):
-        inverse_actions = []
-
-        # Use one loop to collect both coal and recomb candidates efficiently
-        # Prepare coal candidates in a single pass with a list comprehension
-        coal_candidates = [
-            (active_idx, lineage)
-            for active_idx, lineage in enumerate(state.active_lineages)
-            if (
-                lineage.event_type == "coal"
-                and len(lineage.children) == 2
-                and self._is_latest_time_event(state, lineage.node_id)
-                and lineage.children[0] in state.all_nodes
-                and lineage.children[1] in state.all_nodes
-                and lineage.node_id in state.all_nodes[lineage.children[0]].parents
-                and lineage.node_id in state.all_nodes[lineage.children[1]].parents
-            )
-        ]
-        for active_idx, lineage in coal_candidates:
-            child_i, child_j = lineage.children
-            inverse_actions.append(
-                {
-                    "event_type": "coal",
-                    "active_idx": active_idx,
-                    "parent_id": lineage.node_id,
-                    "child_ids": (child_i, child_j),
-                }
-            )
-
-        # Prepare recomb_by_event using a single pass with a dictionary
-        recomb_by_event = {}
-        for active_idx, lineage in enumerate(state.active_lineages):
-            if (
-                lineage.event_type == "recomb"
-                and len(lineage.children) == 1
-                and lineage.breakpoint is not None
-                and lineage.recombination_side in ("left", "right")
-            ):
-                key = (lineage.children[0], lineage.breakpoint)
-                recomb_by_event.setdefault(key, {})[lineage.recombination_side] = (active_idx, lineage.node_id)
-
-        # We can iterate efficiently over recomb_by_event rather than collecting in a list
-        for (child_id, breakpoint), sides in recomb_by_event.items():
-            if "left" not in sides or "right" not in sides or child_id not in state.all_nodes:
-                continue
-            left_idx, left_id = sides["left"]
-            right_idx, right_id = sides["right"]
-            child = state.all_nodes[child_id]
-            left_parent = state.all_nodes[left_id]
-            right_parent = state.all_nodes[right_id]
-
-            # Fast short-circuit checks, in a single conditional
-            if (
-                not self._is_latest_time_event(state, left_id, right_id)
-                or set(child.parents) != {left_id, right_id}
-                or left_parent.material_segments.intersection_count(right_parent.material_segments) > 0
-                or left_parent.material_segments.union(right_parent.material_segments) != child.material_segments
-            ):
-                continue
-
-            inverse_actions.append(
-                {
-                    "event_type": "recomb",
-                    "active_indices": (left_idx, right_idx),
-                    "parent_ids": (left_id, right_id),
-                    "child_id": child_id,
-                    "breakpoint": breakpoint,
-                }
-            )
-
-        return inverse_actions
-
-    def _is_latest_time_event(self, state, *node_ids):
-        current_time = float(state.current_time)
-        return all(
-            math.isclose(
-                float(state.all_nodes[node_id].time),
-                current_time,
-                rel_tol=1e-12,
-                abs_tol=1e-12,
-            )
-            for node_id in node_ids
-        )
-
-    def _max_node_time(self, state):
-        if not state.all_nodes:
-            return 0.0
-        return max(float(lineage.time) for lineage in state.all_nodes.values())
-
-    def _active_index_by_node_id(self, state):
-        return {lineage.node_id: idx for idx, lineage in enumerate(state.active_lineages)}
 
     def get_loss_from_rollout_outputs(self, rollout_outputs):
         """
