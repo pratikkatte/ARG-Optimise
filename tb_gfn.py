@@ -28,11 +28,15 @@ class TBGFlowNetGenerator(torch.nn.Module):
         policy_lr=None,
         log_z_lr=None,
         initialize_z_from_prior=True,
+        ddp=False,
+        local_rank=0,
     ):
         super().__init__()
         print(f"verbose: {verbose}")
         self.env = env
         self.verbose = verbose
+        self.ddp = ddp
+        self.local_rank = local_rank
         self.device = torch.device(device) if device is not None else torch.device(env.device)
         self.env.device = self.device
         if hasattr(self.env, "seq_arrays"):
@@ -56,8 +60,16 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.z_lr = float(z_lr)
         self.model_kwargs = dict(model_kwargs or {})
         self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
-        self.time_model = self.arg_model.time_scorer
-        self.breakpoint_model = self.arg_model.breakpoint_scorer
+        if self.ddp:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            self.arg_model = DDP(
+                self.arg_model,
+                device_ids=[self.local_rank] if torch.cuda.is_available() else None,
+                output_device=self.local_rank if torch.cuda.is_available() else None,
+                find_unused_parameters=True,
+            )
+        self.time_model = self.arg_model.module.time_scorer if self.ddp else self.arg_model.time_scorer
+        self.breakpoint_model = self.arg_model.module.breakpoint_scorer if self.ddp else self.arg_model.breakpoint_scorer
 
         ## Z partition
         self.max_reward_seen = float("-inf")
@@ -257,10 +269,15 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 'param_norm': self.param_norm(self),
                 'loss': self.loss.detach().cpu().numpy().tolist()}
         
+        if self.ddp and self._Z.grad is not None:
+            import torch.distributed as dist
+            dist.all_reduce(self._Z.grad, op=dist.ReduceOp.SUM)
+            self._Z.grad.data /= dist.get_world_size()
+
         torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
         self.opt.step()
         self.opt.zero_grad()
-        self.loss = 0
+        self.loss = torch.tensor(0.0, device=self.device)
 
         return info
 

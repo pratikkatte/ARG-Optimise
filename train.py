@@ -196,8 +196,12 @@ def train(
     refine_trees_path=None,
     refine_window_start=None,
     refine_window_end=None,
+    ddp=False,
+    rank=0,
+    world_size=1,
+    local_rank=0,
 ):
-    seed_everything(seed)
+    seed_everything(seed + rank)
     device = torch.device(device)
 
     sequences = load_sequences(dataset_path)
@@ -222,6 +226,16 @@ def train(
     if refine_trees_path is not None:
         if refine_window_start is None or refine_window_end is None:
             raise ValueError("Both refine_window_start and refine_window_end must be provided if refine_trees_path is set.")
+        
+        if ddp:
+            window_length = refine_window_end - refine_window_start
+            chunk_size = window_length // world_size
+            my_start = refine_window_start + rank * chunk_size
+            my_end = my_start + chunk_size if rank < world_size - 1 else refine_window_end
+            print(f"[Rank {rank}] Refining split window [{my_start}, {my_end}) (original [{refine_window_start}, {refine_window_end}])")
+            refine_window_start = my_start
+            refine_window_end = my_end
+
         refine_window_start_blocks = refine_window_start // bp_per_blocks
         refine_window_end_blocks = refine_window_end // bp_per_blocks
         ts = tskit.load(refine_trees_path)
@@ -249,16 +263,20 @@ def train(
         env,
         init_z_sample_count=init_z_sample_count,
         device=device,
-        verbose=verbose,
+        verbose=verbose and (rank == 0),
         policy_lr=policy_lr,
         log_z_lr=log_z_lr,
         grad_clip=grad_clip,
         model_kwargs=model_kwargs,
+        ddp=ddp,
+        local_rank=local_rank,
     )
-    print(f"Generator device: {generator.device}")
+    if rank == 0:
+        print(f"Generator device: {generator.device}")
 
     rollout_worker = RolloutWorker(env)
-    print(f"Training on device: {generator.device}")
+    if rank == 0:
+        print(f"Training on device: {generator.device}")
 
     os.makedirs(output_path, exist_ok=True)
     checkpoints_path = os.path.join(output_path, "checkpoints")
@@ -270,7 +288,7 @@ def train(
     wandb_run = None
     
     print(f"use_wandb: {use_wandb}")
-    if use_wandb:
+    if use_wandb and rank == 0 and wandb is not None:
         wandb_run = wandb.init()
         wandb.config.update({
             "device": str(generator.device),
@@ -326,13 +344,19 @@ def train(
                         seed=seed + 100000 + epoch,
                     )
                 )
-            history.append(info)
             loss = float(info["loss"])
+            if ddp:
+                import torch.distributed as dist
+                loss_tensor = torch.tensor(loss, device=device)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                loss = loss_tensor.item() / world_size
+
+            history.append(info)
 
             if wandb_run is not None:
                 wandb.log(info, step=epoch + 1)
 
-            if loss < best_loss:
+            if loss < best_loss and rank == 0:
                 best_loss = loss
                 metadata = build_checkpoint_metadata(
                     epoch=epoch,
@@ -351,7 +375,7 @@ def train(
                     grad_clip=grad_clip,
                     grad_accum_steps=grad_accum_steps,
                     eval_episodes=eval_episodes,
-                    eval_every=eval_every,
+                    eval_every=args.eval_every if 'args' in locals() else eval_every,
                     model_kwargs=model_kwargs,
                     seed=seed,
                     init_z_sample_count=init_z_sample_count,
@@ -366,10 +390,12 @@ def train(
                     f" eval_tb_mse={info['eval_tb_mse']:.4f}"
                     f" eval_residual_mean={info['eval_residual_mean']:.4f}"
                 )
-            print(f"Epoch {epoch + 1} loss={loss:.4f} logZ={log_z:.4f}{eval_text}")
+            if rank == 0:
+                print(f"Epoch {epoch + 1} loss={loss:.4f} logZ={log_z:.4f}{eval_text}")
 
-        with open(os.path.join(output_path, "training_history.pkl"), "wb") as handle:
-            pickle.dump(history, handle)
+        if rank == 0:
+            with open(os.path.join(output_path, "training_history.pkl"), "wb") as handle:
+                pickle.dump(history, handle)
     finally:
         if wandb_run is not None:
             wandb.finish()
@@ -468,50 +494,81 @@ def main():
     parser.add_argument("--transformer-mlp-ratio", type=float, default=DEFAULT_TRANSFORMER_MLP_RATIO)
     parser.add_argument("--attention-dropout", type=float, default=DEFAULT_ATTENTION_DROPOUT)
     parser.add_argument("--wandb", action="store_true", default=True)
+    parser.add_argument("--no-wandb", action="store_false", dest="wandb", help="Disable WandB logging")
     parser.add_argument("--refine-trees-path", type=str, default=None, help="Path to tskit tree sequence file to refine")
     parser.add_argument("--refine-window-start", type=int, default=None, help="Specific window start block to optimize")
     parser.add_argument("--refine-window-end", type=int, default=None, help="Specific window end block to optimize")
+    parser.add_argument("--ddp", action="store_true", help="Enable distributed data parallel (DDP) training")
     args = parser.parse_args()
 
-    selected_device = "cuda" if torch.cuda.is_available() else "cpu"
+    ddp = args.ddp
+    rank = 0
+    world_size = 1
+    local_rank = 0
+    if ddp:
+        import torch.distributed as dist
+        dist.init_process_group(
+            backend="nccl" if torch.cuda.is_available() else "gloo",
+            init_method="env://"
+        )
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            selected_device = f"cuda:{local_rank}"
+        else:
+            selected_device = "cpu"
+    else:
+        selected_device = "cuda" if torch.cuda.is_available() else "cpu"
                 
-    print(f"Selected devicesss: {selected_device}")
+    if rank == 0:
+        print(f"Selected devicesss: {selected_device}")
 
-    train(
-        dataset_path=args.dataset_path,
-        output_path=args.output_path,
-        batch_size=args.batch_size,
-        epochs_num=args.epochs,
-        bp_per_blocks=args.bp_per_blocks,
-        init_z_sample_count=args.init_z_sample_count,
-        verbose=args.verbose,
-        seed=args.seed,
-        device=selected_device,
-        use_wandb=args.wandb,
-        effective_population_size=args.effective_population_size,
-        mutation_rate=args.mutation_rate,
-        recombination_rate=args.recombination_rate,
-        policy_lr=args.policy_lr,
-        log_z_lr=args.log_z_lr,
-        grad_clip=args.grad_clip,
-        grad_accum_steps=args.grad_accum_steps,
-        eval_episodes=args.eval_episodes,
-        eval_every=args.eval_every,
-        time_bins=args.time_bins,
-        time_delta_bin_width=args.time_delta_bin_width,
-        embedding_size=args.embedding_size,
-        hidden_size=args.hidden_size,
-        dropout=args.dropout,
-        breakpoint_hidden_dim=args.breakpoint_hidden_dim,
-        breakpoint_dropout=args.breakpoint_dropout,
-        transformer_depth=args.transformer_depth,
-        transformer_heads=args.transformer_heads,
-        transformer_mlp_ratio=args.transformer_mlp_ratio,
-        attention_dropout=args.attention_dropout,
-        refine_trees_path=args.refine_trees_path,
-        refine_window_start=args.refine_window_start,
-        refine_window_end=args.refine_window_end,
-    )
+    try:
+        train(
+            dataset_path=args.dataset_path,
+            output_path=args.output_path,
+            batch_size=args.batch_size,
+            epochs_num=args.epochs,
+            bp_per_blocks=args.bp_per_blocks,
+            init_z_sample_count=args.init_z_sample_count,
+            verbose=args.verbose,
+            seed=args.seed,
+            device=selected_device,
+            use_wandb=args.wandb,
+            effective_population_size=args.effective_population_size,
+            mutation_rate=args.mutation_rate,
+            recombination_rate=args.recombination_rate,
+            policy_lr=args.policy_lr,
+            log_z_lr=args.log_z_lr,
+            grad_clip=args.grad_clip,
+            grad_accum_steps=args.grad_accum_steps,
+            eval_episodes=args.eval_episodes,
+            eval_every=args.eval_every,
+            time_bins=args.time_bins,
+            time_delta_bin_width=args.time_delta_bin_width,
+            embedding_size=args.embedding_size,
+            hidden_size=args.hidden_size,
+            dropout=args.dropout,
+            breakpoint_hidden_dim=args.breakpoint_hidden_dim,
+            breakpoint_dropout=args.breakpoint_dropout,
+            transformer_depth=args.transformer_depth,
+            transformer_heads=args.transformer_heads,
+            transformer_mlp_ratio=args.transformer_mlp_ratio,
+            attention_dropout=args.attention_dropout,
+            refine_trees_path=args.refine_trees_path,
+            refine_window_start=args.refine_window_start,
+            refine_window_end=args.refine_window_end,
+            ddp=ddp,
+            rank=rank,
+            world_size=world_size,
+            local_rank=local_rank,
+        )
+    finally:
+        if ddp:
+            import torch.distributed as dist
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
