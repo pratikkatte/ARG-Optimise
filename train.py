@@ -515,8 +515,14 @@ def main():
     local_rank = 0
     if ddp:
         import torch.distributed as dist
+        # NCCL requires one GPU per process. If we have fewer GPUs than processes (world_size),
+        # we must fall back to the Gloo backend to avoid duplicate GPU errors.
+        device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        use_nccl = torch.cuda.is_available() and device_count >= world_size
+        
         dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
+            backend="nccl" if use_nccl else "gloo",
             init_method="env://"
         )
         rank = dist.get_rank()
