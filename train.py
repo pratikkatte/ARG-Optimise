@@ -201,8 +201,9 @@ def train(
     attention_dropout=DEFAULT_ATTENTION_DROPOUT,
     verbose=True,
     refine_trees_path=None,
-    refine_window_start=None,
-    refine_window_end=None,
+    refine_window_size=50,
+    refine_window_step=25,
+    epochs_per_window=5,
 ):
     seed_everything(seed)
     device = torch.device(device)
@@ -225,8 +226,8 @@ def train(
 
     base_state = None
     if refine_trees_path is not None:
-        if refine_window_start is None or refine_window_end is None:
-            raise ValueError("Both refine_window_start and refine_window_end must be provided if refine_trees_path is set.")
+        if refine_window_size is None or refine_window_step is None or epochs_per_window is None:
+            raise ValueError("All of refine_window_size, refine_window_step, and epochs_per_window must be provided if refine_trees_path is set.")
         ts = tskit.load(refine_trees_path)
         base_state = tree_sequence_to_arg_state(ts, env)
     model_kwargs = {
@@ -293,81 +294,151 @@ def train(
         })
 
     try:
-        for epoch in range(epochs_num):
-            info = train_epoch(
-                epoch,
-                rollout_worker,
-                generator,
-                batch_size=batch_size,
-                grad_accum_steps=grad_accum_steps,
-                base_state=base_state,
-                refine_window_start=refine_window_start,
-                refine_window_end=refine_window_end,
-            )
-            log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
-            if info is None:
-                continue
+        if base_state is not None:
+            # Generate curriculum windows
+            num_blocks = env.num_blocks
+            curriculum_windows = []
+            start = 0
+            while start < num_blocks:
+                end = min(num_blocks, start + refine_window_size)
+                curriculum_windows.append((start, end))
+                if end == num_blocks:
+                    break
+                start += refine_window_step
 
-            info = dict(info)
-            info["epoch"] = epoch
-            info["log_z"] = log_z
-            should_eval = int(eval_episodes) > 0 and (
-                epoch == 0
-                or int(eval_every) <= 1
-                or (epoch + 1) % int(eval_every) == 0
-            )
-
-            ## TODO: Check this implementation of evaluation
-            if should_eval:
-                info.update(
-                    evaluate_generator(
+            global_epoch = 0
+            for w_idx, (w_start, w_end) in enumerate(curriculum_windows):
+                print(f"Curriculum Step {w_idx + 1}/{len(curriculum_windows)}: Optimizing window [{w_start}, {w_end})")
+                generator.reset_Z(base_state)
+                for epoch in range(epochs_per_window):
+                    info = train_epoch(
+                        global_epoch,
                         rollout_worker,
                         generator,
-                        eval_episodes,
-                        seed + 100000 + epoch,
+                        batch_size=batch_size,
+                        grad_accum_steps=grad_accum_steps,
+                        base_state=base_state,
+                        refine_window_start=w_start,
+                        refine_window_end=w_end,
                     )
-                )
-            history.append(info)
-            loss = float(info["loss"])
+                    log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
+                    if info is None:
+                        continue
 
-            if wandb_run is not None:
-                wandb.log(info, step=epoch + 1)
+                    info = dict(info)
+                    info["epoch"] = global_epoch
+                    info["log_z"] = log_z
+                    info["curriculum_window_start"] = w_start
+                    info["curriculum_window_end"] = w_end
+                    
+                    history.append(info)
+                    loss = float(info["loss"])
 
-            if loss < best_loss:
-                best_loss = loss
-                metadata = build_checkpoint_metadata(
-                    epoch=epoch,
-                    best_loss=best_loss,
-                    log_z=log_z,
-                    sequences=sequences,
-                    sequence_length=sequence_length,
-                    bp_per_blocks=bp_per_blocks,
-                    time_metadata=env.time_metadata,
-                    rho=env.rho,
-                    effective_population_size=effective_population_size,
-                    mutation_rate=mutation_rate,
-                    recombination_rate=recombination_rate,
-                    policy_lr=policy_lr,
-                    log_z_lr=log_z_lr,
-                    grad_clip=grad_clip,
+                    if wandb_run is not None:
+                        wandb.log(info, step=global_epoch + 1)
+
+                    if loss < best_loss:
+                        best_loss = loss
+                        metadata = build_checkpoint_metadata(
+                            epoch=global_epoch,
+                            best_loss=best_loss,
+                            log_z=log_z,
+                            sequences=sequences,
+                            sequence_length=sequence_length,
+                            bp_per_blocks=bp_per_blocks,
+                            time_metadata=env.time_metadata,
+                            rho=env.rho,
+                            effective_population_size=effective_population_size,
+                            mutation_rate=mutation_rate,
+                            recombination_rate=recombination_rate,
+                            policy_lr=policy_lr,
+                            log_z_lr=log_z_lr,
+                            grad_clip=grad_clip,
+                            grad_accum_steps=grad_accum_steps,
+                            eval_episodes=eval_episodes,
+                            eval_every=eval_every,
+                            model_kwargs=model_kwargs,
+                            seed=seed,
+                            init_z_sample_count=init_z_sample_count,
+                            model_version=MODEL_VERSION,
+                        )
+                        generator.save(best_checkpoint_path, metadata=metadata)
+                        info["best_checkpoint_path"] = best_checkpoint_path
+
+                    print(f"Epoch {global_epoch + 1} (Window [{w_start}, {w_end})) loss={loss:.4f} logZ={log_z:.4f}")
+                    global_epoch += 1
+        else:
+            for epoch in range(epochs_num):
+                info = train_epoch(
+                    epoch,
+                    rollout_worker,
+                    generator,
+                    batch_size=batch_size,
                     grad_accum_steps=grad_accum_steps,
-                    eval_episodes=eval_episodes,
-                    eval_every=eval_every,
-                    model_kwargs=model_kwargs,
-                    seed=seed,
-                    init_z_sample_count=init_z_sample_count,
-                    model_version=MODEL_VERSION,
                 )
-                generator.save(best_checkpoint_path, metadata=metadata)
-                info["best_checkpoint_path"] = best_checkpoint_path
+                log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
+                if info is None:
+                    continue
 
-            eval_text = ""
-            if "eval_tb_mse" in info:
-                eval_text = (
-                    f" eval_tb_mse={info['eval_tb_mse']:.4f}"
-                    f" eval_residual_mean={info['eval_residual_mean']:.4f}"
+                info = dict(info)
+                info["epoch"] = epoch
+                info["log_z"] = log_z
+                should_eval = int(eval_episodes) > 0 and (
+                    epoch == 0
+                    or int(eval_every) <= 1
+                    or (epoch + 1) % int(eval_every) == 0
                 )
-            print(f"Epoch {epoch + 1} loss={loss:.4f} logZ={log_z:.4f}{eval_text}")
+
+                if should_eval:
+                    info.update(
+                        evaluate_generator(
+                            rollout_worker,
+                            generator,
+                            eval_episodes,
+                            seed + 100000 + epoch,
+                        )
+                    )
+                history.append(info)
+                loss = float(info["loss"])
+
+                if wandb_run is not None:
+                    wandb.log(info, step=epoch + 1)
+
+                if loss < best_loss:
+                    best_loss = loss
+                    metadata = build_checkpoint_metadata(
+                        epoch=epoch,
+                        best_loss=best_loss,
+                        log_z=log_z,
+                        sequences=sequences,
+                        sequence_length=sequence_length,
+                        bp_per_blocks=bp_per_blocks,
+                        time_metadata=env.time_metadata,
+                        rho=env.rho,
+                        effective_population_size=effective_population_size,
+                        mutation_rate=mutation_rate,
+                        recombination_rate=recombination_rate,
+                        policy_lr=policy_lr,
+                        log_z_lr=log_z_lr,
+                        grad_clip=grad_clip,
+                        grad_accum_steps=grad_accum_steps,
+                        eval_episodes=eval_episodes,
+                        eval_every=eval_every,
+                        model_kwargs=model_kwargs,
+                        seed=seed,
+                        init_z_sample_count=init_z_sample_count,
+                        model_version=MODEL_VERSION,
+                    )
+                    generator.save(best_checkpoint_path, metadata=metadata)
+                    info["best_checkpoint_path"] = best_checkpoint_path
+
+                eval_text = ""
+                if "eval_tb_mse" in info:
+                    eval_text = (
+                        f" eval_tb_mse={info['eval_tb_mse']:.4f}"
+                        f" eval_residual_mean={info['eval_residual_mean']:.4f}"
+                    )
+                print(f"Epoch {epoch + 1} loss={loss:.4f} logZ={log_z:.4f}{eval_text}")
 
         with open(os.path.join(output_path, "training_history.pkl"), "wb") as handle:
             pickle.dump(history, handle)
@@ -470,8 +541,9 @@ def main():
     parser.add_argument("--attention-dropout", type=float, default=DEFAULT_ATTENTION_DROPOUT)
     parser.add_argument("--wandb", action="store_true", default=True)
     parser.add_argument("--refine-trees-path", type=str, default=None, help="Path to tskit tree sequence file to refine")
-    parser.add_argument("--refine-window-start", type=int, default=None, help="Specific window start block to optimize")
-    parser.add_argument("--refine-window-end", type=int, default=None, help="Specific window end block to optimize")
+    parser.add_argument("--refine-window-size", type=int, default=50, help="Window size in blocks for local search optimization")
+    parser.add_argument("--refine-window-step", type=int, default=25, help="Step shift in blocks between curriculum windows")
+    parser.add_argument("--epochs-per-window", type=int, default=5, help="Number of training epochs to run per window")
     args = parser.parse_args()
 
     selected_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -510,8 +582,9 @@ def main():
         transformer_mlp_ratio=args.transformer_mlp_ratio,
         attention_dropout=args.attention_dropout,
         refine_trees_path=args.refine_trees_path,
-        refine_window_start=args.refine_window_start,
-        refine_window_end=args.refine_window_end,
+        refine_window_size=args.refine_window_size,
+        refine_window_step=args.refine_window_step,
+        epochs_per_window=args.epochs_per_window,
     )
 
 

@@ -189,6 +189,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def compute_log_Z(self, scale_key=None):
         return self._Z.sum()
 
+    def reset_Z(self, base_state=None):
+        init_Z = 0.0
+        if base_state is not None and base_state.log_reward is not None:
+            init_Z = float(base_state.log_reward)
+        with torch.no_grad():
+            self._Z.fill_(init_Z / 256.0)
+
     def forward(self, input_dict):
 
         states = input_dict.get("states")
@@ -563,7 +570,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         
         return log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
 
-    def accumulate_refinement_loss(self, base_state, window_size_blocks=None, factor=1.0, window_start=None, window_end=None):
+    def accumulate_refinement_loss(self, base_state, window_size_blocks=None, factor=1.0, window_start=None, window_end=None, min_window_size=None, max_window_size=None):
         """
         Refine a base_state (terminal state) by deleting a genomic window, reconstructing the prefix,
         rolling out the suffix, and accumulating the Trajectory Balance loss.
@@ -576,9 +583,17 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if window_start is not None and window_end is not None:
             start = window_start
             end = window_end
+        elif min_window_size is not None and max_window_size is not None:
+            min_size = max(1, int(min_window_size))
+            max_size = min(num_blocks, int(max_window_size))
+            if min_size > max_size:
+                min_size, max_size = max_size, min_size
+            w_size = random.randint(min_size, max_size)
+            start = random.randint(0, num_blocks - w_size)
+            end = start + w_size
         else:
             if window_size_blocks is None:
-                raise ValueError("Either (window_start, window_end) or window_size_blocks must be provided.")
+                raise ValueError("Either (window_start, window_end), (min_window_size, max_window_size), or window_size_blocks must be provided.")
             start = random.randint(0, num_blocks - window_size_blocks)
             end = start + window_size_blocks
             
