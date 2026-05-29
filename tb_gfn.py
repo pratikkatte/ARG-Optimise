@@ -122,7 +122,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
 
     def _encode_states(self, states):
-        return self.arg_model._encode_states(states)
+        model = self.arg_model.module if self.ddp else self.arg_model
+        return model._encode_states(states)
 
 
     def save(self, path, metadata=None):
