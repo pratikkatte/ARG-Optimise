@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from models import ARGModel
-from env import RecombinationChoice
+from env import RecombinationChoice, SimpleTrajectory
 from dataclasses import replace
 from breakpoint_model import BreakpointSplitPositionCNN
 from time_model import TimeModel
@@ -228,7 +228,24 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def compute_log_Z(self, scale_key=None):
         return self._Z.sum()
 
-    def forward(self, input_dict):
+    def _pad_log_path_lists(self, log_path_lists, dtype, device):
+        vectors = [
+            torch.stack(log_paths).to(dtype=dtype, device=device)
+            if log_paths
+            else torch.empty(0, dtype=dtype, device=device)
+            for log_paths in log_path_lists
+        ]
+        return self._pad_log_path_vectors(vectors, dtype, device)
+
+    def _pad_log_path_vectors(self, vectors, dtype, device):
+        max_length = max((vector.numel() for vector in vectors), default=0)
+        padded = torch.zeros(len(vectors), max_length, dtype=dtype, device=device)
+        for row_idx, vector in enumerate(vectors):
+            if vector.numel() > 0:
+                padded[row_idx, :vector.numel()] = vector.to(dtype=dtype, device=device)
+        return padded
+
+    def _forward_one_step(self, input_dict):
 
         states = input_dict.get("states")
 
@@ -286,6 +303,110 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         probs = torch.exp(total_log_pf)
         
+        return total_log_pf, probs, choosen_actions
+
+    def _forward_rollout_batch(
+        self,
+        episodes,
+        base_state,
+        log_pfs=None,
+        backward_num_parents_by_traj=None,
+        random_spec=None,
+        return_states=False,
+    ):
+        states = [base_state.clone(copy_partials=True) for _ in range(episodes)]
+        if log_pfs is not None and backward_num_parents_by_traj is not None:
+            log_paths_pf_by_traj = [log_pfs.copy() for _ in range(episodes)]
+            backward_num_parents_by_traj = [
+                backward_num_parents_by_traj.copy()
+                for _ in range(episodes)
+            ]
+        else:
+            log_paths_pf_by_traj = [[] for _ in range(episodes)]
+            backward_num_parents_by_traj = [[] for _ in range(episodes)]
+
+        trajectories = [SimpleTrajectory() for _ in states]
+        unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
+
+        while unfinished:
+            active_states = [states[idx] for idx in unfinished]
+            input_dict = self.env.prepare_state_rollout_inputs(
+                active_states,
+                random_spec=random_spec,
+            )
+
+            total_log_pf, probs, choosen_actions = self._forward_one_step(input_dict)
+
+            for batch_idx, traj_idx in enumerate(unfinished):
+                state = states[traj_idx]
+                coal_actions, recomb_actions = self.env.enumerate_actions(state)
+
+                action = choosen_actions[batch_idx]
+                log_paths_pf_by_traj[traj_idx].append(total_log_pf[batch_idx])
+                log_prior = self.env.compute_cwr_event_log_prior(
+                    state,
+                    (coal_actions, recomb_actions),
+                    action,
+                )
+
+                next_state = self.env.apply_action(
+                    state,
+                    action,
+                    log_prior=log_prior,
+                )
+                states[traj_idx] = next_state
+                trajectories[traj_idx].update(
+                    action,
+                    log_prior=log_prior,
+                    log_reward=next_state.log_reward,
+                )
+
+                backward_num_parents_by_traj[traj_idx].append(
+                    self.env.count_backward_parents(next_state)
+                )
+            unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
+
+        log_paths_pf = self._pad_log_path_lists(
+            log_paths_pf_by_traj,
+            torch.float32,
+            self.device,
+        )
+
+        log_paths_pb = [
+            -torch.log(torch.tensor(num_parents, dtype=torch.float32, device=self.device))
+            for num_parents in backward_num_parents_by_traj
+        ]
+        log_paths_pb = self._pad_log_path_vectors(log_paths_pb, torch.float32, self.device)
+
+        log_rewards = torch.tensor(
+            [state.log_reward for state in states],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        data = {
+            "log_paths_pf": log_paths_pf,
+            "log_paths_pb": log_paths_pb,
+            "log_rewards": log_rewards,
+            "log_z": self.compute_log_Z(),
+        }
+        if return_states:
+            data["states"] = states
+
+        return data, trajectories
+
+    def forward(self, input_dict):
+        if input_dict.get("mode") == "rollout_batch":
+            return self._forward_rollout_batch(
+                episodes=input_dict["episodes"],
+                base_state=input_dict["base_state"],
+                log_pfs=input_dict.get("log_pfs"),
+                backward_num_parents_by_traj=input_dict.get("backward_num_parents_by_traj"),
+                random_spec=input_dict.get("random_spec"),
+                return_states=input_dict.get("return_states", False),
+            )
+
+        total_log_pf, probs, choosen_actions = self._forward_one_step(input_dict)
         return total_log_pf, probs, choosen_actions, self.compute_log_Z()
 
 

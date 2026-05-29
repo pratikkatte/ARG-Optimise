@@ -22,85 +22,15 @@ class RolloutWorker:
         random_spec=None,
         return_states=False,
         ):
-        
-        states = [base_state.clone(copy_partials=True) for _ in range(episodes)]
-        if log_pfs is not None and backward_num_parents_by_traj is not None:
-            log_paths_pf_by_traj = [log_pfs.copy() for _ in range(episodes)]
-            backward_num_parents_by_traj = [backward_num_parents_by_traj.copy() for _ in range(episodes)]
-        else:
-            log_paths_pf_by_traj = [[] for _ in range(episodes)]
-            backward_num_parents_by_traj = [[] for _ in range(episodes)]
-        log_z_terms = []
-
-        trajectories = [SimpleTrajectory() for _ in states]
-        
-        if self.verbose:
-            print(
-                f"Rolling out {episodes} trajectory/trajectories in batch "
-                f"({len([idx for idx, state in enumerate(states) if not state.is_done])} active)..."
-            )
-
-        unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
-
-        while unfinished:
-            active_states = [states[idx] for idx in unfinished]
-            
-            input_dict = self.env.prepare_state_rollout_inputs(
-                active_states,
-                random_spec=random_spec,
-            )
-
-            total_log_pf, probs, choosen_actions, log_z = generator(input_dict)
-            log_z_terms.append(log_z.reshape(()))
-
-            for batch_idx, traj_idx in enumerate(unfinished):
-                state = states[traj_idx]
-                coal_actions, recomb_actions = self.env.enumerate_actions(state)
-
-                action = choosen_actions[batch_idx]
-                log_paths_pf_by_traj[traj_idx].append(total_log_pf[batch_idx])
-                log_prior = self.env.compute_cwr_event_log_prior(state, (coal_actions, recomb_actions), action)
-
-                next_state = self.env.apply_action(
-                    state,
-                    action,
-                    log_prior=log_prior,
-                )
-                states[traj_idx] = next_state
-                trajectories[traj_idx].update(
-                    action,
-                    log_prior=log_prior,
-                    log_reward=next_state.log_reward,
-                )
-
-                backward_num_parents_by_traj[traj_idx].append(
-                    self.env.count_backward_parents(next_state)
-                    )
-            unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
-
-        log_paths_pf = self._pad_log_path_lists(log_paths_pf_by_traj, torch.float32, self.device)
-
-        log_paths_pb = [
-            -torch.log(torch.tensor(num_parents, dtype=torch.float32, device=self.device))
-            for num_parents in backward_num_parents_by_traj
-            ]
-        
-        log_paths_pb = self._pad_log_path_vectors(log_paths_pb, torch.float32, self.device)
-
-        log_rewards = torch.tensor([state.log_reward for state in states], dtype=torch.float32, device=self.device)
-
-
-        data = {
-            "log_paths_pf": log_paths_pf,
-            "log_paths_pb": log_paths_pb,
-            "log_rewards": log_rewards,
-        }
-        if log_z_terms:
-            data["log_z"] = torch.stack(log_z_terms).mean()
-        if return_states:
-            data["states"] = states
-
-        return data, trajectories
+        return generator({
+            "mode": "rollout_batch",
+            "episodes": episodes,
+            "base_state": base_state,
+            "log_pfs": log_pfs,
+            "backward_num_parents_by_traj": backward_num_parents_by_traj,
+            "random_spec": random_spec,
+            "return_states": return_states,
+        })
 
     def rollout(
         self,
