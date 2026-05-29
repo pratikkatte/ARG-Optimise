@@ -228,11 +228,19 @@ def train(
             raise ValueError("Both refine_window_start and refine_window_end must be provided if refine_trees_path is set.")
         
         if ddp:
-            window_length = refine_window_end - refine_window_start
-            chunk_size = window_length // world_size
-            my_start = refine_window_start + rank * chunk_size
-            my_end = my_start + chunk_size if rank < world_size - 1 else refine_window_end
-            print(f"[Rank {rank}] Refining split window [{my_start}, {my_end}) (original [{refine_window_start}, {refine_window_end}])")
+            hardcoded_windows = {
+                0: (5000, 10000),     # Rank 0 processes 
+                1: (15000, 20000),   # Rank 1 processes 
+            }
+            
+            my_start, my_end = hardcoded_windows.get(rank, (refine_window_start, refine_window_end))
+            print(f"[Rank {rank}] Refining hardcoded window [{my_start}, {my_end})")
+            
+            # window_length = refine_window_end - refine_window_start
+            # chunk_size = window_length // world_size
+            # my_start = refine_window_start + rank * chunk_size
+            # my_end = my_start + chunk_size if rank < world_size - 1 else refine_window_end
+            # print(f"[Rank {rank}] Refining split window [{my_start}, {my_end}) (original [{refine_window_start}, {refine_window_end}])")
             refine_window_start = my_start
             refine_window_end = my_end
 
