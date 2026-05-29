@@ -190,7 +190,7 @@ class EvolutionModelTorch(torch.nn.Module):
         if partials is None:
             raise ValueError("ARGLineage.partials is required")
         if torch.is_tensor(partials):
-            tensor = partials.to(dtype=torch.float32)
+            tensor = partials.to(device=self.env.block_seq_arrays.device, dtype=torch.float32)
         else:
             tensor = torch.as_tensor(partials, dtype=torch.float32, device=self.env.block_seq_arrays.device)
         expected_shape = (int(self.env.num_blocks), 4)
