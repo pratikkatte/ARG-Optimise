@@ -1336,8 +1336,19 @@ class SimpleARGEnvironment:
 
         if window_end is None:
             window_end = self.num_blocks
+
+        if not isinstance(window_start, (list, tuple, np.ndarray, torch.Tensor)):
+            window_starts = [window_start] * batch_size
+        else:
+            window_starts = window_start
+
+        if not isinstance(window_end, (list, tuple, np.ndarray, torch.Tensor)):
+            window_ends = [window_end] * batch_size
+        else:
+            window_ends = window_end
+
         region_contexts = torch.tensor(
-            [[window_start / self.num_blocks, window_end / self.num_blocks] for _ in range(batch_size)],
+            [[float(ws) / self.num_blocks, float(we) / self.num_blocks] for ws, we in zip(window_starts, window_ends)],
             dtype=torch.float32,
             device=self.device
         )

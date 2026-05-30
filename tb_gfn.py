@@ -459,6 +459,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
             else:
                 log_paths_pf_by_traj = [[] for _ in range(episodes)]
                 backward_num_parents_by_traj = [[] for _ in range(episodes)]
+
+            if isinstance(window_start, list) and isinstance(window_end, list):
+                batch_window_starts = [window_start[idx] for idx in candidate_indices]
+                batch_window_ends = [window_end[idx] for idx in candidate_indices]
+            else:
+                batch_window_starts = window_start
+                batch_window_ends = window_end
         else:
             states = [base_state.clone(copy_partials=True) for _ in range(episodes)]
             if log_pfs is not None and backward_num_parents_by_traj is not None:
@@ -471,16 +478,29 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 log_paths_pf_by_traj = [[] for _ in range(episodes)]
                 backward_num_parents_by_traj = [[] for _ in range(episodes)]
 
+            batch_window_starts = window_start
+            batch_window_ends = window_end
+
         trajectories = [SimpleTrajectory() for _ in states]
         unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
 
         while unfinished:
             active_states = [states[idx] for idx in unfinished]
+            if isinstance(batch_window_starts, list):
+                active_window_starts = [batch_window_starts[idx] for idx in unfinished]
+            else:
+                active_window_starts = batch_window_starts
+
+            if isinstance(batch_window_ends, list):
+                active_window_ends = [batch_window_ends[idx] for idx in unfinished]
+            else:
+                active_window_ends = batch_window_ends
+
             input_dict = self.env.prepare_state_rollout_inputs(
                 active_states,
                 random_spec=random_spec,
-                window_start=window_start,
-                window_end=window_end,
+                window_start=active_window_starts,
+                window_end=active_window_ends,
             )
 
             total_log_pf, probs, choosen_actions = self._forward_one_step(input_dict)

@@ -99,10 +99,14 @@ class RolloutWorker:
                     base_state = candidate_states[0]
                     log_pfs = candidate_log_pfs[0]
                     backward_num_parents_by_traj = candidate_backward_num_parents[0]
+                    window_start = window_ranges[0][0]
+                    window_end = window_ranges[0][1]
                 else:
                     base_state = candidate_states
                     log_pfs = candidate_log_pfs
                     backward_num_parents_by_traj = candidate_backward_num_parents
+                    window_start = [r[0] for r in window_ranges]
+                    window_end = [r[1] for r in window_ranges]
             else:
                 base_state = self.env.get_initial_state()
 
