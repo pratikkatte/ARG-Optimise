@@ -1311,6 +1311,8 @@ class SimpleARGEnvironment:
         self,
         states,
         random_spec=None,
+        window_start=0,
+        window_end=None,
     ):
         batch_size = len(states)
         if batch_size == 0:
@@ -1332,11 +1334,20 @@ class SimpleARGEnvironment:
             event[idx]["event_type"] = choosen_event_type
             event[idx]["probability"] = event_prob[event_idx]
 
+        if window_end is None:
+            window_end = self.num_blocks
+        region_contexts = torch.tensor(
+            [[window_start / self.num_blocks, window_end / self.num_blocks] for _ in range(batch_size)],
+            dtype=torch.float32,
+            device=self.device
+        )
+
         input_dict = {
             "states": states,
             "event": event,
             "input_actions": input_actions,
             "random_spec": random_spec,
+            "region_contexts": region_contexts,
         }
 
         return input_dict

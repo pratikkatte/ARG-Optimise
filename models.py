@@ -187,6 +187,11 @@ class ARGModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
+        self.region_encoder = nn.Sequential(
+            nn.Linear(2, embedding_size),
+            nn.ReLU(),
+            nn.Linear(embedding_size, embedding_size)
+        )
         self.logsoftmax = nn.LogSoftmax(dim=1)
 
     def _build_source_sequence_features(self):
@@ -195,7 +200,7 @@ class ARGModel(nn.Module):
     def model_params(self):
         return list(self.parameters())
 
-    def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
+    def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts, region_contexts=None):
         batch_size, active_lineages, seq_len, channels = lineage_seq_features.shape
         if seq_len != int(self.env.num_blocks) or channels != 4:
             raise ValueError(
@@ -220,17 +225,26 @@ class ARGModel(nn.Module):
         )
         lineage_reps = self.seq_embedding(batch_input)
         summary_token = self.summary_token.expand(batch_size, -1, -1)
-        transformer_input = torch.cat([summary_token, lineage_reps], dim=1)
+        
+        if region_contexts is not None:
+            region_emb = self.region_encoder(region_contexts).unsqueeze(1)
+            transformer_input = torch.cat([summary_token, region_emb, lineage_reps], dim=1)
+            key_padding_mask = F.pad(~valid_mask, (2, 0), value=False)
+        else:
+            transformer_input = torch.cat([summary_token, lineage_reps], dim=1)
+            key_padding_mask = F.pad(~valid_mask, (1, 0), value=False)
 
-        key_padding_mask = F.pad(~valid_mask, (1, 0), value=False)
         encoded = self.encoder(transformer_input, key_padding_mask=key_padding_mask)
 
         summary_reps = encoded[:, 0]
-        lineage_reps = encoded[:, 1:]
+        if region_contexts is not None:
+            lineage_reps = encoded[:, 2:]
+        else:
+            lineage_reps = encoded[:, 1:]
         lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
         return lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts
 
-    def _encode_states(self, states):
+    def _encode_states(self, states, region_contexts=None):
         batch_size = len(states)
         if batch_size == 0:
             raise ValueError("ARGModel.forward requires at least one state")
@@ -262,7 +276,7 @@ class ARGModel(nn.Module):
                     self.env.evolution_model.normalize_partials(masked_feature)
                 )
 
-        return self._encode_lineage_features(lineage_seq_features, batch_active_lineage_counts)
+        return self._encode_lineage_features(lineage_seq_features, batch_active_lineage_counts, region_contexts=region_contexts)
 
     def _lineage_partials_tensor(self, lineage):
         if lineage.partials is None:

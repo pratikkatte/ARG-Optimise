@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from models import ARGModel
-from env import RecombinationChoice, SimpleTrajectory
+from env import CoalescenceChoice, RecombinationChoice, SimpleTrajectory
 from dataclasses import replace
 from breakpoint_model import BreakpointSplitPositionCNN
 from time_model import TimeModel
@@ -177,8 +177,9 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
 
 
-    def _encode_states(self, states):
-        return self.arg_model._encode_states(states)
+    def _encode_states(self, states, region_contexts=None):
+        model = self.arg_model.module if self.ddp else self.arg_model
+        return model._encode_states(states, region_contexts=region_contexts)
 
 
     def save(self, path, metadata=None):
@@ -262,10 +263,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
         )
 
         all_actions = input_dict.get("input_actions")
+        region_contexts = input_dict.get("region_contexts")
 
-        lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states(states)
+        lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states(states, region_contexts=region_contexts)
         # input_dict = self._move_input_to_device(input_dict)
-        ret = self.arg_model(all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec)
+        model = self.arg_model.module if self.ddp else self.arg_model
+        ret = model(all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec)
 
         log_action_pf, selected_action_indices, choosen_actions, choosen_action_features = ret
 
@@ -305,6 +308,126 @@ class TBGFlowNetGenerator(torch.nn.Module):
         
         return total_log_pf, probs, choosen_actions
 
+    def _fixed_action_candidates(self, state, action):
+        if action.time_action is None:
+            raise ValueError(f"Fixed refinement action is missing time_action: {action}")
+
+        coal_actions, recomb_actions = self.env.enumerate_actions(state)
+        event_probs = self.env.compute_event_probabilities(state, (coal_actions, recomb_actions))
+
+        if isinstance(action, CoalescenceChoice):
+            candidates = coal_actions
+            event_probability = event_probs["coal"]
+            for idx, candidate in enumerate(candidates):
+                if (
+                    candidate.active_lineage_i == action.active_lineage_i
+                    and candidate.active_lineage_j == action.active_lineage_j
+                ):
+                    return candidates, idx, event_probability
+        elif isinstance(action, RecombinationChoice):
+            if action.breakpoint is None:
+                raise ValueError(f"Fixed refinement recombination action is missing breakpoint: {action}")
+            candidates = recomb_actions
+            event_probability = event_probs["recomb"]
+            for idx, candidate in enumerate(candidates):
+                if (
+                    candidate.active_lineage_i == action.active_lineage_i
+                    and candidate.material_count == action.material_count
+                    and candidate.span_start == action.span_start
+                    and candidate.span_end == action.span_end
+                ):
+                    return candidates, idx, event_probability
+        else:
+            raise ValueError(f"Unsupported fixed refinement action: {action}")
+
+        raise ValueError(f"Fixed refinement action could not be matched to model candidates: {action}")
+
+    def _score_given_actions(self, states, actions, window_start=0, window_end=None):
+        if len(states) != len(actions):
+            raise ValueError(
+                f"states and actions must have the same length, got {len(states)} and {len(actions)}"
+            )
+        if not states:
+            return torch.empty(0, dtype=torch.float32, device=self.device)
+
+        if window_end is None:
+            window_end = self.env.num_blocks
+
+        all_actions = []
+        selected_action_indices = []
+        event_probs = []
+        for state, action in zip(states, actions):
+            candidates, action_idx, event_probability = self._fixed_action_candidates(state, action)
+            all_actions.append(candidates)
+            selected_action_indices.append(action_idx)
+            event_probs.append(float(event_probability))
+
+        log_event_pf = torch.log(
+            torch.tensor(event_probs, dtype=torch.float32, device=self.device)
+        )
+        region_contexts = torch.tensor(
+            [
+                [window_start / self.env.num_blocks, window_end / self.env.num_blocks]
+                for _ in states
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = (
+            self._encode_states(states, region_contexts=region_contexts)
+        )
+        model = self.arg_model.module if self.ddp else self.arg_model
+        logits, action_features = model._score_candidates(
+            all_actions,
+            lineage_reps,
+            summary_reps,
+        )
+
+        action_indices = torch.tensor(
+            selected_action_indices,
+            dtype=torch.long,
+            device=self.device,
+        )
+        log_action_pf = model.compute_log_path_pf(logits, action_indices)
+        batch_indices = torch.arange(len(states), dtype=torch.long, device=self.device)
+        selected_action_features = action_features[batch_indices, action_indices]
+
+        log_p_breakpoints = []
+        for idx, action in enumerate(actions):
+            if isinstance(action, RecombinationChoice):
+                valid_breakpoints = self.breakpoint_model._valid_breakpoints_list(action)
+                breakpoint = int(action.breakpoint)
+                if breakpoint not in valid_breakpoints:
+                    raise ValueError(
+                        f"Fixed refinement breakpoint {breakpoint} is not valid for action: {action}"
+                    )
+
+                lineage_idx = int(action.active_lineage_i)
+                lineage_feature = lineage_seq_features[idx, lineage_idx]
+                valid_logits = self.breakpoint_model.valid_breakpoint_logits(
+                    action,
+                    lineage_feature,
+                    int(self.env.sequence_length),
+                    int(self.env.num_blocks),
+                    action_context=selected_action_features[idx],
+                )
+                local_idx = valid_breakpoints.index(breakpoint)
+                log_p_breakpoints.append(torch.log_softmax(valid_logits, dim=0)[local_idx])
+            else:
+                log_p_breakpoints.append(logits.new_tensor(0.0))
+
+        log_breakpoint_pf = torch.stack(log_p_breakpoints)
+        time_logits = self.time_model(selected_action_features)
+        time_actions = torch.tensor(
+            [int(action.time_action) for action in actions],
+            dtype=torch.long,
+            device=self.device,
+        )
+        log_time_pf = self.time_model.compute_log_time_pf(time_logits, time_actions)
+
+        return log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
+
     def _forward_rollout_batch(
         self,
         episodes,
@@ -313,6 +436,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         backward_num_parents_by_traj=None,
         random_spec=None,
         return_states=False,
+        window_start=0,
+        window_end=None,
     ):
         if isinstance(base_state, list):
             if len(base_state) == 0:
@@ -354,6 +479,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
             input_dict = self.env.prepare_state_rollout_inputs(
                 active_states,
                 random_spec=random_spec,
+                window_start=window_start,
+                window_end=window_end,
             )
 
             total_log_pf, probs, choosen_actions = self._forward_one_step(input_dict)
@@ -425,6 +552,15 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 backward_num_parents_by_traj=input_dict.get("backward_num_parents_by_traj"),
                 random_spec=input_dict.get("random_spec"),
                 return_states=input_dict.get("return_states", False),
+                window_start=input_dict.get("window_start", 0),
+                window_end=input_dict.get("window_end"),
+            )
+        if input_dict.get("mode") == "score_actions":
+            return self._score_given_actions(
+                states=input_dict["states"],
+                actions=input_dict["actions"],
+                window_start=input_dict.get("window_start", 0),
+                window_end=input_dict.get("window_end"),
             )
 
         total_log_pf, probs, choosen_actions = self._forward_one_step(input_dict)

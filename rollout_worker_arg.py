@@ -21,6 +21,8 @@ class RolloutWorker:
         backward_num_parents_by_traj=None,
         random_spec=None,
         return_states=False,
+        window_start=0,
+        window_end=None,
         ):
         return generator({
             "mode": "rollout_batch",
@@ -30,22 +32,25 @@ class RolloutWorker:
             "backward_num_parents_by_traj": backward_num_parents_by_traj,
             "random_spec": random_spec,
             "return_states": return_states,
+            "window_start": window_start,
+            "window_end": window_end,
         })
 
-    def _build_refine_candidate(self, terminal_state, window_start, window_end):
+    def _build_refine_candidate(self, terminal_state, window_start, window_end, generator):
         base_state = self.env.delete_genomic_window(terminal_state, window_start, window_end)
         prefix_states, prefix_actions = self.env.reconstruct_prefix_trajectory(base_state)
-        log_pfs = []
         backward_num_parents_by_traj = []
 
-        for t in range(len(prefix_actions)):
-            s_curr = prefix_states[t]
-            s_next = prefix_states[t + 1] if t + 1 < len(prefix_states) else base_state
-            act = prefix_actions[t]
+        log_pfs = list(generator({
+            "mode": "score_actions",
+            "states": prefix_states,
+            "actions": prefix_actions,
+            "window_start": window_start,
+            "window_end": window_end,
+        }).unbind(0))
 
-            combined_actions = self.env.enumerate_actions(s_curr)
-            log_pf = self.env.compute_cwr_event_log_prior(s_curr, combined_actions, act)
-            log_pfs.append(torch.tensor(log_pf, dtype=torch.float32, device=self.device))
+        for t in range(len(prefix_actions)):
+            s_next = prefix_states[t + 1] if t + 1 < len(prefix_states) else base_state
 
             num_parents = self.env.count_backward_parents(s_next)
             backward_num_parents_by_traj.append(num_parents)
@@ -68,7 +73,6 @@ class RolloutWorker:
         if generator is None:
             raise ValueError("Generator is required for rollout")
 
-
         log_pfs = []
         backward_num_parents_by_traj = []
 
@@ -85,7 +89,7 @@ class RolloutWorker:
                 candidate_backward_num_parents = []
                 for start, end in window_ranges:
                     base_state, prefix_log_pfs, prefix_backward_num_parents = (
-                        self._build_refine_candidate(terminal_state, start, end)
+                        self._build_refine_candidate(terminal_state, start, end, generator)
                     )
                     candidate_states.append(base_state)
                     candidate_log_pfs.append(prefix_log_pfs)
@@ -113,6 +117,8 @@ class RolloutWorker:
             episodes=episodes,
             random_spec=random_spec,
             return_states=return_states,
+            window_start=window_start,
+            window_end=window_end,
         )
         
 
