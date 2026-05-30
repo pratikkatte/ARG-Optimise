@@ -1047,10 +1047,13 @@ class SimpleARGEnvironment:
     def is_terminal(self, state):
         if state.total_active_blocks is None:
             raise ValueError("total_active_blocks is required for terminal check")
-        else:
-            result = int(state.total_active_blocks) == self.num_blocks
-            # bool(np.all(self.get_active_counts(state) == 1)) ## another way, realtime compute. 
-            return result
+        if int(state.total_active_blocks) == self.num_blocks:
+            return True
+        # If no further actions can be taken, treat it as terminal
+        coal_actions, recomb_actions = self.enumerate_actions(state)
+        if len(coal_actions) == 0 and len(recomb_actions) == 0:
+            return True
+        return False
 
     def _finalize_transition_state(self, next_state, log_prior):
         if log_prior is not None:
