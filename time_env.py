@@ -18,6 +18,7 @@ class TimeEnvFixedDelta:
         self,
         bins=DEFAULT_TIME_BINS,
         delta_bin_width=DEFAULT_TIME_DELTA_BIN_WIDTH,
+        rate_dependent=False,
     ):
         self.bins = int(bins)
         if self.bins < 2:
@@ -27,10 +28,16 @@ class TimeEnvFixedDelta:
             raise ValueError("time delta bin width must be positive")
         self.finite_bins = self.bins - 1
         self.tail_start = self.finite_bins * self.delta_bin_width
+        self.rate_dependent = bool(rate_dependent)
 
     def time_action_to_delta(self, action, rate=None):
         action = self._validate_action(action)
         lower_t, upper_t = self._time_bounds(action)
+        if not self.rate_dependent:
+            if math.isinf(upper_t):
+                # For tail bin, return lower_t + delta_bin_width
+                return lower_t + self.delta_bin_width
+            return (lower_t + upper_t) / 2.0
         return self._exponential_conditional_mean(lower_t, upper_t, rate)
 
     def delta_to_time_action(self, delta, rate=None):
@@ -90,3 +97,94 @@ class TimeEnvFixedDelta:
             return lower_t
         tail_factor = math.exp(-rate * width)
         return lower_t + (1.0 / rate) - (width * tail_factor / interval_mass_from_zero)
+
+
+class TimeEnvLogDelta:
+    """Logarithmically-spaced delta-time helper for bottom-up ARG construction.
+
+    The bin boundaries are spaced geometrically/logarithmically to provide high resolution
+    near 0.0 while covering deep ancestral events without tail compression.
+    """
+
+    def __init__(
+        self,
+        bins=DEFAULT_TIME_BINS,
+        min_time=0.0001,
+        max_time=2.0,
+        rate_dependent=False,
+    ):
+        self.bins = int(bins)
+        if self.bins < 2:
+            raise ValueError("log delta time bins must be at least 2")
+        self.min_time = float(min_time)
+        self.max_time = float(max_time)
+        if self.min_time <= 0.0 or self.max_time <= self.min_time:
+            raise ValueError("min_time must be positive and less than max_time")
+        self.rate_dependent = bool(rate_dependent)
+        
+        # Compute bin boundaries
+        self.boundaries = [0.0]
+        for i in range(1, self.bins):
+            val = self.min_time * (self.max_time / self.min_time) ** ((i - 1) / (self.bins - 2))
+            self.boundaries.append(val)
+        self.boundaries.append(math.inf)
+
+    def time_action_to_delta(self, action, rate=None):
+        action = self._validate_action(action)
+        lower_t, upper_t = self._time_bounds(action)
+        if not self.rate_dependent:
+            if math.isinf(upper_t):
+                # Use step size of the previous bin
+                return lower_t + (self.boundaries[-2] - self.boundaries[-3])
+            return (lower_t + upper_t) / 2.0
+        return self._exponential_conditional_mean(lower_t, upper_t, rate)
+
+    def delta_to_time_action(self, delta, rate=None):
+        delta = float(delta)
+        if delta < 0.0:
+            raise ValueError("delta must be non-negative")
+        if delta >= self.boundaries[self.bins - 1]:
+            return self.bins - 1
+        import bisect
+        idx = bisect.bisect_right(self.boundaries, delta) - 1
+        return int(max(0, min(idx, self.bins - 1)))
+
+    def sample_action_from_prior(self, rate, rng=None):
+        probabilities = self.time_action_probabilities(rate)
+        rng = random if rng is None else rng
+        return rng.choices(range(self.bins), weights=probabilities)[0]
+
+    def time_action_log_probability(self, action, rate):
+        lower_t, upper_t = self._time_bounds(action)
+        if math.isinf(upper_t):
+            return -rate * lower_t
+        width = upper_t - lower_t
+        interval_mass_from_zero = -math.expm1(-rate * width)
+        return -rate * lower_t + math.log(interval_mass_from_zero)
+
+    def time_action_probabilities(self, rate):
+        return [
+            math.exp(self.time_action_log_probability(action, rate))
+            for action in range(self.bins)
+        ]
+
+    def _validate_action(self, action):
+        action = int(action)
+        if action < 0 or action >= self.bins:
+            raise ValueError(f"time_action must be in [0, {self.bins - 1}], got {action}")
+        return action
+
+    def _time_bounds(self, action):
+        return self.boundaries[action], self.boundaries[action + 1]
+
+    def _exponential_conditional_mean(self, lower_t, upper_t, rate):
+        if math.isinf(upper_t):
+            return lower_t + 1.0 / rate
+        width = upper_t - lower_t
+        interval_mass_from_zero = -math.expm1(-rate * width)
+        if interval_mass_from_zero <= 0.0:
+            return lower_t
+        tail_factor = math.exp(-rate * width)
+        return lower_t + (1.0 / rate) - (width * tail_factor / interval_mass_from_zero)
+
+

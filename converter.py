@@ -106,7 +106,8 @@ def tree_sequence_to_arg_state(ts: tskit.TreeSequence, env) -> ARGState:
                 span_start=lineage.material_segments.span_start,
                 span_end=lineage.material_segments.span_end,
                 time_action=time_action,
-                breakpoint=bp
+                breakpoint=bp,
+                exact_delta_t=delta_t
             )
             
             combined_actions = env.enumerate_actions(state)
@@ -166,7 +167,8 @@ def tree_sequence_to_arg_state(ts: tskit.TreeSequence, env) -> ARGState:
                             action = CoalescenceChoice(
                                 active_lineage_i=i,
                                 active_lineage_j=j,
-                                time_action=time_action
+                                time_action=time_action,
+                                exact_delta_t=delta_t
                             )
                             
                             combined_actions = env.enumerate_actions(state)

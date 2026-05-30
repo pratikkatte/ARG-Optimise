@@ -10,7 +10,7 @@ from evo import EvolutionModelTorch
 
 import numpy as np
 
-from time_env import TimeEnvFixedDelta
+from time_env import TimeEnvFixedDelta, TimeEnvLogDelta
 
 CHARACTERS_MAPS = {
     'DNA_WITH_GAP': {
@@ -166,6 +166,7 @@ class RecombinationChoice:
     span_end: int
     time_action: Optional[int] = None
     breakpoint: Optional[int] = None
+    exact_delta_t: Optional[float] = None
 
     @property
     def breakpoint_count(self):
@@ -196,6 +197,9 @@ class RecombinationChoice:
         breakpoint = action.get("breakpoint")
         if breakpoint is not None and not isinstance(breakpoint, numbers.Integral):
             return None
+        exact_delta_t = action.get("exact_delta_t")
+        if exact_delta_t is not None and not isinstance(exact_delta_t, (numbers.Real, float)):
+            return None
         return cls(
             active_lineage_i=int(active_lineage_i),
             material_count=int(material_count),
@@ -203,6 +207,7 @@ class RecombinationChoice:
             span_end=int(span_end),
             time_action=int(time_action) if time_action is not None else None,
             breakpoint=int(breakpoint) if breakpoint is not None else None,
+            exact_delta_t=float(exact_delta_t) if exact_delta_t is not None else None,
         )
 
     def is_valid_for(self, active_lineages):
@@ -233,6 +238,7 @@ class CoalescenceChoice:
     active_lineage_i: int
     active_lineage_j: int
     time_action: Optional[int] = None
+    exact_delta_t: Optional[float] = None
 
     def as_dict(self):
         action = {
@@ -242,6 +248,8 @@ class CoalescenceChoice:
         }
         if self.time_action is not None:
             action["time_action"] = self.time_action
+        if self.exact_delta_t is not None:
+            action["exact_delta_t"] = self.exact_delta_t
         return action
 
     def is_valid_for(self, active_lineages):
@@ -268,10 +276,14 @@ class CoalescenceChoice:
         time_action = action.get("time_action")
         if time_action is not None and not isinstance(time_action, numbers.Integral):
             return None
+        exact_delta_t = action.get("exact_delta_t")
+        if exact_delta_t is not None and not isinstance(exact_delta_t, (numbers.Real, float)):
+            return None
         return cls(
             active_lineage_i=int(i),
             active_lineage_j=int(j),
             time_action=int(time_action) if time_action is not None else None,
+            exact_delta_t=float(exact_delta_t) if exact_delta_t is not None else None,
         )
 
     @classmethod
@@ -520,6 +532,8 @@ class SimpleARGEnvironment:
         device: Optional[torch.device] = 'cpu',
         time_bins: Optional[int] = None,
         time_delta_bin_width: Optional[float] = None,
+        time_bin_scheme: Optional[str] = None,
+        time_rate_dependent: bool = False,
     ):
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
@@ -559,9 +573,18 @@ class SimpleARGEnvironment:
         time_env_kwargs = {}
         if time_bins is not None:
             time_env_kwargs["bins"] = int(time_bins)
-        if time_delta_bin_width is not None:
-            time_env_kwargs["delta_bin_width"] = float(time_delta_bin_width)
-        self.time_env = TimeEnvFixedDelta(**time_env_kwargs)
+        
+        scheme = time_bin_scheme if time_bin_scheme is not None else "TimeEnvFixedDelta"
+        if scheme == "TimeEnvFixedDelta":
+            if time_delta_bin_width is not None:
+                time_env_kwargs["delta_bin_width"] = float(time_delta_bin_width)
+            time_env_kwargs["rate_dependent"] = time_rate_dependent
+            self.time_env = TimeEnvFixedDelta(**time_env_kwargs)
+        elif scheme == "TimeEnvLogDelta":
+            time_env_kwargs["rate_dependent"] = time_rate_dependent
+            self.time_env = TimeEnvLogDelta(**time_env_kwargs)
+        else:
+            raise ValueError(f"Unknown time bin scheme: {scheme}")
 
         self.rng = random.Random(seed)
 
@@ -600,11 +623,16 @@ class SimpleARGEnvironment:
 
     @property
     def time_metadata(self):
-        return {
+        meta = {
             "time_bin_scheme": type(self.time_env).__name__,
             "time_bins": int(self.time_env.bins),
-            "time_delta_bin_width": float(self.time_env.delta_bin_width),
         }
+        if hasattr(self.time_env, "delta_bin_width"):
+            meta["time_delta_bin_width"] = float(self.time_env.delta_bin_width)
+        else:
+            meta["min_time"] = float(self.time_env.min_time)
+            meta["max_time"] = float(self.time_env.max_time)
+        return meta
 
     def seq2array(self, seq):
         seq = [self.chars_dict[x] for x in seq]
@@ -1052,7 +1080,10 @@ class SimpleARGEnvironment:
         parent_id = next_state.max_node_idx + 1
         parent_segments = child_i.material_segments.union(child_j.material_segments)
         overlap_count = child_i.material_segments.intersection_count(child_j.material_segments)
-        delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
+        if getattr(action, "exact_delta_t", None) is not None:
+            delta_t = action.exact_delta_t
+        else:
+            delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
         parent_time = float(state.current_time) + delta_t
         next_state.current_time = parent_time
         parent_partials = self._coalesced_parent_partials(
@@ -1107,7 +1138,10 @@ class SimpleARGEnvironment:
 
         left_parent_id = next_state.max_node_idx + 1
         right_parent_id = next_state.max_node_idx + 2
-        delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
+        if getattr(action, "exact_delta_t", None) is not None:
+            delta_t = action.exact_delta_t
+        else:
+            delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
 
         event_time = float(state.current_time) + delta_t
         next_state.current_time = event_time
@@ -1614,7 +1648,8 @@ class SimpleARGEnvironment:
                     span_start=lineage.material_segments.span_start,
                     span_end=lineage.material_segments.span_end,
                     time_action=time_action,
-                    breakpoint=bp
+                    breakpoint=bp,
+                    exact_delta_t=delta_t
                 )
                 
                 combined_actions = self.enumerate_actions(curr_state)
@@ -1663,7 +1698,8 @@ class SimpleARGEnvironment:
                                 action = CoalescenceChoice(
                                     active_lineage_i=i,
                                     active_lineage_j=j,
-                                    time_action=time_action
+                                    time_action=time_action,
+                                    exact_delta_t=delta_t
                                 )
                                 
                                 combined_actions = self.enumerate_actions(curr_state)
