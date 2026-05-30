@@ -1047,13 +1047,10 @@ class SimpleARGEnvironment:
     def is_terminal(self, state):
         if state.total_active_blocks is None:
             raise ValueError("total_active_blocks is required for terminal check")
-        if int(state.total_active_blocks) == self.num_blocks:
-            return True
-        # If no further actions can be taken, treat it as terminal
-        coal_actions, recomb_actions = self.enumerate_actions(state)
-        if len(coal_actions) == 0 and len(recomb_actions) == 0:
-            return True
-        return False
+        else:
+            result = int(state.total_active_blocks) == self.num_blocks
+            # bool(np.all(self.get_active_counts(state) == 1)) ## another way, realtime compute. 
+            return result
 
     def _finalize_transition_state(self, next_state, log_prior):
         if log_prior is not None:
@@ -1520,6 +1517,24 @@ class SimpleARGEnvironment:
             lineage.parents = [p for p in lineage.parents if p not in deletion_set]
             lineage.children = [c for c in lineage.children if c not in deletion_set]
             
+        # 4b. Prune any ancestral nodes (node_id >= num_sequences) that have no remaining children
+        while True:
+            pruned_any = False
+            for node_id in list(new_state.all_nodes.keys()):
+                if node_id < self.num_sequences:
+                    continue
+                node = new_state.all_nodes[node_id]
+                if len(node.children) == 0:
+                    new_state.all_nodes.pop(node_id)
+                    for parent_id in node.parents:
+                        if parent_id in new_state.all_nodes:
+                            new_state.all_nodes[parent_id].children = [
+                                c for c in new_state.all_nodes[parent_id].children if c != node_id
+                            ]
+                    pruned_any = True
+            if not pruned_any:
+                break
+                
         # 5. Determine new active lineages (remaining nodes with no parents)
         new_state.active_lineages = [
             lineage for lineage in new_state.all_nodes.values()
