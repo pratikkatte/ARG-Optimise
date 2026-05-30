@@ -1639,7 +1639,7 @@ class SimpleARGEnvironment:
                 lineage = curr_state.active_lineages[target_idx]
                 rates = self.compute_event_rates(self.enumerate_actions(curr_state))
                 curr_state.rates = rates
-                delta_t = max(0.0, event['time'] - curr_state.current_time)
+                delta_t = max(1e-10, event['time'] - curr_state.current_time)
                 time_action = self.time_env.delta_to_time_action(delta_t, self._total_event_rate(rates))
                 
                 action = RecombinationChoice(
@@ -1692,7 +1692,7 @@ class SimpleARGEnvironment:
                                 
                                 rates = self.compute_event_rates(self.enumerate_actions(curr_state))
                                 curr_state.rates = rates
-                                delta_t = max(0.0, event['time'] - curr_state.current_time)
+                                delta_t = max(1e-10, event['time'] - curr_state.current_time)
                                 time_action = self.time_env.delta_to_time_action(delta_t, self._total_event_rate(rates))
                                 
                                 action = CoalescenceChoice(

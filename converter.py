@@ -97,7 +97,7 @@ def tree_sequence_to_arg_state(ts: tskit.TreeSequence, env) -> ARGState:
             # Calculate time bin
             rates = env.compute_event_rates(env.enumerate_actions(state))
             state.rates = rates
-            delta_t = max(0.0, event['time'] - state.current_time)
+            delta_t = max(1e-10, event['time'] - state.current_time)
             time_action = env.time_env.delta_to_time_action(delta_t, env._total_event_rate(rates))
             
             action = RecombinationChoice(
@@ -161,7 +161,7 @@ def tree_sequence_to_arg_state(ts: tskit.TreeSequence, env) -> ARGState:
                             
                             rates = env.compute_event_rates(env.enumerate_actions(state))
                             state.rates = rates
-                            delta_t = max(0.0, event['time'] - state.current_time)
+                            delta_t = max(1e-10, event['time'] - state.current_time)
                             time_action = env.time_env.delta_to_time_action(delta_t, env._total_event_rate(rates))
                             
                             action = CoalescenceChoice(
