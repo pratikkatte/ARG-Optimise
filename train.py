@@ -425,6 +425,16 @@ def train(
                 loss_tensor = torch.tensor(loss, device=device)
                 dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
                 loss = loss_tensor.item() / world_size
+                info["loss"] = loss
+
+                eval_keys = [k for k in info.keys() if k.startswith("eval_")]
+                if eval_keys:
+                    eval_vals = [float(info[k]) for k in eval_keys]
+                    eval_tensor = torch.tensor(eval_vals, device=device)
+                    dist.all_reduce(eval_tensor, op=dist.ReduceOp.SUM)
+                    eval_averaged = (eval_tensor / world_size).tolist()
+                    for k, val in zip(eval_keys, eval_averaged):
+                        info[k] = val
 
             history.append(info)
 

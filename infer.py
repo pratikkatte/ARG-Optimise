@@ -80,7 +80,7 @@ def run_inference(
     generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
     generator.eval()
 
-    starting_state = None
+    # starting_state = None
     if refine_trees_path is not None:
         if refine_window_start is None or refine_window_end is None:
             raise ValueError("Both refine_window_start and refine_window_end must be provided if refine_trees_path is set.")
@@ -88,8 +88,8 @@ def run_inference(
         refine_window_start_blocks = refine_window_start // bp_per_blocks
         refine_window_end_blocks = refine_window_end // bp_per_blocks
         ts = tskit.load(refine_trees_path)
-        base_state = tree_sequence_to_arg_state(ts, env)
-        starting_state = env.delete_genomic_window(base_state, refine_window_start_blocks, refine_window_end_blocks)
+        terminal_state = tree_sequence_to_arg_state(ts, env)
+        # starting_state = env.delete_genomic_window(base_state, refine_window_start_blocks, refine_window_end_blocks)
 
     random_spec = build_random_spec(temperature=temperature)
     rollout_worker = RolloutWorker(env, verbose=verbose)
@@ -99,8 +99,10 @@ def run_inference(
         num_args=num_args,
         batch_size=batch_size,
         random_spec=random_spec,
+        terminal_state = terminal_state,
         verbose=verbose,
-        starting_state=starting_state,
+        window_start=refine_window_start_blocks,
+        window_end=refine_window_end_blocks,
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -182,7 +184,9 @@ def run_batched_rollouts(
     batch_size,
     random_spec,
     verbose=False,
-    starting_state=None,
+    terminal_state=None,
+    window_start=None,
+    window_end=None,
 ):
     states = []
     trajectories = []
@@ -200,11 +204,13 @@ def run_batched_rollouts(
                     flush=True,
                 )
             chunk_outputs, chunk_trajectories = rollout_worker.rollout(
-                generator,
+                generator=generator,
                 episodes=chunk_size,
                 random_spec=random_spec,
                 return_states=True,
-                starting_state=starting_state,
+                terminal_state=terminal_state,
+                window_start=window_start,
+                window_end=window_end,
             )
             states.extend(chunk_outputs["states"])
             trajectories.extend(chunk_trajectories)
@@ -309,16 +315,16 @@ def main():
         "--num-particles",
         dest="num_args",
         type=int,
-        default=1,
+        default=100,
         help="Total number of ARGs/particles to generate (default: 1).",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
+        default=4,
         help="Number of ARG rollouts to process simultaneously on the GPU (default: 1).",
     )
-    parser.add_argument("--seed", type=int)
+    parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--verbose", action="store_true")

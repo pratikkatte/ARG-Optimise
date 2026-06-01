@@ -29,7 +29,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
         model_kwargs=None,
         policy_lr=None,
         log_z_lr=None,
-        initialize_z_from_prior=True,
         ddp=False,
         local_rank=0,
         time_layers=3,
@@ -120,14 +119,15 @@ class TBGFlowNetGenerator(torch.nn.Module):
         ).to(self.device)
 
         ## Z partition
+
         self.max_reward_seen = float("-inf")
-        if initialize_z_from_prior:
+        if init_z_sample_count > 0:
             log_rewards = env.sample_log_rewards(self.init_z_sample_count, verbose=verbose)
             self.max_reward_seen = float(np.max(log_rewards))
             init_Z = self.max_reward_seen
         else:
-            self.max_reward_seen = 0.0
-            init_Z = 0.0
+            self.max_reward_seen = -6300.0
+            init_Z = -6300.0
         self._Z = torch.nn.Parameter(  # in log
                 torch.ones(256, device=self.device) * init_Z / 256, requires_grad=True
                 )

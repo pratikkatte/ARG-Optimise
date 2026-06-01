@@ -57,18 +57,18 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--truth-dir",
         type=Path,
-        default=None,
+        default="../tcoalmsp/rep0",
         help="Directory of truth *_splsX-Y.tc tracks.",
     )
     ap.add_argument(
         "--truth-prefix",
-        default=None,
+        default="sim_l25kb_0",
         help="Truth filename stem before _spls, e.g. sim_l1mb_0.",
     )
     ap.add_argument(
         "--truth-trees",
         type=Path,
-        default=None,
+        default="../validation/trees/sim_l25kb_0.trees",
         help="Optional msprime truth .trees; if loadable, replaces .tc tracks.",
     )
     ap.add_argument(
@@ -77,7 +77,7 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
         default=10000.0,
         help="Effective population size Ne; tree-sequence times are divided by 2*Ne.",
     )
-    ap.add_argument("-n", "--nspl", type=int, required=True, help="Number of haplotypes.")
+    ap.add_argument("-n", "--nspl", type=int, default=8, help="Number of haplotypes.")
     ap.add_argument(
         "-s",
         "--skip",
