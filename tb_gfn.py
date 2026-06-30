@@ -45,6 +45,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 self.env.block_seq_arrays.detach().to(self.device),
                 requires_grad=False,
             )
+        for attr in ("variant_position_tensor", "variant_prev_gap_tensor", "variant_next_gap_tensor"):
+            if hasattr(self.env, attr):
+                value = getattr(self.env, attr)
+                setattr(
+                    self.env,
+                    attr,
+                    torch.nn.Parameter(value.detach().to(self.device), requires_grad=False),
+                )
         self.init_z_sample_count = init_z_sample_count
 
         ## Policy model
@@ -217,7 +225,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         for idx, chosen_action in enumerate(choosen_actions):
             if isinstance(chosen_action, RecombinationChoice):
                 lineage_idx = int(chosen_action.active_lineage_i)
-                lineage_feature = lineage_seq_features[idx, lineage_idx]
+                if getattr(self.env, "input_mode", "dense") == "vcf":
+                    lineage_feature = states[idx].active_lineages[lineage_idx]
+                else:
+                    lineage_feature = lineage_seq_features[idx, lineage_idx]
                 breakpoint, log_p_breakpoint = self.breakpoint_model(
                     chosen_action,
                     lineage_feature,

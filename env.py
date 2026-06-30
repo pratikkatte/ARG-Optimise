@@ -515,18 +515,33 @@ class SimpleARGEnvironment:
         recombination_rate: float = 2e-8,
         rho: Optional[float] = None,
         sequences: Optional[Sequence[Any]] = None,
+        variant_data: Optional[Any] = None,
         seed: Optional[int] = 7,
         bp_per_blocks: int = 1,
         device: Optional[torch.device] = 'cpu',
         time_bins: Optional[int] = None,
         time_delta_bin_width: Optional[float] = None,
     ):
+        if sequences is not None and variant_data is not None:
+            raise ValueError("Pass either dense sequences or variant_data, not both")
+        self.input_mode = "vcf" if variant_data is not None else "dense"
+        self.variant_data = variant_data
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
         self.event_types = ["coal", "recomb"]
         self.device = torch.device(device)
 
-        if self.sequences is not None:
+        if self.input_mode == "vcf":
+            num_sequences = int(variant_data.num_haplotypes)
+            sequence_length = int(variant_data.sequence_length)
+            inferred_num_blocks = int(variant_data.num_variants)
+            if num_blocks is not None and int(num_blocks) != inferred_num_blocks:
+                raise ValueError(
+                    "VCF mode requires num_blocks to match the retained variant count "
+                    f"({inferred_num_blocks}), got {num_blocks}"
+                )
+            num_blocks = inferred_num_blocks
+        elif self.sequences is not None:
             num_sequences = len(self.sequences)
             sequence_length = len(self.sequences[0])
             if any(len(sequence) != sequence_length for sequence in self.sequences):
@@ -565,32 +580,63 @@ class SimpleARGEnvironment:
 
         self.rng = random.Random(seed)
 
-        ## Sequence arrays
+        ## Sequence or sparse-variant arrays
         self.block_indices = np.arange(self.num_blocks)
 
-        seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences], dtype=np.float32)
-
-        block_seq_arrays = np.empty(
-            (self.num_sequences, self.num_blocks, seq_arrays.shape[-1]),
-            dtype=np.float32,
-        )
-        for block_idx in range(self.num_blocks):
-            site_start = int(round(block_idx * self.sequence_length / self.num_blocks))
-            site_end = int(round((block_idx + 1) * self.sequence_length / self.num_blocks))
-            if site_end <= site_start:
+        if self.input_mode == "vcf":
+            self.sample_ids = list(variant_data.sample_ids)
+            self.haplotype_ids = list(variant_data.haplotype_ids)
+            self.variant_positions0 = np.asarray(variant_data.positions0, dtype=np.int64)
+            self.variant_boundaries = self._build_variant_boundaries(self.variant_positions0)
+            self.variant_gap_lengths = self._build_variant_gap_lengths(self.variant_positions0)
+            variant_partials = np.asarray(variant_data.haplotype_partials, dtype=np.float32)
+            expected_shape = (self.num_sequences, self.num_blocks, 4)
+            if tuple(variant_partials.shape) != expected_shape:
                 raise ValueError(
-                    "num_blocks must not create empty block intervals for sequence_length"
+                    f"variant partials must have shape {expected_shape}, got {variant_partials.shape}"
                 )
-            block_seq_arrays[:, block_idx, :] = seq_arrays[:, site_start:site_end, :].mean(axis=1)
+            self.block_seq_arrays = torch.nn.Parameter(
+                torch.tensor(variant_partials, dtype=torch.float32, device=self.device),
+                requires_grad=False,
+            )
+            self.variant_position_tensor = torch.nn.Parameter(
+                torch.tensor(self.variant_positions0, dtype=torch.float32, device=self.device),
+                requires_grad=False,
+            )
+            self.variant_prev_gap_tensor = torch.nn.Parameter(
+                torch.tensor(self.variant_gap_lengths["prev"], dtype=torch.float32, device=self.device),
+                requires_grad=False,
+            )
+            self.variant_next_gap_tensor = torch.nn.Parameter(
+                torch.tensor(self.variant_gap_lengths["next"], dtype=torch.float32, device=self.device),
+                requires_grad=False,
+            )
+        else:
+            if self.sequences is None:
+                raise ValueError("dense mode requires sequences")
+            seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences], dtype=np.float32)
 
-        self.seq_arrays = torch.nn.Parameter(
-            torch.tensor(seq_arrays, dtype=torch.float32, device=self.device),
-            requires_grad=False,
-        )
-        self.block_seq_arrays = torch.nn.Parameter(
-            torch.tensor(block_seq_arrays, dtype=torch.float32, device=self.device),
-            requires_grad=False,
-        )
+            block_seq_arrays = np.empty(
+                (self.num_sequences, self.num_blocks, seq_arrays.shape[-1]),
+                dtype=np.float32,
+            )
+            for block_idx in range(self.num_blocks):
+                site_start = int(round(block_idx * self.sequence_length / self.num_blocks))
+                site_end = int(round((block_idx + 1) * self.sequence_length / self.num_blocks))
+                if site_end <= site_start:
+                    raise ValueError(
+                        "num_blocks must not create empty block intervals for sequence_length"
+                    )
+                block_seq_arrays[:, block_idx, :] = seq_arrays[:, site_start:site_end, :].mean(axis=1)
+
+            self.seq_arrays = torch.nn.Parameter(
+                torch.tensor(seq_arrays, dtype=torch.float32, device=self.device),
+                requires_grad=False,
+            )
+            self.block_seq_arrays = torch.nn.Parameter(
+                torch.tensor(block_seq_arrays, dtype=torch.float32, device=self.device),
+                requires_grad=False,
+            )
         
         ## Evolution model
         self.evolution_model = EvolutionModelTorch(self)
@@ -606,10 +652,85 @@ class SimpleARGEnvironment:
             "time_delta_bin_width": float(self.time_env.delta_bin_width),
         }
 
+    @property
+    def is_vcf_mode(self):
+        return self.input_mode == "vcf"
+
     def seq2array(self, seq):
         seq = [self.chars_dict[x] for x in seq]
         data = np.array(seq)
         return data
+
+    def _build_variant_boundaries(self, positions0):
+        positions0 = np.asarray(positions0, dtype=np.float64)
+        if positions0.ndim != 1 or positions0.size != int(self.num_blocks):
+            raise ValueError("VCF positions must be a 1D array with num_blocks entries")
+        if positions0.size == 0:
+            raise ValueError("VCF mode requires at least one retained variant")
+        if np.any(np.diff(positions0) <= 0):
+            raise ValueError("VCF positions must be strictly increasing")
+        boundaries = np.empty(positions0.size + 1, dtype=np.float64)
+        boundaries[0] = 0.0
+        boundaries[-1] = float(self.sequence_length)
+        if positions0.size > 1:
+            boundaries[1:-1] = (positions0[:-1] + positions0[1:]) / 2.0
+        return boundaries
+
+    def _build_variant_gap_lengths(self, positions0):
+        positions0 = np.asarray(positions0, dtype=np.float64)
+        prev_gaps = np.zeros_like(positions0, dtype=np.float32)
+        next_gaps = np.zeros_like(positions0, dtype=np.float32)
+        if positions0.size > 1:
+            diffs = np.diff(positions0).astype(np.float32)
+            prev_gaps[1:] = diffs
+            next_gaps[:-1] = diffs
+        return {"prev": prev_gaps, "next": next_gaps}
+
+    def _lineage_block_indices(self, material_segments):
+        return np.asarray(material_segments.to_block_list(), dtype=np.int64)
+
+    def _select_compact_partials(self, partials, source_segments, target_segments):
+        if not self.is_vcf_mode:
+            return partials
+        source_blocks = self._lineage_block_indices(source_segments)
+        target_blocks = self._lineage_block_indices(target_segments)
+        if target_blocks.size == 0:
+            return partials.new_zeros((0, partials.shape[-1]))
+        if source_blocks.size == 0:
+            raise ValueError("Cannot select VCF partial rows from an empty source lineage")
+        positions = np.searchsorted(source_blocks, target_blocks)
+        if (
+            np.any(positions < 0)
+            or np.any(positions >= source_blocks.size)
+            or np.any(source_blocks[positions] != target_blocks)
+        ):
+            raise ValueError("target material segments are not contained in source material segments")
+        index = torch.as_tensor(positions, dtype=torch.long, device=partials.device)
+        return partials.index_select(0, index)
+
+    def _breakpoint_gap_length(self, breakpoint):
+        if not self.is_vcf_mode:
+            return 1.0
+        breakpoint = int(breakpoint)
+        if not (1 <= breakpoint < int(self.num_blocks)):
+            return 0.0
+        return max(
+            float(self.variant_positions0[breakpoint] - self.variant_positions0[breakpoint - 1]),
+            1.0,
+        )
+
+    def _recombination_breakpoint_weights(self, choice):
+        breakpoints = range(int(choice.span_start) + 1, int(choice.span_end) + 1)
+        weights = []
+        for breakpoint in breakpoints:
+            left_segments, right_segments = self._choice_lineage_segments(choice).split(breakpoint)
+            if left_segments.count <= 0 or right_segments.count <= 0:
+                continue
+            weights.append((int(breakpoint), self._breakpoint_gap_length(breakpoint)))
+        return weights
+
+    def _choice_lineage_segments(self, choice):
+        return MaterialSegments(((int(choice.span_start), int(choice.span_end) + 1),))
 
     def _total_event_rate(self, rates):
         total_rate = float(rates["lambda_coal"] + rates["lambda_recomb"])
@@ -660,6 +781,12 @@ class SimpleARGEnvironment:
 
     def _initial_lineage_partials(self, node_id, material_segments):
         partials = self.block_seq_arrays[int(node_id)].detach().clone().float()
+        if self.is_vcf_mode:
+            return self._select_compact_partials(
+                partials,
+                MaterialSegments.full(self.num_blocks),
+                material_segments,
+            )
         return self.evolution_model.mask_partials(partials, material_segments)
 
     def _initial_lineages_partials_batch(self, material_segments_list):
@@ -688,7 +815,23 @@ class SimpleARGEnvironment:
     def _require_lineage_partials(self, lineage):
         if lineage.partials is None:
             raise ValueError(f"ARG lineage {lineage.node_id} is missing partials")
-        return self.evolution_model._as_partials_tensor(lineage.partials)
+        partials = lineage.partials
+        if torch.is_tensor(partials):
+            tensor = partials.to(device=self.device, dtype=torch.float32)
+        else:
+            tensor = torch.as_tensor(partials, device=self.device, dtype=torch.float32)
+        expected_rows = (
+            int(lineage.material_segments.count)
+            if self.is_vcf_mode
+            else int(self.num_blocks)
+        )
+        expected_shape = (expected_rows, 4)
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"ARG lineage {lineage.node_id} partials must have shape "
+                f"{expected_shape}, got {tuple(tensor.shape)}"
+            )
+        return tensor
 
     def _transition_lineage_partials(self, lineage, parent_time):
         edge_time = float(parent_time) - float(lineage.time)
@@ -701,6 +844,14 @@ class SimpleARGEnvironment:
         return self.evolution_model.transition_partials(partials, edge_time)
 
     def _coalesced_parent_partials(self, child_i, child_j, parent_segments, parent_time):
+        if self.is_vcf_mode:
+            return self._coalesced_parent_partials_sparse(
+                child_i,
+                child_j,
+                parent_segments,
+                parent_time,
+            )
+
         reference = self._require_lineage_partials(child_i)
         combined = torch.ones_like(reference)
         has_material = torch.zeros(
@@ -729,8 +880,49 @@ class SimpleARGEnvironment:
 
     def _recombined_parent_partials(self, child, parent_segments, parent_time):
         transitioned = self._transition_lineage_partials(child, parent_time)
+        if self.is_vcf_mode:
+            selected = self._select_compact_partials(
+                transitioned,
+                child.material_segments,
+                parent_segments,
+            )
+            return self.evolution_model.normalize_partials(selected)
         masked = self.evolution_model.mask_partials(transitioned, parent_segments)
         return self.evolution_model.normalize_partials(masked)
+
+    def _coalesced_parent_partials_sparse(self, child_i, child_j, parent_segments, parent_time):
+        parent_blocks = self._lineage_block_indices(parent_segments)
+        combined = torch.ones(
+            (parent_blocks.size, 4),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        has_material = torch.zeros(
+            parent_blocks.size,
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        for child in (child_i, child_j):
+            child_partials = self.evolution_model.normalize_partials(
+                self._transition_lineage_partials(child, parent_time)
+            )
+            child_blocks = self._lineage_block_indices(child.material_segments)
+            if child_blocks.size == 0:
+                continue
+            parent_positions = np.searchsorted(parent_blocks, child_blocks)
+            if (
+                np.any(parent_positions < 0)
+                or np.any(parent_positions >= parent_blocks.size)
+                or np.any(parent_blocks[parent_positions] != child_blocks)
+            ):
+                raise ValueError("child material segments are not contained in coalesced parent segments")
+            parent_index = torch.as_tensor(parent_positions, dtype=torch.long, device=self.device)
+            combined[parent_index] = combined[parent_index] * child_partials
+            has_material[parent_index] = True
+
+        combined = torch.where(has_material[:, None], combined, torch.zeros_like(combined))
+        return self.evolution_model.normalize_partials(combined)
 
     def get_active_counts(self, state):
         if not state.active_lineages:
@@ -881,6 +1073,9 @@ class SimpleARGEnvironment:
         return node_times
 
     def _block_to_sequence_coordinate(self, block_index):
+        if self.is_vcf_mode:
+            block_index = min(max(int(block_index), 0), len(self.variant_boundaries) - 1)
+            return float(self.variant_boundaries[block_index])
         return float(block_index) * float(self.sequence_length) / float(self.num_blocks)
 
     def compute_terminal_log_reward(self, state, log_likelihood=None):
@@ -1087,8 +1282,9 @@ class SimpleARGEnvironment:
 
         lambda_coal = float(len(coal_actions))
 
-        total_blocks = sum(choice.material_count for choice in recomb_actions)
-        total_active_material_length = float(total_blocks) / float(self.num_blocks)
+        total_recomb_weight = sum(self._recomb_weight(choice) for choice in recomb_actions)
+        normalizer = float(self.sequence_length if self.is_vcf_mode else self.num_blocks)
+        total_active_material_length = float(total_recomb_weight) / max(normalizer, 1.0)
         lambda_recomb = self.rho / 2.0 * total_active_material_length
         
         return {
@@ -1171,7 +1367,7 @@ class SimpleARGEnvironment:
         state.rates = rates
         
         total_rate = self._total_event_rate(rates)
-        recomb_total_weight = sum(choice.material_count for choice in recomb_actions)
+        recomb_total_weight = sum(self._recomb_weight(choice) for choice in recomb_actions)
 
         wait_log_prior = self.time_env.time_action_log_probability(action.time_action, total_rate)
 
@@ -1179,7 +1375,12 @@ class SimpleARGEnvironment:
             action_log_prior = math.log((rates["lambda_coal"] / total_rate) / len(coal_actions))
             
         elif isinstance(action, RecombinationChoice) and RecombinationChoice.is_valid_for(action, state.active_lineages):
-            action_log_prior = math.log((rates["lambda_recomb"] / total_rate) * (action.material_count / recomb_total_weight) / action.breakpoint_count)
+            breakpoint_probability = self._breakpoint_prior_probability(action)
+            action_log_prior = math.log(
+                (rates["lambda_recomb"] / total_rate)
+                * (self._recomb_weight(action) / recomb_total_weight)
+                * breakpoint_probability
+            )
         else:
             raise ValueError(f"Invalid action: {action}")
 
@@ -1236,11 +1437,7 @@ class SimpleARGEnvironment:
         if isinstance(selected, RecombinationChoice):
             if selected.breakpoint_count <= 0:
                 return None
-            breakpoint = (
-                selected.span_start
-                + 1
-                + self.rng.randrange(selected.breakpoint_count)
-            )
+            breakpoint = self._sample_breakpoint_from_choice(selected)
             action = {
                 "event_type": "recomb",
                 "active_lineage_i": selected.active_lineage_i,
@@ -1261,8 +1458,36 @@ class SimpleARGEnvironment:
 
     def _recomb_weight(self, recomb_weight):
         if isinstance(recomb_weight, RecombinationChoice):
+            if self.is_vcf_mode:
+                return sum(weight for _, weight in self._recombination_breakpoint_weights(recomb_weight))
             return recomb_weight.material_count
         return recomb_weight[1]
+
+    def _sample_breakpoint_from_choice(self, choice):
+        weighted_breakpoints = self._recombination_breakpoint_weights(choice)
+        if not weighted_breakpoints:
+            raise ValueError("No valid recombination breakpoints to sample")
+        total = sum(weight for _, weight in weighted_breakpoints)
+        target = self.rng.random() * total
+        cumulative = 0.0
+        for breakpoint, weight in weighted_breakpoints:
+            cumulative += weight
+            if target <= cumulative:
+                return int(breakpoint)
+        return int(weighted_breakpoints[-1][0])
+
+    def _breakpoint_prior_probability(self, action):
+        weighted_breakpoints = self._recombination_breakpoint_weights(action)
+        if not weighted_breakpoints:
+            raise ValueError("Recombination action has no valid breakpoints")
+        total = sum(weight for _, weight in weighted_breakpoints)
+        if total <= 0:
+            raise ValueError("Recombination breakpoint prior weight must be positive")
+        selected = int(action.breakpoint)
+        for breakpoint, weight in weighted_breakpoints:
+            if int(breakpoint) == selected:
+                return float(weight) / float(total)
+        raise ValueError(f"Breakpoint {selected} is not valid for action {action}")
 
     def _choice_from_recomb_weight(self, recomb_weight):
         if isinstance(recomb_weight, RecombinationChoice):

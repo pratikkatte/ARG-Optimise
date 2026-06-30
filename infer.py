@@ -15,10 +15,10 @@ from train import (
     DEFAULT_NE,
     seed_everything,
 )
+from utils import is_vcf_path, load_vcf_variants
 
 
 REQUIRED_METADATA_KEYS = {
-    "sequences",
     "num_sequences",
     "sequence_length",
     "num_blocks",
@@ -31,6 +31,15 @@ REQUIRED_METADATA_KEYS = {
     "model_version",
 }
 
+VCF_METADATA_KEYS = {
+    "dataset_path",
+    "num_variants",
+    "sample_ids",
+    "haplotype_ids",
+}
+
+DENSE_METADATA_KEYS = {"sequences"}
+
 
 def run_inference(
     checkpoint,
@@ -41,6 +50,7 @@ def run_inference(
     device="auto",
     temperature=None,
     verbose=False,
+    dataset_path=None,
 ):
     if num_args < 1:
         raise ValueError("num_args must be at least 1")
@@ -58,6 +68,7 @@ def run_inference(
         metadata,
         seed=inference_seed,
         device=resolved_device,
+        dataset_path=dataset_path,
     )
     generator = TBGFlowNetGenerator(
         env,
@@ -120,7 +131,13 @@ def resolve_device(device):
 
 
 def validate_metadata(metadata):
-    missing = sorted(REQUIRED_METADATA_KEYS - set(metadata))
+    input_mode = metadata.get("input_mode", "dense")
+    required = set(REQUIRED_METADATA_KEYS)
+    if input_mode == "vcf":
+        required |= VCF_METADATA_KEYS
+    else:
+        required |= DENSE_METADATA_KEYS
+    missing = sorted(required - set(metadata))
     if missing:
         raise ValueError(
             "Checkpoint metadata is missing fields required for inference: "
@@ -133,12 +150,29 @@ def validate_metadata(metadata):
         )
     if metadata["model_version"] != MODEL_VERSION:
         raise ValueError(
-            "Checkpoint model_version is incompatible with block-resolution partials: "
+            "Checkpoint model_version is incompatible with this sparse VCF implementation: "
             f"expected {MODEL_VERSION!r}, got {metadata['model_version']!r}."
         )
 
 
-def environment_from_metadata(metadata, seed, device=None):
+def environment_from_metadata(metadata, seed, device=None, dataset_path=None):
+    input_mode = metadata.get("input_mode", "dense")
+    variant_data = None
+    sequences = None
+    if input_mode == "vcf":
+        resolved_dataset_path = dataset_path or metadata["dataset_path"]
+        if not is_vcf_path(resolved_dataset_path):
+            raise ValueError("VCF checkpoints require a .vcf or .vcf.gz dataset path")
+        variant_data = load_vcf_variants(resolved_dataset_path)
+        if int(variant_data.num_variants) != int(metadata["num_variants"]):
+            raise ValueError("VCF variant count does not match checkpoint metadata")
+        if int(variant_data.sequence_length) != int(metadata["sequence_length"]):
+            raise ValueError("VCF sequence length does not match checkpoint metadata")
+        if list(variant_data.haplotype_ids) != list(metadata["haplotype_ids"]):
+            raise ValueError("VCF haplotype IDs do not match checkpoint metadata")
+    else:
+        sequences = list(metadata["sequences"])
+
     env_kwargs = {
         "num_sequences": int(metadata["num_sequences"]),
         "sequence_length": int(metadata["sequence_length"]),
@@ -150,7 +184,8 @@ def environment_from_metadata(metadata, seed, device=None):
             metadata.get("effective_population_size", DEFAULT_NE)
         ),
         "mutation_rate": float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
-        "sequences": list(metadata["sequences"]),
+        "sequences": sequences,
+        "variant_data": variant_data,
         "seed": seed,
     }
     if device is not None:
@@ -302,6 +337,7 @@ def main():
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--temperature", type=float)
+    parser.add_argument("--dataset-path", help="Override the dataset path stored in checkpoint metadata.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -314,6 +350,7 @@ def main():
         device=args.device,
         temperature=args.temperature,
         verbose=args.verbose,
+        dataset_path=args.dataset_path,
     )
     print(f"Wrote {manifest['num_args']} ARG tree sequence(s) to {args.output_dir}")
 

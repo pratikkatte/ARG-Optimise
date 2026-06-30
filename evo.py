@@ -56,15 +56,14 @@ class EvolutionModelTorch(torch.nn.Module):
 
         self._require_terminal(state)
 
-        if self.env.sequences is None:
+        if self.env.sequences is None and not getattr(self.env, "is_vcf_mode", False):
             return 0.0
 
-        seq_arrays = self._seq_arrays_numpy()
+        seq_arrays = self._observed_arrays_numpy()
         log_likelihood = 0.0
 
         for block_start, block_end in self.get_arg_sequence_segments(state)["segments"]:
-            site_start = self._block_to_site(block_start)
-            site_end = self._block_to_site(block_end)
+            site_start, site_end = self._observed_slice_for_blocks(block_start, block_end)
             if site_start >= site_end:
                 continue
 
@@ -112,6 +111,11 @@ class EvolutionModelTorch(torch.nn.Module):
 
     def _seq_arrays_numpy(self):
         return self.env.seq_arrays.detach().cpu().numpy().astype(float, copy=False)
+
+    def _observed_arrays_numpy(self):
+        if getattr(self.env, "is_vcf_mode", False):
+            return self.env.block_seq_arrays.detach().cpu().numpy().astype(float, copy=False)
+        return self._seq_arrays_numpy()
 
     def _jc69_transition_matrix(self, edge_length):
         same_prob = 0.25 + 0.75 * math.exp(-4.0 * float(edge_length) / 3.0)
@@ -169,6 +173,8 @@ class EvolutionModelTorch(torch.nn.Module):
     def mask_partials(self, partials, material_segments):
         """Zero out blocks where this lineage carries no ancestral material."""
         partials = self._as_partials_tensor(partials)
+        if getattr(self.env, "is_vcf_mode", False) and partials.shape[0] == material_segments.count:
+            return partials
         weights = self.material_site_weights(
             material_segments,
             device=partials.device,
@@ -193,11 +199,18 @@ class EvolutionModelTorch(torch.nn.Module):
             tensor = partials.to(dtype=torch.float32)
         else:
             tensor = torch.as_tensor(partials, dtype=torch.float32, device=self.env.block_seq_arrays.device)
-        expected_shape = (int(self.env.num_blocks), 4)
-        if tuple(tensor.shape) != expected_shape:
-            raise ValueError(
-                f"ARGLineage.partials must have shape {expected_shape}, got {tuple(tensor.shape)}"
-            )
+        if getattr(self.env, "is_vcf_mode", False):
+            if tensor.ndim != 2 or tensor.shape[-1] != 4:
+                raise ValueError(
+                    "VCF ARGLineage.partials must have shape [covered_variants, 4], "
+                    f"got {tuple(tensor.shape)}"
+                )
+        else:
+            expected_shape = (int(self.env.num_blocks), 4)
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"ARGLineage.partials must have shape {expected_shape}, got {tuple(tensor.shape)}"
+                )
         return tensor
 
     def _jc69_transition_matrix_torch(self, edge_time, device, dtype):
@@ -214,6 +227,11 @@ class EvolutionModelTorch(torch.nn.Module):
             float(block_index) * float(self.env.sequence_length) / float(self.env.num_blocks)
         )
         return int(round(site_fraction))
+
+    def _observed_slice_for_blocks(self, block_start, block_end):
+        if getattr(self.env, "is_vcf_mode", False):
+            return int(block_start), int(block_end)
+        return self._block_to_site(block_start), self._block_to_site(block_end)
 
     def _segment_root_node_id(self, state, block_start, block_end):
         roots = [

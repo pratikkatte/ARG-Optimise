@@ -1,11 +1,12 @@
 from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
-from breakpoint_model import BreakpointSplitPositionCNN
+from breakpoint_model import BreakpointSplitPositionCNN, VCFBreakpointScorer
 from time_model import TimeModel
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from dataclasses import replace
+import math
 
 
 class TransformerMLP(nn.Module):
@@ -143,6 +144,61 @@ class TransformerEncoder(nn.Module):
         return self.norm(x)
 
 
+class VariantTokenEncoder(nn.Module):
+    def __init__(self, input_dim, embedding_size, dropout=0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, embedding_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embedding_size, embedding_size),
+            nn.GELU(),
+        )
+
+    def forward(self, token_features):
+        return self.net(token_features)
+
+
+class SparseLineageEncoder(nn.Module):
+    TOKEN_FEATURE_DIM = 9
+    LINEAGE_FEATURE_DIM = 5
+
+    def __init__(self, env, embedding_size, dropout=0.0):
+        super().__init__()
+        self.env = env
+        self.embedding_size = int(embedding_size)
+        self.token_encoder = VariantTokenEncoder(
+            self.TOKEN_FEATURE_DIM,
+            self.embedding_size,
+            dropout=dropout,
+        )
+        self.lineage_encoder = nn.Sequential(
+            nn.Linear(self.LINEAGE_FEATURE_DIM, self.embedding_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.embedding_size, self.embedding_size),
+        )
+        self.attention_query = nn.Parameter(torch.zeros(self.embedding_size))
+        nn.init.trunc_normal_(self.attention_query, std=0.02)
+        self.output_norm = nn.LayerNorm(self.embedding_size, eps=1e-6)
+
+    def forward(self, token_features, token_mask, lineage_features):
+        token_embeddings = self.token_encoder(token_features)
+        scores = torch.matmul(token_embeddings, self.attention_query)
+        scores = scores / math.sqrt(float(self.embedding_size))
+        scores = scores.masked_fill(~token_mask, float("-inf"))
+
+        empty = ~token_mask.any(dim=1)
+        if empty.any():
+            scores = scores.masked_fill(empty[:, None], 0.0)
+
+        weights = F.softmax(scores, dim=1)
+        weights = weights.masked_fill(~token_mask, 0.0)
+        pooled = torch.sum(token_embeddings * weights.unsqueeze(-1), dim=1)
+        lineage_embedding = self.lineage_encoder(lineage_features)
+        return self.output_norm(pooled + lineage_embedding)
+
+
 class ARGModel(nn.Module):
     """One-step ARG action policy.
 
@@ -174,14 +230,24 @@ class ARGModel(nn.Module):
         super().__init__()
         self.env = env
         self.device = env.device
+        self.input_mode = getattr(env, "input_mode", "dense")
+        self.embedding_size = int(embedding_size)
         if int(embedding_size) % int(transformer_heads) != 0:
             raise ValueError(
                 "embedding_size must be divisible by transformer_heads "
                 f"(got embedding_size={embedding_size}, transformer_heads={transformer_heads})"
             )
-        input_size = int(env.num_blocks) * 4
-
-        self.seq_embedding = nn.Linear(input_size, embedding_size)
+        if self.input_mode == "vcf":
+            self.seq_embedding = None
+            self.sparse_lineage_encoder = SparseLineageEncoder(
+                env,
+                embedding_size=embedding_size,
+                dropout=dropout,
+            )
+        else:
+            input_size = int(env.num_blocks) * 4
+            self.seq_embedding = nn.Linear(input_size, embedding_size)
+            self.sparse_lineage_encoder = None
         self.summary_token = nn.Parameter(torch.zeros(1, 1, embedding_size))
         nn.init.trunc_normal_(self.summary_token, std=0.1)
         self.encoder = TransformerEncoder(
@@ -198,15 +264,25 @@ class ARGModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
-        self.breakpoint_scorer = BreakpointSplitPositionCNN(
-            hidden_dim=breakpoint_hidden_dim,
-            dropout=breakpoint_dropout,
-            action_context_dim=embedding_size * 4,
-            gap_hidden_dim=breakpoint_gap_hidden_size,
-            gap_layers=breakpoint_gap_layers,
-            gap_dropout=breakpoint_gap_dropout,
-            use_position_features=breakpoint_use_position_features,
-        ).to(self.device)
+        if self.input_mode == "vcf":
+            self.breakpoint_scorer = VCFBreakpointScorer(
+                env,
+                hidden_dim=breakpoint_hidden_dim,
+                action_context_dim=embedding_size * 4,
+                gap_hidden_dim=breakpoint_gap_hidden_size,
+                gap_layers=breakpoint_gap_layers,
+                gap_dropout=breakpoint_gap_dropout,
+            ).to(self.device)
+        else:
+            self.breakpoint_scorer = BreakpointSplitPositionCNN(
+                hidden_dim=breakpoint_hidden_dim,
+                dropout=breakpoint_dropout,
+                action_context_dim=embedding_size * 4,
+                gap_hidden_dim=breakpoint_gap_hidden_size,
+                gap_layers=breakpoint_gap_layers,
+                gap_dropout=breakpoint_gap_dropout,
+                use_position_features=breakpoint_use_position_features,
+            ).to(self.device)
 
         self.time_scorer = TimeModel(
             embedding_size * 4,
@@ -259,6 +335,9 @@ class ARGModel(nn.Module):
         return lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts
 
     def _encode_states(self, states):
+        if self.input_mode == "vcf":
+            return self._encode_sparse_states(states)
+
         batch_size = len(states)
         if batch_size == 0:
             raise ValueError("ARGModel.forward requires at least one state")
@@ -292,6 +371,136 @@ class ARGModel(nn.Module):
 
         return self._encode_lineage_features(lineage_seq_features, batch_active_lineage_counts)
 
+    def _encode_sparse_states(self, states):
+        batch_size = len(states)
+        if batch_size == 0:
+            raise ValueError("ARGModel.forward requires at least one state")
+
+        active_counts = [len(state.active_lineages) for state in states]
+        max_active_lineages = max(active_counts, default=0)
+        lineages = [
+            lineage
+            for state in states
+            for lineage in state.active_lineages
+        ]
+        if not lineages:
+            raise ValueError("ARGModel.forward requires at least one active lineage")
+
+        token_feature_rows = []
+        token_masks = []
+        lineage_feature_rows = []
+        max_tokens = max(max(int(lineage.material_segments.count), 1) for lineage in lineages)
+
+        for lineage in lineages:
+            token_features, token_mask, lineage_features = self._sparse_lineage_features(
+                lineage,
+                max_tokens,
+            )
+            token_feature_rows.append(token_features)
+            token_masks.append(token_mask)
+            lineage_feature_rows.append(lineage_features)
+
+        token_features = torch.stack(token_feature_rows, dim=0).to(self.device)
+        token_mask = torch.stack(token_masks, dim=0).to(self.device)
+        lineage_features = torch.stack(lineage_feature_rows, dim=0).to(self.device)
+        encoded_lineages = self.sparse_lineage_encoder(
+            token_features,
+            token_mask,
+            lineage_features,
+        )
+
+        lineage_reps = encoded_lineages.new_zeros(
+            batch_size,
+            max_active_lineages,
+            self.embedding_size,
+        )
+        cursor = 0
+        for batch_idx, active_count in enumerate(active_counts):
+            if active_count > 0:
+                lineage_reps[batch_idx, :active_count] = encoded_lineages[cursor:cursor + active_count]
+            cursor += active_count
+
+        batch_active_lineage_counts = torch.tensor(
+            active_counts,
+            dtype=torch.long,
+            device=self.device,
+        )
+        valid_mask = (
+            torch.arange(max_active_lineages, device=self.device)[None, :]
+            < batch_active_lineage_counts[:, None]
+        )
+        summary_token = self.summary_token.expand(batch_size, -1, -1)
+        transformer_input = torch.cat([summary_token, lineage_reps], dim=1)
+        key_padding_mask = F.pad(~valid_mask, (1, 0), value=False)
+        encoded = self.encoder(transformer_input, key_padding_mask=key_padding_mask)
+
+        summary_reps = encoded[:, 0]
+        lineage_reps = encoded[:, 1:] * valid_mask.unsqueeze(-1)
+        return lineage_reps, summary_reps, states, batch_active_lineage_counts
+
+    def _sparse_lineage_features(self, lineage, max_tokens):
+        partials = self._lineage_partials_tensor(lineage)
+        token_features = partials.new_zeros(max_tokens, SparseLineageEncoder.TOKEN_FEATURE_DIM)
+        token_mask = torch.zeros(max_tokens, dtype=torch.bool, device=partials.device)
+
+        blocks = self.env._lineage_block_indices(lineage.material_segments)
+        count = int(blocks.size)
+        if count > 0:
+            block_index = torch.as_tensor(blocks, dtype=torch.long, device=self.device)
+            positions = self.env.variant_position_tensor.index_select(0, block_index).to(dtype=torch.float32)
+            prev_gaps = self.env.variant_prev_gap_tensor.index_select(0, block_index).to(dtype=torch.float32)
+            next_gaps = self.env.variant_next_gap_tensor.index_select(0, block_index).to(dtype=torch.float32)
+
+            seq_len = max(float(self.env.sequence_length), 1.0)
+            abs_pos = positions / seq_len
+            interval_start, interval_end, interval_width = self._lineage_physical_interval(lineage)
+            rel_pos = (positions - interval_start) / max(interval_width, 1.0)
+            carried = torch.ones_like(abs_pos)
+            row_features = torch.cat(
+                [
+                    partials,
+                    abs_pos[:, None],
+                    rel_pos[:, None],
+                    (prev_gaps / seq_len)[:, None],
+                    (next_gaps / seq_len)[:, None],
+                    carried[:, None],
+                ],
+                dim=1,
+            )
+            token_features[:count] = row_features
+            token_mask[:count] = True
+
+        lineage_features = self._lineage_interval_features(lineage, count, partials.device)
+        return token_features, token_mask, lineage_features
+
+    def _lineage_physical_interval(self, lineage):
+        if lineage.material_segments.span_start is None or lineage.material_segments.span_end is None:
+            start = 0.0
+            end = float(self.env.sequence_length)
+        else:
+            start = self.env._block_to_sequence_coordinate(lineage.material_segments.span_start)
+            end = self.env._block_to_sequence_coordinate(lineage.material_segments.span_end + 1)
+        width = max(float(end - start), 1.0)
+        return float(start), float(end), width
+
+    def _lineage_interval_features(self, lineage, variant_count, device):
+        start, end, width = self._lineage_physical_interval(lineage)
+        seq_len = max(float(self.env.sequence_length), 1.0)
+        count_norm = float(variant_count) / max(float(self.env.num_blocks), 1.0)
+        length_norm = float(width) / seq_len
+        density = count_norm / max(length_norm, 1e-6)
+        return torch.tensor(
+            [
+                start / seq_len,
+                end / seq_len,
+                length_norm,
+                count_norm,
+                density,
+            ],
+            dtype=torch.float32,
+            device=device,
+        )
+
     def _lineage_partials_tensor(self, lineage):
         if lineage.partials is None:
             raise ValueError(
@@ -303,7 +512,11 @@ class ARGModel(nn.Module):
             partials = partials.to(device=self.device, dtype=torch.float32)
         else:
             partials = torch.as_tensor(partials, device=self.device, dtype=torch.float32)
-        expected_shape = (int(self.env.num_blocks), 4)
+        expected_shape = (
+            (int(lineage.material_segments.count), 4)
+            if self.input_mode == "vcf"
+            else (int(self.env.num_blocks), 4)
+        )
         if tuple(partials.shape) != expected_shape:
             raise ValueError(
                 f"Active ARG lineage {lineage.node_id} partials must have shape "
@@ -381,7 +594,7 @@ class ARGModel(nn.Module):
         batch_size = len(candidate_actions)
         max_candidates = max(len(actions) for actions in candidate_actions)
         logits = lineage_reps.new_full((batch_size, max_candidates), float("-inf"))
-        feat_dim = self.seq_embedding.out_features * 4
+        feat_dim = self.embedding_size * 4
         features = lineage_reps.new_zeros(batch_size, max_candidates, feat_dim)
 
         candidate_counts = []

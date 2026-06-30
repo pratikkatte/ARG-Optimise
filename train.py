@@ -15,7 +15,7 @@ from env import SimpleARGEnvironment, action_as_dict
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
-from utils import load_sequences
+from utils import VCF_PARSER_VERSION, is_vcf_path, load_sequences, load_vcf_variants
 
 
 DEFAULT_NE = 10000
@@ -44,7 +44,7 @@ DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE = 256
 DEFAULT_BREAKPOINT_GAP_LAYERS = 3
 DEFAULT_BREAKPOINT_GAP_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_USE_POSITION_FEATURES = True
-MODEL_VERSION = "cwr-event-transformer-block-partials-v3"
+MODEL_VERSION = "cwr-event-sparse-vcf-v1"
 
 def seed_everything(seed):
     random.seed(seed)
@@ -190,14 +190,25 @@ def train(
     seed_everything(seed)
     device = torch.device(device)
 
-    sequences = load_sequences(dataset_path)
-    sequence_length = len(sequences[0])
+    variant_data = None
+    if is_vcf_path(dataset_path):
+        input_mode = "vcf"
+        variant_data = load_vcf_variants(dataset_path)
+        sequences = None
+        sequence_length = int(variant_data.sequence_length)
+        num_sequences = int(variant_data.num_haplotypes)
+    else:
+        input_mode = "dense"
+        sequences = load_sequences(dataset_path)
+        sequence_length = len(sequences[0])
+        num_sequences = len(sequences)
 
     env = SimpleARGEnvironment(
         sequence_length=sequence_length,
-        num_sequences=len(sequences),
+        num_sequences=num_sequences,
         bp_per_blocks = bp_per_blocks,
         sequences=sequences,
+        variant_data=variant_data,
         device=device,
         recombination_rate=recombination_rate,
         population_size=effective_population_size,
@@ -253,6 +264,7 @@ def train(
         wandb_run = wandb.init()
         wandb.config.update({
             "device": str(generator.device),
+            "input_mode": input_mode,
             **env.time_metadata,
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
@@ -313,6 +325,9 @@ def train(
                     best_loss=best_loss,
                     log_z=log_z,
                     sequences=sequences,
+                    variant_data=variant_data,
+                    dataset_path=dataset_path,
+                    input_mode=input_mode,
                     sequence_length=sequence_length,
                     bp_per_blocks=bp_per_blocks,
                     time_metadata=env.time_metadata,
@@ -355,6 +370,9 @@ def build_checkpoint_metadata(
     best_loss,
     log_z,
     sequences,
+    variant_data,
+    dataset_path,
+    input_mode,
     sequence_length,
     bp_per_blocks,
     time_metadata,
@@ -373,14 +391,24 @@ def build_checkpoint_metadata(
     init_z_sample_count,
     model_version,
 ):
-    return {
+    num_blocks = int(
+        variant_data.num_variants
+        if input_mode == "vcf"
+        else sequence_length // bp_per_blocks
+    )
+    metadata = {
         "epoch": int(epoch),
         "best_loss": float(best_loss),
         "log_z": float(log_z),
-        "sequences": list(sequences),
-        "num_sequences": len(sequences),
+        "input_mode": str(input_mode),
+        "dataset_path": os.path.abspath(str(dataset_path)),
+        "num_sequences": int(
+            variant_data.num_haplotypes
+            if input_mode == "vcf"
+            else len(sequences)
+        ),
         "sequence_length": int(sequence_length),
-        "num_blocks": int(sequence_length // bp_per_blocks),
+        "num_blocks": int(num_blocks),
         "bp_per_blocks": int(bp_per_blocks),
         "rho": float(rho),
         "time": dict(time_metadata),
@@ -398,6 +426,19 @@ def build_checkpoint_metadata(
         "seed": int(seed),
         "init_z_sample_count": int(init_z_sample_count),
         "model_version": str(model_version),
+    }
+    if input_mode == "vcf":
+        metadata.update({
+            "num_variants": int(variant_data.num_variants),
+            "sample_ids": list(variant_data.sample_ids),
+            "haplotype_ids": list(variant_data.haplotype_ids),
+            "vcf_parser_version": VCF_PARSER_VERSION,
+        })
+        return metadata
+
+    metadata["sequences"] = list(sequences)
+    return {
+        **metadata,
     }
 
 
@@ -441,7 +482,8 @@ def main():
     parser.add_argument("--transformer-heads", type=int, default=DEFAULT_TRANSFORMER_HEADS)
     parser.add_argument("--transformer-mlp-ratio", type=float, default=DEFAULT_TRANSFORMER_MLP_RATIO)
     parser.add_argument("--attention-dropout", type=float, default=DEFAULT_ATTENTION_DROPOUT)
-    parser.add_argument("--wandb", action="store_true", default=True)
+    parser.add_argument("--wandb", dest="wandb", action="store_true", default=True)
+    parser.add_argument("--no-wandb", dest="wandb", action="store_false")
     args = parser.parse_args()
 
     selected_device = "cuda" if torch.cuda.is_available() else "cpu"

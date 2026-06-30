@@ -152,7 +152,7 @@ class RolloutWorker:
         for log_paths in log_path_lists:
             if log_paths:
                 return log_paths[0].dtype, log_paths[0].device
-        seq_arrays = self.env.seq_arrays
+        seq_arrays = getattr(self.env, "seq_arrays", self.env.block_seq_arrays)
         device = seq_arrays.device if hasattr(seq_arrays, "device") else torch.device("cpu")
         return torch.float32, device
 
@@ -212,4 +212,4 @@ class RolloutWorker:
         try:
             return next(generator.parameters()).device
         except (AttributeError, StopIteration):
-            return self.env.seq_arrays.device
+            return getattr(self.env, "seq_arrays", self.env.block_seq_arrays).device

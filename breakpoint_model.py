@@ -234,3 +234,177 @@ class BreakpointSplitPositionCNN(nn.Module):
         breakpoint = int(valid_breakpoints[int(local_idx.detach().cpu().item())])
         log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
         return breakpoint, log_p
+
+
+class VCFBreakpointScorer(nn.Module):
+    def __init__(
+        self,
+        env,
+        hidden_dim=128,
+        action_context_dim=128,
+        gap_hidden_dim=256,
+        gap_layers=3,
+        gap_dropout=0.0,
+    ):
+        super().__init__()
+        self.env = env
+        self.action_context_dim = int(action_context_dim)
+        self.feature_dim = self.action_context_dim + 11
+        self.gap_scorer = self._build_gap_scorer(
+            input_dim=self.feature_dim,
+            hidden_dim=int(gap_hidden_dim or hidden_dim),
+            layers=int(gap_layers),
+            dropout=float(gap_dropout),
+        )
+
+    def _build_gap_scorer(self, input_dim, hidden_dim, layers, dropout):
+        if layers < 0:
+            raise ValueError(f"gap_layers must be non-negative, got {layers}")
+        if layers == 0:
+            scorer = nn.Sequential(nn.Linear(input_dim, 1))
+        else:
+            modules = [
+                nn.Linear(input_dim, hidden_dim),
+                nn.Dropout(dropout),
+                nn.ReLU(),
+            ]
+            for _ in range(layers - 1):
+                modules.extend([
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.Dropout(dropout),
+                    nn.ReLU(),
+                ])
+            modules.append(nn.Linear(hidden_dim, 1))
+            scorer = nn.Sequential(*modules)
+        scorer.apply(self._init_mlp_weights)
+        return scorer
+
+    def _init_mlp_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+    def _valid_breakpoints_list(self, valid_breakpoints):
+        return list(range(
+            int(valid_breakpoints.span_start) + 1,
+            int(valid_breakpoints.span_end) + 1,
+        )) if hasattr(valid_breakpoints, "span_start") else list(valid_breakpoints)
+
+    def _prepare_action_context(self, action_context, device, dtype):
+        if action_context is None:
+            raise ValueError("action_context is required for breakpoint scoring")
+        if torch.is_tensor(action_context):
+            action_context = action_context.to(device=device, dtype=dtype)
+        else:
+            action_context = torch.as_tensor(action_context, device=device, dtype=dtype)
+        if action_context.ndim == 2 and action_context.shape[0] == 1:
+            action_context = action_context[0]
+        if action_context.ndim != 1:
+            raise ValueError(f"expected 1D action_context, got shape {tuple(action_context.shape)}")
+        if action_context.shape[0] != self.action_context_dim:
+            raise ValueError(
+                f"expected action_context dim {self.action_context_dim}, got {action_context.shape[0]}"
+            )
+        return action_context
+
+    def _partial_lookup(self, lineage):
+        device = next(self.parameters()).device
+        partials = lineage.partials
+        if not torch.is_tensor(partials):
+            partials = torch.as_tensor(partials, dtype=torch.float32, device=device)
+        partials = partials.to(device=device, dtype=torch.float32)
+        blocks = self.env._lineage_block_indices(lineage.material_segments)
+        return {int(block): row_idx for row_idx, block in enumerate(blocks)}, partials
+
+    def _neighbor_partials(self, lineage, breakpoint):
+        lookup, partials = self._partial_lookup(lineage)
+        device = partials.device
+        left = torch.zeros(4, dtype=partials.dtype, device=device)
+        right = torch.zeros(4, dtype=partials.dtype, device=device)
+        left_idx = lookup.get(int(breakpoint) - 1)
+        right_idx = lookup.get(int(breakpoint))
+        if left_idx is not None:
+            left = partials[left_idx]
+        if right_idx is not None:
+            right = partials[right_idx]
+        return left, right
+
+    def _candidate_features(self, valid_breakpoints, lineage, device, dtype):
+        features = []
+        seq_len = max(float(self.env.sequence_length), 1.0)
+        num_blocks = max(int(self.env.num_blocks), 1)
+        span_start = lineage.material_segments.span_start
+        span_end = lineage.material_segments.span_end
+        if span_start is None or span_end is None:
+            interval_start = 0.0
+            interval_end = float(self.env.sequence_length)
+        else:
+            interval_start = self.env._block_to_sequence_coordinate(span_start)
+            interval_end = self.env._block_to_sequence_coordinate(span_end + 1)
+        interval_width = max(float(interval_end - interval_start), 1.0)
+
+        for breakpoint in valid_breakpoints:
+            breakpoint = int(breakpoint)
+            coord = self.env._block_to_sequence_coordinate(breakpoint)
+            split_norm = float(breakpoint) / float(num_blocks)
+            gap_norm = float(self.env._breakpoint_gap_length(breakpoint)) / seq_len
+            rel_pos = (coord - interval_start) / interval_width
+            left, right = self._neighbor_partials(lineage, breakpoint)
+            scalar = torch.tensor(
+                [split_norm, gap_norm, rel_pos],
+                dtype=dtype,
+                device=device,
+            )
+            features.append(torch.cat([scalar, left.to(dtype=dtype), right.to(dtype=dtype)], dim=0))
+        return torch.stack(features, dim=0)
+
+    def valid_breakpoint_logits(
+        self,
+        valid_breakpoints,
+        lineage,
+        sequence_length,
+        num_blocks,
+        action_context,
+    ):
+        valid_breakpoints = self._valid_breakpoints_list(valid_breakpoints)
+        if not valid_breakpoints:
+            raise ValueError("Recombination action has no valid breakpoints")
+
+        device = next(self.parameters()).device
+        partials = lineage.partials
+        dtype = partials.dtype if torch.is_tensor(partials) else torch.float32
+        action_context = self._prepare_action_context(action_context, device, dtype).expand(
+            len(valid_breakpoints),
+            -1,
+        )
+        candidate_features = self._candidate_features(valid_breakpoints, lineage, device, dtype)
+        scorer_input = torch.cat([action_context, candidate_features], dim=1)
+        return self.gap_scorer(scorer_input).squeeze(-1)
+
+    def forward(
+        self,
+        valid_breakpoints,
+        lineage,
+        sequence_length,
+        num_blocks,
+        action_context,
+        random_spec=None,
+    ):
+        valid_breakpoints = self._valid_breakpoints_list(valid_breakpoints)
+        valid_logits = self.valid_breakpoint_logits(
+            valid_breakpoints,
+            lineage,
+            sequence_length,
+            num_blocks,
+            action_context,
+        )
+        if random_spec is not None and "T" in random_spec:
+            sample_logits = valid_logits / random_spec["T"]
+        else:
+            sample_logits = valid_logits
+
+        local_idx = Categorical(logits=sample_logits).sample()
+        breakpoint = int(valid_breakpoints[int(local_idx.detach().cpu().item())])
+        log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
+        return breakpoint, log_p
