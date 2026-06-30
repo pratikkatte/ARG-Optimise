@@ -45,7 +45,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 self.env.block_seq_arrays.detach().to(self.device),
                 requires_grad=False,
             )
-        for attr in ("variant_position_tensor", "variant_prev_gap_tensor", "variant_next_gap_tensor"):
+        for attr in (
+            "variant_position_tensor",
+            "variant_boundary_tensor",
+            "variant_prev_gap_tensor",
+            "variant_next_gap_tensor",
+        ):
             if hasattr(self.env, attr):
                 value = getattr(self.env, attr)
                 setattr(

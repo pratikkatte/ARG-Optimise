@@ -89,6 +89,19 @@ class MaterialSegments:
             blocks.extend(range(start, end))
         return blocks
 
+    def to_block_tensor(self, device):
+        device = torch.device(device)
+        if not self.segments:
+            return torch.empty(0, dtype=torch.long, device=device)
+        chunks = [
+            torch.arange(int(start), int(end), dtype=torch.long, device=device)
+            for start, end in self.segments
+            if int(end) > int(start)
+        ]
+        if not chunks:
+            return torch.empty(0, dtype=torch.long, device=device)
+        return torch.cat(chunks, dim=0)
+
     def valid_breakpoint_count(self):
         if self.count < 2 or self.span_start is None or self.span_end is None:
             return 0
@@ -339,6 +352,7 @@ class ARGLineage:
         self.recombination_side = recombination_side
         self.time = float(time)
         self._material_mask = None
+        self._block_indices_cache = {}
 
         if material_segments is None:
             mask = np.asarray([] if material_mask is None else material_mask, dtype=bool)
@@ -366,14 +380,29 @@ class ARGLineage:
     def material_mask(self, value):
         if value is None:
             self._material_mask = None
+            self.clear_runtime_caches()
             return
         self._material_mask = np.asarray(value, dtype=bool).copy()
         self.num_blocks = int(self._material_mask.size)
         self.material_segments = MaterialSegments.from_mask(self._material_mask)
+        self.clear_runtime_caches()
 
     @property
     def material_count(self):
         return self.material_segments.count
+
+    def clear_runtime_caches(self):
+        if hasattr(self, "_block_indices_cache"):
+            self._block_indices_cache.clear()
+
+    def block_indices_tensor(self, device):
+        device = torch.device(device)
+        key = str(device)
+        cached = self._block_indices_cache.get(key)
+        if cached is None:
+            cached = self.material_segments.to_block_tensor(device)
+            self._block_indices_cache[key] = cached
+        return cached
 
     @property
     def material_span(self):
@@ -604,6 +633,10 @@ class SimpleARGEnvironment:
                 torch.tensor(self.variant_positions0, dtype=torch.float32, device=self.device),
                 requires_grad=False,
             )
+            self.variant_boundary_tensor = torch.nn.Parameter(
+                torch.tensor(self.variant_boundaries, dtype=torch.float32, device=self.device),
+                requires_grad=False,
+            )
             self.variant_prev_gap_tensor = torch.nn.Parameter(
                 torch.tensor(self.variant_gap_lengths["prev"], dtype=torch.float32, device=self.device),
                 requires_grad=False,
@@ -693,21 +726,22 @@ class SimpleARGEnvironment:
     def _select_compact_partials(self, partials, source_segments, target_segments):
         if not self.is_vcf_mode:
             return partials
-        source_blocks = self._lineage_block_indices(source_segments)
-        target_blocks = self._lineage_block_indices(target_segments)
-        if target_blocks.size == 0:
+        source_blocks = source_segments.to_block_tensor(partials.device)
+        target_blocks = target_segments.to_block_tensor(partials.device)
+        if target_blocks.numel() == 0:
             return partials.new_zeros((0, partials.shape[-1]))
-        if source_blocks.size == 0:
+        if source_blocks.numel() == 0:
             raise ValueError("Cannot select VCF partial rows from an empty source lineage")
-        positions = np.searchsorted(source_blocks, target_blocks)
-        if (
-            np.any(positions < 0)
-            or np.any(positions >= source_blocks.size)
-            or np.any(source_blocks[positions] != target_blocks)
-        ):
+        positions = torch.searchsorted(source_blocks, target_blocks)
+        safe_positions = positions.clamp(max=source_blocks.numel() - 1)
+        valid = (
+            (positions >= 0)
+            & (positions < source_blocks.numel())
+            & (source_blocks.index_select(0, safe_positions) == target_blocks)
+        )
+        if not bool(valid.all().detach().cpu().item()):
             raise ValueError("target material segments are not contained in source material segments")
-        index = torch.as_tensor(positions, dtype=torch.long, device=partials.device)
-        return partials.index_select(0, index)
+        return partials.index_select(0, positions)
 
     def _breakpoint_gap_length(self, breakpoint):
         if not self.is_vcf_mode:
@@ -892,14 +926,14 @@ class SimpleARGEnvironment:
         return self.evolution_model.normalize_partials(masked)
 
     def _coalesced_parent_partials_sparse(self, child_i, child_j, parent_segments, parent_time):
-        parent_blocks = self._lineage_block_indices(parent_segments)
+        parent_blocks = parent_segments.to_block_tensor(self.device)
         combined = torch.ones(
-            (parent_blocks.size, 4),
+            (parent_blocks.numel(), 4),
             dtype=torch.float32,
             device=self.device,
         )
         has_material = torch.zeros(
-            parent_blocks.size,
+            parent_blocks.numel(),
             dtype=torch.bool,
             device=self.device,
         )
@@ -908,19 +942,20 @@ class SimpleARGEnvironment:
             child_partials = self.evolution_model.normalize_partials(
                 self._transition_lineage_partials(child, parent_time)
             )
-            child_blocks = self._lineage_block_indices(child.material_segments)
-            if child_blocks.size == 0:
+            child_blocks = child.block_indices_tensor(self.device)
+            if child_blocks.numel() == 0:
                 continue
-            parent_positions = np.searchsorted(parent_blocks, child_blocks)
-            if (
-                np.any(parent_positions < 0)
-                or np.any(parent_positions >= parent_blocks.size)
-                or np.any(parent_blocks[parent_positions] != child_blocks)
-            ):
+            parent_positions = torch.searchsorted(parent_blocks, child_blocks)
+            safe_positions = parent_positions.clamp(max=parent_blocks.numel() - 1)
+            valid = (
+                (parent_positions >= 0)
+                & (parent_positions < parent_blocks.numel())
+                & (parent_blocks.index_select(0, safe_positions) == child_blocks)
+            )
+            if not bool(valid.all().detach().cpu().item()):
                 raise ValueError("child material segments are not contained in coalesced parent segments")
-            parent_index = torch.as_tensor(parent_positions, dtype=torch.long, device=self.device)
-            combined[parent_index] = combined[parent_index] * child_partials
-            has_material[parent_index] = True
+            combined[parent_positions] = combined[parent_positions] * child_partials
+            has_material[parent_positions] = True
 
         combined = torch.where(has_material[:, None], combined, torch.zeros_like(combined))
         return self.evolution_model.normalize_partials(combined)
@@ -1186,6 +1221,8 @@ class SimpleARGEnvironment:
         child_j.parents.append(parent.node_id)
         child_i.partials = None
         child_j.partials = None
+        child_i.clear_runtime_caches()
+        child_j.clear_runtime_caches()
         next_state.active_lineages[i] = child_i
         next_state.active_lineages[j] = child_j
         next_state.all_nodes[child_i.node_id] = child_i
@@ -1251,6 +1288,7 @@ class SimpleARGEnvironment:
 
         child.parents = [left_parent.node_id, right_parent.node_id]
         child.partials = None
+        child.clear_runtime_caches()
         next_state.all_nodes[child.node_id] = child
         next_state.all_nodes[left_parent.node_id] = left_parent
         next_state.all_nodes[right_parent.node_id] = right_parent

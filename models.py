@@ -386,23 +386,7 @@ class ARGModel(nn.Module):
         if not lineages:
             raise ValueError("ARGModel.forward requires at least one active lineage")
 
-        token_feature_rows = []
-        token_masks = []
-        lineage_feature_rows = []
-        max_tokens = max(max(int(lineage.material_segments.count), 1) for lineage in lineages)
-
-        for lineage in lineages:
-            token_features, token_mask, lineage_features = self._sparse_lineage_features(
-                lineage,
-                max_tokens,
-            )
-            token_feature_rows.append(token_features)
-            token_masks.append(token_mask)
-            lineage_feature_rows.append(lineage_features)
-
-        token_features = torch.stack(token_feature_rows, dim=0).to(self.device)
-        token_mask = torch.stack(token_masks, dim=0).to(self.device)
-        lineage_features = torch.stack(lineage_feature_rows, dim=0).to(self.device)
+        token_features, token_mask, lineage_features = self._sparse_lineage_batch_features(lineages)
         encoded_lineages = self.sparse_lineage_encoder(
             token_features,
             token_mask,
@@ -438,15 +422,134 @@ class ARGModel(nn.Module):
         lineage_reps = encoded[:, 1:] * valid_mask.unsqueeze(-1)
         return lineage_reps, summary_reps, states, batch_active_lineage_counts
 
+    def _env_float_tensor(self, attr, fallback):
+        value = getattr(self.env, attr, None)
+        if value is None:
+            return torch.as_tensor(fallback, device=self.device, dtype=torch.float32)
+        return value.to(device=self.device, dtype=torch.float32)
+
+    def _sparse_lineage_batch_intervals(self, lineages):
+        boundaries = self._env_float_tensor("variant_boundary_tensor", self.env.variant_boundaries)
+        max_boundary_idx = max(int(boundaries.numel()) - 1, 0)
+        start_indices = []
+        end_indices = []
+        for lineage in lineages:
+            span_start = lineage.material_segments.span_start
+            span_end = lineage.material_segments.span_end
+            if span_start is None or span_end is None:
+                start_indices.append(0)
+                end_indices.append(max_boundary_idx)
+            else:
+                start_indices.append(min(max(int(span_start), 0), max_boundary_idx))
+                end_indices.append(min(max(int(span_end) + 1, 0), max_boundary_idx))
+
+        start_index = torch.tensor(start_indices, dtype=torch.long, device=self.device)
+        end_index = torch.tensor(end_indices, dtype=torch.long, device=self.device)
+        starts = boundaries.index_select(0, start_index)
+        ends = boundaries.index_select(0, end_index)
+        widths = (ends - starts).clamp_min(1.0)
+        return starts, ends, widths
+
+    def _sparse_lineage_batch_features(self, lineages):
+        if not lineages:
+            raise ValueError("ARGModel.forward requires at least one active lineage")
+
+        count_values = [int(lineage.material_segments.count) for lineage in lineages]
+        max_tokens = max(max(count_values, default=0), 1)
+        num_lineages = len(lineages)
+        token_features = torch.zeros(
+            num_lineages,
+            max_tokens,
+            SparseLineageEncoder.TOKEN_FEATURE_DIM,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        token_mask = torch.zeros(
+            num_lineages,
+            max_tokens,
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        interval_starts, interval_ends, interval_widths = self._sparse_lineage_batch_intervals(lineages)
+        seq_len = max(float(self.env.sequence_length), 1.0)
+        count_tensor = torch.tensor(count_values, dtype=torch.float32, device=self.device)
+        count_norm = count_tensor / max(float(self.env.num_blocks), 1.0)
+        length_norm = interval_widths / seq_len
+        density = count_norm / length_norm.clamp_min(1e-6)
+        lineage_features = torch.stack(
+            [
+                interval_starts / seq_len,
+                interval_ends / seq_len,
+                length_norm,
+                count_norm,
+                density,
+            ],
+            dim=1,
+        )
+
+        block_rows = []
+        partial_rows = []
+        lineage_ids = []
+        token_positions = []
+        for lineage_idx, lineage in enumerate(lineages):
+            partials = self._lineage_partials_tensor(lineage)
+            count = count_values[lineage_idx]
+            if count == 0:
+                continue
+            block_index = lineage.block_indices_tensor(self.device)
+            if int(block_index.numel()) != count:
+                raise ValueError(
+                    f"Active ARG lineage {lineage.node_id} material count ({count}) "
+                    f"does not match block index count ({int(block_index.numel())})"
+                )
+            block_rows.append(block_index)
+            partial_rows.append(partials)
+            lineage_ids.append(
+                torch.full((count,), lineage_idx, dtype=torch.long, device=self.device)
+            )
+            token_positions.append(torch.arange(count, dtype=torch.long, device=self.device))
+
+        if not block_rows:
+            return token_features, token_mask, lineage_features
+
+        all_blocks = torch.cat(block_rows, dim=0)
+        all_partials = torch.cat(partial_rows, dim=0)
+        all_lineage_ids = torch.cat(lineage_ids, dim=0)
+        all_token_positions = torch.cat(token_positions, dim=0)
+
+        positions = self.env.variant_position_tensor.index_select(0, all_blocks).to(dtype=torch.float32)
+        prev_gaps = self.env.variant_prev_gap_tensor.index_select(0, all_blocks).to(dtype=torch.float32)
+        next_gaps = self.env.variant_next_gap_tensor.index_select(0, all_blocks).to(dtype=torch.float32)
+        abs_pos = positions / seq_len
+        rel_pos = (
+            positions - interval_starts.index_select(0, all_lineage_ids)
+        ) / interval_widths.index_select(0, all_lineage_ids).clamp_min(1.0)
+        carried = torch.ones_like(abs_pos)
+        packed_features = torch.cat(
+            [
+                all_partials,
+                abs_pos[:, None],
+                rel_pos[:, None],
+                (prev_gaps / seq_len)[:, None],
+                (next_gaps / seq_len)[:, None],
+                carried[:, None],
+            ],
+            dim=1,
+        )
+
+        token_features[all_lineage_ids, all_token_positions] = packed_features
+        token_mask[all_lineage_ids, all_token_positions] = True
+        return token_features, token_mask, lineage_features
+
     def _sparse_lineage_features(self, lineage, max_tokens):
         partials = self._lineage_partials_tensor(lineage)
         token_features = partials.new_zeros(max_tokens, SparseLineageEncoder.TOKEN_FEATURE_DIM)
         token_mask = torch.zeros(max_tokens, dtype=torch.bool, device=partials.device)
 
-        blocks = self.env._lineage_block_indices(lineage.material_segments)
-        count = int(blocks.size)
+        block_index = lineage.block_indices_tensor(self.device)
+        count = int(block_index.numel())
         if count > 0:
-            block_index = torch.as_tensor(blocks, dtype=torch.long, device=self.device)
             positions = self.env.variant_position_tensor.index_select(0, block_index).to(dtype=torch.float32)
             prev_gaps = self.env.variant_prev_gap_tensor.index_select(0, block_index).to(dtype=torch.float32)
             next_gaps = self.env.variant_next_gap_tensor.index_select(0, block_index).to(dtype=torch.float32)
