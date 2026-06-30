@@ -3,16 +3,16 @@ output_path: runs/vcf_sparse_25kb_real
 device: auto
 
 training:
-  epochs: 300
-  batch_size: 4
+  epochs: 3000
+  batch_size: 64
   seed: 7
-  init_z_sample_count: 16
+  init_z_sample_count: 0
   verbose: false
   wandb: true
 
   policy_lr: 0.0001
   log_z_lr: 0.001
-  loss: tb
+  loss: fl_subtb
   subtb_lambda: 0.9
   grad_clip: 10.0
   grad_accum_steps: 1
