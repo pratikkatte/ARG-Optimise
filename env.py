@@ -446,6 +446,8 @@ class ARGState:
     max_node_idx: int
     log_reward: Optional[float] = None
     accumulated_log_prior: float = 0.0
+    partial_log_reward: float = 0.0
+    terminal_partial_correction: float = 0.0
     is_done: bool = False
     action_options: Tuple[List[Dict[str, Any]], List[Tuple[int, int, List[int]]], List[Dict[str, Any]]] = None
     rates: Optional[Dict[str, float]] = None
@@ -465,6 +467,8 @@ class ARGState:
             max_node_idx=self.max_node_idx,
             log_reward=self.log_reward,
             accumulated_log_prior=self.accumulated_log_prior,
+            partial_log_reward=self.partial_log_reward,
+            terminal_partial_correction=self.terminal_partial_correction,
             is_done=self.is_done,
             total_active_blocks=self.total_active_blocks,
             current_time=float(self.current_time),
@@ -804,6 +808,8 @@ class SimpleARGEnvironment:
             max_node_idx=self.num_sequences - 1,
             log_reward=None,
             accumulated_log_prior=0.0,
+            partial_log_reward=0.0,
+            terminal_partial_correction=0.0,
             is_done=False,
             total_active_blocks=self.num_sequences * self.num_blocks,
             current_time=0.0,
@@ -812,6 +818,8 @@ class SimpleARGEnvironment:
         if state.is_done:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
             state.log_reward = self.compute_terminal_log_reward(state, log_likelihood)
+            state.terminal_partial_correction = float(state.log_reward - state.partial_log_reward)
+            state.partial_log_reward = float(state.log_reward)
         return state
 
     def _initial_lineage_partials(self, node_id, material_segments):
@@ -878,6 +886,27 @@ class SimpleARGEnvironment:
         partials = self._require_lineage_partials(lineage)
         return self.evolution_model.transition_partials(partials, edge_time)
 
+    def normalize_partials_with_log_scale(self, partials, carried_rows=None):
+        row_sums = partials.sum(dim=-1, keepdim=True)
+        normalized = torch.where(
+            row_sums > 0,
+            partials / row_sums.clamp_min(1e-12),
+            torch.zeros_like(partials),
+        )
+        if carried_rows is None:
+            carried = (row_sums.squeeze(-1) > 0)
+        else:
+            carried = torch.as_tensor(
+                carried_rows,
+                dtype=torch.bool,
+                device=partials.device,
+            )
+        valid = carried & (row_sums.squeeze(-1) > 0)
+        if not bool(valid.any().detach().cpu().item()):
+            return normalized, 0.0
+        log_scale = torch.log(row_sums.squeeze(-1)[valid]).sum()
+        return normalized, float(log_scale.detach().cpu().item())
+
     def _coalesced_parent_partials(self, child_i, child_j, parent_segments, parent_time):
         if self.is_vcf_mode:
             return self._coalesced_parent_partials_sparse(
@@ -911,7 +940,14 @@ class SimpleARGEnvironment:
 
         combined = torch.where(has_material, combined, torch.zeros_like(combined))
         combined = self.evolution_model.mask_partials(combined, parent_segments)
-        return self.evolution_model.normalize_partials(combined)
+        carried_rows = has_material.squeeze(-1) & (
+            self.evolution_model.material_site_weights(
+                parent_segments,
+                device=combined.device,
+                dtype=combined.dtype,
+            ) > 0
+        )
+        return self.normalize_partials_with_log_scale(combined, carried_rows)
 
     def _recombined_parent_partials(self, child, parent_segments, parent_time):
         transitioned = self._transition_lineage_partials(child, parent_time)
@@ -958,7 +994,7 @@ class SimpleARGEnvironment:
             has_material[parent_positions] = True
 
         combined = torch.where(has_material[:, None], combined, torch.zeros_like(combined))
-        return self.evolution_model.normalize_partials(combined)
+        return self.normalize_partials_with_log_scale(combined, has_material)
 
     def get_active_counts(self, state):
         if not state.active_lineages:
@@ -1168,15 +1204,22 @@ class SimpleARGEnvironment:
             # bool(np.all(self.get_active_counts(state) == 1)) ## another way, realtime compute. 
             return result
 
-    def _finalize_transition_state(self, next_state, log_prior):
+    def _finalize_transition_state(self, next_state, log_prior, partial_log_likelihood_increment=0.0):
         if log_prior is not None:
             next_state.accumulated_log_prior += log_prior
+            next_state.partial_log_reward += log_prior
+        next_state.partial_log_reward += float(partial_log_likelihood_increment)
         next_state.is_done = self.is_terminal(next_state)
         if next_state.is_done:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
             next_state.log_reward = self.compute_terminal_log_reward(next_state, log_likelihood)
+            next_state.terminal_partial_correction = float(
+                next_state.log_reward - next_state.partial_log_reward
+            )
+            next_state.partial_log_reward = float(next_state.log_reward)
         else:
             next_state.log_reward = None
+            next_state.terminal_partial_correction = 0.0
         return next_state
 
     def apply_coalescence(self, state, action, log_prior=None):
@@ -1199,7 +1242,7 @@ class SimpleARGEnvironment:
         delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
         parent_time = float(state.current_time) + delta_t
         next_state.current_time = parent_time
-        parent_partials = self._coalesced_parent_partials(
+        parent_partials, partial_log_likelihood_increment = self._coalesced_parent_partials(
             child_i,
             child_j,
             parent_segments,
@@ -1235,7 +1278,11 @@ class SimpleARGEnvironment:
         next_state.max_node_idx = parent.node_id
         if next_state.total_active_blocks is not None:
             next_state.total_active_blocks = int(next_state.total_active_blocks) - overlap_count
-        return self._finalize_transition_state(next_state, log_prior)
+        return self._finalize_transition_state(
+            next_state,
+            log_prior,
+            partial_log_likelihood_increment=partial_log_likelihood_increment,
+        )
 
     def apply_recombination(self, state, action, log_prior=None):
         rates = state.rates
@@ -1297,7 +1344,11 @@ class SimpleARGEnvironment:
         ]
         next_state.active_lineages.extend([left_parent, right_parent])
         next_state.max_node_idx = right_parent.node_id
-        return self._finalize_transition_state(next_state, log_prior)
+        return self._finalize_transition_state(
+            next_state,
+            log_prior,
+            partial_log_likelihood_increment=0.0,
+        )
 
     def apply_action(self, state, action, log_prior=None):
         

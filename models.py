@@ -264,6 +264,12 @@ class ARGModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
+        self.flow_head = nn.Sequential(
+            nn.Linear(embedding_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1),
+        )
         if self.input_mode == "vcf":
             self.breakpoint_scorer = VCFBreakpointScorer(
                 env,
@@ -298,6 +304,9 @@ class ARGModel(nn.Module):
 
     def model_params(self):
         return list(self.parameters())
+
+    def compute_log_state_flows(self, summary_reps):
+        return self.flow_head(summary_reps).squeeze(-1)
 
     def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
         batch_size, active_lineages, seq_len, channels = lineage_seq_features.shape

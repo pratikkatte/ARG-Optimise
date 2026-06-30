@@ -21,6 +21,7 @@ class RolloutWorker:
         
         states = [self.env.get_initial_state() for _ in range(episodes)]
         trajectories = [SimpleTrajectory() for _ in states]
+        trajectory_states = [[state] for state in states]
         
         
         log_paths_pf_by_traj = [[] for _ in range(episodes)]
@@ -58,6 +59,7 @@ class RolloutWorker:
                     log_prior=log_prior,
                 )
                 states[traj_idx] = next_state
+                trajectory_states[traj_idx].append(next_state)
                 trajectories[traj_idx].update(
                     action,
                     log_prior=log_prior,
@@ -79,12 +81,19 @@ class RolloutWorker:
         log_paths_pb = self._pad_log_path_vectors(log_paths_pb, torch.float32, self.device)
 
         log_rewards = torch.tensor([state.log_reward for state in states], dtype=torch.float32, device=self.device)
+        trajectory_lengths = torch.tensor(
+            [len(path) - 1 for path in trajectory_states],
+            dtype=torch.long,
+            device=self.device,
+        )
 
 
         data = {
             "log_paths_pf": log_paths_pf,
             "log_paths_pb": log_paths_pb,
             "log_rewards": log_rewards,
+            "trajectory_states": trajectory_states,
+            "trajectory_lengths": trajectory_lengths,
         }
         if return_states:
             data["states"] = states

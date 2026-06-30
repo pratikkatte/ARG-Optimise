@@ -30,6 +30,8 @@ DEFAULT_GRAD_CLIP = 10.0
 DEFAULT_GRAD_ACCUM_STEPS = 1
 DEFAULT_EVAL_EPISODES = 8
 DEFAULT_EVAL_EVERY = 10
+DEFAULT_LOSS = "tb"
+DEFAULT_SUBTB_LAMBDA = 0.9
 DEFAULT_EMBEDDING_SIZE = 32
 DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_DROPOUT = 0.0
@@ -62,6 +64,8 @@ DEFAULT_CONFIG = {
         "wandb": True,
         "policy_lr": DEFAULT_POLICY_LR,
         "log_z_lr": DEFAULT_LOG_Z_LR,
+        "loss": DEFAULT_LOSS,
+        "subtb_lambda": DEFAULT_SUBTB_LAMBDA,
         "grad_clip": DEFAULT_GRAD_CLIP,
         "grad_accum_steps": DEFAULT_GRAD_ACCUM_STEPS,
         "eval_episodes": DEFAULT_EVAL_EPISODES,
@@ -104,6 +108,8 @@ CLI_CONFIG_PATHS = {
     "wandb": ("training", "wandb"),
     "policy_lr": ("training", "policy_lr"),
     "log_z_lr": ("training", "log_z_lr"),
+    "loss": ("training", "loss"),
+    "subtb_lambda": ("training", "subtb_lambda"),
     "grad_clip": ("training", "grad_clip"),
     "grad_accum_steps": ("training", "grad_accum_steps"),
     "eval_episodes": ("training", "eval_episodes"),
@@ -189,6 +195,13 @@ def validate_train_config(config):
             + ", ".join(missing)
             + ". Provide them in YAML or via CLI flags."
         )
+    training = config.get("training", {})
+    loss = str(training.get("loss", DEFAULT_LOSS)).lower()
+    if loss not in {"tb", "subtb", "fl_subtb"}:
+        raise ValueError("training.loss must be one of 'tb', 'subtb', or 'fl_subtb'")
+    subtb_lambda = float(training.get("subtb_lambda", DEFAULT_SUBTB_LAMBDA))
+    if subtb_lambda <= 0.0:
+        raise ValueError("training.subtb_lambda must be positive")
 
 
 def config_to_train_kwargs(config):
@@ -214,6 +227,8 @@ def config_to_train_kwargs(config):
         "recombination_rate": environment["recombination_rate"],
         "policy_lr": training["policy_lr"],
         "log_z_lr": training["log_z_lr"],
+        "loss_mode": str(training["loss"]).lower(),
+        "subtb_lambda": training["subtb_lambda"],
         "grad_clip": training["grad_clip"],
         "grad_accum_steps": training["grad_accum_steps"],
         "eval_episodes": training["eval_episodes"],
@@ -287,11 +302,57 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             log_pf = outputs["log_paths_pf"].sum(-1)
             log_pb = outputs["log_paths_pb"].sum(-1)
             log_rewards = outputs["log_rewards"]
-            residuals = generator.compute_log_Z().detach().to(log_pf) + log_pf - (
-                log_rewards + log_pb
-            )
             initial_state = env.get_initial_state()
             initial_event_probs = env.compute_event_probabilities(initial_state)
+            if generator.loss_mode == "fl_subtb":
+                corrections = torch.tensor(
+                    [
+                        float(getattr(path[-1], "terminal_partial_correction", 0.0))
+                        for path in outputs["trajectory_states"]
+                    ],
+                    dtype=log_pf.dtype,
+                    device=log_pf.device,
+                )
+                loss_metrics = {
+                    "eval_fl_subtb_mse": float(
+                        generator.compute_subtb_loss_from_rollout_outputs(outputs)
+                        .detach()
+                        .cpu()
+                        .item()
+                    ),
+                    "eval_log_f0": float(
+                        generator.compute_root_log_flow().detach().cpu().item()
+                    ),
+                    "eval_terminal_partial_correction_mean": float(
+                        corrections.mean().detach().cpu().item()
+                    ),
+                    "eval_terminal_partial_correction_abs_mean": float(
+                        corrections.abs().mean().detach().cpu().item()
+                    ),
+                }
+            elif generator.loss_mode == "subtb":
+                loss_metrics = {
+                    "eval_subtb_mse": float(
+                        generator.compute_subtb_loss_from_rollout_outputs(outputs)
+                        .detach()
+                        .cpu()
+                        .item()
+                    ),
+                    "eval_log_f0": float(
+                        generator.compute_root_log_flow().detach().cpu().item()
+                    ),
+                }
+            else:
+                residuals = generator.compute_log_Z().detach().to(log_pf) + log_pf - (
+                    log_rewards + log_pb
+                )
+                loss_metrics = {
+                    "eval_tb_mse": float(residuals.pow(2).mean().detach().cpu().item()),
+                    "eval_residual_mean": float(residuals.mean().detach().cpu().item()),
+                    "eval_residual_std": float(
+                        residuals.std(unbiased=False).detach().cpu().item()
+                    ),
+                }
 
         lengths = torch.tensor([len(traj) for traj in trajectories], dtype=torch.float32)
         coal_counts = torch.tensor(
@@ -317,11 +378,7 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             dtype=torch.float32,
         )
         return {
-            "eval_tb_mse": float(residuals.pow(2).mean().detach().cpu().item()),
-            "eval_residual_mean": float(residuals.mean().detach().cpu().item()),
-            "eval_residual_std": float(
-                residuals.std(unbiased=False).detach().cpu().item()
-            ),
+            **loss_metrics,
             "eval_log_pf_mean": float(log_pf.mean().detach().cpu().item()),
             "eval_log_pb_mean": float(log_pb.mean().detach().cpu().item()),
             "eval_log_reward_mean": float(log_rewards.mean().detach().cpu().item()),
@@ -355,6 +412,8 @@ def train(
     recombination_rate=DEFAULT_R_PER_BP,
     policy_lr=DEFAULT_POLICY_LR,
     log_z_lr=DEFAULT_LOG_Z_LR,
+    loss_mode=DEFAULT_LOSS,
+    subtb_lambda=DEFAULT_SUBTB_LAMBDA,
     grad_clip=DEFAULT_GRAD_CLIP,
     grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
     eval_episodes=DEFAULT_EVAL_EPISODES,
@@ -376,6 +435,7 @@ def train(
 ):
     seed_everything(seed)
     device = torch.device(device)
+    loss_mode = str(loss_mode).lower()
 
     variant_data = None
     if is_vcf_path(dataset_path):
@@ -432,6 +492,8 @@ def train(
         log_z_lr=log_z_lr,
         grad_clip=grad_clip,
         model_kwargs=model_kwargs,
+        loss_mode=loss_mode,
+        subtb_lambda=subtb_lambda,
     )
     print(f"Generator device: {generator.device}")
 
@@ -459,6 +521,8 @@ def train(
             "recombination_rate": float(recombination_rate),
             "policy_lr": float(policy_lr),
             "log_z_lr": float(log_z_lr),
+            "loss": loss_mode,
+            "subtb_lambda": float(subtb_lambda),
             "grad_clip": float(grad_clip),
             "grad_accum_steps": int(grad_accum_steps),
             "eval_episodes": int(eval_episodes),
@@ -477,13 +541,19 @@ def train(
                 batch_size=batch_size,
                 grad_accum_steps=grad_accum_steps,
             )
-            log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
+            if generator.loss_mode in {"subtb", "fl_subtb"}:
+                with torch.no_grad():
+                    log_z = generator.compute_root_log_flow().detach().cpu().reshape(-1)[0].item()
+            else:
+                log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
             if info is None:
                 continue
 
             info = dict(info)
             info["epoch"] = epoch
             info["log_z"] = log_z
+            if generator.loss_mode in {"subtb", "fl_subtb"}:
+                info["log_f0"] = log_z
             should_eval = int(eval_episodes) > 0 and (
                 epoch == 0
                 or int(eval_every) <= 1
@@ -526,6 +596,8 @@ def train(
                     recombination_rate=recombination_rate,
                     policy_lr=policy_lr,
                     log_z_lr=log_z_lr,
+                    loss_mode=loss_mode,
+                    subtb_lambda=subtb_lambda,
                     grad_clip=grad_clip,
                     grad_accum_steps=grad_accum_steps,
                     eval_episodes=eval_episodes,
@@ -544,7 +616,12 @@ def train(
                     f" eval_tb_mse={info['eval_tb_mse']:.4f}"
                     f" eval_residual_mean={info['eval_residual_mean']:.4f}"
                 )
-            print(f"Epoch {epoch + 1} loss={loss:.4f} logZ={log_z:.4f}{eval_text}")
+            elif "eval_subtb_mse" in info:
+                eval_text = f" eval_subtb_mse={info['eval_subtb_mse']:.4f}"
+            elif "eval_fl_subtb_mse" in info:
+                eval_text = f" eval_fl_subtb_mse={info['eval_fl_subtb_mse']:.4f}"
+            log_label = "logF0" if generator.loss_mode in {"subtb", "fl_subtb"} else "logZ"
+            print(f"Epoch {epoch + 1} loss={loss:.4f} {log_label}={log_z:.4f}{eval_text}")
 
         with open(os.path.join(output_path, "training_history.pkl"), "wb") as handle:
             pickle.dump(history, handle)
@@ -572,6 +649,8 @@ def build_checkpoint_metadata(
     recombination_rate,
     policy_lr,
     log_z_lr,
+    loss_mode,
+    subtb_lambda,
     grad_clip,
     grad_accum_steps,
     eval_episodes,
@@ -609,6 +688,8 @@ def build_checkpoint_metadata(
         "recombination_rate": float(recombination_rate),
         "policy_lr": float(policy_lr),
         "log_z_lr": float(log_z_lr),
+        "loss": str(loss_mode),
+        "subtb_lambda": float(subtb_lambda),
         "grad_clip": float(grad_clip),
         "grad_accum_steps": int(grad_accum_steps),
         "eval_episodes": int(eval_episodes),
@@ -654,6 +735,8 @@ def main():
     parser.add_argument("--recombination-rate", type=float)
     parser.add_argument("--policy-lr", type=float)
     parser.add_argument("--log-z-lr", type=float)
+    parser.add_argument("--loss", choices=["tb", "subtb", "fl_subtb"])
+    parser.add_argument("--subtb-lambda", type=float)
     parser.add_argument("--grad-clip", type=float)
     parser.add_argument(
         "--grad-accum-steps",

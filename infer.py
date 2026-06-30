@@ -9,7 +9,9 @@ from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from time_env import DEFAULT_TIME_BIN_SCHEME
 from train import (
+    DEFAULT_LOSS,
     DEFAULT_LOG_Z_LR,
+    DEFAULT_SUBTB_LAMBDA,
     MODEL_VERSION,
     DEFAULT_MU_PER_BP,
     DEFAULT_NE,
@@ -82,6 +84,8 @@ def run_inference(
         log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
         model_kwargs=dict(metadata.get("model", {})),
         initialize_z_from_prior=False,
+        loss_mode=str(metadata.get("loss", DEFAULT_LOSS)),
+        subtb_lambda=float(metadata.get("subtb_lambda", DEFAULT_SUBTB_LAMBDA)),
     )
     generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
     generator.eval()

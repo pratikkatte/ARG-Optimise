@@ -10,13 +10,15 @@ training:
   verbose: false
   wandb: true
 
-  policy_lr: 0.0003
+  policy_lr: 0.0001
   log_z_lr: 0.001
+  loss: tb
+  subtb_lambda: 0.9
   grad_clip: 10.0
   grad_accum_steps: 1
 
-  eval_episodes: 16
-  eval_every: 10
+  eval_episodes: 32
+  eval_every: 20
 
 environment:
   bp_per_blocks: 1

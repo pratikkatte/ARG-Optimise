@@ -12,6 +12,7 @@ LOSS_FN = {
     'MSE': torch.nn.MSELoss(),
     'HUBER': torch.nn.HuberLoss(delta=1.0),
 }
+LOSS_MODES = {"tb", "subtb", "fl_subtb"}
 
 class TBGFlowNetGenerator(torch.nn.Module):
     def __init__(
@@ -28,6 +29,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         policy_lr=None,
         log_z_lr=None,
         initialize_z_from_prior=True,
+        loss_mode="tb",
+        subtb_lambda=0.9,
     ):
         super().__init__()
         print(f"verbose: {verbose}")
@@ -58,7 +61,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
                     attr,
                     torch.nn.Parameter(value.detach().to(self.device), requires_grad=False),
                 )
-        self.init_z_sample_count = init_z_sample_count
+        self.init_z_sample_count = int(init_z_sample_count)
 
         ## Policy model
         if policy_lr is not None:
@@ -67,6 +70,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
             z_lr = log_z_lr
         self.arg_model_lr = float(arg_model_lr)
         self.z_lr = float(z_lr)
+        self.loss_mode = str(loss_mode).lower()
+        if self.loss_mode not in LOSS_MODES:
+            raise ValueError(f"loss_mode must be one of {sorted(LOSS_MODES)}, got {loss_mode!r}")
+        self.subtb_lambda = float(subtb_lambda)
+        if self.subtb_lambda <= 0.0:
+            raise ValueError(f"subtb_lambda must be positive, got {subtb_lambda!r}")
         self.model_kwargs = dict(model_kwargs or {})
         self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
         self.time_model = self.arg_model.time_scorer
@@ -74,7 +83,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         ## Z partition
         self.max_reward_seen = float("-inf")
-        if initialize_z_from_prior:
+        if initialize_z_from_prior and self.init_z_sample_count > 0:
             log_rewards = env.sample_log_rewards(self.init_z_sample_count, verbose=verbose)
             self.max_reward_seen = float(np.max(log_rewards))
             init_Z = self.max_reward_seen
@@ -89,7 +98,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.policy_params = self.arg_model_params
 
         params = [{'params': self.arg_model_params, 'lr': self.arg_model_lr}]
-        params.append({'params': [self._Z], 'lr': self.z_lr})
+        if self.loss_mode == "tb":
+            params.append({'params': [self._Z], 'lr': self.z_lr})
 
         # gradient clipping exclude the Z part
         self.gradient_clipping_params = list(self.arg_model.parameters())
@@ -148,7 +158,21 @@ class TBGFlowNetGenerator(torch.nn.Module):
             else self._torch_load(path, map_location=map_location)
         )
         state_dict = checkpoint.get("generator_state_dict", checkpoint)
-        self.load_state_dict(state_dict)
+        load_result = self.load_state_dict(state_dict, strict=False)
+        allowed_missing = [
+            key for key in load_result.missing_keys
+            if key.startswith("arg_model.flow_head.")
+        ]
+        unexpected = list(load_result.unexpected_keys)
+        non_flow_missing = [
+            key for key in load_result.missing_keys
+            if key not in allowed_missing
+        ]
+        if non_flow_missing or unexpected:
+            raise RuntimeError(
+                "Checkpoint state_dict is incompatible with this generator: "
+                f"missing={non_flow_missing}, unexpected={unexpected}"
+            )
         self.to(self.device)
         self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
 
@@ -201,6 +225,44 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
     def compute_log_Z(self, scale_key=None):
         return self._Z.sum()
+
+    def compute_log_state_flows(self, states):
+        if not states:
+            return torch.empty(0, dtype=self._model_dtype(), device=self.device)
+
+        log_flows = [None] * len(states)
+        nonterminal_states = []
+        nonterminal_indices = []
+        for idx, state in enumerate(states):
+            if state.is_done:
+                if state.log_reward is None:
+                    raise ValueError("Terminal ARGState is missing log_reward")
+                log_flows[idx] = torch.tensor(
+                    float(state.log_reward),
+                    dtype=self._model_dtype(),
+                    device=self.device,
+                )
+            else:
+                nonterminal_indices.append(idx)
+                nonterminal_states.append(state)
+
+        if nonterminal_states:
+            _, summary_reps, _, _ = self._encode_states(nonterminal_states)
+            nonterminal_log_flows = self.arg_model.compute_log_state_flows(summary_reps)
+            for idx, log_flow in zip(nonterminal_indices, nonterminal_log_flows):
+                if self.loss_mode == "fl_subtb":
+                    log_flow = log_flow + log_flow.new_tensor(
+                        float(getattr(states[idx], "partial_log_reward", 0.0))
+                    )
+                log_flows[idx] = log_flow
+
+        return torch.stack(log_flows)
+
+    def compute_root_log_flow(self):
+        return self.compute_log_state_flows([self.env.get_initial_state()])[0]
+
+    def _model_dtype(self):
+        return next(self.arg_model.parameters()).dtype
 
     def forward(self, input_dict):
 
@@ -482,6 +544,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return {lineage.node_id: idx for idx, lineage in enumerate(state.active_lineages)}
 
     def get_loss_from_rollout_outputs(self, rollout_outputs):
+        if self.loss_mode in {"subtb", "fl_subtb"}:
+            return self.compute_subtb_loss_from_rollout_outputs(rollout_outputs)
+        return self.compute_tb_loss_from_rollout_outputs(rollout_outputs)
+
+    def compute_tb_loss_from_rollout_outputs(self, rollout_outputs):
         log_paths_pf = rollout_outputs['log_paths_pf']
         log_paths_pb = rollout_outputs['log_paths_pb']
         log_rewards = torch.as_tensor(
@@ -502,6 +569,81 @@ class TBGFlowNetGenerator(torch.nn.Module):
         loss = self.loss_fn(forward_value, backward_value)
 
         return loss
+
+    def compute_subtb_loss_from_rollout_outputs(self, rollout_outputs):
+        if "trajectory_states" not in rollout_outputs:
+            raise ValueError("SubTB loss requires rollout_outputs['trajectory_states']")
+        if "trajectory_lengths" not in rollout_outputs:
+            raise ValueError("SubTB loss requires rollout_outputs['trajectory_lengths']")
+
+        state_paths = rollout_outputs["trajectory_states"]
+        flat_states = [state for path in state_paths for state in path]
+        flat_log_flows = self.compute_log_state_flows(flat_states)
+
+        log_flows_by_traj = []
+        cursor = 0
+        for path in state_paths:
+            next_cursor = cursor + len(path)
+            log_flows_by_traj.append(flat_log_flows[cursor:next_cursor])
+            cursor = next_cursor
+
+        return self._subtb_loss_from_log_flows(
+            log_flows_by_traj,
+            rollout_outputs["log_paths_pf"],
+            rollout_outputs["log_paths_pb"],
+            rollout_outputs["trajectory_lengths"],
+            self.subtb_lambda,
+        )
+
+    @staticmethod
+    def _subtb_loss_from_log_flows(
+        log_flows_by_traj,
+        log_paths_pf,
+        log_paths_pb,
+        trajectory_lengths,
+        subtb_lambda,
+    ):
+        if torch.is_tensor(trajectory_lengths):
+            lengths = trajectory_lengths.detach().cpu().tolist()
+        else:
+            lengths = list(trajectory_lengths)
+
+        weighted_sum = log_paths_pf.new_tensor(0.0)
+        weight_sum = log_paths_pf.new_tensor(0.0)
+        for traj_idx, length in enumerate(lengths):
+            length = int(length)
+            if length <= 0:
+                continue
+            log_flows = log_flows_by_traj[traj_idx]
+            if int(log_flows.numel()) != length + 1:
+                raise ValueError(
+                    "Each SubTB state path must have exactly trajectory length + 1 "
+                    f"log flows, got {int(log_flows.numel())} for length {length}"
+                )
+
+            zero = log_paths_pf.new_zeros(1)
+            pf_prefix = torch.cat([
+                zero,
+                torch.cumsum(log_paths_pf[traj_idx, :length], dim=0),
+            ])
+            pb_prefix = torch.cat([
+                zero,
+                torch.cumsum(log_paths_pb[traj_idx, :length], dim=0),
+            ])
+
+            for start in range(length):
+                for end in range(start + 1, length + 1):
+                    span = end - start
+                    log_pf = pf_prefix[end] - pf_prefix[start]
+                    log_pb = pb_prefix[end] - pb_prefix[start]
+                    residual = log_flows[start] + log_pf - log_flows[end] - log_pb
+                    weight = log_paths_pf.new_tensor(float(subtb_lambda) ** span)
+                    weighted_sum = weighted_sum + weight * residual.pow(2)
+                    weight_sum = weight_sum + weight
+
+        if float(weight_sum.detach().cpu().item()) == 0.0:
+            return weighted_sum
+        return weighted_sum / weight_sum
         
     
     def accumulate_loss(self, rollout_outputs, factor=1.0):
