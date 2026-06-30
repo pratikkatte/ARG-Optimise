@@ -521,6 +521,7 @@ class SimpleARGEnvironment:
         device: Optional[torch.device] = 'cpu',
         time_bins: Optional[int] = None,
         time_delta_bin_width: Optional[float] = None,
+        reward_C: float = 30000,
     ):
         if sequences is not None and variant_data is not None:
             raise ValueError("Pass either dense sequences or variant_data, not both")
@@ -642,7 +643,7 @@ class SimpleARGEnvironment:
         self.evolution_model = EvolutionModelTorch(self)
 
         ## Reward function 
-        self.reward_fn = ARGReward()
+        self.reward_fn = ARGReward(C=reward_C)
 
     @property
     def time_metadata(self):

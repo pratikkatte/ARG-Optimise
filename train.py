@@ -1,10 +1,12 @@
 import argparse
+import copy
 import os
 import pickle
 import random
 
 import numpy as np
 import torch
+import yaml
 
 try:
     import wandb
@@ -46,12 +48,196 @@ DEFAULT_BREAKPOINT_GAP_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_USE_POSITION_FEATURES = True
 MODEL_VERSION = "cwr-event-sparse-vcf-v1"
 
+
+DEFAULT_CONFIG = {
+    "dataset_path": None,
+    "output_path": None,
+    "device": "auto",
+    "training": {
+        "epochs": None,
+        "batch_size": 10,
+        "seed": 7,
+        "init_z_sample_count": DEFAULT_INIT_Z_SAMPLE_COUNT,
+        "verbose": False,
+        "wandb": True,
+        "policy_lr": DEFAULT_POLICY_LR,
+        "log_z_lr": DEFAULT_LOG_Z_LR,
+        "grad_clip": DEFAULT_GRAD_CLIP,
+        "grad_accum_steps": DEFAULT_GRAD_ACCUM_STEPS,
+        "eval_episodes": DEFAULT_EVAL_EPISODES,
+        "eval_every": DEFAULT_EVAL_EVERY,
+    },
+    "environment": {
+        "bp_per_blocks": 1,
+        "effective_population_size": DEFAULT_NE,
+        "mutation_rate": DEFAULT_MU_PER_BP,
+        "recombination_rate": DEFAULT_R_PER_BP,
+        "time_bins": DEFAULT_TIME_BINS,
+        "time_delta_bin_width": DEFAULT_TIME_DELTA_BIN_WIDTH,
+    },
+    "reward": {
+        "constant": 30000,
+    },
+    "model": {
+        "embedding_size": DEFAULT_EMBEDDING_SIZE,
+        "hidden_size": DEFAULT_HIDDEN_SIZE,
+        "dropout": DEFAULT_DROPOUT,
+        "breakpoint_hidden_dim": DEFAULT_BREAKPOINT_HIDDEN_DIM,
+        "breakpoint_dropout": DEFAULT_BREAKPOINT_DROPOUT,
+        "transformer_depth": DEFAULT_TRANSFORMER_DEPTH,
+        "transformer_heads": DEFAULT_TRANSFORMER_HEADS,
+        "transformer_mlp_ratio": DEFAULT_TRANSFORMER_MLP_RATIO,
+        "attention_dropout": DEFAULT_ATTENTION_DROPOUT,
+    },
+}
+
+
+CLI_CONFIG_PATHS = {
+    "dataset_path": ("dataset_path",),
+    "output_path": ("output_path",),
+    "device": ("device",),
+    "epochs": ("training", "epochs"),
+    "batch_size": ("training", "batch_size"),
+    "seed": ("training", "seed"),
+    "init_z_sample_count": ("training", "init_z_sample_count"),
+    "verbose": ("training", "verbose"),
+    "wandb": ("training", "wandb"),
+    "policy_lr": ("training", "policy_lr"),
+    "log_z_lr": ("training", "log_z_lr"),
+    "grad_clip": ("training", "grad_clip"),
+    "grad_accum_steps": ("training", "grad_accum_steps"),
+    "eval_episodes": ("training", "eval_episodes"),
+    "eval_every": ("training", "eval_every"),
+    "bp_per_blocks": ("environment", "bp_per_blocks"),
+    "effective_population_size": ("environment", "effective_population_size"),
+    "mutation_rate": ("environment", "mutation_rate"),
+    "recombination_rate": ("environment", "recombination_rate"),
+    "time_bins": ("environment", "time_bins"),
+    "time_delta_bin_width": ("environment", "time_delta_bin_width"),
+    "reward_constant": ("reward", "constant"),
+    "embedding_size": ("model", "embedding_size"),
+    "hidden_size": ("model", "hidden_size"),
+    "dropout": ("model", "dropout"),
+    "breakpoint_hidden_dim": ("model", "breakpoint_hidden_dim"),
+    "breakpoint_dropout": ("model", "breakpoint_dropout"),
+    "transformer_depth": ("model", "transformer_depth"),
+    "transformer_heads": ("model", "transformer_heads"),
+    "transformer_mlp_ratio": ("model", "transformer_mlp_ratio"),
+    "attention_dropout": ("model", "attention_dropout"),
+}
+
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def load_train_config(config_path=None):
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    if config_path is None:
+        return config
+    with open(config_path, "r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError("YAML training config must contain a mapping at the top level")
+    return _deep_merge(config, loaded)
+
+
+def _deep_merge(base, override):
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if (
+            key in result
+            and isinstance(result[key], dict)
+            and isinstance(value, dict)
+        ):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def apply_cli_overrides(config, args):
+    merged = copy.deepcopy(config)
+    for arg_name, path in CLI_CONFIG_PATHS.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            _set_nested(merged, path, value)
+    return merged
+
+
+def _set_nested(config, path, value):
+    cursor = config
+    for key in path[:-1]:
+        cursor = cursor.setdefault(key, {})
+    cursor[path[-1]] = value
+
+
+def validate_train_config(config):
+    missing = []
+    if not config.get("dataset_path"):
+        missing.append("dataset_path")
+    if not config.get("output_path"):
+        missing.append("output_path")
+    if config.get("training", {}).get("epochs") is None:
+        missing.append("training.epochs")
+    if missing:
+        raise ValueError(
+            "Missing required training config value(s): "
+            + ", ".join(missing)
+            + ". Provide them in YAML or via CLI flags."
+        )
+
+
+def config_to_train_kwargs(config):
+    training = config["training"]
+    environment = config["environment"]
+    reward = config["reward"]
+    model = config["model"]
+    device = config.get("device", "auto")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    return {
+        "dataset_path": config["dataset_path"],
+        "output_path": config["output_path"],
+        "device": device,
+        "bp_per_blocks": environment["bp_per_blocks"],
+        "batch_size": training["batch_size"],
+        "epochs_num": training["epochs"],
+        "seed": training["seed"],
+        "init_z_sample_count": training["init_z_sample_count"],
+        "use_wandb": training["wandb"],
+        "effective_population_size": environment["effective_population_size"],
+        "mutation_rate": environment["mutation_rate"],
+        "recombination_rate": environment["recombination_rate"],
+        "policy_lr": training["policy_lr"],
+        "log_z_lr": training["log_z_lr"],
+        "grad_clip": training["grad_clip"],
+        "grad_accum_steps": training["grad_accum_steps"],
+        "eval_episodes": training["eval_episodes"],
+        "eval_every": training["eval_every"],
+        "time_bins": environment["time_bins"],
+        "time_delta_bin_width": environment["time_delta_bin_width"],
+        "reward_C": reward["constant"],
+        "embedding_size": model["embedding_size"],
+        "hidden_size": model["hidden_size"],
+        "dropout": model["dropout"],
+        "breakpoint_hidden_dim": model["breakpoint_hidden_dim"],
+        "breakpoint_dropout": model["breakpoint_dropout"],
+        "transformer_depth": model["transformer_depth"],
+        "transformer_heads": model["transformer_heads"],
+        "transformer_mlp_ratio": model["transformer_mlp_ratio"],
+        "attention_dropout": model["attention_dropout"],
+        "verbose": training["verbose"],
+    }
+
+
+def save_resolved_config(config, output_path):
+    os.makedirs(output_path, exist_ok=True)
+    with open(os.path.join(output_path, "config.yaml"), "w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
 
 def train_epoch(
     epoch_id,
@@ -175,6 +361,7 @@ def train(
     eval_every=DEFAULT_EVAL_EVERY,
     time_bins=DEFAULT_TIME_BINS,
     time_delta_bin_width=DEFAULT_TIME_DELTA_BIN_WIDTH,
+    reward_C=30000,
     embedding_size=DEFAULT_EMBEDDING_SIZE,
     hidden_size=DEFAULT_HIDDEN_SIZE,
     dropout=DEFAULT_DROPOUT,
@@ -215,6 +402,7 @@ def train(
         mutation_rate=mutation_rate,
         time_bins=time_bins,
         time_delta_bin_width=time_delta_bin_width,
+        reward_C=reward_C,
     )
     model_kwargs = {
         "embedding_size": int(embedding_size),
@@ -331,6 +519,7 @@ def train(
                     sequence_length=sequence_length,
                     bp_per_blocks=bp_per_blocks,
                     time_metadata=env.time_metadata,
+                    reward_C=reward_C,
                     rho=env.rho,
                     effective_population_size=effective_population_size,
                     mutation_rate=mutation_rate,
@@ -376,6 +565,7 @@ def build_checkpoint_metadata(
     sequence_length,
     bp_per_blocks,
     time_metadata,
+    reward_C,
     rho,
     effective_population_size,
     mutation_rate,
@@ -413,6 +603,7 @@ def build_checkpoint_metadata(
         "rho": float(rho),
         "time": dict(time_metadata),
         **dict(time_metadata),
+        "reward_C": float(reward_C),
         "effective_population_size": float(effective_population_size),
         "mutation_rate": float(mutation_rate),
         "recombination_rate": float(recombination_rate),
@@ -444,84 +635,57 @@ def build_checkpoint_metadata(
 
 def main():
     parser = argparse.ArgumentParser(description="Train the simplified ARG GFlowNet demo.")
-    parser.add_argument("--output-path", required=True)
-    parser.add_argument("--dataset-path",required=True)
-    parser.add_argument("--epochs", type=int, required=True)
-    parser.add_argument("--batch-size", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--config", "-c", help="Path to YAML training config.")
+    parser.add_argument("--output-path")
+    parser.add_argument("--dataset-path")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--bp-per-blocks",
         type=int,
-        default=1,
         help="Number of bp per block",
     )
-    parser.add_argument("--init-z-sample-count", type=int, default=DEFAULT_INIT_Z_SAMPLE_COUNT)
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--effective-population-size", type=float, default=DEFAULT_NE)
-    parser.add_argument("--mutation-rate", type=float, default=DEFAULT_MU_PER_BP)
-    parser.add_argument("--recombination-rate", type=float, default=DEFAULT_R_PER_BP)
-    parser.add_argument("--policy-lr", type=float, default=DEFAULT_POLICY_LR)
-    parser.add_argument("--log-z-lr", type=float, default=DEFAULT_LOG_Z_LR)
-    parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP)
+    parser.add_argument("--init-z-sample-count", type=int)
+    parser.add_argument("--verbose", action="store_true", default=None)
+    parser.add_argument("--effective-population-size", type=float)
+    parser.add_argument("--mutation-rate", type=float)
+    parser.add_argument("--recombination-rate", type=float)
+    parser.add_argument("--policy-lr", type=float)
+    parser.add_argument("--log-z-lr", type=float)
+    parser.add_argument("--grad-clip", type=float)
     parser.add_argument(
         "--grad-accum-steps",
         type=int,
-        default=DEFAULT_GRAD_ACCUM_STEPS,
         help="Number of gradient accumulation steps",
     )
-    parser.add_argument("--eval-episodes", type=int, default=DEFAULT_EVAL_EPISODES)
-    parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
-    parser.add_argument("--time-bins", type=int, default=DEFAULT_TIME_BINS)
-    parser.add_argument("--time-delta-bin-width", type=float, default=DEFAULT_TIME_DELTA_BIN_WIDTH)
-    parser.add_argument("--embedding-size", type=int, default=DEFAULT_EMBEDDING_SIZE)
-    parser.add_argument("--hidden-size", type=int, default=DEFAULT_HIDDEN_SIZE)
-    parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
-    parser.add_argument("--breakpoint-hidden-dim", type=int, default=DEFAULT_BREAKPOINT_HIDDEN_DIM)
-    parser.add_argument("--breakpoint-dropout", type=float, default=DEFAULT_BREAKPOINT_DROPOUT)
-    parser.add_argument("--transformer-depth", type=int, default=DEFAULT_TRANSFORMER_DEPTH)
-    parser.add_argument("--transformer-heads", type=int, default=DEFAULT_TRANSFORMER_HEADS)
-    parser.add_argument("--transformer-mlp-ratio", type=float, default=DEFAULT_TRANSFORMER_MLP_RATIO)
-    parser.add_argument("--attention-dropout", type=float, default=DEFAULT_ATTENTION_DROPOUT)
-    parser.add_argument("--wandb", dest="wandb", action="store_true", default=True)
+    parser.add_argument("--eval-episodes", type=int)
+    parser.add_argument("--eval-every", type=int)
+    parser.add_argument("--time-bins", type=int)
+    parser.add_argument("--time-delta-bin-width", type=float)
+    parser.add_argument("--reward-constant", type=float)
+    parser.add_argument("--embedding-size", type=int)
+    parser.add_argument("--hidden-size", type=int)
+    parser.add_argument("--dropout", type=float)
+    parser.add_argument("--breakpoint-hidden-dim", type=int)
+    parser.add_argument("--breakpoint-dropout", type=float)
+    parser.add_argument("--transformer-depth", type=int)
+    parser.add_argument("--transformer-heads", type=int)
+    parser.add_argument("--transformer-mlp-ratio", type=float)
+    parser.add_argument("--attention-dropout", type=float)
+    parser.add_argument("--wandb", dest="wandb", action="store_true", default=None)
     parser.add_argument("--no-wandb", dest="wandb", action="store_false")
     args = parser.parse_args()
 
-    selected_device = "cuda" if torch.cuda.is_available() else "cpu"
-                
-    print(f"Selected devicesss: {selected_device}")
+    config = load_train_config(args.config)
+    config = apply_cli_overrides(config, args)
+    validate_train_config(config)
+    save_resolved_config(config, config["output_path"])
+    train_kwargs = config_to_train_kwargs(config)
 
-    train(
-        dataset_path=args.dataset_path,
-        output_path=args.output_path,
-        batch_size=args.batch_size,
-        epochs_num=args.epochs,
-        bp_per_blocks=args.bp_per_blocks,
-        init_z_sample_count=args.init_z_sample_count,
-        verbose=args.verbose,
-        seed=args.seed,
-        device=selected_device,
-        use_wandb=args.wandb,
-        effective_population_size=args.effective_population_size,
-        mutation_rate=args.mutation_rate,
-        recombination_rate=args.recombination_rate,
-        policy_lr=args.policy_lr,
-        log_z_lr=args.log_z_lr,
-        grad_clip=args.grad_clip,
-        grad_accum_steps=args.grad_accum_steps,
-        eval_episodes=args.eval_episodes,
-        eval_every=args.eval_every,
-        time_bins=args.time_bins,
-        time_delta_bin_width=args.time_delta_bin_width,
-        embedding_size=args.embedding_size,
-        hidden_size=args.hidden_size,
-        dropout=args.dropout,
-        breakpoint_hidden_dim=args.breakpoint_hidden_dim,
-        breakpoint_dropout=args.breakpoint_dropout,
-        transformer_depth=args.transformer_depth,
-        transformer_heads=args.transformer_heads,
-        transformer_mlp_ratio=args.transformer_mlp_ratio,
-        attention_dropout=args.attention_dropout,
-    )
+    print(f"Selected device: {train_kwargs['device']}")
+    train(**train_kwargs)
 
 
 if __name__ == "__main__":

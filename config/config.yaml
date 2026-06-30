@@ -1,0 +1,43 @@
+dataset_path: validation/vcf/sim_l25kb_0.vcf
+output_path: runs/vcf_sparse_25kb_real
+device: auto
+
+training:
+  epochs: 300
+  batch_size: 4
+  seed: 7
+  init_z_sample_count: 16
+  verbose: false
+  wandb: true
+
+  policy_lr: 0.0003
+  log_z_lr: 0.001
+  grad_clip: 10.0
+  grad_accum_steps: 1
+
+  eval_episodes: 16
+  eval_every: 10
+
+environment:
+  bp_per_blocks: 1
+  effective_population_size: 10000
+  mutation_rate: 2.0e-8
+  recombination_rate: 2.0e-8
+  time_bins: 32
+  time_delta_bin_width: 0.001
+
+reward:
+  constant: 0
+
+model:
+  embedding_size: 64
+  hidden_size: 128
+  dropout: 0.05
+
+  breakpoint_hidden_dim: 128
+  breakpoint_dropout: 0.05
+
+  transformer_depth: 4
+  transformer_heads: 4
+  transformer_mlp_ratio: 2.0
+  attention_dropout: 0.05

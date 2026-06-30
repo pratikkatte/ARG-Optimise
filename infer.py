@@ -186,6 +186,7 @@ def environment_from_metadata(metadata, seed, device=None, dataset_path=None):
         "mutation_rate": float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
         "sequences": sequences,
         "variant_data": variant_data,
+        "reward_C": float(metadata.get("reward_C", 30000.0)),
         "seed": seed,
     }
     if device is not None:
