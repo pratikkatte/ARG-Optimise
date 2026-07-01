@@ -35,6 +35,8 @@ training:
   loss: fl_subtb
   subtb_lambda: 0.9
   subtb_max_span: 16
+  subtb_state_flow_batch_size: 16
+  rollout_microbatch_size: 4
   grad_clip: 10.0
   grad_accum_steps: 1
 

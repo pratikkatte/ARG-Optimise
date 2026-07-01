@@ -32,6 +32,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         loss_mode="tb",
         subtb_lambda=0.9,
         subtb_max_span=None,
+        subtb_state_flow_batch_size=16,
     ):
         super().__init__()
         print(f"verbose: {verbose}")
@@ -84,6 +85,19 @@ class TBGFlowNetGenerator(torch.nn.Module):
             raise ValueError(
                 f"subtb_max_span must be positive when provided, got {subtb_max_span!r}"
             )
+        self.subtb_state_flow_batch_size = (
+            None
+            if subtb_state_flow_batch_size is None
+            else int(subtb_state_flow_batch_size)
+        )
+        if (
+            self.subtb_state_flow_batch_size is not None
+            and self.subtb_state_flow_batch_size <= 0
+        ):
+            raise ValueError(
+                "subtb_state_flow_batch_size must be positive when provided, "
+                f"got {subtb_state_flow_batch_size!r}"
+            )
         self.model_kwargs = dict(model_kwargs or {})
         self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
         self.time_model = self.arg_model.time_scorer
@@ -129,7 +143,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.param_norm = lambda model: math.sqrt(sum([p.norm().item() ** 2 for p in self.gradient_clipping_params]))
 
         # scaler for AMP
-        self.scaler = torch.cuda.amp.GradScaler()
+        if torch.cuda.is_available():
+            self.scaler = torch.amp.GradScaler("cuda")
+        else:
+            self.scaler = torch.amp.GradScaler("cpu", enabled=False)
 
         self.loss = 0
 
@@ -254,10 +271,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 nonterminal_indices.append(idx)
                 nonterminal_states.append(state)
 
-        if nonterminal_states:
-            _, summary_reps, _, _ = self._encode_states(nonterminal_states)
+        state_flow_batch_size = self.subtb_state_flow_batch_size or len(nonterminal_states)
+        for start in range(0, len(nonterminal_states), state_flow_batch_size):
+            end = min(start + state_flow_batch_size, len(nonterminal_states))
+            state_chunk = nonterminal_states[start:end]
+            index_chunk = nonterminal_indices[start:end]
+            _, summary_reps, _, _ = self._encode_states(state_chunk)
             nonterminal_log_flows = self.arg_model.compute_log_state_flows(summary_reps)
-            for idx, log_flow in zip(nonterminal_indices, nonterminal_log_flows):
+            for idx, log_flow in zip(index_chunk, nonterminal_log_flows):
                 if self.loss_mode == "fl_subtb":
                     log_flow = log_flow + log_flow.new_tensor(
                         float(getattr(states[idx], "partial_log_reward", 0.0))
@@ -346,7 +367,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
         self.opt.step()
         self.opt.zero_grad()
-        self.loss = 0
+        self.loss = torch.tensor(0.0, device=self.device)
 
         return info
 
@@ -677,4 +698,4 @@ class TBGFlowNetGenerator(torch.nn.Module):
         loss = self.get_loss_from_rollout_outputs(rollout_outputs)
         loss = (loss / factor)
         loss.backward()
-        self.loss += loss 
+        self.loss = self.loss + loss.detach()

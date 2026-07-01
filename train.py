@@ -40,6 +40,9 @@ DEFAULT_EVAL_EVERY = 10
 DEFAULT_LOSS = "tb"
 DEFAULT_SUBTB_LAMBDA = 0.9
 DEFAULT_SUBTB_MAX_SPAN = None
+DEFAULT_SUBTB_STATE_FLOW_BATCH_SIZE = 16
+DEFAULT_ROLLOUT_MICROBATCH_SIZE = None
+DEFAULT_LOCAL_REFINEMENT_ROLLOUT_MICROBATCH_SIZE = 4
 DEFAULT_PARTIAL_SEGMENT_MAX_STEPS = 16
 DEFAULT_TERMINAL_BACKTRACK_LENGTHS = (5, 10, 25)
 DEFAULT_EMBEDDING_SIZE = 32
@@ -87,6 +90,8 @@ DEFAULT_CONFIG = {
         "loss": DEFAULT_LOSS,
         "subtb_lambda": DEFAULT_SUBTB_LAMBDA,
         "subtb_max_span": DEFAULT_SUBTB_MAX_SPAN,
+        "subtb_state_flow_batch_size": DEFAULT_SUBTB_STATE_FLOW_BATCH_SIZE,
+        "rollout_microbatch_size": DEFAULT_ROLLOUT_MICROBATCH_SIZE,
         "grad_clip": DEFAULT_GRAD_CLIP,
         "grad_accum_steps": DEFAULT_GRAD_ACCUM_STEPS,
         "eval_episodes": DEFAULT_EVAL_EPISODES,
@@ -140,6 +145,8 @@ CLI_CONFIG_PATHS = {
     "loss": ("training", "loss"),
     "subtb_lambda": ("training", "subtb_lambda"),
     "subtb_max_span": ("training", "subtb_max_span"),
+    "subtb_state_flow_batch_size": ("training", "subtb_state_flow_batch_size"),
+    "rollout_microbatch_size": ("training", "rollout_microbatch_size"),
     "grad_clip": ("training", "grad_clip"),
     "grad_accum_steps": ("training", "grad_accum_steps"),
     "eval_episodes": ("training", "eval_episodes"),
@@ -280,6 +287,17 @@ def validate_train_config(config):
         training.get("subtb_max_span", DEFAULT_SUBTB_MAX_SPAN),
         "training.subtb_max_span",
     )
+    training["subtb_state_flow_batch_size"] = parse_optional_positive_int(
+        training.get(
+            "subtb_state_flow_batch_size",
+            DEFAULT_SUBTB_STATE_FLOW_BATCH_SIZE,
+        ),
+        "training.subtb_state_flow_batch_size",
+    )
+    training["rollout_microbatch_size"] = parse_optional_positive_int(
+        training.get("rollout_microbatch_size", DEFAULT_ROLLOUT_MICROBATCH_SIZE),
+        "training.rollout_microbatch_size",
+    )
     partial_segment_max_steps = int(
         training.get("partial_segment_max_steps", DEFAULT_PARTIAL_SEGMENT_MAX_STEPS)
     )
@@ -334,6 +352,8 @@ def config_to_train_kwargs(config):
         "loss_mode": str(training["loss"]).lower(),
         "subtb_lambda": training["subtb_lambda"],
         "subtb_max_span": training["subtb_max_span"],
+        "subtb_state_flow_batch_size": training["subtb_state_flow_batch_size"],
+        "rollout_microbatch_size": training["rollout_microbatch_size"],
         "grad_clip": training["grad_clip"],
         "grad_accum_steps": training["grad_accum_steps"],
         "eval_episodes": training["eval_episodes"],
@@ -389,56 +409,120 @@ def train_epoch(
     grad_accum_steps=1,
     start_state_sampler=None,
     rollout_logger=None,
+    rollout_microbatch_size=None,
 ):
     grad_accum_steps = max(int(grad_accum_steps), 1)
+    batch_size = int(batch_size)
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    rollout_microbatch_size = _resolve_rollout_microbatch_size(
+        rollout_microbatch_size,
+        batch_size,
+    )
     rollout_metrics = {}
 
     for accum_idx in range(grad_accum_steps):
-        start_states = None
-        action_filter = None
-        max_steps = None
-        rollout_mode = "terminal"
-        rollout_spec = None
-        if start_state_sampler is not None:
-            rollout_spec = start_state_sampler(batch_size)
-            if isinstance(rollout_spec, dict):
-                start_states = rollout_spec.get("start_states")
-                action_filter = rollout_spec.get("action_filter")
-                max_steps = rollout_spec.get("max_steps")
-                rollout_mode = str(
-                    rollout_spec.get(
-                        "rollout_mode",
-                        "segment" if max_steps is not None else "terminal",
-                    )
+        rollout_spec = _sample_rollout_spec(start_state_sampler, batch_size)
+        rollout_mode = _rollout_mode_from_spec(rollout_spec)
+        max_steps = rollout_spec.get("max_steps")
+        microbatches = list(
+            _iter_rollout_microbatches(rollout_spec, rollout_microbatch_size)
+        )
+        for microbatch_idx, microbatch_spec in enumerate(microbatches):
+            microbatch_size = int(microbatch_spec["episodes"])
+            if rollout_logger is not None:
+                rollout_logger(
+                    epoch_id=epoch_id,
+                    accum_step=accum_idx + 1,
+                    grad_accum_steps=grad_accum_steps,
+                    batch_size=batch_size,
+                    rollout_mode=rollout_mode,
+                    max_steps=max_steps,
+                    rollout_spec=rollout_spec,
+                    microbatch_step=microbatch_idx + 1,
+                    microbatch_count=len(microbatches),
+                    microbatch_size=microbatch_size,
                 )
-            else:
-                start_states, action_filter = rollout_spec
-        if rollout_logger is not None:
-            rollout_logger(
-                epoch_id=epoch_id,
-                accum_step=accum_idx + 1,
-                grad_accum_steps=grad_accum_steps,
-                batch_size=batch_size,
-                rollout_mode=rollout_mode,
-                max_steps=max_steps,
-                rollout_spec=rollout_spec,
+            ret, trajectories = rollout_worker.rollout(
+                generator,
+                episodes=microbatch_size,
+                start_states=microbatch_spec.get("start_states"),
+                action_filter=microbatch_spec.get("action_filter"),
+                max_steps=microbatch_spec.get("max_steps"),
             )
-        ret, trajectories = rollout_worker.rollout(
-            generator,
-            episodes=batch_size,
-            start_states=start_states,
-            action_filter=action_filter,
-            max_steps=max_steps,
-        )
-        _record_rollout_metrics(rollout_metrics, rollout_mode, ret)
-        generator.accumulate_loss(
-            ret,
-            factor=grad_accum_steps,
-        )
+            _record_rollout_metrics(rollout_metrics, rollout_mode, ret)
+            generator.accumulate_loss(
+                ret,
+                factor=(grad_accum_steps * batch_size / microbatch_size),
+            )
 
     info = generator.update_model()
     info.update(_summarize_rollout_metrics(rollout_metrics))
     return info
+
+
+def _resolve_rollout_microbatch_size(rollout_microbatch_size, batch_size):
+    if rollout_microbatch_size is None:
+        return int(batch_size)
+    rollout_microbatch_size = int(rollout_microbatch_size)
+    if rollout_microbatch_size <= 0:
+        raise ValueError("rollout_microbatch_size must be positive when provided")
+    return min(rollout_microbatch_size, int(batch_size))
+
+
+def _sample_rollout_spec(start_state_sampler, batch_size):
+    if start_state_sampler is None:
+        return {
+            "episodes": int(batch_size),
+            "start_states": None,
+            "action_filter": None,
+            "max_steps": None,
+            "rollout_mode": "terminal",
+        }
+    rollout_spec = start_state_sampler(batch_size)
+    if isinstance(rollout_spec, dict):
+        spec = dict(rollout_spec)
+    else:
+        start_states, action_filter = rollout_spec
+        spec = {
+            "start_states": start_states,
+            "action_filter": action_filter,
+        }
+    spec.setdefault("episodes", int(batch_size))
+    spec.setdefault("max_steps", None)
+    spec.setdefault("rollout_mode", _rollout_mode_from_spec(spec))
+    return spec
+
+
+def _rollout_mode_from_spec(rollout_spec):
+    return str(
+        rollout_spec.get(
+            "rollout_mode",
+            "segment" if rollout_spec.get("max_steps") is not None else "terminal",
+        )
+    )
+
+
+def _iter_rollout_microbatches(rollout_spec, rollout_microbatch_size):
+    total_episodes = int(rollout_spec.get("episodes", 0))
+    if total_episodes < 1:
+        raise ValueError("rollout spec episodes must be at least 1")
+    rollout_microbatch_size = _resolve_rollout_microbatch_size(
+        rollout_microbatch_size,
+        total_episodes,
+    )
+    start_states = rollout_spec.get("start_states")
+    if start_states is not None and len(start_states) != total_episodes:
+        raise ValueError(
+            f"start_states length ({len(start_states)}) must match episodes ({total_episodes})"
+        )
+    for start in range(0, total_episodes, rollout_microbatch_size):
+        end = min(start + rollout_microbatch_size, total_episodes)
+        spec = dict(rollout_spec)
+        spec["episodes"] = end - start
+        if start_states is not None:
+            spec["start_states"] = start_states[start:end]
+        yield spec
 
 
 def _record_rollout_metrics(metrics, rollout_mode, rollout_outputs):
@@ -618,6 +702,8 @@ def train(
     loss_mode=DEFAULT_LOSS,
     subtb_lambda=DEFAULT_SUBTB_LAMBDA,
     subtb_max_span=DEFAULT_SUBTB_MAX_SPAN,
+    subtb_state_flow_batch_size=DEFAULT_SUBTB_STATE_FLOW_BATCH_SIZE,
+    rollout_microbatch_size=DEFAULT_ROLLOUT_MICROBATCH_SIZE,
     grad_clip=DEFAULT_GRAD_CLIP,
     grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
     eval_episodes=DEFAULT_EVAL_EPISODES,
@@ -700,6 +786,7 @@ def train(
         loss_mode=loss_mode,
         subtb_lambda=subtb_lambda,
         subtb_max_span=subtb_max_span,
+        subtb_state_flow_batch_size=subtb_state_flow_batch_size,
     )
     print(f"Generator device: {generator.device}")
 
@@ -730,6 +817,8 @@ def train(
             "loss": loss_mode,
             "subtb_lambda": float(subtb_lambda),
             "subtb_max_span": subtb_max_span,
+            "subtb_state_flow_batch_size": subtb_state_flow_batch_size,
+            "rollout_microbatch_size": rollout_microbatch_size,
             "grad_clip": float(grad_clip),
             "grad_accum_steps": int(grad_accum_steps),
             "eval_episodes": int(eval_episodes),
@@ -747,6 +836,7 @@ def train(
                 generator,
                 batch_size=batch_size,
                 grad_accum_steps=grad_accum_steps,
+                rollout_microbatch_size=rollout_microbatch_size,
             )
             if generator.loss_mode in {"subtb", "fl_subtb"}:
                 with torch.no_grad():
@@ -806,6 +896,8 @@ def train(
                     loss_mode=loss_mode,
                     subtb_lambda=subtb_lambda,
                     subtb_max_span=subtb_max_span,
+                    subtb_state_flow_batch_size=subtb_state_flow_batch_size,
+                    rollout_microbatch_size=rollout_microbatch_size,
                     grad_clip=grad_clip,
                     grad_accum_steps=grad_accum_steps,
                     eval_episodes=eval_episodes,
@@ -864,6 +956,8 @@ def train_local_refinement(
     loss_mode=DEFAULT_LOSS,
     subtb_lambda=DEFAULT_SUBTB_LAMBDA,
     subtb_max_span=DEFAULT_SUBTB_MAX_SPAN,
+    subtb_state_flow_batch_size=DEFAULT_SUBTB_STATE_FLOW_BATCH_SIZE,
+    rollout_microbatch_size=DEFAULT_ROLLOUT_MICROBATCH_SIZE,
     grad_clip=DEFAULT_GRAD_CLIP,
     grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
     eval_episodes=DEFAULT_EVAL_EPISODES,
@@ -890,6 +984,16 @@ def train_local_refinement(
     partial_segment_max_steps = int(partial_segment_max_steps)
     if partial_segment_max_steps <= 0:
         raise ValueError("partial_segment_max_steps must be positive")
+    if rollout_microbatch_size is None:
+        rollout_microbatch_size = min(
+            int(batch_size),
+            DEFAULT_LOCAL_REFINEMENT_ROLLOUT_MICROBATCH_SIZE,
+        )
+    else:
+        rollout_microbatch_size = _resolve_rollout_microbatch_size(
+            rollout_microbatch_size,
+            int(batch_size),
+        )
     terminal_backtrack_lengths = parse_positive_int_list(
         (
             terminal_backtrack_lengths
@@ -980,6 +1084,8 @@ def train_local_refinement(
         partial_segment_max_steps=partial_segment_max_steps,
         terminal_backtrack_lengths=terminal_backtrack_lengths,
         subtb_max_span=subtb_max_span,
+        subtb_state_flow_batch_size=subtb_state_flow_batch_size,
+        rollout_microbatch_size=rollout_microbatch_size,
     )
 
     os.makedirs(output_path, exist_ok=True)
@@ -997,6 +1103,9 @@ def train_local_refinement(
         diagnostic_rows=diagnostic_rows,
         partial_segment_max_steps=partial_segment_max_steps,
         terminal_backtrack_lengths=terminal_backtrack_lengths,
+        subtb_max_span=subtb_max_span,
+        subtb_state_flow_batch_size=subtb_state_flow_batch_size,
+        rollout_microbatch_size=rollout_microbatch_size,
     )
 
     generator = TBGFlowNetGenerator(
@@ -1012,6 +1121,7 @@ def train_local_refinement(
         loss_mode="fl_subtb",
         subtb_lambda=subtb_lambda,
         subtb_max_span=subtb_max_span,
+        subtb_state_flow_batch_size=subtb_state_flow_batch_size,
     )
     if checkpoint_data is not None:
         generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
@@ -1069,6 +1179,8 @@ def train_local_refinement(
             "loss": "fl_subtb",
             "subtb_lambda": float(subtb_lambda),
             "subtb_max_span": subtb_max_span,
+            "subtb_state_flow_batch_size": subtb_state_flow_batch_size,
+            "rollout_microbatch_size": rollout_microbatch_size,
             "grad_clip": float(grad_clip),
             "grad_accum_steps": int(grad_accum_steps),
             **model_kwargs,
@@ -1085,6 +1197,7 @@ def train_local_refinement(
                 grad_accum_steps=grad_accum_steps,
                 start_state_sampler=start_state_sampler,
                 rollout_logger=print_local_rollout_training_spec,
+                rollout_microbatch_size=rollout_microbatch_size,
             )
             if info is None:
                 continue
@@ -1155,6 +1268,8 @@ def train_local_refinement(
                     loss_mode="fl_subtb",
                     subtb_lambda=subtb_lambda,
                     subtb_max_span=subtb_max_span,
+                    subtb_state_flow_batch_size=subtb_state_flow_batch_size,
+                    rollout_microbatch_size=rollout_microbatch_size,
                     grad_clip=grad_clip,
                     grad_accum_steps=grad_accum_steps,
                     eval_episodes=eval_episodes,
@@ -1175,6 +1290,8 @@ def train_local_refinement(
                         "partial_segment_max_steps": int(partial_segment_max_steps),
                         "terminal_backtrack_lengths": list(terminal_backtrack_lengths),
                         "subtb_max_span": subtb_max_span,
+                        "subtb_state_flow_batch_size": subtb_state_flow_batch_size,
+                        "rollout_microbatch_size": rollout_microbatch_size,
                         "refinement_contexts": [
                             context.to_manifest_record() for context in segment_contexts
                         ],
@@ -1329,6 +1446,8 @@ def print_local_refinement_startup_summary(
     partial_segment_max_steps,
     terminal_backtrack_lengths,
     subtb_max_span,
+    subtb_state_flow_batch_size,
+    rollout_microbatch_size,
 ):
     print("Detected local refinement bad regions:")
     selected_regions = {}
@@ -1354,7 +1473,9 @@ def print_local_refinement_startup_summary(
         f"partial->partial max_steps={int(partial_segment_max_steps)}, "
         "partial->terminal full completion, "
         f"terminal_backtrack_lengths={list(terminal_backtrack_lengths)}, "
-        f"subtb_max_span={subtb_max_span}"
+        f"subtb_max_span={subtb_max_span}, "
+        f"subtb_state_flow_batch_size={subtb_state_flow_batch_size}, "
+        f"rollout_microbatch_size={rollout_microbatch_size}"
     )
     print("Segment rollout starts:")
     for context in segment_contexts:
@@ -1372,6 +1493,9 @@ def print_local_rollout_training_spec(
     rollout_mode,
     max_steps,
     rollout_spec,
+    microbatch_step=None,
+    microbatch_count=None,
+    microbatch_size=None,
 ):
     if not isinstance(rollout_spec, dict):
         return
@@ -1384,10 +1508,17 @@ def print_local_rollout_training_spec(
         else "partial->terminal"
     )
     max_steps_text = "terminal" if max_steps is None else str(int(max_steps))
+    microbatch_text = ""
+    if microbatch_step is not None and microbatch_count is not None:
+        microbatch_text = (
+            f"microbatch={int(microbatch_step)}/{int(microbatch_count)} "
+            f"microbatch_episodes={int(microbatch_size)} "
+        )
     print(
         f"Epoch {int(epoch_id) + 1} rollout {int(accum_step)}/{int(grad_accum_steps)}: "
         f"training {direction} "
-        f"episodes={int(batch_size)} "
+        f"batch_episodes={int(batch_size)} "
+        f"{microbatch_text}"
         f"max_steps={max_steps_text} "
         + _format_context_summary(context)
     )
@@ -1467,6 +1598,9 @@ def save_refinement_context_manifest(
     diagnostic_rows,
     partial_segment_max_steps,
     terminal_backtrack_lengths,
+    subtb_max_span,
+    subtb_state_flow_batch_size,
+    rollout_microbatch_size,
 ):
     manifest = {
         "training_mode": "local_refinement",
@@ -1476,6 +1610,15 @@ def save_refinement_context_manifest(
         "refine_strategy": str(strategy),
         "partial_segment_max_steps": int(partial_segment_max_steps),
         "terminal_backtrack_lengths": list(terminal_backtrack_lengths),
+        "subtb_max_span": None if subtb_max_span is None else int(subtb_max_span),
+        "subtb_state_flow_batch_size": (
+            None
+            if subtb_state_flow_batch_size is None
+            else int(subtb_state_flow_batch_size)
+        ),
+        "rollout_microbatch_size": (
+            None if rollout_microbatch_size is None else int(rollout_microbatch_size)
+        ),
         "contexts": [context.to_manifest_record() for context in segment_contexts],
         "segment_contexts": [
             context.to_manifest_record() for context in segment_contexts
@@ -1514,6 +1657,8 @@ def build_checkpoint_metadata(
     loss_mode,
     subtb_lambda,
     subtb_max_span,
+    subtb_state_flow_batch_size,
+    rollout_microbatch_size,
     grad_clip,
     grad_accum_steps,
     eval_episodes,
@@ -1555,6 +1700,14 @@ def build_checkpoint_metadata(
         "subtb_lambda": float(subtb_lambda),
         "subtb_max_span": (
             None if subtb_max_span is None else int(subtb_max_span)
+        ),
+        "subtb_state_flow_batch_size": (
+            None
+            if subtb_state_flow_batch_size is None
+            else int(subtb_state_flow_batch_size)
+        ),
+        "rollout_microbatch_size": (
+            None if rollout_microbatch_size is None else int(rollout_microbatch_size)
         ),
         "grad_clip": float(grad_clip),
         "grad_accum_steps": int(grad_accum_steps),
@@ -1631,6 +1784,8 @@ def main():
     parser.add_argument("--loss", choices=["tb", "subtb", "fl_subtb"])
     parser.add_argument("--subtb-lambda", type=float)
     parser.add_argument("--subtb-max-span", type=int)
+    parser.add_argument("--subtb-state-flow-batch-size", type=int)
+    parser.add_argument("--rollout-microbatch-size", type=int)
     parser.add_argument("--grad-clip", type=float)
     parser.add_argument(
         "--grad-accum-steps",
