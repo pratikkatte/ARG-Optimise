@@ -1396,10 +1396,16 @@ class SimpleARGEnvironment:
             "recomb": rates["lambda_recomb"] / denom,
         }
 
-    def enumerate_actions(self, state):
+    def enumerate_actions(self, state, action_filter=None):
 
         coal_actions = self.compute_coalescence_actions(state)
         recomb_actions = self.compute_recombination_actions(state)
+        if action_filter is not None:
+            coal_actions, recomb_actions = action_filter(
+                state,
+                coal_actions,
+                recomb_actions,
+            )
 
         return coal_actions, recomb_actions
 
@@ -1480,6 +1486,7 @@ class SimpleARGEnvironment:
         self,
         states,
         random_spec=None,
+        action_filter=None,
     ):
         batch_size = len(states)
         if batch_size == 0:
@@ -1488,7 +1495,15 @@ class SimpleARGEnvironment:
         event = {}
         input_actions = []
         for idx, state in enumerate(states):
-            coal_actions, recomb_actions = self.enumerate_actions(state)
+            coal_actions, recomb_actions = self.enumerate_actions(
+                state,
+                action_filter=action_filter,
+            )
+            if not coal_actions and not recomb_actions:
+                raise ValueError(
+                    "No available ARG actions for non-terminal state; "
+                    "local refinement action filter may be too restrictive."
+                )
             event_prob = list(self.compute_event_probabilities(state, (coal_actions, recomb_actions)).values())
             event_idx = np.random.choice(2, p=event_prob)
             choosen_event_type = self.event_types[event_idx]

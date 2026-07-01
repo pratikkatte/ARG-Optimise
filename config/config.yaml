@@ -1,6 +1,26 @@
 dataset_path: validation/vcf/sim_l25kb_0.vcf
-output_path: runs/vcf_sparse_25kb_real
+output_path: runs/local_refinement_25kb
 device: auto
+
+refinement:
+  enabled: true
+
+  # Existing inferred ARG to backtrack into suspicious partial ARGState starts.
+  arg_path: validation/output/tsinfer/l25kb_dated.trees
+
+  # Optional global policy checkpoint. Leave null to scratch-train only from
+  # local suspicious-region partial states.
+  checkpoint: null
+
+  # Region selection. Automatic top-k can be combined with manual block/BP
+  # overrides; contiguous selected blocks are merged before refinement.
+  bad_region_top_k: 3
+  bad_region_blocks: null
+  bad_region_bp: null
+
+  # Options: before_last_touch, before_first_touch, before_last_coalescence.
+  strategy: before_last_coalescence
+  terminal_backtrack_lengths: [5, 10, 25]
 
 training:
   epochs: 3000
@@ -14,11 +34,13 @@ training:
   log_z_lr: 0.001
   loss: fl_subtb
   subtb_lambda: 0.9
+  subtb_max_span: 16
   grad_clip: 10.0
   grad_accum_steps: 1
 
   eval_episodes: 32
   eval_every: 20
+  partial_segment_max_steps: 16
 
 environment:
   bp_per_blocks: 1

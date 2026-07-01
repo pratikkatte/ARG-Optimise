@@ -1,0 +1,57 @@
+dataset_path: validation/vcf/sim_l25kb_0.vcf
+output_path: runs/test_local_refinement
+device: auto
+
+refinement:
+  enabled: true
+  arg_path: validation/output/tsinfer/l25kb_dated.trees
+  checkpoint: null
+  bad_region_top_k: 3
+  bad_region_blocks: null
+  bad_region_bp: null
+  strategy: before_last_coalescence
+  terminal_backtrack_lengths: [1]
+
+training:
+  epochs: 2
+  batch_size: 1
+  seed: 7
+  init_z_sample_count: 0
+  verbose: false
+  wandb: false
+
+  policy_lr: 0.0001
+  log_z_lr: 0.001
+  loss: fl_subtb
+  subtb_lambda: 0.9
+  subtb_max_span: 1
+  grad_clip: 10.0
+  grad_accum_steps: 1
+
+  eval_episodes: 0
+  eval_every: 1
+  partial_segment_max_steps: 1
+
+environment:
+  bp_per_blocks: 1
+  effective_population_size: 10000
+  mutation_rate: 2.0e-8
+  recombination_rate: 2.0e-8
+  time_bins: 4
+  time_delta_bin_width: 0.001
+
+reward:
+  constant: 0
+
+model:
+  embedding_size: 8
+  hidden_size: 16
+  dropout: 0.0
+
+  breakpoint_hidden_dim: 32
+  breakpoint_dropout: 0.0
+
+  transformer_depth: 1
+  transformer_heads: 2
+  transformer_mlp_ratio: 2.0
+  attention_dropout: 0.0

@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 import os
 import pickle
 import random
@@ -14,6 +15,12 @@ except ImportError:
     wandb = None
 
 from env import SimpleARGEnvironment, action_as_dict
+from refinement import (
+    build_refinement_context_sets,
+    build_refinement_source,
+    parse_block_groups,
+    parse_bp_intervals,
+)
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
@@ -32,6 +39,9 @@ DEFAULT_EVAL_EPISODES = 8
 DEFAULT_EVAL_EVERY = 10
 DEFAULT_LOSS = "tb"
 DEFAULT_SUBTB_LAMBDA = 0.9
+DEFAULT_SUBTB_MAX_SPAN = None
+DEFAULT_PARTIAL_SEGMENT_MAX_STEPS = 16
+DEFAULT_TERMINAL_BACKTRACK_LENGTHS = (5, 10, 25)
 DEFAULT_EMBEDDING_SIZE = 32
 DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_DROPOUT = 0.0
@@ -55,6 +65,16 @@ DEFAULT_CONFIG = {
     "dataset_path": None,
     "output_path": None,
     "device": "auto",
+    "refinement": {
+        "enabled": False,
+        "checkpoint": None,
+        "arg_path": None,
+        "bad_region_top_k": None,
+        "bad_region_blocks": None,
+        "bad_region_bp": None,
+        "strategy": "before_last_coalescence",
+        "terminal_backtrack_lengths": list(DEFAULT_TERMINAL_BACKTRACK_LENGTHS),
+    },
     "training": {
         "epochs": None,
         "batch_size": 10,
@@ -66,10 +86,12 @@ DEFAULT_CONFIG = {
         "log_z_lr": DEFAULT_LOG_Z_LR,
         "loss": DEFAULT_LOSS,
         "subtb_lambda": DEFAULT_SUBTB_LAMBDA,
+        "subtb_max_span": DEFAULT_SUBTB_MAX_SPAN,
         "grad_clip": DEFAULT_GRAD_CLIP,
         "grad_accum_steps": DEFAULT_GRAD_ACCUM_STEPS,
         "eval_episodes": DEFAULT_EVAL_EPISODES,
         "eval_every": DEFAULT_EVAL_EVERY,
+        "partial_segment_max_steps": DEFAULT_PARTIAL_SEGMENT_MAX_STEPS,
     },
     "environment": {
         "bp_per_blocks": 1,
@@ -100,6 +122,13 @@ CLI_CONFIG_PATHS = {
     "dataset_path": ("dataset_path",),
     "output_path": ("output_path",),
     "device": ("device",),
+    "checkpoint": ("refinement", "checkpoint"),
+    "local_refinement_arg": ("refinement", "arg_path"),
+    "bad_region_top_k": ("refinement", "bad_region_top_k"),
+    "bad_region_blocks": ("refinement", "bad_region_blocks"),
+    "bad_region_bp": ("refinement", "bad_region_bp"),
+    "refine_strategy": ("refinement", "strategy"),
+    "terminal_backtrack_lengths": ("refinement", "terminal_backtrack_lengths"),
     "epochs": ("training", "epochs"),
     "batch_size": ("training", "batch_size"),
     "seed": ("training", "seed"),
@@ -110,10 +139,12 @@ CLI_CONFIG_PATHS = {
     "log_z_lr": ("training", "log_z_lr"),
     "loss": ("training", "loss"),
     "subtb_lambda": ("training", "subtb_lambda"),
+    "subtb_max_span": ("training", "subtb_max_span"),
     "grad_clip": ("training", "grad_clip"),
     "grad_accum_steps": ("training", "grad_accum_steps"),
     "eval_episodes": ("training", "eval_episodes"),
     "eval_every": ("training", "eval_every"),
+    "partial_segment_max_steps": ("training", "partial_segment_max_steps"),
     "bp_per_blocks": ("environment", "bp_per_blocks"),
     "effective_population_size": ("environment", "effective_population_size"),
     "mutation_rate": ("environment", "mutation_rate"),
@@ -181,6 +212,49 @@ def _set_nested(config, path, value):
     cursor[path[-1]] = value
 
 
+def parse_positive_int_list(value, field_name, allow_empty=True):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "":
+            return []
+        raw_items = [item.strip() for item in text.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+
+    parsed = []
+    for item in raw_items:
+        if item is None or str(item).strip() == "":
+            continue
+        try:
+            parsed_value = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} must contain only positive integers") from exc
+        if parsed_value <= 0:
+            raise ValueError(f"{field_name} must contain only positive integers")
+        parsed.append(parsed_value)
+    if not parsed and not allow_empty:
+        raise ValueError(f"{field_name} must contain at least one positive integer")
+    return parsed
+
+
+def parse_optional_positive_int(value, field_name):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    try:
+        parsed_value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer or null") from exc
+    if parsed_value <= 0:
+        raise ValueError(f"{field_name} must be a positive integer or null")
+    return parsed_value
+
+
 def validate_train_config(config):
     missing = []
     if not config.get("dataset_path"):
@@ -202,6 +276,36 @@ def validate_train_config(config):
     subtb_lambda = float(training.get("subtb_lambda", DEFAULT_SUBTB_LAMBDA))
     if subtb_lambda <= 0.0:
         raise ValueError("training.subtb_lambda must be positive")
+    training["subtb_max_span"] = parse_optional_positive_int(
+        training.get("subtb_max_span", DEFAULT_SUBTB_MAX_SPAN),
+        "training.subtb_max_span",
+    )
+    partial_segment_max_steps = int(
+        training.get("partial_segment_max_steps", DEFAULT_PARTIAL_SEGMENT_MAX_STEPS)
+    )
+    if partial_segment_max_steps <= 0:
+        raise ValueError("training.partial_segment_max_steps must be positive")
+    training["partial_segment_max_steps"] = partial_segment_max_steps
+    refinement = config.get("refinement", {})
+    refinement["terminal_backtrack_lengths"] = parse_positive_int_list(
+        refinement.get(
+            "terminal_backtrack_lengths",
+            DEFAULT_TERMINAL_BACKTRACK_LENGTHS,
+        ),
+        "refinement.terminal_backtrack_lengths",
+    )
+    if refinement_enabled(config) and not refinement.get("arg_path"):
+        missing_refinement = "refinement.arg_path"
+        raise ValueError(
+            "Missing required local refinement config value: "
+            f"{missing_refinement}. Provide it in YAML or via --local-refinement-arg."
+        )
+    strategy = refinement.get("strategy", "before_last_coalescence")
+    if strategy not in {"before_last_touch", "before_first_touch", "before_last_coalescence"}:
+        raise ValueError(
+            "refinement.strategy must be one of 'before_last_touch', "
+            "'before_first_touch', or 'before_last_coalescence'"
+        )
 
 
 def config_to_train_kwargs(config):
@@ -229,10 +333,12 @@ def config_to_train_kwargs(config):
         "log_z_lr": training["log_z_lr"],
         "loss_mode": str(training["loss"]).lower(),
         "subtb_lambda": training["subtb_lambda"],
+        "subtb_max_span": training["subtb_max_span"],
         "grad_clip": training["grad_clip"],
         "grad_accum_steps": training["grad_accum_steps"],
         "eval_episodes": training["eval_episodes"],
         "eval_every": training["eval_every"],
+        "partial_segment_max_steps": training["partial_segment_max_steps"],
         "time_bins": environment["time_bins"],
         "time_delta_bin_width": environment["time_delta_bin_width"],
         "reward_C": reward["constant"],
@@ -249,6 +355,27 @@ def config_to_train_kwargs(config):
     }
 
 
+def refinement_enabled(config):
+    refinement = config.get("refinement", {})
+    return bool(refinement.get("enabled") or refinement.get("arg_path"))
+
+
+def config_to_refinement_kwargs(config):
+    refinement = config.get("refinement", {})
+    return {
+        "checkpoint": refinement.get("checkpoint"),
+        "local_refinement_arg": refinement.get("arg_path"),
+        "bad_region_top_k": refinement.get("bad_region_top_k"),
+        "bad_region_blocks": refinement.get("bad_region_blocks"),
+        "bad_region_bp": refinement.get("bad_region_bp"),
+        "refine_strategy": refinement.get("strategy", "before_last_coalescence"),
+        "terminal_backtrack_lengths": refinement.get(
+            "terminal_backtrack_lengths",
+            list(DEFAULT_TERMINAL_BACKTRACK_LENGTHS),
+        ),
+    }
+
+
 def save_resolved_config(config, output_path):
     os.makedirs(output_path, exist_ok=True)
     with open(os.path.join(output_path, "config.yaml"), "w", encoding="utf-8") as handle:
@@ -260,20 +387,96 @@ def train_epoch(
     generator,
     batch_size=1,
     grad_accum_steps=1,
+    start_state_sampler=None,
+    rollout_logger=None,
 ):
     grad_accum_steps = max(int(grad_accum_steps), 1)
+    rollout_metrics = {}
 
-    for _ in range(grad_accum_steps):
+    for accum_idx in range(grad_accum_steps):
+        start_states = None
+        action_filter = None
+        max_steps = None
+        rollout_mode = "terminal"
+        rollout_spec = None
+        if start_state_sampler is not None:
+            rollout_spec = start_state_sampler(batch_size)
+            if isinstance(rollout_spec, dict):
+                start_states = rollout_spec.get("start_states")
+                action_filter = rollout_spec.get("action_filter")
+                max_steps = rollout_spec.get("max_steps")
+                rollout_mode = str(
+                    rollout_spec.get(
+                        "rollout_mode",
+                        "segment" if max_steps is not None else "terminal",
+                    )
+                )
+            else:
+                start_states, action_filter = rollout_spec
+        if rollout_logger is not None:
+            rollout_logger(
+                epoch_id=epoch_id,
+                accum_step=accum_idx + 1,
+                grad_accum_steps=grad_accum_steps,
+                batch_size=batch_size,
+                rollout_mode=rollout_mode,
+                max_steps=max_steps,
+                rollout_spec=rollout_spec,
+            )
         ret, trajectories = rollout_worker.rollout(
             generator,
             episodes=batch_size,
+            start_states=start_states,
+            action_filter=action_filter,
+            max_steps=max_steps,
         )
+        _record_rollout_metrics(rollout_metrics, rollout_mode, ret)
         generator.accumulate_loss(
             ret,
             factor=grad_accum_steps,
         )
 
-    return generator.update_model()
+    info = generator.update_model()
+    info.update(_summarize_rollout_metrics(rollout_metrics))
+    return info
+
+
+def _record_rollout_metrics(metrics, rollout_mode, rollout_outputs):
+    mode = str(rollout_mode)
+    entry = metrics.setdefault(
+        mode,
+        {
+            "batches": 0,
+            "trajectories": 0,
+            "length_sum": 0.0,
+            "terminal_sum": 0.0,
+            "truncated_sum": 0.0,
+        },
+    )
+    lengths = rollout_outputs["trajectory_lengths"].detach().float().cpu()
+    terminal_mask = rollout_outputs.get("terminal_mask")
+    truncated_mask = rollout_outputs.get("truncated_mask")
+    entry["batches"] += 1
+    entry["trajectories"] += int(lengths.numel())
+    entry["length_sum"] += float(lengths.sum().item())
+    if terminal_mask is not None:
+        entry["terminal_sum"] += float(terminal_mask.detach().float().cpu().sum().item())
+    if truncated_mask is not None:
+        entry["truncated_sum"] += float(truncated_mask.detach().float().cpu().sum().item())
+
+
+def _summarize_rollout_metrics(metrics):
+    summary = {}
+    for mode, entry in metrics.items():
+        trajectories = max(int(entry["trajectories"]), 1)
+        prefix = f"train_{mode}"
+        summary[f"{prefix}_batches"] = int(entry["batches"])
+        summary[f"{prefix}_trajectory_length_mean"] = float(
+            entry["length_sum"] / trajectories
+        )
+        summary[f"{prefix}_terminal_rate"] = float(entry["terminal_sum"] / trajectories)
+        summary[f"{prefix}_truncated_rate"] = float(entry["truncated_sum"] / trajectories)
+    return summary
 
 
 def evaluate_generator(rollout_worker, generator, episodes, seed):
@@ -414,10 +617,12 @@ def train(
     log_z_lr=DEFAULT_LOG_Z_LR,
     loss_mode=DEFAULT_LOSS,
     subtb_lambda=DEFAULT_SUBTB_LAMBDA,
+    subtb_max_span=DEFAULT_SUBTB_MAX_SPAN,
     grad_clip=DEFAULT_GRAD_CLIP,
     grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
     eval_episodes=DEFAULT_EVAL_EPISODES,
     eval_every=DEFAULT_EVAL_EVERY,
+    partial_segment_max_steps=DEFAULT_PARTIAL_SEGMENT_MAX_STEPS,
     time_bins=DEFAULT_TIME_BINS,
     time_delta_bin_width=DEFAULT_TIME_DELTA_BIN_WIDTH,
     reward_C=30000,
@@ -494,6 +699,7 @@ def train(
         model_kwargs=model_kwargs,
         loss_mode=loss_mode,
         subtb_lambda=subtb_lambda,
+        subtb_max_span=subtb_max_span,
     )
     print(f"Generator device: {generator.device}")
 
@@ -523,6 +729,7 @@ def train(
             "log_z_lr": float(log_z_lr),
             "loss": loss_mode,
             "subtb_lambda": float(subtb_lambda),
+            "subtb_max_span": subtb_max_span,
             "grad_clip": float(grad_clip),
             "grad_accum_steps": int(grad_accum_steps),
             "eval_episodes": int(eval_episodes),
@@ -598,6 +805,7 @@ def train(
                     log_z_lr=log_z_lr,
                     loss_mode=loss_mode,
                     subtb_lambda=subtb_lambda,
+                    subtb_max_span=subtb_max_span,
                     grad_clip=grad_clip,
                     grad_accum_steps=grad_accum_steps,
                     eval_episodes=eval_episodes,
@@ -631,6 +839,660 @@ def train(
     return history
 
 
+def train_local_refinement(
+    dataset_path,
+    output_path,
+    device,
+    local_refinement_arg,
+    checkpoint=None,
+    bad_region_top_k=None,
+    bad_region_blocks=None,
+    bad_region_bp=None,
+    refine_strategy="before_last_coalescence",
+    terminal_backtrack_lengths=None,
+    bp_per_blocks=1,
+    batch_size=1,
+    epochs_num=10,
+    seed=7,
+    init_z_sample_count=DEFAULT_INIT_Z_SAMPLE_COUNT,
+    use_wandb=True,
+    effective_population_size=DEFAULT_NE,
+    mutation_rate=DEFAULT_MU_PER_BP,
+    recombination_rate=DEFAULT_R_PER_BP,
+    policy_lr=DEFAULT_POLICY_LR,
+    log_z_lr=DEFAULT_LOG_Z_LR,
+    loss_mode=DEFAULT_LOSS,
+    subtb_lambda=DEFAULT_SUBTB_LAMBDA,
+    subtb_max_span=DEFAULT_SUBTB_MAX_SPAN,
+    grad_clip=DEFAULT_GRAD_CLIP,
+    grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
+    eval_episodes=DEFAULT_EVAL_EPISODES,
+    eval_every=DEFAULT_EVAL_EVERY,
+    partial_segment_max_steps=DEFAULT_PARTIAL_SEGMENT_MAX_STEPS,
+    time_bins=DEFAULT_TIME_BINS,
+    time_delta_bin_width=DEFAULT_TIME_DELTA_BIN_WIDTH,
+    reward_C=30000,
+    embedding_size=DEFAULT_EMBEDDING_SIZE,
+    hidden_size=DEFAULT_HIDDEN_SIZE,
+    dropout=DEFAULT_DROPOUT,
+    breakpoint_hidden_dim=DEFAULT_BREAKPOINT_HIDDEN_DIM,
+    breakpoint_dropout=DEFAULT_BREAKPOINT_DROPOUT,
+    transformer_depth=DEFAULT_TRANSFORMER_DEPTH,
+    transformer_heads=DEFAULT_TRANSFORMER_HEADS,
+    transformer_mlp_ratio=DEFAULT_TRANSFORMER_MLP_RATIO,
+    attention_dropout=DEFAULT_ATTENTION_DROPOUT,
+    verbose=True,
+):
+    if not is_vcf_path(dataset_path):
+        raise ValueError("local ARG refinement currently requires a VCF dataset")
+    seed_everything(seed)
+    device = torch.device(device)
+    partial_segment_max_steps = int(partial_segment_max_steps)
+    if partial_segment_max_steps <= 0:
+        raise ValueError("partial_segment_max_steps must be positive")
+    terminal_backtrack_lengths = parse_positive_int_list(
+        (
+            terminal_backtrack_lengths
+            if terminal_backtrack_lengths is not None
+            else DEFAULT_TERMINAL_BACKTRACK_LENGTHS
+        ),
+        "terminal_backtrack_lengths",
+    )
+    variant_data = load_vcf_variants(dataset_path)
+    env = SimpleARGEnvironment(
+        sequence_length=int(variant_data.sequence_length),
+        num_sequences=int(variant_data.num_haplotypes),
+        bp_per_blocks=bp_per_blocks,
+        variant_data=variant_data,
+        device=device,
+        recombination_rate=recombination_rate,
+        population_size=effective_population_size,
+        mutation_rate=mutation_rate,
+        time_bins=time_bins,
+        time_delta_bin_width=time_delta_bin_width,
+        reward_C=reward_C,
+    )
+    source_env = SimpleARGEnvironment(
+        sequence_length=int(variant_data.sequence_length),
+        num_sequences=int(variant_data.num_haplotypes),
+        bp_per_blocks=bp_per_blocks,
+        variant_data=variant_data,
+        device="cpu",
+        recombination_rate=recombination_rate,
+        population_size=effective_population_size,
+        mutation_rate=mutation_rate,
+        time_bins=time_bins,
+        time_delta_bin_width=time_delta_bin_width,
+        reward_C=reward_C,
+    )
+    model_kwargs = {
+        "embedding_size": int(embedding_size),
+        "hidden_size": int(hidden_size),
+        "dropout": float(dropout),
+        "breakpoint_hidden_dim": int(breakpoint_hidden_dim),
+        "breakpoint_dropout": float(breakpoint_dropout),
+        "transformer_depth": int(transformer_depth),
+        "transformer_heads": int(transformer_heads),
+        "transformer_mlp_ratio": float(transformer_mlp_ratio),
+        "attention_dropout": float(attention_dropout),
+        "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
+        "time_layers": int(DEFAULT_TIME_LAYERS),
+        "time_dropout": float(DEFAULT_TIME_DROPOUT),
+        "breakpoint_gap_hidden_size": int(DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE),
+        "breakpoint_gap_layers": int(DEFAULT_BREAKPOINT_GAP_LAYERS),
+        "breakpoint_gap_dropout": float(DEFAULT_BREAKPOINT_GAP_DROPOUT),
+        "breakpoint_use_position_features": bool(DEFAULT_BREAKPOINT_USE_POSITION_FEATURES),
+    }
+
+    checkpoint_data = None
+    checkpoint_metadata = {}
+    if checkpoint:
+        checkpoint_data = load_checkpoint(checkpoint, map_location="cpu")
+        checkpoint_metadata = checkpoint_data.get("metadata", {})
+        validate_checkpoint_metadata_for_env(checkpoint_metadata, env)
+        if checkpoint_metadata.get("model"):
+            model_kwargs = dict(checkpoint_metadata["model"])
+
+    source = build_refinement_source(
+        source_env,
+        local_refinement_arg,
+        dataset_path,
+        population_size=effective_population_size,
+        mutation_rate=mutation_rate,
+    )
+    segment_contexts, terminal_contexts, diagnostic_rows = build_refinement_context_sets(
+        source,
+        top_k=bad_region_top_k,
+        block_groups=parse_block_groups(bad_region_blocks),
+        bp_intervals=parse_bp_intervals(bad_region_bp),
+        strategy=refine_strategy,
+        terminal_backtrack_lengths=terminal_backtrack_lengths,
+    )
+    if not segment_contexts:
+        raise ValueError("no local refinement segment contexts were selected")
+    if not terminal_contexts:
+        raise ValueError("no local refinement terminal contexts were selected")
+    all_contexts = list(segment_contexts) + list(terminal_contexts)
+    print_local_refinement_startup_summary(
+        segment_contexts,
+        terminal_contexts,
+        diagnostic_rows,
+        partial_segment_max_steps=partial_segment_max_steps,
+        terminal_backtrack_lengths=terminal_backtrack_lengths,
+        subtb_max_span=subtb_max_span,
+    )
+
+    os.makedirs(output_path, exist_ok=True)
+    checkpoints_path = os.path.join(output_path, "checkpoints")
+    os.makedirs(checkpoints_path, exist_ok=True)
+    best_checkpoint_path = os.path.join(checkpoints_path, "best.pt")
+    save_refinement_context_manifest(
+        output_path,
+        checkpoint=checkpoint,
+        local_refinement_arg=local_refinement_arg,
+        dataset_path=dataset_path,
+        strategy=refine_strategy,
+        segment_contexts=segment_contexts,
+        terminal_contexts=terminal_contexts,
+        diagnostic_rows=diagnostic_rows,
+        partial_segment_max_steps=partial_segment_max_steps,
+        terminal_backtrack_lengths=terminal_backtrack_lengths,
+    )
+
+    generator = TBGFlowNetGenerator(
+        env,
+        init_z_sample_count=0,
+        device=device,
+        verbose=verbose,
+        policy_lr=policy_lr,
+        log_z_lr=log_z_lr,
+        grad_clip=grad_clip,
+        model_kwargs=model_kwargs,
+        initialize_z_from_prior=False,
+        loss_mode="fl_subtb",
+        subtb_lambda=subtb_lambda,
+        subtb_max_span=subtb_max_span,
+    )
+    if checkpoint_data is not None:
+        generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
+        print(f"Loaded global policy checkpoint for local refinement: {checkpoint}")
+    else:
+        print("No checkpoint supplied; training local refinement policy from scratch.")
+
+    rollout_worker = RolloutWorker(env, verbose=verbose)
+    rollout_cursor = {"mode": 0, "segment": 0, "terminal": 0}
+
+    def start_state_sampler(current_batch_size):
+        rollout_mode = "segment" if rollout_cursor["mode"] % 2 == 0 else "terminal"
+        rollout_cursor["mode"] += 1
+        contexts_for_mode = (
+            segment_contexts if rollout_mode == "segment" else terminal_contexts
+        )
+        context = contexts_for_mode[
+            rollout_cursor[rollout_mode] % len(contexts_for_mode)
+        ]
+        rollout_cursor[rollout_mode] += 1
+        return {
+            "start_states": [context.partial_state for _ in range(int(current_batch_size))],
+            "action_filter": context.action_filter(),
+            "max_steps": (
+                partial_segment_max_steps if rollout_mode == "segment" else None
+            ),
+            "rollout_mode": rollout_mode,
+            "context": context,
+        }
+
+    history = []
+    best_loss = float("inf")
+    wandb_run = None
+    if use_wandb:
+        if wandb is None:
+            raise ImportError("wandb is not installed but training.wandb is true")
+        wandb_run = wandb.init()
+        wandb.config.update({
+            "training_mode": "local_refinement",
+            "device": str(generator.device),
+            "input_mode": "vcf",
+            "checkpoint": os.path.abspath(checkpoint) if checkpoint else None,
+            "local_refinement_arg": os.path.abspath(local_refinement_arg),
+            "bad_region_top_k": bad_region_top_k,
+            "refine_strategy": refine_strategy,
+            "partial_segment_max_steps": int(partial_segment_max_steps),
+            "terminal_backtrack_lengths": list(terminal_backtrack_lengths),
+            "local_segment_contexts": len(segment_contexts),
+            "local_terminal_contexts": len(terminal_contexts),
+            **env.time_metadata,
+            "effective_population_size": float(effective_population_size),
+            "mutation_rate": float(mutation_rate),
+            "recombination_rate": float(recombination_rate),
+            "policy_lr": float(policy_lr),
+            "loss": "fl_subtb",
+            "subtb_lambda": float(subtb_lambda),
+            "subtb_max_span": subtb_max_span,
+            "grad_clip": float(grad_clip),
+            "grad_accum_steps": int(grad_accum_steps),
+            **model_kwargs,
+            "model_version": MODEL_VERSION,
+        })
+
+    try:
+        for epoch in range(int(epochs_num)):
+            info = train_epoch(
+                epoch,
+                rollout_worker,
+                generator,
+                batch_size=batch_size,
+                grad_accum_steps=grad_accum_steps,
+                start_state_sampler=start_state_sampler,
+                rollout_logger=print_local_rollout_training_spec,
+            )
+            if info is None:
+                continue
+            info = dict(info)
+            info["epoch"] = epoch
+            with torch.no_grad():
+                all_start_flows = generator.compute_log_state_flows(
+                    [context.partial_state for context in all_contexts]
+                )
+                segment_start_flows = generator.compute_log_state_flows(
+                    [context.partial_state for context in segment_contexts]
+                )
+                terminal_start_flows = generator.compute_log_state_flows(
+                    [context.partial_state for context in terminal_contexts]
+                )
+                log_f_start = all_start_flows.mean().detach().cpu().reshape(-1)[0].item()
+            info["log_f_start_mean"] = log_f_start
+            info["log_f_segment_start_mean"] = (
+                segment_start_flows.mean().detach().cpu().reshape(-1)[0].item()
+            )
+            info["log_f_terminal_start_mean"] = (
+                terminal_start_flows.mean().detach().cpu().reshape(-1)[0].item()
+            )
+
+            should_eval = int(eval_episodes) > 0 and (
+                epoch == 0
+                or int(eval_every) <= 1
+                or (epoch + 1) % int(eval_every) == 0
+            )
+            if should_eval:
+                info.update(
+                    evaluate_local_refinement(
+                        rollout_worker,
+                        generator,
+                        segment_contexts,
+                        terminal_contexts,
+                        episodes=eval_episodes,
+                        seed=seed + 100000 + epoch,
+                        partial_segment_max_steps=partial_segment_max_steps,
+                    )
+                )
+
+            history.append(info)
+            loss = float(info["loss"])
+            if wandb_run is not None:
+                wandb.log(info, step=epoch + 1)
+
+            if loss < best_loss:
+                best_loss = loss
+                metadata = build_checkpoint_metadata(
+                    epoch=epoch,
+                    best_loss=best_loss,
+                    log_z=log_f_start,
+                    sequences=None,
+                    variant_data=variant_data,
+                    dataset_path=dataset_path,
+                    input_mode="vcf",
+                    sequence_length=int(variant_data.sequence_length),
+                    bp_per_blocks=bp_per_blocks,
+                    time_metadata=env.time_metadata,
+                    reward_C=reward_C,
+                    rho=env.rho,
+                    effective_population_size=effective_population_size,
+                    mutation_rate=mutation_rate,
+                    recombination_rate=recombination_rate,
+                    policy_lr=policy_lr,
+                    log_z_lr=log_z_lr,
+                    loss_mode="fl_subtb",
+                    subtb_lambda=subtb_lambda,
+                    subtb_max_span=subtb_max_span,
+                    grad_clip=grad_clip,
+                    grad_accum_steps=grad_accum_steps,
+                    eval_episodes=eval_episodes,
+                    eval_every=eval_every,
+                    model_kwargs=model_kwargs,
+                    seed=seed,
+                    init_z_sample_count=init_z_sample_count,
+                    model_version=MODEL_VERSION,
+                )
+                metadata.update(
+                    {
+                        "training_mode": "local_refinement",
+                        "source_checkpoint": (
+                            os.path.abspath(checkpoint) if checkpoint else None
+                        ),
+                        "local_refinement_arg": os.path.abspath(local_refinement_arg),
+                        "refine_strategy": str(refine_strategy),
+                        "partial_segment_max_steps": int(partial_segment_max_steps),
+                        "terminal_backtrack_lengths": list(terminal_backtrack_lengths),
+                        "subtb_max_span": subtb_max_span,
+                        "refinement_contexts": [
+                            context.to_manifest_record() for context in segment_contexts
+                        ],
+                        "segment_refinement_contexts": [
+                            context.to_manifest_record() for context in segment_contexts
+                        ],
+                        "terminal_refinement_contexts": [
+                            context.to_manifest_record() for context in terminal_contexts
+                        ],
+                    }
+                )
+                generator.save(best_checkpoint_path, metadata=metadata)
+                info["best_checkpoint_path"] = best_checkpoint_path
+
+            eval_text = ""
+            if "eval_local_loss_mean" in info:
+                eval_text = f" eval_local_loss={info['eval_local_loss_mean']:.4f}"
+            print(
+                f"Epoch {epoch + 1} local_loss={loss:.4f} "
+                f"logFstart={log_f_start:.4f}{eval_text}"
+            )
+
+        with open(os.path.join(output_path, "training_history.pkl"), "wb") as handle:
+            pickle.dump(history, handle)
+    finally:
+        if wandb_run is not None:
+            wandb.finish()
+    return history
+
+
+def evaluate_local_refinement(
+    rollout_worker,
+    generator,
+    segment_contexts,
+    terminal_contexts,
+    episodes,
+    seed,
+    partial_segment_max_steps=DEFAULT_PARTIAL_SEGMENT_MAX_STEPS,
+):
+    episodes = int(episodes)
+    if episodes <= 0:
+        return {}
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    env_rng_state = rollout_worker.env.rng.getstate() if hasattr(rollout_worker.env.rng, "getstate") else None
+
+    try:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        if hasattr(rollout_worker.env.rng, "seed"):
+            rollout_worker.env.rng.seed(seed)
+
+        metrics = {}
+        with torch.no_grad():
+            for idx in range(episodes):
+                rollout_mode = "segment" if idx % 2 == 0 else "terminal"
+                contexts_for_mode = (
+                    segment_contexts if rollout_mode == "segment" else terminal_contexts
+                )
+                context = contexts_for_mode[(idx // 2) % len(contexts_for_mode)]
+                outputs, trajectories = rollout_worker.rollout(
+                    generator,
+                    episodes=1,
+                    start_states=[context.partial_state],
+                    action_filter=context.action_filter(),
+                    max_steps=(
+                        int(partial_segment_max_steps)
+                        if rollout_mode == "segment"
+                        else None
+                    ),
+                )
+                loss = generator.compute_subtb_loss_from_rollout_outputs(outputs)
+                _record_eval_metrics(metrics, rollout_mode, outputs, loss)
+        return _summarize_eval_metrics(metrics)
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+        if env_rng_state is not None:
+            rollout_worker.env.rng.setstate(env_rng_state)
+
+
+def _record_eval_metrics(metrics, rollout_mode, rollout_outputs, loss):
+    mode = str(rollout_mode)
+    entry = metrics.setdefault(
+        mode,
+        {
+            "count": 0,
+            "loss_sum": 0.0,
+            "reward_sum": 0.0,
+            "reward_count": 0,
+            "length_sum": 0.0,
+            "terminal_sum": 0.0,
+            "truncated_sum": 0.0,
+        },
+    )
+    entry["count"] += 1
+    entry["loss_sum"] += float(loss.detach().cpu().item())
+    length = float(rollout_outputs["trajectory_lengths"][0].detach().cpu().item())
+    entry["length_sum"] += length
+    terminal = bool(rollout_outputs["terminal_mask"][0].detach().cpu().item())
+    truncated = bool(rollout_outputs["truncated_mask"][0].detach().cpu().item())
+    entry["terminal_sum"] += float(terminal)
+    entry["truncated_sum"] += float(truncated)
+    reward = rollout_outputs["log_rewards"][0]
+    if bool(torch.isfinite(reward).detach().cpu().item()):
+        entry["reward_sum"] += float(reward.detach().cpu().item())
+        entry["reward_count"] += 1
+
+
+def _summarize_eval_metrics(metrics):
+    summary = {}
+    loss_values = []
+    length_values = []
+    reward_values = []
+    for mode, entry in metrics.items():
+        count = max(int(entry["count"]), 1)
+        prefix = f"eval_{mode}"
+        loss_mean = float(entry["loss_sum"] / count)
+        length_mean = float(entry["length_sum"] / count)
+        summary[f"{prefix}_loss_mean"] = loss_mean
+        summary[f"{prefix}_trajectory_length_mean"] = length_mean
+        summary[f"{prefix}_terminal_rate"] = float(entry["terminal_sum"] / count)
+        summary[f"{prefix}_truncated_rate"] = float(entry["truncated_sum"] / count)
+        loss_values.append(loss_mean)
+        length_values.append(length_mean)
+        if entry["reward_count"] > 0:
+            reward_mean = float(entry["reward_sum"] / int(entry["reward_count"]))
+            summary[f"{prefix}_log_reward_mean"] = reward_mean
+            reward_values.append(reward_mean)
+    summary["eval_local_loss_mean"] = float(np.mean(loss_values)) if loss_values else 0.0
+    summary["eval_trajectory_length_mean"] = (
+        float(np.mean(length_values)) if length_values else 0.0
+    )
+    if reward_values:
+        summary["eval_log_reward_mean"] = float(np.mean(reward_values))
+    return summary
+
+
+def print_local_refinement_startup_summary(
+    segment_contexts,
+    terminal_contexts,
+    diagnostic_rows,
+    partial_segment_max_steps,
+    terminal_backtrack_lengths,
+    subtb_max_span,
+):
+    print("Detected local refinement bad regions:")
+    selected_regions = {}
+    for context in list(segment_contexts) + list(terminal_contexts):
+        selected_regions[int(context.region.index)] = context.region
+    for region in sorted(selected_regions.values(), key=lambda item: int(item.index)):
+        print(
+            "  "
+            + _format_region_summary(region)
+        )
+    if diagnostic_rows:
+        top_rows = diagnostic_rows[: min(len(diagnostic_rows), 5)]
+        print("Top bad-region diagnostic blocks:")
+        for row in top_rows:
+            print(
+                "  "
+                f"block={int(row['block'])} "
+                f"bp=[{float(row['left_bp']):.1f},{float(row['right_bp']):.1f}) "
+                f"score={float(row['bad_region_score']):.4f}"
+            )
+    print(
+        "Local refinement rollout mix: "
+        f"partial->partial max_steps={int(partial_segment_max_steps)}, "
+        "partial->terminal full completion, "
+        f"terminal_backtrack_lengths={list(terminal_backtrack_lengths)}, "
+        f"subtb_max_span={subtb_max_span}"
+    )
+    print("Segment rollout starts:")
+    for context in segment_contexts:
+        print("  " + _format_context_summary(context))
+    print("Terminal rollout starts:")
+    for context in terminal_contexts:
+        print("  " + _format_context_summary(context))
+
+
+def print_local_rollout_training_spec(
+    epoch_id,
+    accum_step,
+    grad_accum_steps,
+    batch_size,
+    rollout_mode,
+    max_steps,
+    rollout_spec,
+):
+    if not isinstance(rollout_spec, dict):
+        return
+    context = rollout_spec.get("context")
+    if context is None:
+        return
+    direction = (
+        "partial->partial"
+        if str(rollout_mode) == "segment"
+        else "partial->terminal"
+    )
+    max_steps_text = "terminal" if max_steps is None else str(int(max_steps))
+    print(
+        f"Epoch {int(epoch_id) + 1} rollout {int(accum_step)}/{int(grad_accum_steps)}: "
+        f"training {direction} "
+        f"episodes={int(batch_size)} "
+        f"max_steps={max_steps_text} "
+        + _format_context_summary(context)
+    )
+
+
+def _format_region_summary(region):
+    return (
+        f"region={int(region.index)} "
+        f"blocks={_format_block_tuple(region.blocks)} "
+        f"bp=[{float(region.left_bp):.1f},{float(region.right_bp):.1f}) "
+        f"score_max={float(region.max_bad_region_score):.4f} "
+        f"score_sum={float(region.sum_bad_region_score):.4f} "
+        f"variants={list(region.variant_positions)}"
+    )
+
+
+def _format_context_summary(context):
+    return (
+        f"mode={context.rollout_mode} "
+        f"{_format_region_summary(context.region)} "
+        f"backtrack_step={int(context.backtrack_step)} "
+        f"strategy_step={context.strategy_backtrack_step} "
+        f"offset={int(context.backtrack_offset)} "
+        f"partial_active_lineages={len(context.partial_state.active_lineages)} "
+        f"partial_total_active_blocks={int(context.partial_state.total_active_blocks)} "
+        f"effective_blocks={len(context.effective_blocks)}"
+    )
+
+
+def _format_block_tuple(blocks):
+    blocks = tuple(int(block) for block in blocks)
+    if len(blocks) <= 8:
+        return str(list(blocks))
+    return (
+        "["
+        + ", ".join(str(block) for block in blocks[:4])
+        + ", ..., "
+        + ", ".join(str(block) for block in blocks[-3:])
+        + "]"
+    )
+
+
+def load_checkpoint(path, map_location=None):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def validate_checkpoint_metadata_for_env(metadata, env):
+    if not metadata:
+        return
+    expected = {
+        "num_sequences": int(env.num_sequences),
+        "sequence_length": int(env.sequence_length),
+        "num_blocks": int(env.num_blocks),
+    }
+    mismatches = []
+    for key, expected_value in expected.items():
+        if key in metadata and int(metadata[key]) != expected_value:
+            mismatches.append(f"{key}: checkpoint={metadata[key]} env={expected_value}")
+    if mismatches:
+        raise ValueError(
+            "checkpoint metadata does not match local refinement environment: "
+            + "; ".join(mismatches)
+        )
+
+
+def save_refinement_context_manifest(
+    output_path,
+    checkpoint,
+    local_refinement_arg,
+    dataset_path,
+    strategy,
+    segment_contexts,
+    terminal_contexts,
+    diagnostic_rows,
+    partial_segment_max_steps,
+    terminal_backtrack_lengths,
+):
+    manifest = {
+        "training_mode": "local_refinement",
+        "checkpoint": os.path.abspath(checkpoint) if checkpoint else None,
+        "local_refinement_arg": os.path.abspath(local_refinement_arg),
+        "dataset_path": os.path.abspath(dataset_path),
+        "refine_strategy": str(strategy),
+        "partial_segment_max_steps": int(partial_segment_max_steps),
+        "terminal_backtrack_lengths": list(terminal_backtrack_lengths),
+        "contexts": [context.to_manifest_record() for context in segment_contexts],
+        "segment_contexts": [
+            context.to_manifest_record() for context in segment_contexts
+        ],
+        "terminal_contexts": [
+            context.to_manifest_record() for context in terminal_contexts
+        ],
+        "diagnostics": diagnostic_rows,
+    }
+    with open(
+        os.path.join(output_path, "refinement_context_manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(manifest, handle, indent=2)
+
+
 def build_checkpoint_metadata(
     epoch,
     best_loss,
@@ -651,6 +1513,7 @@ def build_checkpoint_metadata(
     log_z_lr,
     loss_mode,
     subtb_lambda,
+    subtb_max_span,
     grad_clip,
     grad_accum_steps,
     eval_episodes,
@@ -690,6 +1553,9 @@ def build_checkpoint_metadata(
         "log_z_lr": float(log_z_lr),
         "loss": str(loss_mode),
         "subtb_lambda": float(subtb_lambda),
+        "subtb_max_span": (
+            None if subtb_max_span is None else int(subtb_max_span)
+        ),
         "grad_clip": float(grad_clip),
         "grad_accum_steps": int(grad_accum_steps),
         "eval_episodes": int(eval_episodes),
@@ -717,6 +1583,33 @@ def build_checkpoint_metadata(
 def main():
     parser = argparse.ArgumentParser(description="Train the simplified ARG GFlowNet demo.")
     parser.add_argument("--config", "-c", help="Path to YAML training config.")
+    parser.add_argument("--checkpoint", help="Optional global checkpoint to fine-tune for local refinement.")
+    parser.add_argument(
+        "--local-refinement-arg",
+        help="Existing .trees ARG to backtrack for local bad-region refinement.",
+    )
+    parser.add_argument(
+        "--bad-region-top-k",
+        type=int,
+        help="Automatically refine the top K suspicious blocks.",
+    )
+    parser.add_argument(
+        "--bad-region-blocks",
+        help="Manual block groups, e.g. '1,2,3;8-10'.",
+    )
+    parser.add_argument(
+        "--bad-region-bp",
+        help="Manual BP intervals, e.g. '1000-2500;9000-11000'.",
+    )
+    parser.add_argument(
+        "--refine-strategy",
+        default="before_last_coalescence",
+        choices=["before_last_touch", "before_first_touch", "before_last_coalescence"],
+    )
+    parser.add_argument(
+        "--terminal-backtrack-lengths",
+        help="Comma-separated terminal refinement backtrack offsets, e.g. '5,10,25'.",
+    )
     parser.add_argument("--output-path")
     parser.add_argument("--dataset-path")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"])
@@ -737,6 +1630,7 @@ def main():
     parser.add_argument("--log-z-lr", type=float)
     parser.add_argument("--loss", choices=["tb", "subtb", "fl_subtb"])
     parser.add_argument("--subtb-lambda", type=float)
+    parser.add_argument("--subtb-max-span", type=int)
     parser.add_argument("--grad-clip", type=float)
     parser.add_argument(
         "--grad-accum-steps",
@@ -745,6 +1639,7 @@ def main():
     )
     parser.add_argument("--eval-episodes", type=int)
     parser.add_argument("--eval-every", type=int)
+    parser.add_argument("--partial-segment-max-steps", type=int)
     parser.add_argument("--time-bins", type=int)
     parser.add_argument("--time-delta-bin-width", type=float)
     parser.add_argument("--reward-constant", type=float)
@@ -768,7 +1663,13 @@ def main():
     train_kwargs = config_to_train_kwargs(config)
 
     print(f"Selected device: {train_kwargs['device']}")
-    train(**train_kwargs)
+    if refinement_enabled(config):
+        train_local_refinement(
+            **train_kwargs,
+            **config_to_refinement_kwargs(config),
+        )
+    else:
+        train(**train_kwargs)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from env import SimpleTrajectory, action_as_dict
+from refinement import clone_start_state, move_state_partials_to_device
 
 
 class RolloutWorker:
@@ -17,9 +18,16 @@ class RolloutWorker:
         episodes,
         random_spec=None,
         return_states=False,
+        start_states=None,
+        action_filter=None,
+        max_steps=None,
         ):
+        if max_steps is not None:
+            max_steps = int(max_steps)
+            if max_steps < 1:
+                raise ValueError("max_steps must be at least 1 when provided")
         
-        states = [self.env.get_initial_state() for _ in range(episodes)]
+        states = self._initial_rollout_states(episodes, start_states)
         trajectories = [SimpleTrajectory() for _ in states]
         trajectory_states = [[state] for state in states]
         
@@ -33,7 +41,7 @@ class RolloutWorker:
                 f"({len([idx for idx, state in enumerate(states) if not state.is_done])} active)..."
             )
 
-        unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
+        unfinished = self._unfinished_indices(states, trajectory_states, max_steps)
 
         while unfinished:
             active_states = [states[idx] for idx in unfinished]
@@ -41,15 +49,24 @@ class RolloutWorker:
             input_dict = self.env.prepare_state_rollout_inputs(
                 active_states,
                 random_spec=random_spec,
+                action_filter=action_filter,
             )
 
             total_log_pf, log_probs, choosen_actions = generator(input_dict)
 
             for batch_idx, traj_idx in enumerate(unfinished):
                 state = states[traj_idx]
-                coal_actions, recomb_actions = self.env.enumerate_actions(state)
+                coal_actions, recomb_actions = self.env.enumerate_actions(
+                    state,
+                    action_filter=action_filter,
+                )
 
                 action = choosen_actions[batch_idx]
+                if action_filter is not None and hasattr(action_filter, "action_touches_blocks"):
+                    if not action_filter.action_touches_blocks(state, action):
+                        raise ValueError(
+                            "sampled action does not touch the local refinement region"
+                        )
                 log_paths_pf_by_traj[traj_idx].append(total_log_pf[batch_idx])
                 log_prior = self.env.compute_cwr_event_log_prior(state, (coal_actions, recomb_actions), action)
 
@@ -69,7 +86,7 @@ class RolloutWorker:
                 backward_num_parents_by_traj[traj_idx].append(
                     generator.count_backward_parents(next_state)
                     )
-            unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
+            unfinished = self._unfinished_indices(states, trajectory_states, max_steps)
 
         log_paths_pf = self._pad_log_path_lists(log_paths_pf_by_traj, torch.float32, self.device)
 
@@ -80,7 +97,33 @@ class RolloutWorker:
         
         log_paths_pb = self._pad_log_path_vectors(log_paths_pb, torch.float32, self.device)
 
-        log_rewards = torch.tensor([state.log_reward for state in states], dtype=torch.float32, device=self.device)
+        terminal_mask = torch.tensor(
+            [bool(state.is_done) for state in states],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        truncated_mask = torch.tensor(
+            [
+                (
+                    max_steps is not None
+                    and not bool(state.is_done)
+                    and (len(path) - 1) >= max_steps
+                )
+                for state, path in zip(states, trajectory_states)
+            ],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        log_rewards = torch.tensor(
+            [
+                float(state.log_reward)
+                if state.is_done and state.log_reward is not None
+                else float("nan")
+                for state in states
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
         trajectory_lengths = torch.tensor(
             [len(path) - 1 for path in trajectory_states],
             dtype=torch.long,
@@ -94,6 +137,8 @@ class RolloutWorker:
             "log_rewards": log_rewards,
             "trajectory_states": trajectory_states,
             "trajectory_lengths": trajectory_lengths,
+            "terminal_mask": terminal_mask,
+            "truncated_mask": truncated_mask,
         }
         if return_states:
             data["states"] = states
@@ -106,6 +151,9 @@ class RolloutWorker:
         episodes=1,
         random_spec=None,
         return_states=False,
+        start_states=None,
+        action_filter=None,
+        max_steps=None,
     ):
         """Run one or more model-guided ARG rollouts."""
         if generator is None:
@@ -115,7 +163,35 @@ class RolloutWorker:
             episodes=episodes,
             random_spec=random_spec,
             return_states=return_states,
+            start_states=start_states,
+            action_filter=action_filter,
+            max_steps=max_steps,
         )
+
+    def _unfinished_indices(self, states, trajectory_states, max_steps):
+        unfinished = []
+        for idx, state in enumerate(states):
+            if state.is_done:
+                continue
+            if max_steps is not None and (len(trajectory_states[idx]) - 1) >= max_steps:
+                continue
+            unfinished.append(idx)
+        return unfinished
+
+    def _initial_rollout_states(self, episodes, start_states):
+        episodes = int(episodes)
+        if episodes < 1:
+            raise ValueError("episodes must be at least 1")
+        if start_states is None:
+            return [self.env.get_initial_state() for _ in range(episodes)]
+        if len(start_states) != episodes:
+            raise ValueError(
+                f"start_states length ({len(start_states)}) must match episodes ({episodes})"
+            )
+        return [
+            move_state_partials_to_device(clone_start_state(state), self.env.device)
+            for state in start_states
+        ]
 
     def _states_to_padded_tree_features(self, states, device=None):
         lineage_features = [

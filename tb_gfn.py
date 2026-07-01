@@ -31,6 +31,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         initialize_z_from_prior=True,
         loss_mode="tb",
         subtb_lambda=0.9,
+        subtb_max_span=None,
     ):
         super().__init__()
         print(f"verbose: {verbose}")
@@ -76,6 +77,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.subtb_lambda = float(subtb_lambda)
         if self.subtb_lambda <= 0.0:
             raise ValueError(f"subtb_lambda must be positive, got {subtb_lambda!r}")
+        self.subtb_max_span = (
+            None if subtb_max_span is None else int(subtb_max_span)
+        )
+        if self.subtb_max_span is not None and self.subtb_max_span <= 0:
+            raise ValueError(
+                f"subtb_max_span must be positive when provided, got {subtb_max_span!r}"
+            )
         self.model_kwargs = dict(model_kwargs or {})
         self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
         self.time_model = self.arg_model.time_scorer
@@ -551,11 +559,21 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def compute_tb_loss_from_rollout_outputs(self, rollout_outputs):
         log_paths_pf = rollout_outputs['log_paths_pf']
         log_paths_pb = rollout_outputs['log_paths_pb']
+        terminal_mask = rollout_outputs.get("terminal_mask")
+        if terminal_mask is not None and not bool(terminal_mask.all().detach().cpu().item()):
+            raise ValueError(
+                "Trajectory balance requires terminal rollout outputs; "
+                "use subtb/fl_subtb for capped partial-to-partial rollouts."
+            )
         log_rewards = torch.as_tensor(
             rollout_outputs['log_rewards'],
             dtype=log_paths_pf.dtype,
             device=log_paths_pf.device,
         )
+        if not bool(torch.isfinite(log_rewards).all().detach().cpu().item()):
+            raise ValueError(
+                "Trajectory balance requires finite terminal log rewards for every trajectory."
+            )
 
         log_pf = log_paths_pf.sum(-1)
         log_pb = log_paths_pb.sum(-1)
@@ -593,6 +611,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
             rollout_outputs["log_paths_pb"],
             rollout_outputs["trajectory_lengths"],
             self.subtb_lambda,
+            self.subtb_max_span,
         )
 
     @staticmethod
@@ -602,7 +621,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
         log_paths_pb,
         trajectory_lengths,
         subtb_lambda,
+        subtb_max_span=None,
     ):
+        if subtb_max_span is not None:
+            subtb_max_span = int(subtb_max_span)
+            if subtb_max_span <= 0:
+                raise ValueError("subtb_max_span must be positive when provided")
         if torch.is_tensor(trajectory_lengths):
             lengths = trajectory_lengths.detach().cpu().tolist()
         else:
@@ -632,7 +656,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
             ])
 
             for start in range(length):
-                for end in range(start + 1, length + 1):
+                max_end = length + 1
+                if subtb_max_span is not None:
+                    max_end = min(max_end, start + int(subtb_max_span) + 1)
+                for end in range(start + 1, max_end):
                     span = end - start
                     log_pf = pf_prefix[end] - pf_prefix[start]
                     log_pb = pb_prefix[end] - pb_prefix[start]

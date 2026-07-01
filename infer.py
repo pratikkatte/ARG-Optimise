@@ -5,6 +5,12 @@ import os
 import torch
 
 from env import SimpleARGEnvironment
+from refinement import (
+    build_refinement_contexts,
+    build_refinement_source,
+    parse_block_groups,
+    parse_bp_intervals,
+)
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from time_env import DEFAULT_TIME_BIN_SCHEME
@@ -53,6 +59,11 @@ def run_inference(
     temperature=None,
     verbose=False,
     dataset_path=None,
+    refine_arg=None,
+    bad_region_top_k=None,
+    bad_region_blocks=None,
+    bad_region_bp=None,
+    refine_strategy="before_last_coalescence",
 ):
     if num_args < 1:
         raise ValueError("num_args must be at least 1")
@@ -92,6 +103,33 @@ def run_inference(
 
     random_spec = build_random_spec(temperature=temperature)
     rollout_worker = RolloutWorker(env, verbose=verbose)
+    if refine_arg is not None:
+        return run_refinement_inference(
+            checkpoint=checkpoint,
+            metadata=metadata,
+            seed=inference_seed,
+            random_spec=random_spec,
+            output_dir=output_dir,
+            env=env,
+            source_env=environment_from_metadata(
+                metadata,
+                seed=inference_seed,
+                device=torch.device("cpu"),
+                dataset_path=dataset_path,
+            ),
+            rollout_worker=rollout_worker,
+            generator=generator,
+            refine_arg=refine_arg,
+            dataset_path=dataset_path or metadata.get("dataset_path"),
+            num_args=num_args,
+            batch_size=batch_size,
+            bad_region_top_k=bad_region_top_k,
+            bad_region_blocks=bad_region_blocks,
+            bad_region_bp=bad_region_bp,
+            refine_strategy=refine_strategy,
+            verbose=verbose,
+        )
+
     rollout_outputs, trajectories = run_batched_rollouts(
         rollout_worker,
         generator,
@@ -205,6 +243,8 @@ def run_batched_rollouts(
     batch_size,
     random_spec,
     verbose=False,
+    start_state=None,
+    action_filter=None,
 ):
     states = []
     trajectories = []
@@ -226,6 +266,12 @@ def run_batched_rollouts(
                 episodes=chunk_size,
                 random_spec=random_spec,
                 return_states=True,
+                start_states=(
+                    [start_state for _ in range(chunk_size)]
+                    if start_state is not None
+                    else None
+                ),
+                action_filter=action_filter,
             )
             states.extend(chunk_outputs["states"])
             trajectories.extend(chunk_trajectories)
@@ -250,6 +296,118 @@ def run_batched_rollouts(
         "log_paths_pb": _pad_log_path_rows(log_paths_pb_rows),
     }
     return rollout_outputs, trajectories
+
+
+def run_refinement_inference(
+    checkpoint,
+    metadata,
+    seed,
+    random_spec,
+    output_dir,
+    env,
+    source_env,
+    rollout_worker,
+    generator,
+    refine_arg,
+    dataset_path,
+    num_args,
+    batch_size,
+    bad_region_top_k,
+    bad_region_blocks,
+    bad_region_bp,
+    refine_strategy,
+    verbose=False,
+):
+    if not dataset_path:
+        raise ValueError("refinement inference requires a VCF dataset path")
+    source = build_refinement_source(
+        source_env,
+        refine_arg,
+        dataset_path,
+        population_size=float(metadata.get("effective_population_size", DEFAULT_NE)),
+        mutation_rate=float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
+    )
+    contexts, diagnostic_rows = build_refinement_contexts(
+        source,
+        top_k=bad_region_top_k,
+        block_groups=parse_block_groups(bad_region_blocks),
+        bp_intervals=parse_bp_intervals(bad_region_bp),
+        strategy=refine_strategy,
+    )
+    if not contexts:
+        raise ValueError("no local refinement contexts were selected")
+
+    os.makedirs(output_dir, exist_ok=True)
+    region_records = []
+    total_outputs = 0
+    for context_idx, context in enumerate(contexts, start=1):
+        region_dir = os.path.join(output_dir, f"region_{context_idx:06d}")
+        os.makedirs(region_dir, exist_ok=True)
+        if verbose:
+            print(
+                f"Refining region {context_idx}/{len(contexts)} "
+                f"blocks={list(context.region.blocks)} "
+                f"effective_blocks={list(context.effective_blocks)}",
+                flush=True,
+            )
+        rollout_outputs, trajectories = run_batched_rollouts(
+            rollout_worker,
+            generator,
+            num_args=num_args,
+            batch_size=batch_size,
+            random_spec=random_spec,
+            verbose=verbose,
+            start_state=context.partial_state,
+            action_filter=context.action_filter(),
+        )
+        region_manifest = build_manifest(
+            checkpoint=checkpoint,
+            metadata=metadata,
+            seed=seed,
+            random_spec=random_spec,
+            output_dir=region_dir,
+            env=env,
+            rollout_outputs=rollout_outputs,
+            trajectories=trajectories,
+        )
+        region_manifest["refinement_context"] = context.to_manifest_record()
+        with open(
+            os.path.join(region_dir, "manifest.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(region_manifest, handle, indent=2)
+        region_records.append(
+            {
+                **context.to_manifest_record(),
+                "output_dir": region_dir,
+                "outputs": region_manifest["outputs"],
+            }
+        )
+        total_outputs += len(region_manifest["outputs"])
+
+    manifest = {
+        "mode": "local_refinement",
+        "checkpoint": os.path.abspath(checkpoint),
+        "checkpoint_epoch": int(metadata["epoch"]) if "epoch" in metadata else None,
+        "checkpoint_best_loss": (
+            float(metadata["best_loss"]) if "best_loss" in metadata else None
+        ),
+        "seed": int(seed),
+        "source_arg": os.path.abspath(refine_arg),
+        "dataset_path": os.path.abspath(dataset_path),
+        "num_regions": len(region_records),
+        "num_args_per_region": int(num_args),
+        "num_outputs": int(total_outputs),
+        "random_spec": random_spec,
+        "refine_strategy": str(refine_strategy),
+        "regions": region_records,
+        "diagnostics": diagnostic_rows,
+    }
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+    return manifest
 
 
 def _pad_log_path_rows(rows):
@@ -343,6 +501,28 @@ def main():
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--dataset-path", help="Override the dataset path stored in checkpoint metadata.")
+    parser.add_argument(
+        "--refine-arg",
+        help="Existing .trees ARG to backtrack and locally refine.",
+    )
+    parser.add_argument(
+        "--bad-region-top-k",
+        type=int,
+        help="Automatically refine the top K suspicious blocks.",
+    )
+    parser.add_argument(
+        "--bad-region-blocks",
+        help="Manual block groups, e.g. '1,2,3;8-10'.",
+    )
+    parser.add_argument(
+        "--bad-region-bp",
+        help="Manual BP intervals, e.g. '1000-2500;9000-11000'.",
+    )
+    parser.add_argument(
+        "--refine-strategy",
+        default="before_last_coalescence",
+        choices=["before_last_touch", "before_first_touch", "before_last_coalescence"],
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -356,8 +536,16 @@ def main():
         temperature=args.temperature,
         verbose=args.verbose,
         dataset_path=args.dataset_path,
+        refine_arg=args.refine_arg,
+        bad_region_top_k=args.bad_region_top_k,
+        bad_region_blocks=args.bad_region_blocks,
+        bad_region_bp=args.bad_region_bp,
+        refine_strategy=args.refine_strategy,
     )
-    print(f"Wrote {manifest['num_args']} ARG tree sequence(s) to {args.output_dir}")
+    print(
+        f"Wrote {manifest.get('num_outputs', manifest.get('num_args', 0))} "
+        f"ARG tree sequence(s) to {args.output_dir}"
+    )
 
 
 if __name__ == "__main__":
