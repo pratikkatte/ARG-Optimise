@@ -959,6 +959,67 @@ def build_refinement_source(env, trees_path, vcf_path, **kwargs):
     return RefinementSource(env, trees_path, vcf_path, **kwargs)
 
 
+def estimate_time_delta_bin_width_from_trees(
+    trees_path,
+    population_size,
+    time_bins,
+    margin=1.05,
+):
+    try:
+        import tskit
+    except ImportError as exc:
+        raise ImportError(
+            "tskit is required to auto-calibrate time bins from .trees files."
+        ) from exc
+
+    time_bins = int(time_bins)
+    if time_bins < 2:
+        raise ValueError("time_bins must be at least 2 for time-bin calibration")
+    population_size = float(population_size)
+    if population_size <= 0.0:
+        raise ValueError("population_size must be positive for time-bin calibration")
+    margin = float(margin)
+    if margin <= 0.0:
+        raise ValueError("time-bin calibration margin must be positive")
+
+    ts = tskit.load(str(trees_path))
+    positive_times_generations = np.asarray(
+        sorted({float(node.time) for node in ts.nodes() if float(node.time) > 0.0}),
+        dtype=np.float64,
+    )
+    if positive_times_generations.size == 0:
+        raise ValueError(
+            f"{trees_path} has no positive node times to calibrate time bins"
+        )
+
+    local_times = positive_times_generations / (2.0 * population_size)
+    event_times = np.concatenate(([0.0], local_times))
+    deltas = np.diff(event_times)
+    positive_deltas = deltas[deltas > 0.0]
+    if positive_deltas.size == 0:
+        raise ValueError(
+            f"{trees_path} has no positive event-time deltas to calibrate time bins"
+        )
+
+    max_delta = float(np.max(positive_deltas))
+    finite_bins = time_bins - 1
+    width = max_delta * margin / float(finite_bins)
+    tail_start = finite_bins * width
+    return {
+        "source_time_units": str(ts.time_units),
+        "time_bins": int(time_bins),
+        "finite_bins": int(finite_bins),
+        "margin": float(margin),
+        "population_size": float(population_size),
+        "positive_event_time_count": int(local_times.size),
+        "max_event_time_generations": float(np.max(positive_times_generations)),
+        "max_event_time_t_over_2Ne": float(np.max(local_times)),
+        "max_delta_t_over_2Ne": max_delta,
+        "time_delta_bin_width": float(width),
+        "tail_start_t_over_2Ne": float(tail_start),
+    }
+
+
 def score_bad_regions(source):
     pairwise_sample_pairs = [
         (source.samples[i], source.samples[j])

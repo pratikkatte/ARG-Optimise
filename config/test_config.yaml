@@ -40,7 +40,7 @@ environment:
   mutation_rate: 2.0e-8
   recombination_rate: 2.0e-8
   time_bins: 4
-  time_delta_bin_width: 0.001
+  time_delta_bin_width: auto
 
 reward:
   constant: 0

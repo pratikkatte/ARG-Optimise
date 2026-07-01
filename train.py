@@ -18,6 +18,7 @@ from env import SimpleARGEnvironment, action_as_dict
 from refinement import (
     build_refinement_context_sets,
     build_refinement_source,
+    estimate_time_delta_bin_width_from_trees,
     parse_block_groups,
     parse_bp_intervals,
 )
@@ -61,6 +62,8 @@ DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE = 256
 DEFAULT_BREAKPOINT_GAP_LAYERS = 3
 DEFAULT_BREAKPOINT_GAP_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_USE_POSITION_FEATURES = True
+AUTO_TIME_DELTA_BIN_WIDTH = "auto"
+LOCAL_REFINEMENT_TIME_BIN_MARGIN = 1.05
 MODEL_VERSION = "cwr-event-sparse-vcf-v1"
 
 
@@ -262,6 +265,27 @@ def parse_optional_positive_int(value, field_name):
     return parsed_value
 
 
+def is_auto_time_delta_bin_width(value):
+    return (
+        isinstance(value, str)
+        and value.strip().lower() == AUTO_TIME_DELTA_BIN_WIDTH
+    )
+
+
+def parse_time_delta_bin_width(value, field_name, allow_auto=False):
+    if is_auto_time_delta_bin_width(value):
+        if not allow_auto:
+            raise ValueError(f"{field_name}='auto' is only valid for local refinement")
+        return AUTO_TIME_DELTA_BIN_WIDTH
+    try:
+        parsed_value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive float") from exc
+    if parsed_value <= 0.0:
+        raise ValueError(f"{field_name} must be a positive float")
+    return parsed_value
+
+
 def validate_train_config(config):
     missing = []
     if not config.get("dataset_path"):
@@ -283,6 +307,16 @@ def validate_train_config(config):
     subtb_lambda = float(training.get("subtb_lambda", DEFAULT_SUBTB_LAMBDA))
     if subtb_lambda <= 0.0:
         raise ValueError("training.subtb_lambda must be positive")
+    environment = config.setdefault("environment", {})
+    time_bins = int(environment.get("time_bins", DEFAULT_TIME_BINS))
+    if time_bins < 2:
+        raise ValueError("environment.time_bins must be at least 2")
+    environment["time_bins"] = time_bins
+    environment["time_delta_bin_width"] = parse_time_delta_bin_width(
+        environment.get("time_delta_bin_width", DEFAULT_TIME_DELTA_BIN_WIDTH),
+        "environment.time_delta_bin_width",
+        allow_auto=refinement_enabled(config),
+    )
     training["subtb_max_span"] = parse_optional_positive_int(
         training.get("subtb_max_span", DEFAULT_SUBTB_MAX_SPAN),
         "training.subtb_max_span",
@@ -684,6 +718,30 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
         if env_rng_state is not None:
             env.rng.setstate(env_rng_state)
 
+
+def resolve_local_refinement_time_delta_bin_width(
+    time_delta_bin_width,
+    local_refinement_arg,
+    effective_population_size,
+    time_bins,
+):
+    if time_delta_bin_width is None or is_auto_time_delta_bin_width(time_delta_bin_width):
+        calibration = estimate_time_delta_bin_width_from_trees(
+            local_refinement_arg,
+            population_size=effective_population_size,
+            time_bins=time_bins,
+            margin=LOCAL_REFINEMENT_TIME_BIN_MARGIN,
+        )
+        return float(calibration["time_delta_bin_width"]), calibration
+    return (
+        parse_time_delta_bin_width(
+            time_delta_bin_width,
+            "environment.time_delta_bin_width",
+        ),
+        None,
+    )
+
+
 def train(
     dataset_path,
     output_path,
@@ -1002,6 +1060,14 @@ def train_local_refinement(
         ),
         "terminal_backtrack_lengths",
     )
+    time_delta_bin_width, time_delta_calibration = (
+        resolve_local_refinement_time_delta_bin_width(
+            time_delta_bin_width,
+            local_refinement_arg,
+            effective_population_size,
+            time_bins,
+        )
+    )
     variant_data = load_vcf_variants(dataset_path)
     env = SimpleARGEnvironment(
         sequence_length=int(variant_data.sequence_length),
@@ -1086,6 +1152,7 @@ def train_local_refinement(
         subtb_max_span=subtb_max_span,
         subtb_state_flow_batch_size=subtb_state_flow_batch_size,
         rollout_microbatch_size=rollout_microbatch_size,
+        time_delta_calibration=time_delta_calibration,
     )
 
     os.makedirs(output_path, exist_ok=True)
@@ -1106,6 +1173,8 @@ def train_local_refinement(
         subtb_max_span=subtb_max_span,
         subtb_state_flow_batch_size=subtb_state_flow_batch_size,
         rollout_microbatch_size=rollout_microbatch_size,
+        time_metadata=env.time_metadata,
+        time_delta_calibration=time_delta_calibration,
     )
 
     generator = TBGFlowNetGenerator(
@@ -1171,6 +1240,7 @@ def train_local_refinement(
             "terminal_backtrack_lengths": list(terminal_backtrack_lengths),
             "local_segment_contexts": len(segment_contexts),
             "local_terminal_contexts": len(terminal_contexts),
+            "time_delta_calibration": time_delta_calibration,
             **env.time_metadata,
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
@@ -1292,6 +1362,7 @@ def train_local_refinement(
                         "subtb_max_span": subtb_max_span,
                         "subtb_state_flow_batch_size": subtb_state_flow_batch_size,
                         "rollout_microbatch_size": rollout_microbatch_size,
+                        "time_delta_calibration": time_delta_calibration,
                         "refinement_contexts": [
                             context.to_manifest_record() for context in segment_contexts
                         ],
@@ -1448,7 +1519,19 @@ def print_local_refinement_startup_summary(
     subtb_max_span,
     subtb_state_flow_batch_size,
     rollout_microbatch_size,
+    time_delta_calibration=None,
 ):
+    if time_delta_calibration is not None:
+        print(
+            "Auto-calibrated local refinement time bins: "
+            f"bins={int(time_delta_calibration['time_bins'])} "
+            f"width={float(time_delta_calibration['time_delta_bin_width']):.6g} "
+            f"tail_start={float(time_delta_calibration['tail_start_t_over_2Ne']):.6g} "
+            f"max_delta={float(time_delta_calibration['max_delta_t_over_2Ne']):.6g} "
+            "t/(2Ne), "
+            f"max_tree_time={float(time_delta_calibration['max_event_time_generations']):.6g} "
+            "generations"
+        )
     print("Detected local refinement bad regions:")
     selected_regions = {}
     for context in list(segment_contexts) + list(terminal_contexts):
@@ -1601,6 +1684,8 @@ def save_refinement_context_manifest(
     subtb_max_span,
     subtb_state_flow_batch_size,
     rollout_microbatch_size,
+    time_metadata=None,
+    time_delta_calibration=None,
 ):
     manifest = {
         "training_mode": "local_refinement",
@@ -1619,6 +1704,8 @@ def save_refinement_context_manifest(
         "rollout_microbatch_size": (
             None if rollout_microbatch_size is None else int(rollout_microbatch_size)
         ),
+        "time": dict(time_metadata or {}),
+        "time_delta_calibration": time_delta_calibration,
         "contexts": [context.to_manifest_record() for context in segment_contexts],
         "segment_contexts": [
             context.to_manifest_record() for context in segment_contexts
@@ -1796,7 +1883,10 @@ def main():
     parser.add_argument("--eval-every", type=int)
     parser.add_argument("--partial-segment-max-steps", type=int)
     parser.add_argument("--time-bins", type=int)
-    parser.add_argument("--time-delta-bin-width", type=float)
+    parser.add_argument(
+        "--time-delta-bin-width",
+        help="Positive float, or 'auto' for local refinement .trees calibration.",
+    )
     parser.add_argument("--reward-constant", type=float)
     parser.add_argument("--embedding-size", type=int)
     parser.add_argument("--hidden-size", type=int)

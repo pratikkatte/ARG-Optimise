@@ -777,6 +777,13 @@ class SimpleARGEnvironment:
             raise ValueError("waiting-time rate must be positive")
         return total_rate
 
+    def _time_action_for_delta(self, delta_t, rates=None):
+        delta_t = float(delta_t)
+        if delta_t < 0.0 and math.isclose(delta_t, 0.0, rel_tol=1e-12, abs_tol=1e-12):
+            delta_t = 0.0
+        rate = self._total_event_rate(rates) if isinstance(rates, dict) else rates
+        return self.time_env.delta_to_time_action(delta_t, rate)
+
     def get_initial_state(self):
         active_lineages = []
         all_nodes = {}
