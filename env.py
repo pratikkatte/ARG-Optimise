@@ -315,6 +315,43 @@ class CoalescenceChoice:
         )
 
 
+def action_active_lineage_indices(actions, active_count=None):
+    """Return original active-lineage indices referenced by an action collection."""
+    indices = set()
+
+    def visit(item):
+        if item is None:
+            return
+        if isinstance(item, CoalescenceChoice):
+            indices.add(int(item.active_lineage_i))
+            indices.add(int(item.active_lineage_j))
+            return
+        if isinstance(item, RecombinationChoice):
+            indices.add(int(item.active_lineage_i))
+            return
+        if isinstance(item, dict):
+            coal = CoalescenceChoice.from_action(item)
+            if coal is not None:
+                visit(coal)
+                return
+            recomb = RecombinationChoice.from_action(item)
+            if recomb is not None:
+                visit(recomb)
+            return
+        try:
+            iterator = iter(item)
+        except TypeError:
+            return
+        for child in iterator:
+            visit(child)
+
+    visit(actions)
+    if active_count is not None:
+        active_count = int(active_count)
+        indices = {idx for idx in indices if 0 <= idx < active_count}
+    return tuple(sorted(indices))
+
+
 @dataclass(frozen=True)
 class PriorActionOptions:
     coal_actions: Tuple[CoalescenceChoice, ...]
@@ -454,6 +491,7 @@ class ARGState:
     prior_options: Optional[PriorActionOptions] = None
     total_active_blocks: Optional[int] = None
     current_time: float = 0.0
+    local_visible_lineage_indices: Optional[Tuple[int, ...]] = None
 
     def clone(self, copy_partials=False):
         all_nodes = {
@@ -472,6 +510,7 @@ class ARGState:
             is_done=self.is_done,
             total_active_blocks=self.total_active_blocks,
             current_time=float(self.current_time),
+            local_visible_lineage_indices=None,
         )
 
 
@@ -1501,6 +1540,7 @@ class SimpleARGEnvironment:
 
         event = {}
         input_actions = []
+        visible_lineage_indices = []
         for idx, state in enumerate(states):
             coal_actions, recomb_actions = self.enumerate_actions(
                 state,
@@ -1519,6 +1559,12 @@ class SimpleARGEnvironment:
             else:
                 input_actions.append(recomb_actions)
 
+            visible_lineage_indices.append(
+                action_active_lineage_indices(
+                    (coal_actions, recomb_actions),
+                    active_count=len(state.active_lineages),
+                )
+            )
             event[idx] = {}
             event[idx]["event_type"] = choosen_event_type
             event[idx]["probability"] = event_prob[event_idx]
@@ -1527,6 +1573,7 @@ class SimpleARGEnvironment:
             "states": states,
             "event": event,
             "input_actions": input_actions,
+            "visible_lineage_indices": visible_lineage_indices,
             "random_spec": random_spec,
         }
 

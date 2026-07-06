@@ -1,7 +1,11 @@
 import torch
 import numpy as np
 from env import SimpleTrajectory, action_as_dict
-from refinement import clone_start_state, move_state_partials_to_device
+from refinement import (
+    clone_start_state,
+    move_state_partials_to_device,
+    visible_lineage_indices_for_blocks,
+)
 
 
 class RolloutWorker:
@@ -75,6 +79,7 @@ class RolloutWorker:
                     action,
                     log_prior=log_prior,
                 )
+                self._attach_local_visible_lineages(next_state, action_filter)
                 states[traj_idx] = next_state
                 trajectory_states[traj_idx].append(next_state)
                 trajectories[traj_idx].update(
@@ -192,6 +197,15 @@ class RolloutWorker:
             move_state_partials_to_device(clone_start_state(state), self.env.device)
             for state in start_states
         ]
+
+    def _attach_local_visible_lineages(self, state, action_filter):
+        if action_filter is None or not hasattr(action_filter, "blocks"):
+            return state
+        state.local_visible_lineage_indices = visible_lineage_indices_for_blocks(
+            state,
+            action_filter.blocks,
+        )
+        return state
 
     def _states_to_padded_tree_features(self, states, device=None):
         lineage_features = [

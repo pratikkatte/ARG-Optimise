@@ -17,6 +17,10 @@ refinement:
   bad_region_top_k: 3
   bad_region_blocks: null
   bad_region_bp: null
+  # Expand/cap selected local windows in physical BP units. Leave null to use
+  # the exact selected variant block groups.
+  bad_region_min_bp: null
+  bad_region_max_bp: null
 
   # Options: before_last_touch, before_first_touch, before_last_coalescence.
   strategy: before_last_coalescence

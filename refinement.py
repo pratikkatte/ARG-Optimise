@@ -147,6 +147,9 @@ class LocalRegionActionFilter:
     def __init__(self, blocks: Iterable[int]):
         self.blocks = tuple(sorted({int(block) for block in blocks}))
         self.block_set = set(self.blocks)
+        self.material_segments = MaterialSegments.from_segments(
+            blocks_to_segments(self.block_set)
+        )
 
     def __call__(self, state, coal_actions, recomb_actions):
         coal = [
@@ -180,9 +183,7 @@ class LocalRegionActionFilter:
 
     def _restricted_recombination_choices(self, state, action):
         lineage = state.active_lineages[int(action.active_lineage_i)]
-        segments = lineage.material_segments.intersection(
-            MaterialSegments.from_segments(blocks_to_segments(self.block_set))
-        )
+        segments = lineage.material_segments.intersection(self.material_segments)
         choices = []
         for start, end in segments.segments:
             if end - start < 2:
@@ -1120,7 +1121,14 @@ class RefinementSource:
     def score_bad_regions(self):
         return score_bad_regions(self)
 
-    def select_regions(self, top_k=None, block_groups=None, bp_intervals=None):
+    def select_regions(
+        self,
+        top_k=None,
+        block_groups=None,
+        bp_intervals=None,
+        min_bp=None,
+        max_bp=None,
+    ):
         rows = self.score_bad_regions()
         return select_regions(
             self,
@@ -1128,6 +1136,8 @@ class RefinementSource:
             top_k=top_k,
             block_groups=block_groups,
             bp_intervals=bp_intervals,
+            min_bp=min_bp,
+            max_bp=max_bp,
         )
 
     def build_refinement_contexts(
@@ -1308,6 +1318,10 @@ class RefinementSource:
         }
         effective_blocks = tuple(
             sorted(set(region.blocks).union(unfinished_blocks))
+        )
+        state.local_visible_lineage_indices = visible_lineage_indices_for_blocks(
+            state,
+            effective_blocks,
         )
         return RefinementContext(
             region=region,
@@ -1728,7 +1742,13 @@ def select_regions(
     top_k=None,
     block_groups=None,
     bp_intervals=None,
+    min_bp=None,
+    max_bp=None,
 ):
+    min_bp = normalize_optional_bp_span(min_bp, "min_bp")
+    max_bp = normalize_optional_bp_span(max_bp, "max_bp")
+    if min_bp is not None and max_bp is not None and max_bp < min_bp:
+        raise ValueError("max_bp must be greater than or equal to min_bp")
     score_by_block = {
         int(row["block"]): float(row["bad_region_score"])
         for row in diagnostic_rows
@@ -1753,9 +1773,33 @@ def select_regions(
             )
         )
 
+    adjusted_groups = []
+    for group in selected_groups:
+        blocks = normalize_region_block_group(
+            source,
+            group,
+            score_by_block,
+            min_bp=min_bp,
+            max_bp=max_bp,
+        )
+        if blocks:
+            adjusted_groups.append(blocks)
+    adjusted_groups = merge_overlapping_block_groups(adjusted_groups)
+    if max_bp is not None:
+        adjusted_groups = [
+            normalize_region_block_group(
+                source,
+                group,
+                score_by_block,
+                min_bp=None,
+                max_bp=max_bp,
+            )
+            for group in adjusted_groups
+        ]
+
     unique_groups = []
     seen = set()
-    for group in selected_groups:
+    for group in adjusted_groups:
         blocks = tuple(sorted({int(block) for block in group}))
         if not blocks:
             continue
@@ -1795,6 +1839,8 @@ def build_refinement_contexts(
     top_k=None,
     block_groups=None,
     bp_intervals=None,
+    min_bp=None,
+    max_bp=None,
     strategy="before_last_coalescence",
 ):
     rows = source.score_bad_regions()
@@ -1804,6 +1850,8 @@ def build_refinement_contexts(
         top_k=top_k,
         block_groups=block_groups,
         bp_intervals=bp_intervals,
+        min_bp=min_bp,
+        max_bp=max_bp,
     )
     return source.build_refinement_contexts(regions, strategy=strategy), rows
 
@@ -1813,6 +1861,8 @@ def build_refinement_context_sets(
     top_k=None,
     block_groups=None,
     bp_intervals=None,
+    min_bp=None,
+    max_bp=None,
     strategy="before_last_coalescence",
     terminal_backtrack_lengths=None,
 ):
@@ -1823,6 +1873,8 @@ def build_refinement_context_sets(
         top_k=top_k,
         block_groups=block_groups,
         bp_intervals=bp_intervals,
+        min_bp=min_bp,
+        max_bp=max_bp,
     )
     segment_contexts, terminal_contexts = source.build_refinement_context_sets(
         regions,
@@ -1856,6 +1908,17 @@ def blocks_to_segments(blocks):
             start = prev = block
     segments.append((start, prev + 1))
     return tuple(segments)
+
+
+def visible_lineage_indices_for_blocks(state, blocks):
+    block_segments = MaterialSegments.from_segments(blocks_to_segments(blocks))
+    if not block_segments.segments:
+        return tuple()
+    return tuple(
+        idx
+        for idx, lineage in enumerate(state.active_lineages)
+        if lineage.material_segments.overlaps(block_segments)
+    )
 
 
 def segments_to_blocks(segments):
@@ -1968,6 +2031,149 @@ def blocks_from_bp_interval(source, left_bp, right_bp):
     return selected
 
 
+def normalize_optional_bp_span(value, field_name):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    try:
+        span = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive BP span or null") from exc
+    if span <= 0.0:
+        raise ValueError(f"{field_name} must be a positive BP span or null")
+    return span
+
+
+def normalize_region_block_group(
+    source,
+    group,
+    score_by_block,
+    min_bp=None,
+    max_bp=None,
+):
+    blocks = tuple(sorted({int(block) for block in group}))
+    if not blocks:
+        return tuple()
+    for block in blocks:
+        if block < 0 or block >= int(source.num_blocks):
+            raise ValueError(
+                f"bad-region block {block} is outside [0, {int(source.num_blocks) - 1}]"
+            )
+    if min_bp is not None:
+        blocks = expand_region_blocks_to_min_bp(
+            source,
+            blocks,
+            float(min_bp),
+            score_by_block,
+        )
+    if max_bp is not None:
+        blocks = cap_region_blocks_to_max_bp(
+            source,
+            blocks,
+            float(max_bp),
+            score_by_block,
+        )
+    return tuple(sorted({int(block) for block in blocks}))
+
+
+def expand_region_blocks_to_min_bp(source, blocks, min_bp, score_by_block):
+    if region_width_bp(source, blocks) >= float(min_bp):
+        return tuple(blocks)
+    center_bp = region_focal_center_bp(source, blocks, score_by_block)
+    expanded = blocks_from_centered_bp_window(source, center_bp, float(min_bp))
+    return tuple(sorted(set(expanded).union(int(block) for block in blocks)))
+
+
+def cap_region_blocks_to_max_bp(source, blocks, max_bp, score_by_block):
+    if region_width_bp(source, blocks) <= float(max_bp):
+        return tuple(blocks)
+    center_bp = region_focal_center_bp(source, blocks, score_by_block)
+    capped = blocks_from_centered_bp_window(source, center_bp, float(max_bp))
+    if capped:
+        return tuple(capped)
+    return (max(blocks, key=lambda block: score_by_block.get(int(block), 0.0)),)
+
+
+def region_width_bp(source, blocks):
+    blocks = tuple(sorted({int(block) for block in blocks}))
+    if not blocks:
+        return 0.0
+    return float(source.block_table[blocks[-1]]["right_bp"]) - float(
+        source.block_table[blocks[0]]["left_bp"]
+    )
+
+
+def region_focal_center_bp(source, blocks, score_by_block):
+    blocks = tuple(sorted({int(block) for block in blocks}))
+    left_bp = float(source.block_table[blocks[0]]["left_bp"])
+    right_bp = float(source.block_table[blocks[-1]]["right_bp"])
+    span_center = 0.5 * (left_bp + right_bp)
+
+    def rank(block):
+        block = int(block)
+        block_center = block_center_bp(source, block)
+        return (
+            float(score_by_block.get(block, 0.0)),
+            -abs(block_center - span_center),
+        )
+
+    focal_block = max(blocks, key=rank)
+    return block_center_bp(source, focal_block)
+
+
+def block_center_bp(source, block):
+    block = int(block)
+    return 0.5 * (
+        float(source.block_table[block]["left_bp"])
+        + float(source.block_table[block]["right_bp"])
+    )
+
+
+def blocks_from_centered_bp_window(source, center_bp, width_bp):
+    half_width = 0.5 * float(width_bp)
+    left_bp = float(center_bp) - half_width
+    right_bp = float(center_bp) + half_width
+    left_limit = max(
+        float(getattr(source, "analysis_left", 0.0)),
+        float(source.block_table[0]["left_bp"]),
+    )
+    right_limit = min(
+        float(getattr(source, "analysis_right", source.block_table[-1]["right_bp"])),
+        float(source.block_table[-1]["right_bp"]),
+    )
+    left_bp = max(left_limit, left_bp)
+    right_bp = min(right_limit, right_bp)
+    if right_bp <= left_bp:
+        center_block = min(
+            range(int(source.num_blocks)),
+            key=lambda block: abs(block_center_bp(source, block) - float(center_bp)),
+        )
+        return (center_block,)
+    return tuple(blocks_from_bp_interval(source, left_bp, right_bp))
+
+
+def merge_overlapping_block_groups(groups):
+    intervals = []
+    for group in groups:
+        blocks = tuple(sorted({int(block) for block in group}))
+        if blocks:
+            intervals.append([blocks[0], blocks[-1], set(blocks)])
+    if not intervals:
+        return []
+    intervals.sort(key=lambda item: (item[0], item[1]))
+    merged = [intervals[0]]
+    for start, end, block_set in intervals[1:]:
+        current = merged[-1]
+        if start <= current[1] + 1:
+            current[1] = max(current[1], end)
+            current[2].update(block_set)
+            current[2].update(range(current[0], current[1] + 1))
+        else:
+            merged.append([start, end, set(block_set)])
+    return [tuple(sorted(block_set)) for _start, _end, block_set in merged]
+
+
 def merge_contiguous_bad_blocks(source, blocks):
     ordered = sorted({int(block) for block in blocks})
     if not ordered:
@@ -2041,7 +2247,7 @@ def parse_bp_intervals(text):
 
 def clone_start_state(state):
     cloned = state.clone(copy_partials=False)
-    for attr in ("canonical_step_index",):
+    for attr in ("canonical_step_index", "local_visible_lineage_indices"):
         if hasattr(state, attr):
             setattr(cloned, attr, getattr(state, attr))
     return cloned

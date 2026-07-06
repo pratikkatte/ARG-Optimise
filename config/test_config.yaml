@@ -9,6 +9,8 @@ refinement:
   bad_region_top_k: 3
   bad_region_blocks: null
   bad_region_bp: null
+  bad_region_min_bp: null
+  bad_region_max_bp: null
   strategy: before_last_coalescence
   terminal_backtrack_lengths: [1]
 

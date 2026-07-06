@@ -78,6 +78,8 @@ DEFAULT_CONFIG = {
         "bad_region_top_k": None,
         "bad_region_blocks": None,
         "bad_region_bp": None,
+        "bad_region_min_bp": None,
+        "bad_region_max_bp": None,
         "strategy": "before_last_coalescence",
         "terminal_backtrack_lengths": list(DEFAULT_TERMINAL_BACKTRACK_LENGTHS),
     },
@@ -135,6 +137,8 @@ CLI_CONFIG_PATHS = {
     "bad_region_top_k": ("refinement", "bad_region_top_k"),
     "bad_region_blocks": ("refinement", "bad_region_blocks"),
     "bad_region_bp": ("refinement", "bad_region_bp"),
+    "bad_region_min_bp": ("refinement", "bad_region_min_bp"),
+    "bad_region_max_bp": ("refinement", "bad_region_max_bp"),
     "refine_strategy": ("refinement", "strategy"),
     "terminal_backtrack_lengths": ("refinement", "terminal_backtrack_lengths"),
     "epochs": ("training", "epochs"),
@@ -265,6 +269,20 @@ def parse_optional_positive_int(value, field_name):
     return parsed_value
 
 
+def parse_optional_positive_float(value, field_name):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"", "none", "null"}:
+        return None
+    try:
+        parsed_value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive number or null") from exc
+    if parsed_value <= 0.0:
+        raise ValueError(f"{field_name} must be a positive number or null")
+    return parsed_value
+
+
 def is_auto_time_delta_bin_width(value):
     return (
         isinstance(value, str)
@@ -346,6 +364,23 @@ def validate_train_config(config):
         ),
         "refinement.terminal_backtrack_lengths",
     )
+    refinement["bad_region_min_bp"] = parse_optional_positive_float(
+        refinement.get("bad_region_min_bp"),
+        "refinement.bad_region_min_bp",
+    )
+    refinement["bad_region_max_bp"] = parse_optional_positive_float(
+        refinement.get("bad_region_max_bp"),
+        "refinement.bad_region_max_bp",
+    )
+    if (
+        refinement["bad_region_min_bp"] is not None
+        and refinement["bad_region_max_bp"] is not None
+        and refinement["bad_region_max_bp"] < refinement["bad_region_min_bp"]
+    ):
+        raise ValueError(
+            "refinement.bad_region_max_bp must be greater than or equal to "
+            "refinement.bad_region_min_bp"
+        )
     if refinement_enabled(config) and not refinement.get("arg_path"):
         missing_refinement = "refinement.arg_path"
         raise ValueError(
@@ -422,6 +457,8 @@ def config_to_refinement_kwargs(config):
         "bad_region_top_k": refinement.get("bad_region_top_k"),
         "bad_region_blocks": refinement.get("bad_region_blocks"),
         "bad_region_bp": refinement.get("bad_region_bp"),
+        "bad_region_min_bp": refinement.get("bad_region_min_bp"),
+        "bad_region_max_bp": refinement.get("bad_region_max_bp"),
         "refine_strategy": refinement.get("strategy", "before_last_coalescence"),
         "terminal_backtrack_lengths": refinement.get(
             "terminal_backtrack_lengths",
@@ -998,6 +1035,8 @@ def train_local_refinement(
     bad_region_top_k=None,
     bad_region_blocks=None,
     bad_region_bp=None,
+    bad_region_min_bp=None,
+    bad_region_max_bp=None,
     refine_strategy="before_last_coalescence",
     terminal_backtrack_lengths=None,
     bp_per_blocks=1,
@@ -1155,6 +1194,8 @@ def train_local_refinement(
         top_k=bad_region_top_k,
         block_groups=parse_block_groups(bad_region_blocks),
         bp_intervals=parse_bp_intervals(bad_region_bp),
+        min_bp=bad_region_min_bp,
+        max_bp=bad_region_max_bp,
         strategy=refine_strategy,
         terminal_backtrack_lengths=terminal_backtrack_lengths,
     )
@@ -1178,6 +1219,8 @@ def train_local_refinement(
         subtb_max_span=subtb_max_span,
         subtb_state_flow_batch_size=subtb_state_flow_batch_size,
         rollout_microbatch_size=rollout_microbatch_size,
+        bad_region_min_bp=bad_region_min_bp,
+        bad_region_max_bp=bad_region_max_bp,
         time_delta_calibration=time_delta_calibration,
     )
 
@@ -1191,6 +1234,8 @@ def train_local_refinement(
         local_refinement_arg=local_refinement_arg,
         dataset_path=dataset_path,
         strategy=refine_strategy,
+        bad_region_min_bp=bad_region_min_bp,
+        bad_region_max_bp=bad_region_max_bp,
         segment_contexts=segment_contexts,
         terminal_contexts=terminal_contexts,
         diagnostic_rows=diagnostic_rows,
@@ -1261,6 +1306,8 @@ def train_local_refinement(
             "checkpoint": os.path.abspath(checkpoint) if checkpoint else None,
             "local_refinement_arg": os.path.abspath(local_refinement_arg),
             "bad_region_top_k": bad_region_top_k,
+            "bad_region_min_bp": bad_region_min_bp,
+            "bad_region_max_bp": bad_region_max_bp,
             "refine_strategy": refine_strategy,
             "partial_segment_max_steps": int(partial_segment_max_steps),
             "terminal_backtrack_lengths": list(terminal_backtrack_lengths),
@@ -1383,6 +1430,8 @@ def train_local_refinement(
                         ),
                         "local_refinement_arg": os.path.abspath(local_refinement_arg),
                         "refine_strategy": str(refine_strategy),
+                        "bad_region_min_bp": bad_region_min_bp,
+                        "bad_region_max_bp": bad_region_max_bp,
                         "partial_segment_max_steps": int(partial_segment_max_steps),
                         "terminal_backtrack_lengths": list(terminal_backtrack_lengths),
                         "subtb_max_span": subtb_max_span,
@@ -1545,6 +1594,8 @@ def print_local_refinement_startup_summary(
     subtb_max_span,
     subtb_state_flow_batch_size,
     rollout_microbatch_size,
+    bad_region_min_bp=None,
+    bad_region_max_bp=None,
     time_delta_calibration=None,
 ):
     if time_delta_calibration is not None:
@@ -1582,6 +1633,8 @@ def print_local_refinement_startup_summary(
         f"partial->partial max_steps={int(partial_segment_max_steps)}, "
         "partial->terminal full completion, "
         f"terminal_backtrack_lengths={list(terminal_backtrack_lengths)}, "
+        f"bad_region_min_bp={bad_region_min_bp}, "
+        f"bad_region_max_bp={bad_region_max_bp}, "
         f"subtb_max_span={subtb_max_span}, "
         f"subtb_state_flow_batch_size={subtb_state_flow_batch_size}, "
         f"rollout_microbatch_size={rollout_microbatch_size}"
@@ -1710,6 +1763,8 @@ def save_refinement_context_manifest(
     subtb_max_span,
     subtb_state_flow_batch_size,
     rollout_microbatch_size,
+    bad_region_min_bp=None,
+    bad_region_max_bp=None,
     time_metadata=None,
     time_delta_calibration=None,
 ):
@@ -1719,6 +1774,8 @@ def save_refinement_context_manifest(
         "local_refinement_arg": os.path.abspath(local_refinement_arg),
         "dataset_path": os.path.abspath(dataset_path),
         "refine_strategy": str(strategy),
+        "bad_region_min_bp": bad_region_min_bp,
+        "bad_region_max_bp": bad_region_max_bp,
         "partial_segment_max_steps": int(partial_segment_max_steps),
         "terminal_backtrack_lengths": list(terminal_backtrack_lengths),
         "subtb_max_span": None if subtb_max_span is None else int(subtb_max_span),
@@ -1866,6 +1923,16 @@ def main():
     parser.add_argument(
         "--bad-region-bp",
         help="Manual BP intervals, e.g. '1000-2500;9000-11000'.",
+    )
+    parser.add_argument(
+        "--bad-region-min-bp",
+        type=float,
+        help="Expand selected refinement regions to at least this BP span.",
+    )
+    parser.add_argument(
+        "--bad-region-max-bp",
+        type=float,
+        help="Cap selected refinement regions to at most this BP span when possible.",
     )
     parser.add_argument(
         "--refine-strategy",

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from models import ARGModel
-from env import RecombinationChoice
+from env import RecombinationChoice, action_active_lineage_indices
 from dataclasses import replace
 
 LOSS_FN = {
@@ -157,8 +157,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
 
 
-    def _encode_states(self, states):
-        return self.arg_model._encode_states(states)
+    def _encode_states(self, states, visible_lineage_indices_by_state=None):
+        return self.arg_model._encode_states(
+            states,
+            visible_lineage_indices_by_state=visible_lineage_indices_by_state,
+        )
 
 
     def save(self, path, metadata=None):
@@ -310,8 +313,16 @@ class TBGFlowNetGenerator(torch.nn.Module):
         )
 
         all_actions = input_dict.get("input_actions")
+        visible_lineage_indices = self._visible_lineage_indices_for_forward(
+            states,
+            all_actions,
+            input_dict.get("visible_lineage_indices"),
+        )
 
-        lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states(states)
+        lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states(
+            states,
+            visible_lineage_indices_by_state=visible_lineage_indices,
+        )
         # input_dict = self._move_input_to_device(input_dict)
         ret = self.arg_model(all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec)
 
@@ -355,6 +366,44 @@ class TBGFlowNetGenerator(torch.nn.Module):
         log_probs = torch.exp(total_log_pf)
         
         return total_log_pf, log_probs, choosen_actions
+
+    def _visible_lineage_indices_for_forward(
+        self,
+        states,
+        all_actions,
+        visible_lineage_indices,
+    ):
+        if visible_lineage_indices is None and all_actions is not None:
+            visible_lineage_indices = [
+                action_active_lineage_indices(
+                    actions,
+                    active_count=len(state.active_lineages),
+                )
+                for state, actions in zip(states, all_actions)
+            ]
+        if visible_lineage_indices is None:
+            visible_lineage_indices = [
+                getattr(state, "local_visible_lineage_indices", None)
+                for state in states
+            ]
+
+        normalized = []
+        for state, indices in zip(states, visible_lineage_indices):
+            if indices is None:
+                normalized.append(None)
+                continue
+            indices = tuple(
+                sorted(
+                    {
+                        int(lineage_idx)
+                        for lineage_idx in indices
+                        if 0 <= int(lineage_idx) < len(state.active_lineages)
+                    }
+                )
+            )
+            state.local_visible_lineage_indices = indices
+            normalized.append(indices)
+        return normalized
 
 
     def update_model(self):

@@ -226,12 +226,23 @@ class ARGModel(nn.Module):
         breakpoint_gap_layers=3,
         breakpoint_gap_dropout=0.0,
         breakpoint_use_position_features=True,
+        sparse_transformer_max_lineages=512,
     ):
         super().__init__()
         self.env = env
         self.device = env.device
         self.input_mode = getattr(env, "input_mode", "dense")
         self.embedding_size = int(embedding_size)
+        self.sparse_transformer_max_lineages = (
+            None
+            if sparse_transformer_max_lineages is None
+            else int(sparse_transformer_max_lineages)
+        )
+        if (
+            self.sparse_transformer_max_lineages is not None
+            and self.sparse_transformer_max_lineages < 1
+        ):
+            raise ValueError("sparse_transformer_max_lineages must be positive or None")
         if int(embedding_size) % int(transformer_heads) != 0:
             raise ValueError(
                 "embedding_size must be divisible by transformer_heads "
@@ -343,9 +354,12 @@ class ARGModel(nn.Module):
         lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
         return lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts
 
-    def _encode_states(self, states):
+    def _encode_states(self, states, visible_lineage_indices_by_state=None):
         if self.input_mode == "vcf":
-            return self._encode_sparse_states(states)
+            return self._encode_sparse_states(
+                states,
+                visible_lineage_indices_by_state=visible_lineage_indices_by_state,
+            )
 
         batch_size = len(states)
         if batch_size == 0:
@@ -380,20 +394,27 @@ class ARGModel(nn.Module):
 
         return self._encode_lineage_features(lineage_seq_features, batch_active_lineage_counts)
 
-    def _encode_sparse_states(self, states):
+    def _encode_sparse_states(self, states, visible_lineage_indices_by_state=None):
         batch_size = len(states)
         if batch_size == 0:
             raise ValueError("ARGModel.forward requires at least one state")
 
         active_counts = [len(state.active_lineages) for state in states]
         max_active_lineages = max(active_counts, default=0)
+        visible_indices_by_state = self._normalize_visible_lineage_indices(
+            states,
+            active_counts,
+            visible_lineage_indices_by_state,
+        )
+        visible_counts = [len(indices) for indices in visible_indices_by_state]
+        max_visible_lineages = max(visible_counts, default=0)
         lineages = [
-            lineage
-            for state in states
-            for lineage in state.active_lineages
+            state.active_lineages[lineage_idx]
+            for state, indices in zip(states, visible_indices_by_state)
+            for lineage_idx in indices
         ]
         if not lineages:
-            raise ValueError("ARGModel.forward requires at least one active lineage")
+            raise ValueError("ARGModel.forward requires at least one visible active lineage")
 
         token_features, token_mask, lineage_features = self._sparse_lineage_batch_features(lineages)
         encoded_lineages = self.sparse_lineage_encoder(
@@ -402,34 +423,116 @@ class ARGModel(nn.Module):
             lineage_features,
         )
 
-        lineage_reps = encoded_lineages.new_zeros(
+        visible_lineage_reps = encoded_lineages.new_zeros(
             batch_size,
-            max_active_lineages,
+            max_visible_lineages,
             self.embedding_size,
         )
         cursor = 0
-        for batch_idx, active_count in enumerate(active_counts):
-            if active_count > 0:
-                lineage_reps[batch_idx, :active_count] = encoded_lineages[cursor:cursor + active_count]
-            cursor += active_count
+        for batch_idx, visible_count in enumerate(visible_counts):
+            if visible_count > 0:
+                visible_lineage_reps[batch_idx, :visible_count] = (
+                    encoded_lineages[cursor:cursor + visible_count]
+                )
+            cursor += visible_count
 
         batch_active_lineage_counts = torch.tensor(
             active_counts,
             dtype=torch.long,
             device=self.device,
         )
-        valid_mask = (
+        batch_visible_lineage_counts = torch.tensor(
+            visible_counts,
+            dtype=torch.long,
+            device=self.device,
+        )
+        visible_valid_mask = (
+            torch.arange(max_visible_lineages, device=self.device)[None, :]
+            < batch_visible_lineage_counts[:, None]
+        )
+        summary_token = self.summary_token.expand(batch_size, -1, -1)
+        if (
+            self.sparse_transformer_max_lineages is not None
+            and max_visible_lineages > self.sparse_transformer_max_lineages
+        ):
+            encoded_visible_lineages = (
+                visible_lineage_reps * visible_valid_mask.unsqueeze(-1)
+            )
+            denom = batch_visible_lineage_counts.clamp_min(1).to(
+                dtype=encoded_visible_lineages.dtype
+            )
+            pooled = encoded_visible_lineages.sum(dim=1) / denom[:, None]
+            summary_reps = pooled + summary_token[:, 0, :]
+        else:
+            transformer_input = torch.cat([summary_token, visible_lineage_reps], dim=1)
+            key_padding_mask = F.pad(~visible_valid_mask, (1, 0), value=False)
+            encoded = self.encoder(transformer_input, key_padding_mask=key_padding_mask)
+
+            summary_reps = encoded[:, 0]
+            encoded_visible_lineages = encoded[:, 1:] * visible_valid_mask.unsqueeze(-1)
+        lineage_reps = encoded_lineages.new_zeros(
+            batch_size,
+            max_active_lineages,
+            self.embedding_size,
+        )
+        for batch_idx, indices in enumerate(visible_indices_by_state):
+            if not indices:
+                continue
+            index_tensor = torch.tensor(indices, dtype=torch.long, device=self.device)
+            lineage_reps[batch_idx].index_copy_(
+                0,
+                index_tensor,
+                encoded_visible_lineages[batch_idx, :len(indices)],
+            )
+        active_valid_mask = (
             torch.arange(max_active_lineages, device=self.device)[None, :]
             < batch_active_lineage_counts[:, None]
         )
-        summary_token = self.summary_token.expand(batch_size, -1, -1)
-        transformer_input = torch.cat([summary_token, lineage_reps], dim=1)
-        key_padding_mask = F.pad(~valid_mask, (1, 0), value=False)
-        encoded = self.encoder(transformer_input, key_padding_mask=key_padding_mask)
-
-        summary_reps = encoded[:, 0]
-        lineage_reps = encoded[:, 1:] * valid_mask.unsqueeze(-1)
+        lineage_reps = lineage_reps * active_valid_mask.unsqueeze(-1)
         return lineage_reps, summary_reps, states, batch_active_lineage_counts
+
+    def _normalize_visible_lineage_indices(
+        self,
+        states,
+        active_counts,
+        visible_lineage_indices_by_state=None,
+    ):
+        if visible_lineage_indices_by_state is not None:
+            if len(visible_lineage_indices_by_state) != len(states):
+                raise ValueError(
+                    "visible_lineage_indices_by_state length must match states length"
+                )
+            raw_indices_by_state = visible_lineage_indices_by_state
+        else:
+            raw_indices_by_state = [
+                getattr(state, "local_visible_lineage_indices", None)
+                for state in states
+            ]
+
+        visible_indices_by_state = []
+        for state_idx, (raw_indices, active_count) in enumerate(
+            zip(raw_indices_by_state, active_counts)
+        ):
+            active_count = int(active_count)
+            if raw_indices is None:
+                visible_indices_by_state.append(tuple(range(active_count)))
+                continue
+            indices = tuple(
+                sorted(
+                    {
+                        int(lineage_idx)
+                        for lineage_idx in raw_indices
+                        if 0 <= int(lineage_idx) < active_count
+                    }
+                )
+            )
+            if not indices and active_count > 0:
+                raise ValueError(
+                    "local VCF state encoding received an empty visible-lineage "
+                    f"selection for batch item {state_idx}"
+                )
+            visible_indices_by_state.append(indices)
+        return visible_indices_by_state
 
     def _env_float_tensor(self, attr, fallback):
         value = getattr(self.env, attr, None)
