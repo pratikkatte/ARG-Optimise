@@ -83,6 +83,43 @@ class RefinementContext:
         }
 
 
+class LazyCanonicalStateStore:
+    """Sequence-like view over canonical replay states without retaining them all."""
+
+    def __init__(self, source, events):
+        self.source = source
+        self.events = tuple(events)
+        self._initial_state = None
+
+    def __len__(self):
+        return len(self.events) + 1
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        step_index = self._normalize_index(index)
+        if step_index == 0:
+            if self._initial_state is None:
+                self._initial_state = self.source._materialize_canonical_state(0)
+            return self._initial_state
+        return self.source._materialize_canonical_state(step_index)
+
+    def __iter__(self):
+        for step_index in range(len(self)):
+            yield self[step_index]
+
+    def _normalize_index(self, index):
+        step_index = int(index)
+        if step_index < 0:
+            step_index += len(self)
+        if not 0 <= step_index < len(self):
+            raise IndexError(
+                f"canonical state index must be in [0, {len(self) - 1}], "
+                f"got {index}"
+            )
+        return step_index
+
+
 class LocalRegionActionFilter:
     """Restrict local rollouts to actions that touch selected ARG blocks."""
 
@@ -238,15 +275,22 @@ class RefinementSource:
             self.canonical_unary_skips,
             self.canonical_same_time_groups_adjusted,
         ) = self._build_canonical_action_trace()
+        self._canonical_terminal_state = None
         self.canonical_states = self.replay_canonical_action_trace(
             self.canonical_action_trace
         )
-        self.canonical_terminal_state = self.canonical_states[-1]
-        errors = self.validate_canonical_terminal_state(self.canonical_terminal_state)
-        if errors:
-            raise ValueError(
-                "canonical terminal validation failed: " + "; ".join(errors)
-            )
+
+    @property
+    def canonical_terminal_state(self):
+        if self._canonical_terminal_state is None:
+            terminal = self.canonical_states[-1]
+            errors = self.validate_canonical_terminal_state(terminal)
+            if errors:
+                raise ValueError(
+                    "canonical terminal validation failed: " + "; ".join(errors)
+                )
+            self._canonical_terminal_state = terminal
+        return self._canonical_terminal_state
 
     def _validate_inputs(self):
         if int(self.vcf_data.num_haplotypes) != int(self.ts.num_samples):
@@ -565,21 +609,203 @@ class RefinementSource:
         return adjusted, same_time_groups_adjusted
 
     def replay_canonical_action_trace(self, events):
-        states = [self.env.get_initial_state()]
-        states[0].canonical_step_index = 0
-        for event in events:
-            next_state = self.apply_canonical_event(states[-1], event)
-            next_state.canonical_step_index = int(event["step"])
-            states.append(next_state)
-        terminal = states[-1]
-        if terminal.is_done:
-            log_likelihood = self.env.evolution_model.compute_arg_log_likelihood(terminal)
-            terminal.log_reward = self.env.compute_terminal_log_reward(
-                terminal,
-                log_likelihood,
+        return LazyCanonicalStateStore(self, events)
+
+    def _materialize_canonical_state(self, step_index):
+        step_index = int(step_index)
+        if not 0 <= step_index <= len(self.canonical_action_trace):
+            raise IndexError(
+                f"canonical state index must be in [0, {len(self.canonical_action_trace)}], "
+                f"got {step_index}"
             )
-            terminal.partial_log_reward = float(terminal.log_reward)
-        return states
+        state = self.env.get_initial_state()
+        state.canonical_step_index = 0
+        for event_idx in range(step_index):
+            event = self.canonical_action_trace[event_idx]
+            self._apply_canonical_event_in_place(state, event)
+            state.canonical_step_index = int(event["step"])
+        return state
+
+    def _apply_canonical_event_in_place(self, state, event):
+        if event["event_type"] == "recomb":
+            self._apply_canonical_recombination_in_place(state, event)
+        elif event["event_type"] == "coal":
+            self._apply_canonical_coalescence_in_place(state, event)
+        else:
+            raise ValueError(f"unknown canonical event type: {event['event_type']}")
+        self._finalize_canonical_state_in_place(state, event)
+        return state
+
+    def _apply_canonical_recombination_in_place(self, state, event):
+        active_by_id = active_index_by_node_id(state)
+        child_id = int(event["child_ids"][0])
+        if child_id not in active_by_id:
+            raise ValueError(
+                f"recombination child {child_id} is not active at step {event['step']}"
+            )
+        child_idx = active_by_id[child_id]
+        child = state.active_lineages[child_idx]
+        breakpoint = int(event["breakpoint"])
+        left_segments, right_segments = child.material_segments.split(breakpoint)
+        left_id, right_id = [int(node_id) for node_id in event["parent_ids"]]
+        parent_time = float(event["adjusted_time_t_over_2Ne"])
+
+        left_partials, right_partials = self._canonical_recombined_parent_partials(
+            child,
+            left_segments,
+            right_segments,
+            parent_time,
+        )
+        left_parent = ARGLineage(
+            node_id=left_id,
+            children=[child.node_id],
+            parents=[],
+            material_segments=left_segments,
+            num_blocks=self.num_blocks,
+            partials=left_partials,
+            sequences_indices=list(child.sequences_indices),
+            event_type="recomb",
+            breakpoint=breakpoint,
+            recombination_side="left",
+            time=parent_time,
+        )
+        right_parent = ARGLineage(
+            node_id=right_id,
+            children=[child.node_id],
+            parents=[],
+            material_segments=right_segments,
+            num_blocks=self.num_blocks,
+            partials=right_partials,
+            sequences_indices=list(child.sequences_indices),
+            event_type="recomb",
+            breakpoint=breakpoint,
+            recombination_side="right",
+            time=parent_time,
+        )
+        child.parents = [left_id, right_id]
+        child.partials = None
+        child.clear_runtime_caches()
+
+        state.all_nodes[left_id] = left_parent
+        state.all_nodes[right_id] = right_parent
+        state.active_lineages = [
+            lineage
+            for idx, lineage in enumerate(state.active_lineages)
+            if idx != child_idx
+        ]
+        state.active_lineages.extend([left_parent, right_parent])
+        state.max_node_idx = max(state.max_node_idx, left_id, right_id)
+
+    def _canonical_recombined_parent_partials(
+        self,
+        child,
+        left_segments,
+        right_segments,
+        parent_time,
+    ):
+        transitioned = self.env._transition_lineage_partials(child, parent_time)
+        if self.env.is_vcf_mode:
+            left_selected = self.env._select_compact_partials(
+                transitioned,
+                child.material_segments,
+                left_segments,
+            )
+            right_selected = self.env._select_compact_partials(
+                transitioned,
+                child.material_segments,
+                right_segments,
+            )
+            return (
+                self.env.evolution_model.normalize_partials(left_selected),
+                self.env.evolution_model.normalize_partials(right_selected),
+            )
+
+        left_masked = self.env.evolution_model.mask_partials(
+            transitioned,
+            left_segments,
+        )
+        right_masked = self.env.evolution_model.mask_partials(
+            transitioned,
+            right_segments,
+        )
+        return (
+            self.env.evolution_model.normalize_partials(left_masked),
+            self.env.evolution_model.normalize_partials(right_masked),
+        )
+
+    def _apply_canonical_coalescence_in_place(self, state, event):
+        active_by_id = active_index_by_node_id(state)
+        child_ids = tuple(int(node_id) for node_id in event["child_ids"])
+        missing = [node_id for node_id in child_ids if node_id not in active_by_id]
+        if missing:
+            raise ValueError(
+                f"coalescence child/children {missing} are not active at step "
+                f"{event['step']}"
+            )
+        child_i = state.active_lineages[active_by_id[child_ids[0]]]
+        child_j = state.active_lineages[active_by_id[child_ids[1]]]
+        parent_id = int(event["parent_ids"][0])
+        parent_segments = child_i.material_segments.union(child_j.material_segments)
+        overlap_count = child_i.material_segments.intersection_count(
+            child_j.material_segments
+        )
+        parent_time = float(event["adjusted_time_t_over_2Ne"])
+        parent_partials, _partial_log_likelihood_increment = (
+            self.env._coalesced_parent_partials(
+                child_i,
+                child_j,
+                parent_segments,
+                parent_time,
+            )
+        )
+        parent = ARGLineage(
+            node_id=parent_id,
+            children=[child_i.node_id, child_j.node_id],
+            parents=[],
+            material_segments=parent_segments,
+            num_blocks=self.num_blocks,
+            partials=parent_partials,
+            sequences_indices=sorted(
+                set(child_i.sequences_indices + child_j.sequences_indices)
+            ),
+            event_type="coal",
+            time=parent_time,
+        )
+        child_i.parents.append(parent_id)
+        child_j.parents.append(parent_id)
+        child_i.partials = None
+        child_j.partials = None
+        child_i.clear_runtime_caches()
+        child_j.clear_runtime_caches()
+
+        state.all_nodes[parent_id] = parent
+        remove_ids = set(child_ids)
+        state.active_lineages = [
+            lineage
+            for lineage in state.active_lineages
+            if lineage.node_id not in remove_ids
+        ]
+        state.active_lineages.append(parent)
+        state.max_node_idx = max(state.max_node_idx, parent_id)
+        if state.total_active_blocks is not None:
+            state.total_active_blocks = int(state.total_active_blocks) - int(
+                overlap_count
+            )
+
+    def _finalize_canonical_state_in_place(self, state, event):
+        state.current_time = float(event["adjusted_time_t_over_2Ne"])
+        state.log_reward = None
+        state.action_options = None
+        state.rates = None
+        state.prior_options = None
+        state.accumulated_log_prior = 0.0
+        state.partial_log_reward = 0.0
+        state.terminal_partial_correction = 0.0
+        if state.total_active_blocks is None:
+            state.total_active_blocks = int(
+                sum(lineage.material_count for lineage in state.active_lineages)
+            )
+        state.is_done = self.env.is_terminal(state)
 
     def apply_canonical_event(self, state, event):
         if event["event_type"] == "recomb":
@@ -783,10 +1009,10 @@ class RefinementSource:
         blocks = {int(block) for block in blocks}
         touching = []
         for event in self.canonical_action_trace:
-            event_blocks = set()
-            for start, end in canonical_event_material_segments(event):
-                event_blocks.update(range(int(start), int(end)))
-            if event_blocks & blocks:
+            if material_segments_touch_blocks(
+                canonical_event_material_segments(event),
+                blocks,
+            ):
                 touching.append(event)
         return touching
 
@@ -1538,6 +1764,24 @@ def active_index_by_node_id(state):
 
 def canonical_event_material_segments(event):
     return tuple(tuple(pair) for pair in event.get("material_segments", ()))
+
+
+def material_segments_touch_blocks(segments, blocks):
+    if not blocks:
+        return False
+    ordered_blocks = sorted({int(block) for block in blocks})
+    for start, end in segments:
+        start = int(start)
+        end = int(end)
+        if end <= start:
+            continue
+        for block in ordered_blocks:
+            if block < start:
+                continue
+            if block >= end:
+                break
+            return True
+    return False
 
 
 def finite_robust_z(values):
