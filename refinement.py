@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -89,7 +89,8 @@ class LazyCanonicalStateStore:
     def __init__(self, source, events):
         self.source = source
         self.events = tuple(events)
-        self._initial_state = None
+        self._cache = OrderedDict()
+        self._max_cached_states = 16
 
     def __len__(self):
         return len(self.events) + 1
@@ -98,15 +99,35 @@ class LazyCanonicalStateStore:
         if isinstance(index, slice):
             return [self[item] for item in range(*index.indices(len(self)))]
         step_index = self._normalize_index(index)
-        if step_index == 0:
-            if self._initial_state is None:
-                self._initial_state = self.source._materialize_canonical_state(0)
-            return self._initial_state
-        return self.source._materialize_canonical_state(step_index)
+        cached = self._cache.get(step_index)
+        if cached is not None:
+            self._cache.move_to_end(step_index)
+            return cached
+        state = self.source._materialize_canonical_state(step_index)
+        self._remember(step_index, state)
+        return state
 
     def __iter__(self):
         for step_index in range(len(self)):
             yield self[step_index]
+
+    def nearest_cached_state(self, step_index):
+        candidates = [step for step in self._cache if step <= step_index]
+        if not candidates:
+            return None, None
+        step = max(candidates)
+        self._cache.move_to_end(step)
+        return step, self._cache[step]
+
+    def _remember(self, step_index, state):
+        self._cache[int(step_index)] = state
+        self._cache.move_to_end(int(step_index))
+        while len(self._cache) > self._max_cached_states:
+            oldest_step = next(iter(self._cache))
+            if oldest_step == 0 and len(self._cache) > 1:
+                self._cache.move_to_end(oldest_step)
+                oldest_step = next(iter(self._cache))
+            self._cache.pop(oldest_step)
 
     def _normalize_index(self, index):
         step_index = int(index)
@@ -279,6 +300,7 @@ class RefinementSource:
         self.canonical_states = self.replay_canonical_action_trace(
             self.canonical_action_trace
         )
+        self._canonical_events_by_block = None
 
     @property
     def canonical_terminal_state(self):
@@ -618,26 +640,39 @@ class RefinementSource:
                 f"canonical state index must be in [0, {len(self.canonical_action_trace)}], "
                 f"got {step_index}"
             )
-        state = self.env.get_initial_state()
-        state.canonical_step_index = 0
-        for event_idx in range(step_index):
+        cached_step = None
+        cached_state = None
+        canonical_states = getattr(self, "canonical_states", None)
+        if canonical_states is not None and hasattr(canonical_states, "nearest_cached_state"):
+            cached_step, cached_state = canonical_states.nearest_cached_state(step_index)
+
+        if cached_state is None:
+            state = self.env.get_initial_state()
+            state.canonical_step_index = 0
+            start_step = 0
+        else:
+            state = cached_state.clone(copy_partials=False)
+            state.canonical_step_index = int(cached_step)
+            start_step = int(cached_step)
+
+        active_by_id = active_index_by_node_id(state)
+        for event_idx in range(start_step, step_index):
             event = self.canonical_action_trace[event_idx]
-            self._apply_canonical_event_in_place(state, event)
+            self._apply_canonical_event_in_place(state, event, active_by_id)
             state.canonical_step_index = int(event["step"])
         return state
 
-    def _apply_canonical_event_in_place(self, state, event):
+    def _apply_canonical_event_in_place(self, state, event, active_by_id):
         if event["event_type"] == "recomb":
-            self._apply_canonical_recombination_in_place(state, event)
+            self._apply_canonical_recombination_in_place(state, event, active_by_id)
         elif event["event_type"] == "coal":
-            self._apply_canonical_coalescence_in_place(state, event)
+            self._apply_canonical_coalescence_in_place(state, event, active_by_id)
         else:
             raise ValueError(f"unknown canonical event type: {event['event_type']}")
         self._finalize_canonical_state_in_place(state, event)
         return state
 
-    def _apply_canonical_recombination_in_place(self, state, event):
-        active_by_id = active_index_by_node_id(state)
+    def _apply_canonical_recombination_in_place(self, state, event, active_by_id):
         child_id = int(event["child_ids"][0])
         if child_id not in active_by_id:
             raise ValueError(
@@ -688,12 +723,12 @@ class RefinementSource:
 
         state.all_nodes[left_id] = left_parent
         state.all_nodes[right_id] = right_parent
-        state.active_lineages = [
-            lineage
-            for idx, lineage in enumerate(state.active_lineages)
-            if idx != child_idx
-        ]
+        state.active_lineages.pop(child_idx)
+        active_by_id.pop(child_id)
+        self._refresh_active_indices_from(state, active_by_id, child_idx)
         state.active_lineages.extend([left_parent, right_parent])
+        active_by_id[left_id] = len(state.active_lineages) - 2
+        active_by_id[right_id] = len(state.active_lineages) - 1
         state.max_node_idx = max(state.max_node_idx, left_id, right_id)
 
     def _canonical_recombined_parent_partials(
@@ -733,8 +768,7 @@ class RefinementSource:
             self.env.evolution_model.normalize_partials(right_masked),
         )
 
-    def _apply_canonical_coalescence_in_place(self, state, event):
-        active_by_id = active_index_by_node_id(state)
+    def _apply_canonical_coalescence_in_place(self, state, event, active_by_id):
         child_ids = tuple(int(node_id) for node_id in event["child_ids"])
         missing = [node_id for node_id in child_ids if node_id not in active_by_id]
         if missing:
@@ -779,18 +813,26 @@ class RefinementSource:
         child_j.clear_runtime_caches()
 
         state.all_nodes[parent_id] = parent
-        remove_ids = set(child_ids)
-        state.active_lineages = [
-            lineage
-            for lineage in state.active_lineages
-            if lineage.node_id not in remove_ids
-        ]
+        remove_positions = sorted(
+            (active_by_id[child_ids[0]], active_by_id[child_ids[1]]),
+            reverse=True,
+        )
+        refresh_from = min(remove_positions)
+        for position in remove_positions:
+            removed = state.active_lineages.pop(position)
+            active_by_id.pop(int(removed.node_id))
+        self._refresh_active_indices_from(state, active_by_id, refresh_from)
         state.active_lineages.append(parent)
+        active_by_id[parent_id] = len(state.active_lineages) - 1
         state.max_node_idx = max(state.max_node_idx, parent_id)
         if state.total_active_blocks is not None:
             state.total_active_blocks = int(state.total_active_blocks) - int(
                 overlap_count
             )
+
+    def _refresh_active_indices_from(self, state, active_by_id, start_idx):
+        for idx in range(max(int(start_idx), 0), len(state.active_lineages)):
+            active_by_id[int(state.active_lineages[idx].node_id)] = idx
 
     def _finalize_canonical_state_in_place(self, state, event):
         state.current_time = float(event["adjusted_time_t_over_2Ne"])
@@ -1007,16 +1049,39 @@ class RefinementSource:
 
     def canonical_events_touching_blocks(self, blocks):
         blocks = {int(block) for block in blocks}
-        touching = []
+        if not blocks:
+            return []
+        events_by_block = self._canonical_event_block_index()
+        selected = {}
+        for block in sorted(blocks):
+            if not 0 <= block < self.num_blocks:
+                continue
+            for event in events_by_block[block]:
+                selected[int(event["step"])] = event
+        return [selected[step] for step in sorted(selected)]
+
+    def _canonical_event_block_index(self):
+        if self._canonical_events_by_block is not None:
+            return self._canonical_events_by_block
+
+        events_by_block = [[] for _ in range(int(self.num_blocks))]
         for event in self.canonical_action_trace:
-            if material_segments_touch_blocks(
-                canonical_event_material_segments(event),
-                blocks,
-            ):
-                touching.append(event)
-        return touching
+            for start, end in canonical_event_material_segments(event):
+                start = max(int(start), 0)
+                end = min(int(end), int(self.num_blocks))
+                if end <= start:
+                    continue
+                for block in range(start, end):
+                    events_by_block[block].append(event)
+        self._canonical_events_by_block = events_by_block
+        return events_by_block
 
     def backtrack_bad_region(self, blocks, strategy="before_last_coalescence"):
+        touching, target_step = self._backtrack_bad_region_plan(blocks, strategy)
+        state = self.backtrack_to_step(target_step)
+        return state, touching, target_step
+
+    def _backtrack_bad_region_plan(self, blocks, strategy="before_last_coalescence"):
         if strategy not in BACKTRACK_STRATEGIES:
             raise ValueError(
                 f"strategy must be one of {sorted(BACKTRACK_STRATEGIES)}, got {strategy!r}"
@@ -1043,8 +1108,7 @@ class RefinementSource:
                 else max(int(event["step"]) for event in touching) - 1
             )
         target_step = max(0, int(target_step))
-        state = self.backtrack_to_step(target_step)
-        return state, touching, target_step
+        return touching, target_step
 
     def variant_indices_for_block(self, block):
         row = self.block_table[int(block)]
@@ -1071,22 +1135,32 @@ class RefinementSource:
         regions,
         strategy="before_last_coalescence",
     ):
-        contexts = []
-        for region in regions:
-            state, touching, target_step = self.backtrack_bad_region(
+        plans = []
+        for output_idx, region in enumerate(regions):
+            touching, target_step = self._backtrack_bad_region_plan(
                 region.blocks,
                 strategy=strategy,
             )
-            contexts.append(
-                self._make_refinement_context(
-                    region,
-                    state,
-                    touching,
-                    target_step,
-                    rollout_mode="segment",
-                    backtrack_offset=0,
-                    strategy_backtrack_step=target_step,
-                )
+            plans.append(
+                {
+                    "output_idx": output_idx,
+                    "region": region,
+                    "touching": touching,
+                    "target_step": target_step,
+                }
+            )
+
+        contexts = [None] * len(plans)
+        for plan in sorted(plans, key=lambda item: item["target_step"]):
+            state = self.backtrack_to_step(plan["target_step"])
+            contexts[plan["output_idx"]] = self._make_refinement_context(
+                plan["region"],
+                state,
+                plan["touching"],
+                plan["target_step"],
+                rollout_mode="segment",
+                backtrack_offset=0,
+                strategy_backtrack_step=plan["target_step"],
             )
         return contexts
 
@@ -1098,9 +1172,9 @@ class RefinementSource:
     ):
         offsets = [0]
         offsets.extend(int(length) for length in (terminal_backtrack_lengths or ()))
-        contexts = []
+        plans = []
         for region in regions:
-            _state, touching, strategy_step = self.backtrack_bad_region(
+            touching, strategy_step = self._backtrack_bad_region_plan(
                 region.blocks,
                 strategy=strategy,
             )
@@ -1112,19 +1186,99 @@ class RefinementSource:
                 if target_step in seen_steps:
                     continue
                 seen_steps.add(target_step)
-                state = self.backtrack_to_step(target_step)
-                contexts.append(
-                    self._make_refinement_context(
-                        region,
-                        state,
-                        touching,
-                        target_step,
-                        rollout_mode="terminal",
-                        backtrack_offset=offset,
-                        strategy_backtrack_step=strategy_step,
-                    )
+                plans.append(
+                    {
+                        "output_idx": len(plans),
+                        "region": region,
+                        "touching": touching,
+                        "target_step": target_step,
+                        "backtrack_offset": offset,
+                        "strategy_step": strategy_step,
+                    }
                 )
+
+        contexts = [None] * len(plans)
+        for plan in sorted(plans, key=lambda item: item["target_step"]):
+            state = self.backtrack_to_step(plan["target_step"])
+            contexts[plan["output_idx"]] = self._make_refinement_context(
+                plan["region"],
+                state,
+                plan["touching"],
+                plan["target_step"],
+                rollout_mode="terminal",
+                backtrack_offset=plan["backtrack_offset"],
+                strategy_backtrack_step=plan["strategy_step"],
+            )
         return contexts
+
+    def build_refinement_context_sets(
+        self,
+        regions,
+        strategy="before_last_coalescence",
+        terminal_backtrack_lengths=None,
+    ):
+        offsets = [0]
+        offsets.extend(int(length) for length in (terminal_backtrack_lengths or ()))
+        segment_plans = []
+        terminal_plans = []
+
+        for region_idx, region in enumerate(regions):
+            touching, strategy_step = self._backtrack_bad_region_plan(
+                region.blocks,
+                strategy=strategy,
+            )
+            segment_plans.append(
+                {
+                    "kind": "segment",
+                    "output_idx": region_idx,
+                    "region": region,
+                    "touching": touching,
+                    "target_step": strategy_step,
+                    "backtrack_offset": 0,
+                    "strategy_step": strategy_step,
+                }
+            )
+
+            seen_steps = set()
+            for offset in offsets:
+                if offset < 0:
+                    raise ValueError("terminal backtrack offsets must be non-negative")
+                target_step = max(0, int(strategy_step) - int(offset))
+                if target_step in seen_steps:
+                    continue
+                seen_steps.add(target_step)
+                terminal_plans.append(
+                    {
+                        "kind": "terminal",
+                        "output_idx": len(terminal_plans),
+                        "region": region,
+                        "touching": touching,
+                        "target_step": target_step,
+                        "backtrack_offset": offset,
+                        "strategy_step": strategy_step,
+                    }
+                )
+
+        segment_contexts = [None] * len(segment_plans)
+        terminal_contexts = [None] * len(terminal_plans)
+        all_plans = segment_plans + terminal_plans
+        for plan in sorted(all_plans, key=lambda item: item["target_step"]):
+            state = self.backtrack_to_step(plan["target_step"])
+            context = self._make_refinement_context(
+                plan["region"],
+                state,
+                plan["touching"],
+                plan["target_step"],
+                rollout_mode=plan["kind"],
+                backtrack_offset=plan["backtrack_offset"],
+                strategy_backtrack_step=plan["strategy_step"],
+            )
+            if plan["kind"] == "segment":
+                segment_contexts[plan["output_idx"]] = context
+            else:
+                terminal_contexts[plan["output_idx"]] = context
+
+        return segment_contexts, terminal_contexts
 
     def _make_refinement_context(
         self,
@@ -1670,11 +1824,7 @@ def build_refinement_context_sets(
         block_groups=block_groups,
         bp_intervals=bp_intervals,
     )
-    segment_contexts = source.build_refinement_contexts(
-        regions,
-        strategy=strategy,
-    )
-    terminal_contexts = source.build_terminal_refinement_contexts(
+    segment_contexts, terminal_contexts = source.build_refinement_context_sets(
         regions,
         strategy=strategy,
         terminal_backtrack_lengths=terminal_backtrack_lengths,

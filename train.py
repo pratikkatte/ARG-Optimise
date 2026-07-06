@@ -1068,7 +1068,17 @@ def train_local_refinement(
             time_bins,
         )
     )
+    if verbose:
+        print(f"Loading VCF variants for local refinement: {dataset_path}", flush=True)
     variant_data = load_vcf_variants(dataset_path)
+    if verbose:
+        print(
+            "Loaded VCF variants: "
+            f"haplotypes={variant_data.num_haplotypes} "
+            f"variants={variant_data.num_variants} "
+            f"sequence_length={variant_data.sequence_length}",
+            flush=True,
+        )
     env = SimpleARGEnvironment(
         sequence_length=int(variant_data.sequence_length),
         num_sequences=int(variant_data.num_haplotypes),
@@ -1123,6 +1133,11 @@ def train_local_refinement(
         if checkpoint_metadata.get("model"):
             model_kwargs = dict(checkpoint_metadata["model"])
 
+    if verbose:
+        print(
+            f"Building local refinement source from ARG: {local_refinement_arg}",
+            flush=True,
+        )
     source = build_refinement_source(
         source_env,
         local_refinement_arg,
@@ -1130,6 +1145,11 @@ def train_local_refinement(
         population_size=effective_population_size,
         mutation_rate=mutation_rate,
     )
+    if verbose:
+        print(
+            "Scoring bad regions and materializing local refinement contexts...",
+            flush=True,
+        )
     segment_contexts, terminal_contexts, diagnostic_rows = build_refinement_context_sets(
         source,
         top_k=bad_region_top_k,
@@ -1143,6 +1163,12 @@ def train_local_refinement(
     if not terminal_contexts:
         raise ValueError("no local refinement terminal contexts were selected")
     all_contexts = list(segment_contexts) + list(terminal_contexts)
+    if verbose:
+        print(
+            "Prepared local refinement contexts: "
+            f"segment={len(segment_contexts)} terminal={len(terminal_contexts)}",
+            flush=True,
+        )
     print_local_refinement_startup_summary(
         segment_contexts,
         terminal_contexts,
