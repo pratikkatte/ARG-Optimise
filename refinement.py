@@ -54,7 +54,10 @@ class RefinementContext:
     strategy_backtrack_step: Optional[int] = None
 
     def action_filter(self):
-        return LocalRegionActionFilter(self.effective_blocks)
+        return LocalRegionActionFilter(
+            self.effective_blocks,
+            terminal_completion=(str(self.rollout_mode) == "terminal"),
+        )
 
     def to_manifest_record(self):
         return {
@@ -144,12 +147,13 @@ class LazyCanonicalStateStore:
 class LocalRegionActionFilter:
     """Restrict local rollouts to actions that touch selected ARG blocks."""
 
-    def __init__(self, blocks: Iterable[int]):
+    def __init__(self, blocks: Iterable[int], terminal_completion: bool = False):
         self.blocks = tuple(sorted({int(block) for block in blocks}))
         self.block_set = set(self.blocks)
         self.material_segments = MaterialSegments.from_segments(
             blocks_to_segments(self.block_set)
         )
+        self.terminal_completion = bool(terminal_completion)
 
     def __call__(self, state, coal_actions, recomb_actions):
         coal = [
@@ -157,6 +161,8 @@ class LocalRegionActionFilter:
             for action in coal_actions
             if self._coal_touches_blocks(state, action)
         ]
+        if self.terminal_completion and coal:
+            return coal, []
         recomb = []
         for action in recomb_actions:
             recomb.extend(self._restricted_recombination_choices(state, action))
@@ -785,7 +791,7 @@ class RefinementSource:
             child_j.material_segments
         )
         parent_time = float(event["adjusted_time_t_over_2Ne"])
-        parent_partials, _partial_log_likelihood_increment = (
+        parent_partials, partial_log_likelihood_increment = (
             self.env._coalesced_parent_partials(
                 child_i,
                 child_j,
@@ -830,6 +836,7 @@ class RefinementSource:
             state.total_active_blocks = int(state.total_active_blocks) - int(
                 overlap_count
             )
+        state.partial_log_reward += float(partial_log_likelihood_increment)
 
     def _refresh_active_indices_from(self, state, active_by_id, start_idx):
         for idx in range(max(int(start_idx), 0), len(state.active_lineages)):
@@ -842,7 +849,6 @@ class RefinementSource:
         state.rates = None
         state.prior_options = None
         state.accumulated_log_prior = 0.0
-        state.partial_log_reward = 0.0
         state.terminal_partial_correction = 0.0
         if state.total_active_blocks is None:
             state.total_active_blocks = int(
@@ -996,7 +1002,6 @@ class RefinementSource:
         state.rates = None
         state.prior_options = None
         state.accumulated_log_prior = 0.0
-        state.partial_log_reward = 0.0
         state.terminal_partial_correction = 0.0
         state.total_active_blocks = int(
             sum(lineage.material_count for lineage in state.active_lineages)

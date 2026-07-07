@@ -1205,6 +1205,26 @@ class SimpleARGEnvironment:
         log_reward = self.reward_fn(log_likelihood, state.accumulated_log_prior)
         return log_reward
 
+    def compute_terminal_log_likelihood_from_partials(self, state):
+        """Use carried root partials and accumulated scaling for terminal likelihood."""
+        if not self.is_terminal(state):
+            raise ValueError("terminal likelihood requires a terminal ARGState")
+
+        partial_log_likelihood = (
+            float(state.partial_log_reward)
+            - float(state.accumulated_log_prior)
+        )
+        root_log_likelihood = 0.0
+        for lineage in state.active_lineages:
+            if int(lineage.material_segments.count) <= 0:
+                continue
+            partials = self._require_lineage_partials(lineage)
+            site_probs = torch.sum(partials * 0.25, dim=-1).clamp_min(1e-300)
+            root_log_likelihood += float(
+                torch.log(site_probs).sum().detach().cpu().item()
+            )
+        return float(partial_log_likelihood + root_log_likelihood)
+
     def compute_coalescence_actions(self, state):
         return list(CoalescenceChoice.enumerate_from_active_lineages(state.active_lineages))
 
@@ -1257,7 +1277,7 @@ class SimpleARGEnvironment:
         next_state.partial_log_reward += float(partial_log_likelihood_increment)
         next_state.is_done = self.is_terminal(next_state)
         if next_state.is_done:
-            log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
+            log_likelihood = self.compute_terminal_log_likelihood_from_partials(next_state)
             next_state.log_reward = self.compute_terminal_log_reward(next_state, log_likelihood)
             next_state.terminal_partial_correction = float(
                 next_state.log_reward - next_state.partial_log_reward
