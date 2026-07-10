@@ -11,6 +11,7 @@
 
 # --- Training & inference (train.py, infer.py, models.py, ...) ---
 numpy
+numba
 torch
 wandb
 pyyaml
