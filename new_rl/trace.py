@@ -1104,8 +1104,12 @@ def build_fast_trace_from_full_arg(
     strict: bool = True,
     source_storage: str = "compact",
     recombination_flag: int = RECOMBINATION_NODE_FLAG,
+    require_unique_event_times: bool = False,
 ) -> FastARGTrace:
-    """Build a compact full-ARG replay trace for large synthetic ARG inputs."""
+    """Build a compact full-ARG replay trace for large synthetic ARG inputs.
+
+    Set ``require_unique_event_times`` for continuous-time event-by-event replay.
+    """
     if source_storage != "compact":
         raise ValueError("only source_storage='compact' is currently supported")
 
@@ -1242,6 +1246,8 @@ def build_fast_trace_from_full_arg(
     event_node2 = raw_node2[order]
     event_edge_count = raw_edge_count[order]
     del raw_kind, raw_time, raw_node1, raw_node2, raw_edge_count, order
+    if require_unique_event_times:
+        _validate_unique_event_times(event_time)
 
     event_edge_start = _prefix_sum_int32(event_edge_count)
     if strict and int(event_edge_start[-1]) != num_edges:
@@ -1297,8 +1303,12 @@ def build_trace_from_full_arg(
     *,
     recombination_flag: int = RECOMBINATION_NODE_FLAG,
     strict: bool = True,
+    require_unique_event_times: bool = False,
 ) -> ARGTrace:
-    """Build a replay trace from a full-ARG-like tskit tree sequence."""
+    """Build a replay trace from a full-ARG-like tskit tree sequence.
+
+    Set ``require_unique_event_times`` for continuous-time event-by-event replay.
+    """
     ts = _load_tree_sequence(ts_or_path)
     tables = ts.tables
     node_time = np.asarray(tables.nodes.time, dtype=np.float64).copy()
@@ -1376,6 +1386,7 @@ def build_trace_from_full_arg(
         events=events,
         recombination_flag=recombination_flag,
         strict=strict,
+        require_unique_event_times=require_unique_event_times,
     )
 
 
@@ -1392,9 +1403,12 @@ def _build_trace_from_events(
     events: list[_EventBuild],
     recombination_flag: int,
     strict: bool,
+    require_unique_event_times: bool,
 ) -> ARGTrace:
     event_kind = np.asarray([event.kind for event in events], dtype=np.int8)
     event_time = np.asarray([event.time for event in events], dtype=np.float64)
+    if require_unique_event_times:
+        _validate_unique_event_times(event_time)
 
     node_offsets = [0]
     edge_offsets = [0]
@@ -2380,6 +2394,26 @@ def _validate_edge_times(
         raise ValueError(
             "all edges must satisfy parent.time > child.time; "
             f"edge {edge_id} violates this"
+        )
+
+
+def _validate_unique_event_times(event_time: np.ndarray) -> None:
+    nonfinite = np.flatnonzero(~np.isfinite(event_time))
+    if nonfinite.size:
+        event_index = int(nonfinite[0])
+        raise ValueError(
+            "continuous-time trace requires finite, strictly increasing event "
+            f"times; event {event_index} has time {float(event_time[event_index])}"
+        )
+    bad = np.flatnonzero(event_time[1:] <= event_time[:-1])
+    if bad.size:
+        event_index = int(bad[0])
+        next_index = event_index + 1
+        raise ValueError(
+            "continuous-time trace requires strictly increasing event times; "
+            f"events {event_index} and {next_index} have times "
+            f"{float(event_time[event_index])} and "
+            f"{float(event_time[next_index])}"
         )
 
 

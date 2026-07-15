@@ -36,11 +36,127 @@ def _many_interval_child_tree_sequence(group_count=16):
     return tables.tree_sequence(), tuple(parents)
 
 
+def _two_independent_recombination_candidates():
+    tables = tskit.TableCollection(sequence_length=2.0)
+    children = [
+        tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0.0)
+        for _ in range(2)
+    ]
+    parents = [tables.nodes.add_row(flags=0, time=10.0) for _ in range(2)]
+    for child in children:
+        tables.edges.add_row(left=0.0, right=1.0, parent=parents[0], child=child)
+        tables.edges.add_row(left=1.0, right=2.0, parent=parents[1], child=child)
+    tables.sort()
+    return tables.tree_sequence()
+
+
+def _tied_original_coalescences():
+    tables = tskit.TableCollection(sequence_length=1.0)
+    samples = [
+        tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0.0)
+        for _ in range(4)
+    ]
+    parents = [tables.nodes.add_row(flags=0, time=10.0) for _ in range(2)]
+    tables.edges.add_row(0.0, 1.0, parent=parents[0], child=samples[0])
+    tables.edges.add_row(0.0, 1.0, parent=parents[0], child=samples[1])
+    tables.edges.add_row(0.0, 1.0, parent=parents[1], child=samples[2])
+    tables.edges.add_row(0.0, 1.0, parent=parents[1], child=samples[3])
+    tables.sort()
+    return tables.tree_sequence(), tuple(parents)
+
+
+def _dense_tied_events_below_adjacent_float(group_size=69):
+    tables = tskit.TableCollection(sequence_length=1.0)
+    tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0.0)
+    tied_time = 0.7142799014136905
+    tied_nodes = [
+        tables.nodes.add_row(flags=0, time=tied_time)
+        for _ in range(group_size)
+    ]
+    upper_time = float(np.nextafter(tied_time, np.inf))
+    upper_node = tables.nodes.add_row(flags=0, time=upper_time)
+    tables.sort()
+    return (
+        tables.tree_sequence(),
+        np.asarray(tied_nodes, dtype=np.int32),
+        upper_node,
+        tied_time,
+        upper_time,
+    )
+
+
+def _dense_tied_events_between_adjacent_floats(group_size=87):
+    tables = tskit.TableCollection(sequence_length=1.0)
+    tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0.0)
+    tied_time = 0.9999949137369791
+    lower_time = float(np.nextafter(tied_time, -np.inf))
+    upper_time = float(np.nextafter(tied_time, np.inf))
+    lower_node = tables.nodes.add_row(flags=0, time=lower_time)
+    tied_nodes = [
+        tables.nodes.add_row(flags=0, time=tied_time)
+        for _ in range(group_size)
+    ]
+    upper_node = tables.nodes.add_row(flags=0, time=upper_time)
+    tables.sort()
+    return (
+        tables.tree_sequence(),
+        lower_node,
+        np.asarray(tied_nodes, dtype=np.int32),
+        upper_node,
+        tied_time,
+        upper_time,
+    )
+
+
 def _assert_strict_edge_times(ts):
     tables = ts.tables
     assert np.all(
         tables.nodes.time[tables.edges.parent] > tables.nodes.time[tables.edges.child]
     )
+
+
+def test_dense_tied_group_uses_available_space_below_adjacent_float():
+    ts, tied_nodes, upper_node, tied_time, upper_time = (
+        _dense_tied_events_below_adjacent_float()
+    )
+
+    result = build_synthetic_full_arg(ts)
+    adjusted_time = np.asarray(result.tree_sequence.nodes_time)
+    tied_adjusted_time = adjusted_time[tied_nodes]
+
+    assert np.all(np.diff(tied_adjusted_time) > 0)
+    assert tied_adjusted_time[0] < tied_time
+    assert tied_adjusted_time[-1] == tied_time
+    assert adjusted_time[upper_node] == upper_time
+    assert result.metadata["event_time_adjusted_event_count"] == tied_nodes.size - 1
+    assert result.metadata["max_event_time_adjustment"] > 0
+
+    trace = build_trace_from_full_arg(
+        result.tree_sequence,
+        strict=False,
+        require_unique_event_times=True,
+    )
+    assert np.all(np.diff(trace.event_time) > 0)
+
+
+def test_dense_tied_group_propagates_past_both_adjacent_floats():
+    ts, lower_node, tied_nodes, upper_node, tied_time, upper_time = (
+        _dense_tied_events_between_adjacent_floats()
+    )
+
+    result = build_synthetic_full_arg(ts)
+    adjusted_time = np.asarray(result.tree_sequence.nodes_time)
+
+    assert adjusted_time[lower_node] < adjusted_time[tied_nodes[0]]
+    assert np.all(np.diff(adjusted_time[tied_nodes]) > 0)
+    assert adjusted_time[tied_nodes[-1]] == tied_time
+    assert adjusted_time[upper_node] == upper_time
+    trace = build_trace_from_full_arg(
+        result.tree_sequence,
+        strict=False,
+        require_unique_event_times=True,
+    )
+    assert np.all(np.diff(trace.event_time) > 0)
 
 
 def test_strict_loader_requires_explicit_recombination_nodes():
@@ -51,7 +167,7 @@ def test_strict_loader_requires_explicit_recombination_nodes():
 def test_trace_replays_synthetic_full_arg_to_final_graph():
     result = build_synthetic_full_arg(SOURCE_TREES)
     ts = result.tree_sequence
-    trace = build_trace_from_full_arg(ts)
+    trace = build_trace_from_full_arg(ts, require_unique_event_times=True)
 
     assert trace.recombination_event_count == result.metadata[
         "synthetic_recombination_event_count"
@@ -63,6 +179,7 @@ def test_trace_replays_synthetic_full_arg_to_final_graph():
     assert set(final_state.visible_edge_ids.tolist()) == set(range(ts.num_edges))
 
     assert np.all(trace.node_time[trace.edge_parent] > trace.node_time[trace.edge_child])
+    assert np.all(np.diff(trace.event_time) > 0)
     assert sum(
         1 for node in ts.nodes() if node.flags & NODE_IS_RE_EVENT
     ) == trace.recombination_event_count * 2
@@ -123,6 +240,66 @@ def test_synthetic_recombination_nodes_are_msprime_style_pairs():
     _assert_strict_edge_times(synthetic_ts)
 
 
+def test_independent_recombination_events_receive_globally_unique_times():
+    result = build_synthetic_full_arg(_two_independent_recombination_candidates())
+    trace = build_trace_from_full_arg(
+        result.tree_sequence,
+        require_unique_event_times=True,
+    )
+
+    recombination_times = [
+        trace.event_at_index(index).time
+        for index in range(trace.event_count)
+        if trace.event_at_index(index).kind == "recombination"
+    ]
+    assert len(recombination_times) == 2
+    assert recombination_times[1] > recombination_times[0]
+    assert result.metadata["event_times_are_globally_unique"] is True
+    assert result.metadata["event_time_adjusted_event_count"] >= 1
+    assert result.metadata["max_event_time_adjustment"] > 0.0
+
+
+def test_parallel_balanced_recombination_events_receive_unique_times():
+    ts, _parents = _many_interval_child_tree_sequence(group_count=4)
+    result = build_synthetic_full_arg(ts, split_rule="balanced")
+    trace = build_trace_from_full_arg(
+        result.tree_sequence,
+        require_unique_event_times=True,
+    )
+
+    assert np.all(np.diff(trace.event_time) > 0)
+    assert result.metadata["event_time_adjusted_event_count"] >= 1
+    _assert_strict_edge_times(result.tree_sequence)
+
+
+def test_tied_original_coalescence_events_are_deconflicted():
+    ts, parents = _tied_original_coalescences()
+    result = build_synthetic_full_arg(ts)
+    adjusted_times = result.tree_sequence.tables.nodes.time[list(parents)]
+
+    assert adjusted_times[1] > adjusted_times[0]
+    assert result.metadata["event_time_adjusted_event_count"] == 1
+    assert result.metadata["event_times_are_globally_unique"] is True
+    _assert_strict_edge_times(result.tree_sequence)
+
+
+def test_unique_event_time_opt_out_preserves_ties():
+    result = build_synthetic_full_arg(
+        _two_independent_recombination_candidates(),
+        ensure_unique_event_times=False,
+    )
+    trace = build_trace_from_full_arg(result.tree_sequence)
+
+    assert np.any(np.diff(trace.event_time) == 0)
+    assert result.metadata["ensure_unique_event_times"] is False
+    assert result.metadata["event_times_are_globally_unique"] is False
+    with pytest.raises(ValueError, match="strictly increasing event times"):
+        build_trace_from_full_arg(
+            result.tree_sequence,
+            require_unique_event_times=True,
+        )
+
+
 def test_synthetic_topology_preserves_original_leaf_intervals():
     ts, parents = _many_interval_child_tree_sequence(group_count=12)
     result = build_synthetic_full_arg(ts)
@@ -155,6 +332,12 @@ def test_balanced_topology_is_smaller_than_left_to_right_chain():
     assert balanced.num_nodes == left_to_right.num_nodes
     _assert_strict_edge_times(balanced)
     _assert_strict_edge_times(left_to_right)
+    for synthetic_ts in (balanced, left_to_right):
+        trace = build_trace_from_full_arg(
+            synthetic_ts,
+            require_unique_event_times=True,
+        )
+        assert np.all(np.diff(trace.event_time) > 0)
 
 
 @pytest.mark.parametrize("path", [L1MB_DATED_TREES, SIM_L1MB_TREES])
@@ -165,7 +348,8 @@ def test_larger_local_fixtures_build_with_strict_synthetic_times(path):
     assert result.metadata["synthetic_recombination_event_count"] > 0
     _assert_strict_edge_times(ts)
 
-    trace = build_trace_from_full_arg(ts)
+    trace = build_trace_from_full_arg(ts, require_unique_event_times=True)
     assert trace.recombination_event_count == result.metadata[
         "synthetic_recombination_event_count"
     ]
+    assert np.all(np.diff(trace.event_time) > 0)

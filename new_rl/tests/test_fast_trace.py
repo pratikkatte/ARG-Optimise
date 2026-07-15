@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+import tskit
 
 from argscape import build_synthetic_full_arg
 from new_rl import build_fast_trace_from_full_arg, build_trace_from_full_arg
@@ -29,17 +30,54 @@ def synthetic_ts():
 
 @pytest.fixture(scope="module")
 def slow_trace(synthetic_ts):
-    return build_trace_from_full_arg(synthetic_ts)
+    return build_trace_from_full_arg(
+        synthetic_ts,
+        require_unique_event_times=True,
+    )
 
 
 @pytest.fixture(scope="module")
 def fast_trace(synthetic_ts):
-    return build_fast_trace_from_full_arg(synthetic_ts)
+    return build_fast_trace_from_full_arg(
+        synthetic_ts,
+        require_unique_event_times=True,
+    )
+
+
+def _tied_synthetic_full_arg():
+    tables = tskit.TableCollection(sequence_length=2.0)
+    children = [
+        tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0.0)
+        for _ in range(2)
+    ]
+    parents = [tables.nodes.add_row(flags=0, time=10.0) for _ in range(2)]
+    for child in children:
+        tables.edges.add_row(0.0, 1.0, parent=parents[0], child=child)
+        tables.edges.add_row(1.0, 2.0, parent=parents[1], child=child)
+    tables.sort()
+    return build_synthetic_full_arg(
+        tables.tree_sequence(),
+        ensure_unique_event_times=False,
+    ).tree_sequence
 
 
 def test_fast_strict_loader_requires_explicit_recombination_nodes():
     with pytest.raises(ValueError, match="no explicit recombination nodes"):
         build_fast_trace_from_full_arg(SOURCE_TREES)
+
+
+def test_slow_and_fast_continuous_time_guards_reject_tied_events():
+    tied_ts = _tied_synthetic_full_arg()
+
+    build_trace_from_full_arg(tied_ts)
+    build_fast_trace_from_full_arg(tied_ts)
+    with pytest.raises(ValueError, match="strictly increasing event times"):
+        build_trace_from_full_arg(tied_ts, require_unique_event_times=True)
+    with pytest.raises(ValueError, match="strictly increasing event times"):
+        build_fast_trace_from_full_arg(
+            tied_ts,
+            require_unique_event_times=True,
+        )
 
 
 def test_fast_trace_matches_slow_event_summary(fast_trace, slow_trace):
