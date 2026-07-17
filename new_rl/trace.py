@@ -14,8 +14,10 @@ import numpy as np
 import tskit
 from numba import njit
 
+from .synthetic_full_arg import NODE_IS_RE_EVENT
 
-RECOMBINATION_NODE_FLAG = 131072
+
+RECOMBINATION_NODE_FLAG = NODE_IS_RE_EVENT
 
 EVENT_KIND_RECOMBINATION = 1
 EVENT_KIND_COALESCENCE = 2

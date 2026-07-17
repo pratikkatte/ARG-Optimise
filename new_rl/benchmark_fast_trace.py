@@ -7,7 +7,7 @@ import resource
 import sys
 import time
 
-from new_rl import build_fast_trace_from_full_arg
+from arg.new_rl import build_fast_trace_from_full_arg
 
 
 def _emit(message: str) -> None:

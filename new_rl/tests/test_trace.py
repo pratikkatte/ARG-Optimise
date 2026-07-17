@@ -2,8 +2,13 @@ import numpy as np
 import pytest
 import tskit
 
-from argscape import NODE_IS_RE_EVENT, build_synthetic_full_arg
-from new_rl import build_fast_trace_from_full_arg
+from arg.new_rl import (
+    NODE_IS_RE_EVENT,
+    SYNTHETIC_FULL_ARG_PROVENANCE_NAME,
+    build_fast_trace_from_full_arg,
+    build_synthetic_full_arg,
+    get_synthetic_full_arg_provenance,
+)
 
 
 SOURCE_TREES = "arg/validation/output/tsinfer/l25kb_dated.trees"
@@ -183,6 +188,21 @@ def test_trace_replays_synthetic_full_arg_to_final_graph():
     assert sum(
         1 for node in ts.nodes() if node.flags & NODE_IS_RE_EVENT
     ) == trace.recombination_event_count * 2
+
+
+def test_converter_records_new_rl_provenance_and_accepts_legacy_fixture():
+    result = build_synthetic_full_arg(SOURCE_TREES)
+    record = get_synthetic_full_arg_provenance(result.tree_sequence)
+
+    assert record is not None
+    assert record["software"]["name"] == SYNTHETIC_FULL_ARG_PROVENANCE_NAME
+    assert record["summary"]["event_times_are_globally_unique"] is True
+
+    legacy_ts = tskit.load(
+        "arg/validation/output/tsinfer/"
+        "l25kb_dated_synthetic_full_arg.trees"
+    )
+    assert get_synthetic_full_arg_provenance(legacy_ts) is not None
 
 
 def test_previous_state_traces_back_one_event():

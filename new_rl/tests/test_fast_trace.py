@@ -2,8 +2,7 @@ import numpy as np
 import pytest
 import tskit
 
-from argscape import build_synthetic_full_arg
-from new_rl import build_fast_trace_from_full_arg
+from arg.new_rl import build_fast_trace_from_full_arg, build_synthetic_full_arg
 
 
 SOURCE_TREES = "arg/validation/output/tsinfer/l25kb_dated.trees"
