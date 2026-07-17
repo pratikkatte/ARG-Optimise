@@ -3,7 +3,7 @@ import pytest
 import tskit
 
 from argscape import build_synthetic_full_arg
-from new_rl import build_fast_trace_from_full_arg, build_trace_from_full_arg
+from new_rl import build_fast_trace_from_full_arg
 
 
 SOURCE_TREES = "arg/validation/output/tsinfer/l25kb_dated.trees"
@@ -23,17 +23,71 @@ def _compact_signature(frontier):
     )
 
 
+def _merge_reference_segments(segments):
+    merged = []
+    for left, right in sorted(segments):
+        if left >= right:
+            continue
+        if merged and left <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+        else:
+            merged.append((left, right))
+    return tuple(merged)
+
+
+def _subtract_reference_segment(segments, left, right):
+    updated = []
+    covered = 0.0
+    for segment_left, segment_right in segments:
+        overlap_left = max(segment_left, left)
+        overlap_right = min(segment_right, right)
+        if overlap_left < overlap_right:
+            covered += overlap_right - overlap_left
+            if segment_left < overlap_left:
+                updated.append((segment_left, overlap_left))
+            if overlap_right < segment_right:
+                updated.append((overlap_right, segment_right))
+        else:
+            updated.append((segment_left, segment_right))
+    assert np.isclose(covered, right - left)
+    return _merge_reference_segments(updated)
+
+
+def _reference_active_signature(trace, step):
+    active = {
+        int(node_id): ((0.0, trace.sequence_length),)
+        for node_id in trace.sample_nodes
+    }
+    for event_index in range(step):
+        edge_start = int(trace.event_edge_start[event_index])
+        edge_end = int(trace.event_edge_start[event_index + 1])
+        edge_ids = trace.revealed_edge_ids[edge_start:edge_end]
+        parent_segments = {}
+        for edge_id in edge_ids:
+            edge_id = int(edge_id)
+            parent = int(trace.edge_parent[edge_id])
+            child = int(trace.edge_child[edge_id])
+            segment = (
+                float(trace.edge_left[edge_id]),
+                float(trace.edge_right[edge_id]),
+            )
+            active[child] = _subtract_reference_segment(
+                active.get(child, ()),
+                *segment,
+            )
+            if not active[child]:
+                del active[child]
+            parent_segments.setdefault(parent, []).append(segment)
+        for parent, segments in parent_segments.items():
+            active[parent] = _merge_reference_segments(
+                active.get(parent, ()) + tuple(segments)
+            )
+    return tuple(sorted(active.items()))
+
+
 @pytest.fixture(scope="module")
 def synthetic_ts():
     return build_synthetic_full_arg(SOURCE_TREES).tree_sequence
-
-
-@pytest.fixture(scope="module")
-def slow_trace(synthetic_ts):
-    return build_trace_from_full_arg(
-        synthetic_ts,
-        require_unique_event_times=True,
-    )
 
 
 @pytest.fixture(scope="module")
@@ -66,13 +120,10 @@ def test_fast_strict_loader_requires_explicit_recombination_nodes():
         build_fast_trace_from_full_arg(SOURCE_TREES)
 
 
-def test_slow_and_fast_continuous_time_guards_reject_tied_events():
+def test_continuous_time_guard_rejects_tied_events():
     tied_ts = _tied_synthetic_full_arg()
 
-    build_trace_from_full_arg(tied_ts)
     build_fast_trace_from_full_arg(tied_ts)
-    with pytest.raises(ValueError, match="strictly increasing event times"):
-        build_trace_from_full_arg(tied_ts, require_unique_event_times=True)
     with pytest.raises(ValueError, match="strictly increasing event times"):
         build_fast_trace_from_full_arg(
             tied_ts,
@@ -80,20 +131,27 @@ def test_slow_and_fast_continuous_time_guards_reject_tied_events():
         )
 
 
-def test_fast_trace_matches_slow_event_summary(fast_trace, slow_trace):
-    assert fast_trace.event_count == slow_trace.event_count
-    assert fast_trace.num_steps == slow_trace.num_steps
-    assert fast_trace.recombination_event_count == slow_trace.recombination_event_count
-    assert fast_trace.coalescence_event_count == slow_trace.coalescence_event_count
+def test_event_summary_matches_25kb_fixture(fast_trace):
+    assert fast_trace.event_count == 25
+    assert fast_trace.num_steps == 25
+    assert fast_trace.recombination_event_count == 13
+    assert fast_trace.coalescence_event_count == 12
 
     indices = sorted({0, min(5, fast_trace.event_count - 1), fast_trace.event_count - 1})
     for index in indices:
-        fast_event = fast_trace.event_at_index(index)
-        slow_event = slow_trace.event_at_index(index)
-        assert fast_event.kind == slow_event.kind
-        assert fast_event.time == slow_event.time
-        assert fast_event.node_ids == slow_event.node_ids
-        assert fast_event.edge_ids == slow_event.edge_ids
+        event = fast_trace.event_at_index(index)
+        edge_start = int(fast_trace.event_edge_start[index])
+        edge_end = int(fast_trace.event_edge_start[index + 1])
+        expected_nodes = [int(fast_trace.event_node1[index])]
+        if fast_trace.event_node2[index] >= 0:
+            expected_nodes.append(int(fast_trace.event_node2[index]))
+        assert event.step == index + 1
+        assert event.time == fast_trace.event_time[index]
+        assert event.node_ids == tuple(expected_nodes)
+        assert event.edge_ids == tuple(
+            int(edge_id)
+            for edge_id in fast_trace.revealed_edge_ids[edge_start:edge_end]
+        )
 
 
 def test_fast_trace_final_state_reveals_source_tables(fast_trace, synthetic_ts):
@@ -105,30 +163,20 @@ def test_fast_trace_final_state_reveals_source_tables(fast_trace, synthetic_ts):
         final_state.active_lineages
 
 
-def test_fast_trace_optional_active_segments_match_slow_trace(fast_trace, slow_trace):
+def test_optional_active_segments_match_reference_replay(fast_trace):
     step = min(6, fast_trace.num_steps)
     fast_state = fast_trace.state_at_step(step, include_active=True)
-    slow_state = slow_trace.state_at_step(step)
 
-    assert _active_signature(fast_state) == _active_signature(slow_state)
-    assert set(fast_state.visible_node_ids.tolist()) == set(
-        slow_state.visible_node_ids.tolist()
-    )
-    assert set(fast_state.visible_edge_ids.tolist()) == set(
-        slow_state.visible_edge_ids.tolist()
-    )
+    assert _active_signature(fast_state) == _reference_active_signature(fast_trace, step)
 
 
-def test_fast_state_matches_slow_trace_at_every_step_forward_and_backward(
-    fast_trace,
-    slow_trace,
-):
+def test_fast_state_matches_reference_at_every_step_forward_and_backward(fast_trace):
     state = fast_trace.initial_state(chunk_size=4, initial_segment_capacity=1)
 
     for step in range(fast_trace.num_steps + 1):
         state.move_to(step)
         frontier = state.compact_active_frontier()
-        expected = _active_signature(slow_trace.state_at_step(step))
+        expected = _reference_active_signature(fast_trace, step)
         assert tuple(sorted(_compact_signature(frontier))) == expected
         expected_ids = {node_id for node_id, _segments in expected}
         expected_order = [
@@ -140,7 +188,7 @@ def test_fast_state_matches_slow_trace_at_every_step_forward_and_backward(
 
     for step in range(fast_trace.num_steps - 1, -1, -1):
         state.move_to(step)
-        expected = _active_signature(slow_trace.state_at_step(step))
+        expected = _reference_active_signature(fast_trace, step)
         observed = _compact_signature(state.compact_active_frontier())
         assert tuple(sorted(observed)) == expected
 
@@ -149,14 +197,14 @@ def test_fast_state_matches_slow_trace_at_every_step_forward_and_backward(
     assert state.segment_count == fast_trace.sample_nodes.size
 
 
-def test_fast_state_chunking_clone_and_snapshot_are_independent(fast_trace, slow_trace):
+def test_fast_state_chunking_clone_and_snapshot_are_independent(fast_trace):
     target = min(12, fast_trace.num_steps)
     single_step = fast_trace.initial_state(chunk_size=1)
     chunked = fast_trace.initial_state(chunk_size=7)
     single_step.advance(target)
     chunked.advance_to(target)
 
-    expected = _active_signature(slow_trace.state_at_step(target))
+    expected = _reference_active_signature(fast_trace, target)
     single_signature = _compact_signature(single_step.compact_active_frontier())
     chunked_signature = _compact_signature(chunked.compact_active_frontier())
     assert tuple(sorted(single_signature)) == expected
@@ -182,12 +230,12 @@ def test_fast_state_chunking_clone_and_snapshot_are_independent(fast_trace, slow
         snapshot.node_ids[0] = -1
 
 
-def test_fast_state_structural_properties_and_compatibility_state(fast_trace, slow_trace):
+def test_fast_state_structural_properties_and_compatibility_state(fast_trace):
     step = min(6, fast_trace.num_steps)
     state = fast_trace.initial_state().advance_to(step)
     compatibility_state = state.as_trace_state()
     direct_state = fast_trace.state_at_step(step, include_active=True)
-    expected = _active_signature(slow_trace.state_at_step(step))
+    expected = _reference_active_signature(fast_trace, step)
 
     assert state.step == step
     assert state.current_time == fast_trace.event_time[step - 1]

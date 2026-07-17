@@ -3,7 +3,7 @@ import pytest
 import tskit
 
 from argscape import NODE_IS_RE_EVENT, build_synthetic_full_arg
-from new_rl import build_trace_from_full_arg
+from new_rl import build_fast_trace_from_full_arg
 
 
 SOURCE_TREES = "arg/validation/output/tsinfer/l25kb_dated.trees"
@@ -131,7 +131,7 @@ def test_dense_tied_group_uses_available_space_below_adjacent_float():
     assert result.metadata["event_time_adjusted_event_count"] == tied_nodes.size - 1
     assert result.metadata["max_event_time_adjustment"] > 0
 
-    trace = build_trace_from_full_arg(
+    trace = build_fast_trace_from_full_arg(
         result.tree_sequence,
         strict=False,
         require_unique_event_times=True,
@@ -151,7 +151,7 @@ def test_dense_tied_group_propagates_past_both_adjacent_floats():
     assert np.all(np.diff(adjusted_time[tied_nodes]) > 0)
     assert adjusted_time[tied_nodes[-1]] == tied_time
     assert adjusted_time[upper_node] == upper_time
-    trace = build_trace_from_full_arg(
+    trace = build_fast_trace_from_full_arg(
         result.tree_sequence,
         strict=False,
         require_unique_event_times=True,
@@ -161,13 +161,13 @@ def test_dense_tied_group_propagates_past_both_adjacent_floats():
 
 def test_strict_loader_requires_explicit_recombination_nodes():
     with pytest.raises(ValueError, match="no explicit recombination nodes"):
-        build_trace_from_full_arg(SOURCE_TREES)
+        build_fast_trace_from_full_arg(SOURCE_TREES)
 
 
 def test_trace_replays_synthetic_full_arg_to_final_graph():
     result = build_synthetic_full_arg(SOURCE_TREES)
     ts = result.tree_sequence
-    trace = build_trace_from_full_arg(ts, require_unique_event_times=True)
+    trace = build_fast_trace_from_full_arg(ts, require_unique_event_times=True)
 
     assert trace.recombination_event_count == result.metadata[
         "synthetic_recombination_event_count"
@@ -186,12 +186,13 @@ def test_trace_replays_synthetic_full_arg_to_final_graph():
 
 
 def test_previous_state_traces_back_one_event():
-    trace = build_trace_from_full_arg(build_synthetic_full_arg(SOURCE_TREES).tree_sequence)
+    trace = build_fast_trace_from_full_arg(
+        build_synthetic_full_arg(SOURCE_TREES).tree_sequence
+    )
 
     step = min(6, trace.num_steps)
-    state = trace.state_at_step(step)
-    previous = trace.previous_state(state)
-    expected = trace.state_at_step(step - 1)
+    previous = trace.initial_state().advance_to(step).backtrack().as_trace_state()
+    expected = trace.state_at_step(step - 1, include_active=True)
 
     assert previous.step == step - 1
     assert _active_signature(previous) == _active_signature(expected)
@@ -200,7 +201,9 @@ def test_previous_state_traces_back_one_event():
 
 
 def test_windowed_graph_materialization():
-    trace = build_trace_from_full_arg(build_synthetic_full_arg(SOURCE_TREES).tree_sequence)
+    trace = build_fast_trace_from_full_arg(
+        build_synthetic_full_arg(SOURCE_TREES).tree_sequence
+    )
     graph = trace.graph_at_step(trace.num_steps, genomic_range=(5000, 7000))
 
     assert graph["metadata"]["genomic_range"] == [5000.0, 7000.0]
@@ -210,7 +213,9 @@ def test_windowed_graph_materialization():
 
 
 def test_trace_uses_column_arrays_for_source_tables():
-    trace = build_trace_from_full_arg(build_synthetic_full_arg(SOURCE_TREES).tree_sequence)
+    trace = build_fast_trace_from_full_arg(
+        build_synthetic_full_arg(SOURCE_TREES).tree_sequence
+    )
 
     assert isinstance(trace.node_time, np.ndarray)
     assert isinstance(trace.edge_parent, np.ndarray)
@@ -242,7 +247,7 @@ def test_synthetic_recombination_nodes_are_msprime_style_pairs():
 
 def test_independent_recombination_events_receive_globally_unique_times():
     result = build_synthetic_full_arg(_two_independent_recombination_candidates())
-    trace = build_trace_from_full_arg(
+    trace = build_fast_trace_from_full_arg(
         result.tree_sequence,
         require_unique_event_times=True,
     )
@@ -262,7 +267,7 @@ def test_independent_recombination_events_receive_globally_unique_times():
 def test_parallel_balanced_recombination_events_receive_unique_times():
     ts, _parents = _many_interval_child_tree_sequence(group_count=4)
     result = build_synthetic_full_arg(ts, split_rule="balanced")
-    trace = build_trace_from_full_arg(
+    trace = build_fast_trace_from_full_arg(
         result.tree_sequence,
         require_unique_event_times=True,
     )
@@ -288,13 +293,13 @@ def test_unique_event_time_opt_out_preserves_ties():
         _two_independent_recombination_candidates(),
         ensure_unique_event_times=False,
     )
-    trace = build_trace_from_full_arg(result.tree_sequence)
+    trace = build_fast_trace_from_full_arg(result.tree_sequence)
 
     assert np.any(np.diff(trace.event_time) == 0)
     assert result.metadata["ensure_unique_event_times"] is False
     assert result.metadata["event_times_are_globally_unique"] is False
     with pytest.raises(ValueError, match="strictly increasing event times"):
-        build_trace_from_full_arg(
+        build_fast_trace_from_full_arg(
             result.tree_sequence,
             require_unique_event_times=True,
         )
@@ -333,7 +338,7 @@ def test_balanced_topology_is_smaller_than_left_to_right_chain():
     _assert_strict_edge_times(balanced)
     _assert_strict_edge_times(left_to_right)
     for synthetic_ts in (balanced, left_to_right):
-        trace = build_trace_from_full_arg(
+        trace = build_fast_trace_from_full_arg(
             synthetic_ts,
             require_unique_event_times=True,
         )
@@ -348,7 +353,7 @@ def test_larger_local_fixtures_build_with_strict_synthetic_times(path):
     assert result.metadata["synthetic_recombination_event_count"] > 0
     _assert_strict_edge_times(ts)
 
-    trace = build_trace_from_full_arg(ts, require_unique_event_times=True)
+    trace = build_fast_trace_from_full_arg(ts, require_unique_event_times=True)
     assert trace.recombination_event_count == result.metadata[
         "synthetic_recombination_event_count"
     ]
