@@ -95,6 +95,28 @@ class ExactConeScanResult:
 
 
 @dataclass(frozen=True)
+class ExactRegionWitnessScan:
+    """One best exact cut witness for each requested normal-TS region."""
+
+    regions: tuple[dict[str, Any], ...]
+    valid_witnesses: tuple[dict[str, Any], ...]
+    per_cut_summary: tuple[dict[str, Any], ...]
+    scan_seconds: float
+    diagnostics: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ExactRegionWitnessBenchmark:
+    """Reference/incremental comparison for region witness discovery."""
+
+    reference_result: ExactRegionWitnessScan
+    incremental_result: ExactRegionWitnessScan
+    reference_seconds: float
+    incremental_seconds: float
+    speedup: float
+
+
+@dataclass(frozen=True)
 class TwoStageExactConeEvaluation:
     """Complete normal-candidate and synthetic-oracle comparison."""
 
@@ -804,6 +826,767 @@ def scan_exact_closed_cones(
     )
 
 
+def _canonical_interval_union(intervals: Iterable[Interval]) -> tuple[Interval, ...]:
+    merged: list[Interval] = []
+    for left_value, right_value in sorted(
+        (float(left), float(right)) for left, right in intervals
+    ):
+        if not left_value < right_value:
+            raise ValueError("material intervals must be nonempty")
+        if merged and left_value <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], right_value))
+        else:
+            merged.append((left_value, right_value))
+    return tuple(merged)
+
+
+@dataclass
+class _WitnessComponent:
+    support: tuple[Interval, ...]
+    event_indices: set[int]
+    edge_ids: set[int]
+    node_ids: set[int]
+    terminal_lineage_ids: set[int]
+
+    @property
+    def weight(self) -> int:
+        return (
+            len(self.event_indices)
+            + len(self.edge_ids)
+            + len(self.node_ids)
+            + len(self.terminal_lineage_ids)
+        )
+
+
+class _WitnessDisjointSet:
+    """Monotone suffix connectivity with mergeable witness metadata."""
+
+    def __init__(self, node_count: int) -> None:
+        self.parent = np.arange(int(node_count), dtype=np.int32)
+        self.size = np.ones(int(node_count), dtype=np.int32)
+        self.components: list[_WitnessComponent | None] = [
+            None for _ in range(int(node_count))
+        ]
+        self.active_roots: set[int] = set()
+        self.union_count = 0
+
+    def find(self, item: int) -> int:
+        item = int(item)
+        root = item
+        while int(self.parent[root]) != root:
+            root = int(self.parent[root])
+        while int(self.parent[item]) != item:
+            following = int(self.parent[item])
+            self.parent[item] = root
+            item = following
+        return root
+
+    def ensure_node(
+        self,
+        node_id: int,
+        *,
+        support: Iterable[Interval] = (),
+        terminal: bool = False,
+    ) -> int:
+        node_id = int(node_id)
+        root = self.find(node_id)
+        component = self.components[root]
+        new_support = tuple(support)
+        if component is None:
+            component = _WitnessComponent(
+                support=_canonical_interval_union(new_support),
+                event_indices=set(),
+                edge_ids=set(),
+                node_ids={node_id},
+                terminal_lineage_ids={node_id} if terminal else set(),
+            )
+            self.components[root] = component
+            self.active_roots.add(root)
+        else:
+            component.node_ids.add(node_id)
+            if terminal:
+                component.terminal_lineage_ids.add(node_id)
+            if new_support:
+                component.support = _canonical_interval_union(
+                    (*component.support, *new_support)
+                )
+        return root
+
+    def component(self, item: int) -> _WitnessComponent:
+        root = self.find(item)
+        component = self.components[root]
+        if component is None:
+            raise KeyError(f"node {item} has no suffix component")
+        return component
+
+    def union(self, left_item: int, right_item: int) -> int:
+        left_root = self.find(left_item)
+        right_root = self.find(right_item)
+        if left_root == right_root:
+            return left_root
+        left_component = self.components[left_root]
+        right_component = self.components[right_root]
+        if left_component is None and right_component is not None:
+            left_root, right_root = right_root, left_root
+            left_component, right_component = right_component, left_component
+        elif left_component is not None and right_component is not None:
+            if left_component.weight < right_component.weight:
+                left_root, right_root = right_root, left_root
+                left_component, right_component = right_component, left_component
+        elif left_component is None and right_component is None:
+            if int(self.size[left_root]) < int(self.size[right_root]):
+                left_root, right_root = right_root, left_root
+
+        self.parent[right_root] = left_root
+        self.size[left_root] += self.size[right_root]
+        self.union_count += 1
+        if right_component is None:
+            return left_root
+        if left_component is None:
+            self.components[left_root] = right_component
+        else:
+            left_component.support = _canonical_interval_union(
+                (*left_component.support, *right_component.support)
+            )
+            if len(left_component.event_indices) < len(right_component.event_indices):
+                left_component.event_indices, right_component.event_indices = (
+                    right_component.event_indices,
+                    left_component.event_indices,
+                )
+            left_component.event_indices.update(right_component.event_indices)
+            if len(left_component.edge_ids) < len(right_component.edge_ids):
+                left_component.edge_ids, right_component.edge_ids = (
+                    right_component.edge_ids,
+                    left_component.edge_ids,
+                )
+            left_component.edge_ids.update(right_component.edge_ids)
+            if len(left_component.node_ids) < len(right_component.node_ids):
+                left_component.node_ids, right_component.node_ids = (
+                    right_component.node_ids,
+                    left_component.node_ids,
+                )
+            left_component.node_ids.update(right_component.node_ids)
+            if len(left_component.terminal_lineage_ids) < len(
+                right_component.terminal_lineage_ids
+            ):
+                (
+                    left_component.terminal_lineage_ids,
+                    right_component.terminal_lineage_ids,
+                ) = (
+                    right_component.terminal_lineage_ids,
+                    left_component.terminal_lineage_ids,
+                )
+            left_component.terminal_lineage_ids.update(
+                right_component.terminal_lineage_ids
+            )
+        self.components[right_root] = None
+        self.active_roots.discard(right_root)
+        self.active_roots.add(left_root)
+        return left_root
+
+
+def _normalise_witness_regions(
+    normal_regions: Iterable[Mapping[str, Any]], sequence_length: float
+) -> tuple[dict[str, Any], ...]:
+    output = []
+    for region_index, region_value in enumerate(normal_regions):
+        region = copy.deepcopy(dict(region_value))
+        try:
+            left = float(region["left"])
+            right = float(region["right"])
+        except KeyError as error:
+            raise ValueError("every normal region must define left and right") from error
+        if not 0.0 <= left < right <= float(sequence_length):
+            raise ValueError(
+                f"normal region {region_index} is outside the trace sequence: "
+                f"[{left}, {right})"
+            )
+        region["left"] = left
+        region["right"] = right
+        region.setdefault("span", right - left)
+        region.setdefault("region_id", f"normal-region-{region_index:04d}")
+        output.append(region)
+    return tuple(output)
+
+
+def _empty_rejection_diagnostics() -> dict[str, int]:
+    return {
+        "support_mismatch": 0,
+        "whole_sequence": 0,
+        "zero_event": 0,
+        "assigned_edge_outside_region": 0,
+        "outside_suffix_edge_overlap": 0,
+        "empty_frontier": 0,
+    }
+
+
+def _witness_rank(candidate: Mapping[str, Any]) -> tuple[int, int, int]:
+    return (
+        int(candidate["event_count"]),
+        len(candidate["lower_frontier_anchor_node_ids"]),
+        -int(candidate["boundary_step"]),
+    )
+
+
+def _decorate_witness(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    witness = copy.deepcopy(dict(candidate))
+    witness["witness_cut_step"] = int(candidate["boundary_step"])
+    witness["witness_cut_time"] = float(candidate["boundary_time"])
+    witness["internal_event_count"] = int(candidate["event_count"])
+    witness["frontier_node_count"] = len(
+        candidate["lower_frontier_anchor_node_ids"]
+    )
+    witness["selection_rank"] = _witness_rank(candidate)
+    return witness
+
+
+def _assemble_witness_scan(
+    normal_regions: tuple[dict[str, Any], ...],
+    best_by_interval: Mapping[Interval, Mapping[str, Any]],
+    rejection_by_interval: Mapping[Interval, Mapping[str, int]],
+    per_cut_summary: Sequence[Mapping[str, Any]],
+    diagnostics: Mapping[str, Any],
+    started: float,
+) -> ExactRegionWitnessScan:
+    region_records = []
+    for region in normal_regions:
+        interval = (float(region["left"]), float(region["right"]))
+        record = copy.deepcopy(region)
+        candidate = best_by_interval.get(interval)
+        if candidate is None:
+            record.update(
+                {
+                    "status": "no_valid_witness",
+                    "witness_cut_step": None,
+                    "witness_cut_time": None,
+                    "witness_internal_event_count": None,
+                    "witness_frontier_node_count": None,
+                    "witness": None,
+                    "rejection_diagnostics": dict(
+                        rejection_by_interval.get(
+                            interval, _empty_rejection_diagnostics()
+                        )
+                    ),
+                }
+            )
+        else:
+            witness = _decorate_witness(candidate)
+            record.update(
+                {
+                    "status": "valid",
+                    "witness_cut_step": witness["witness_cut_step"],
+                    "witness_cut_time": witness["witness_cut_time"],
+                    "witness_internal_event_count": witness[
+                        "internal_event_count"
+                    ],
+                    "witness_frontier_node_count": witness[
+                        "frontier_node_count"
+                    ],
+                    "witness": witness,
+                    "rejection_diagnostics": dict(
+                        rejection_by_interval.get(
+                            interval, _empty_rejection_diagnostics()
+                        )
+                    ),
+                }
+            )
+        region_records.append(record)
+    valid = tuple(record for record in region_records if record["status"] == "valid")
+    scan_seconds = time.perf_counter() - started
+    final_diagnostics = dict(diagnostics)
+    final_diagnostics.update(
+        {
+            "candidate_region_count": len(normal_regions),
+            "valid_witness_count": len(valid),
+            "invalid_region_count": len(normal_regions) - len(valid),
+        }
+    )
+    return ExactRegionWitnessScan(
+        regions=tuple(region_records),
+        valid_witnesses=valid,
+        per_cut_summary=tuple(dict(item) for item in per_cut_summary),
+        scan_seconds=scan_seconds,
+        diagnostics=final_diagnostics,
+    )
+
+
+def _scan_exact_region_witnesses_reference(
+    trace: FastARGTrace,
+    normal_regions: tuple[dict[str, Any], ...],
+) -> ExactRegionWitnessScan:
+    """Reference witness selection using the established all-cut classifier."""
+
+    started = time.perf_counter()
+    intervals = tuple(
+        sorted({(float(region["left"]), float(region["right"])) for region in normal_regions})
+    )
+    interval_set = frozenset(intervals)
+    best_by_interval: dict[Interval, dict[str, Any]] = {}
+    rejection_by_interval = {
+        interval: _empty_rejection_diagnostics() for interval in intervals
+    }
+    terminal_state = trace.initial_state().advance_to(trace.num_steps)
+    terminal_frontier = terminal_state.compact_active_frontier()
+    state = trace.initial_state()
+    per_cut_summary = []
+    candidate_evaluations = 0
+    suffix_event_visits = 0
+    suffix_edge_visits = 0
+
+    for cut_step in range(trace.num_steps + 1):
+        result = exact_components_at_cut(state, cut_step, terminal_frontier)
+        components_by_interval = {
+            (float(candidate["left"]), float(candidate["right"])): candidate
+            for candidate in result["candidates"]
+            if candidate["contiguous"]
+            and (float(candidate["left"]), float(candidate["right"])) in interval_set
+        }
+        valid_at_cut = 0
+        for interval in intervals:
+            candidate_evaluations += 1
+            candidate = components_by_interval.get(interval)
+            if candidate is None:
+                rejection_by_interval[interval]["support_mismatch"] += 1
+                continue
+            if candidate["exact"]:
+                valid_at_cut += 1
+                previous = best_by_interval.get(interval)
+                if previous is None or _witness_rank(candidate) < _witness_rank(previous):
+                    best_by_interval[interval] = copy.deepcopy(candidate)
+            else:
+                for reason in candidate["rejection_reasons"]:
+                    if reason in rejection_by_interval[interval]:
+                        rejection_by_interval[interval][reason] += 1
+        suffix_event_visits += int(result["suffix_event_count"])
+        suffix_edge_visits += int(
+            trace.event_edge_start[-1] - trace.event_edge_start[cut_step]
+        )
+        per_cut_summary.append(
+            {
+                "boundary_step": cut_step,
+                "boundary_time": float(state.current_time),
+                "candidate_regions_checked": len(intervals),
+                "valid_candidate_regions": valid_at_cut,
+                "unresolved_candidate_regions": len(intervals),
+            }
+        )
+        if cut_step < trace.num_steps:
+            state.advance()
+
+    return _assemble_witness_scan(
+        normal_regions,
+        best_by_interval,
+        rejection_by_interval,
+        per_cut_summary,
+        {
+            "algorithm": "reference",
+            "candidate_cut_evaluations": candidate_evaluations,
+            "suffix_event_visits": suffix_event_visits,
+            "suffix_edge_visits": suffix_edge_visits,
+            "event_insertions": 0,
+            "edge_insertions": 0,
+            "suffix_rebuilds": trace.num_steps + 1,
+        },
+        started,
+    )
+
+
+def _frontier_component_catalog(
+    dsu: _WitnessDisjointSet,
+    frontier: Any,
+) -> tuple[dict[int, tuple[int, ...]], dict[int, tuple[tuple[int, float, float], ...]], int]:
+    """Add current material overlaps and group frontier data by final root."""
+
+    segment_rows: list[tuple[float, float, int]] = []
+    for lineage_index, node_value in enumerate(frontier.node_ids):
+        node_id = int(node_value)
+        start = int(frontier.segment_offsets[lineage_index])
+        end = int(frontier.segment_offsets[lineage_index + 1])
+        support = tuple(
+            (
+                float(frontier.segment_left[segment_index]),
+                float(frontier.segment_right[segment_index]),
+            )
+            for segment_index in range(start, end)
+        )
+        dsu.ensure_node(node_id, support=support)
+        segment_rows.extend((left, right, node_id) for left, right in support)
+
+    overlap_checks = 0
+    active: list[tuple[float, int]] = []
+    for left, right, node_id in sorted(segment_rows):
+        active = [item for item in active if item[0] > left]
+        for _, other_node_id in active:
+            if other_node_id != node_id:
+                overlap_checks += 1
+                dsu.union(node_id, other_node_id)
+        active.append((right, node_id))
+
+    nodes_by_root: dict[int, list[int]] = {}
+    segments_by_root: dict[int, list[tuple[int, float, float]]] = {}
+    for lineage_index, node_value in enumerate(frontier.node_ids):
+        node_id = int(node_value)
+        root = dsu.find(node_id)
+        nodes_by_root.setdefault(root, []).append(node_id)
+        start = int(frontier.segment_offsets[lineage_index])
+        end = int(frontier.segment_offsets[lineage_index + 1])
+        bucket = segments_by_root.setdefault(root, [])
+        for segment_index in range(start, end):
+            bucket.append(
+                (
+                    node_id,
+                    float(frontier.segment_left[segment_index]),
+                    float(frontier.segment_right[segment_index]),
+                )
+            )
+    return (
+        {root: tuple(values) for root, values in nodes_by_root.items()},
+        {root: tuple(values) for root, values in segments_by_root.items()},
+        overlap_checks,
+    )
+
+
+def _materialize_incremental_witness(
+    trace: FastARGTrace,
+    state: FastARGState,
+    cut_step: int,
+    candidate_index: int,
+    interval: Interval,
+    root: int,
+    component: _WitnessComponent,
+    frontier_nodes: tuple[int, ...],
+    frontier_segments: tuple[tuple[int, float, float], ...],
+    terminal_lineage_ids: tuple[int, ...],
+    outside_overlap_edge_ids: Sequence[int],
+) -> dict[str, Any]:
+    left, right = interval
+    edge_ids = np.asarray(sorted(component.edge_ids), dtype=np.int32)
+    event_indices = np.asarray(sorted(component.event_indices), dtype=np.int64)
+    event_kinds = trace.event_kind[event_indices]
+    separation_event = None if cut_step == 0 else trace.event_at_index(cut_step - 1)
+    assigned_edges_inside = bool(
+        np.all(trace.edge_left[edge_ids] >= left)
+        and np.all(trace.edge_right[edge_ids] <= right)
+    )
+    node_ids = set(component.node_ids)
+    node_ids.update(frontier_nodes)
+    return {
+        "boundary_step": int(cut_step),
+        "boundary_time": float(state.current_time),
+        "component_index": int(root),
+        "region_key": interval,
+        "intervals": component.support,
+        "left": float(left),
+        "right": float(right),
+        "span": float(right - left),
+        "material_length": float(
+            sum(end - start for start, end in component.support)
+        ),
+        "contiguous": len(component.support) == 1,
+        "proper_subregion": not (
+            left <= 0.0 and right >= float(trace.sequence_length)
+        ),
+        "lower_frontier_anchor_node_ids": tuple(frontier_nodes),
+        "frontier_segments": tuple(frontier_segments),
+        "suffix_event_indices": tuple(int(value) for value in event_indices),
+        "edge_ids": tuple(int(value) for value in edge_ids),
+        "node_ids": tuple(sorted(node_ids)),
+        "terminal_lineage_ids": terminal_lineage_ids,
+        "event_count": int(event_indices.size),
+        "recombination_event_count": int(
+            np.sum(event_kinds == EVENT_KIND_RECOMBINATION)
+        ),
+        "coalescence_event_count": int(
+            np.sum(event_kinds == EVENT_KIND_COALESCENCE)
+        ),
+        "node_count": len(node_ids),
+        "edge_count": int(edge_ids.size),
+        "assigned_edges_inside": assigned_edges_inside,
+        "outside_overlap_edge_ids": tuple(
+            int(value) for value in outside_overlap_edge_ids
+        ),
+        "closure_verified": assigned_edges_inside
+        and not outside_overlap_edge_ids,
+        "exact": True,
+        "rejection_reasons": (),
+        "separation_event_index": None if separation_event is None else cut_step - 1,
+        "separation_event_time": (
+            None if separation_event is None else separation_event.time
+        ),
+        "separation_event_kind": (
+            None if separation_event is None else separation_event.kind
+        ),
+        "separation_event_node_ids": (
+            () if separation_event is None else separation_event.node_ids
+        ),
+        "candidate_id": f"step-{cut_step}-region-{candidate_index:04d}",
+    }
+
+
+def _scan_exact_region_witnesses_incremental(
+    trace: FastARGTrace,
+    normal_regions: tuple[dict[str, Any], ...],
+) -> ExactRegionWitnessScan:
+    """Find exact witnesses in one terminal-to-present suffix pass."""
+
+    started = time.perf_counter()
+    intervals = tuple(
+        sorted({(float(region["left"]), float(region["right"])) for region in normal_regions})
+    )
+    interval_index = {interval: index for index, interval in enumerate(intervals)}
+    rejection_by_interval = {
+        interval: _empty_rejection_diagnostics() for interval in intervals
+    }
+    best_by_interval: dict[Interval, dict[str, Any]] = {}
+    unresolved = set(intervals)
+    candidate_overlap_edges: list[list[int]] = [[] for _ in intervals]
+    edge_candidate_indices: list[tuple[int, ...]] = []
+    for edge_id in range(trace.edge_left.size):
+        edge_left = float(trace.edge_left[edge_id])
+        edge_right = float(trace.edge_right[edge_id])
+        edge_candidate_indices.append(
+            tuple(
+                candidate_index
+                for candidate_index, (left, right) in enumerate(intervals)
+                if edge_left < right and edge_right > left
+            )
+        )
+
+    state = trace.initial_state().advance_to(trace.num_steps)
+    terminal_frontier = state.compact_active_frontier()
+    terminal_node_order = tuple(int(value) for value in terminal_frontier.node_ids)
+    dsu = _WitnessDisjointSet(trace.node_time.size)
+    for lineage_index, node_value in enumerate(terminal_frontier.node_ids):
+        start = int(terminal_frontier.segment_offsets[lineage_index])
+        end = int(terminal_frontier.segment_offsets[lineage_index + 1])
+        dsu.ensure_node(
+            int(node_value),
+            support=tuple(
+                (
+                    float(terminal_frontier.segment_left[segment_index]),
+                    float(terminal_frontier.segment_right[segment_index]),
+                )
+                for segment_index in range(start, end)
+            ),
+            terminal=True,
+        )
+
+    frontier_nodes_by_root, frontier_segments_by_root, overlap_checks = (
+        _frontier_component_catalog(dsu, terminal_frontier)
+    )
+    event_insertions = 0
+    edgeful_event_insertions = 0
+    edge_insertions = 0
+    candidate_evaluations = 0
+    per_cut_summary = []
+
+    def evaluate_cut(cut_step: int) -> None:
+        nonlocal candidate_evaluations
+        support_to_root = {}
+        for root_value in tuple(dsu.active_roots):
+            root = dsu.find(root_value)
+            component = dsu.components[root]
+            if component is not None and component.support:
+                support_to_root[component.support] = root
+        valid_at_cut = 0
+        finalized = []
+        for interval in tuple(unresolved):
+            candidate_evaluations += 1
+            root = support_to_root.get((interval,))
+            if root is None:
+                rejection_by_interval[interval]["support_mismatch"] += 1
+                if interval in best_by_interval:
+                    finalized.append(interval)
+                continue
+            component = dsu.component(root)
+            previous = best_by_interval.get(interval)
+            if previous is not None and len(component.event_indices) > int(
+                previous["event_count"]
+            ):
+                finalized.append(interval)
+                continue
+            reasons = []
+            if interval[0] <= 0.0 and interval[1] >= float(trace.sequence_length):
+                reasons.append("whole_sequence")
+            if not component.event_indices:
+                reasons.append("zero_event")
+            edge_ids = np.asarray(sorted(component.edge_ids), dtype=np.int32)
+            assigned_inside = bool(
+                np.all(trace.edge_left[edge_ids] >= interval[0])
+                and np.all(trace.edge_right[edge_ids] <= interval[1])
+            )
+            if not assigned_inside:
+                reasons.append("assigned_edge_outside_region")
+            candidate_index = interval_index[interval]
+            outside_overlap_edge_ids = tuple(
+                edge_id
+                for edge_id in candidate_overlap_edges[candidate_index]
+                if dsu.find(int(trace.edge_parent[edge_id])) != root
+            )
+            if outside_overlap_edge_ids:
+                reasons.append("outside_suffix_edge_overlap")
+            frontier_nodes = frontier_nodes_by_root.get(root, ())
+            frontier_segments = frontier_segments_by_root.get(root, ())
+            if not frontier_nodes or not frontier_segments:
+                reasons.append("empty_frontier")
+            if reasons:
+                for reason in reasons:
+                    rejection_by_interval[interval][reason] += 1
+                continue
+            valid_at_cut += 1
+            witness = _materialize_incremental_witness(
+                trace,
+                state,
+                cut_step,
+                candidate_index,
+                interval,
+                root,
+                component,
+                frontier_nodes,
+                frontier_segments,
+                tuple(
+                    node_id
+                    for node_id in terminal_node_order
+                    if dsu.find(node_id) == root
+                ),
+                outside_overlap_edge_ids,
+            )
+            if previous is None or _witness_rank(witness) < _witness_rank(previous):
+                best_by_interval[interval] = witness
+        unresolved.difference_update(finalized)
+        per_cut_summary.append(
+            {
+                "boundary_step": int(cut_step),
+                "boundary_time": float(state.current_time),
+                "candidate_regions_checked": len(unresolved) + len(finalized),
+                "valid_candidate_regions": valid_at_cut,
+                "unresolved_candidate_regions": len(unresolved),
+            }
+        )
+
+    evaluate_cut(trace.num_steps)
+    for cut_step in range(trace.num_steps - 1, -1, -1):
+        state.backtrack()
+        event_insertions += 1
+        edge_start = int(trace.event_edge_start[cut_step])
+        edge_end = int(trace.event_edge_start[cut_step + 1])
+        edge_ids = np.asarray(
+            trace.revealed_edge_ids[edge_start:edge_end], dtype=np.int32
+        )
+        event_root = -1
+        for edge_value in edge_ids:
+            edge_id = int(edge_value)
+            parent_node = int(trace.edge_parent[edge_id])
+            child_node = int(trace.edge_child[edge_id])
+            dsu.ensure_node(parent_node)
+            dsu.ensure_node(child_node)
+            edge_root = dsu.union(parent_node, child_node)
+            event_root = (
+                edge_root if event_root < 0 else dsu.union(event_root, edge_root)
+            )
+            for candidate_index in edge_candidate_indices[edge_id]:
+                candidate_overlap_edges[candidate_index].append(edge_id)
+            edge_insertions += 1
+        if event_root >= 0:
+            edgeful_event_insertions += 1
+            for node_id in (
+                int(trace.event_node1[cut_step]),
+                int(trace.event_node2[cut_step]),
+            ):
+                if node_id >= 0:
+                    dsu.ensure_node(node_id)
+                    event_root = dsu.union(event_root, node_id)
+            event_root = dsu.find(event_root)
+            component = dsu.component(event_root)
+            component.event_indices.add(cut_step)
+            component.edge_ids.update(int(value) for value in edge_ids)
+            for node_id in (
+                int(trace.event_node1[cut_step]),
+                int(trace.event_node2[cut_step]),
+            ):
+                if node_id >= 0:
+                    component.node_ids.add(node_id)
+
+        frontier = state.compact_active_frontier()
+        (
+            frontier_nodes_by_root,
+            frontier_segments_by_root,
+            cut_overlap_checks,
+        ) = _frontier_component_catalog(dsu, frontier)
+        overlap_checks += cut_overlap_checks
+        evaluate_cut(cut_step)
+
+    per_cut_summary.reverse()
+    return _assemble_witness_scan(
+        normal_regions,
+        best_by_interval,
+        rejection_by_interval,
+        per_cut_summary,
+        {
+            "algorithm": "incremental",
+            "candidate_cut_evaluations": candidate_evaluations,
+            "event_insertions": event_insertions,
+            "edgeful_event_insertions": edgeful_event_insertions,
+            "edge_insertions": edge_insertions,
+            "component_unions": dsu.union_count,
+            "frontier_overlap_checks": overlap_checks,
+            "candidate_edge_overlap_links": sum(
+                len(values) for values in candidate_overlap_edges
+            ),
+            "suffix_rebuilds": 0,
+        },
+        started,
+    )
+
+
+def scan_exact_region_witnesses(
+    trace: FastARGTrace,
+    normal_regions: Iterable[Mapping[str, Any]],
+    *,
+    algorithm: str = "incremental",
+) -> ExactRegionWitnessScan:
+    """Find one best existential exact-cut witness per normal-TS region.
+
+    Witnesses isolate the older event suffix and are ranked by internal event
+    count, frontier-node count, then oldest cut step.  The incremental scanner
+    adds every suffix event and edge once; ``algorithm="reference"`` retains
+    the established all-cut component rebuild as an independent oracle.
+    """
+
+    regions = _normalise_witness_regions(normal_regions, trace.sequence_length)
+    if algorithm == "incremental":
+        return _scan_exact_region_witnesses_incremental(trace, regions)
+    if algorithm == "reference":
+        return _scan_exact_region_witnesses_reference(trace, regions)
+    raise ValueError("algorithm must be 'incremental' or 'reference'")
+
+
+def benchmark_exact_region_witnesses(
+    trace: FastARGTrace,
+    normal_regions: Iterable[Mapping[str, Any]],
+) -> ExactRegionWitnessBenchmark:
+    """Run both witness scanners and return their reusable results."""
+
+    regions = tuple(copy.deepcopy(dict(region)) for region in normal_regions)
+    reference_result = scan_exact_region_witnesses(
+        trace, regions, algorithm="reference"
+    )
+    incremental_result = scan_exact_region_witnesses(
+        trace, regions, algorithm="incremental"
+    )
+    return ExactRegionWitnessBenchmark(
+        reference_result=reference_result,
+        incremental_result=incremental_result,
+        reference_seconds=reference_result.scan_seconds,
+        incremental_seconds=incremental_result.scan_seconds,
+        speedup=(
+            reference_result.scan_seconds / incremental_result.scan_seconds
+            if incremental_result.scan_seconds > 0.0
+            else float("inf")
+        ),
+    )
+
+
 def assert_synthetic_endpoints_are_normal_breakpoints(
     normal_ts: tskit.TreeSequence,
     synthetic_ts: tskit.TreeSequence,
@@ -941,10 +1724,13 @@ def evaluate_two_stage_exact_cones(
 __all__ = [
     "DEFAULT_ADJACENCY_TIERS",
     "ExactConeScanResult",
+    "ExactRegionWitnessBenchmark",
+    "ExactRegionWitnessScan",
     "NormalTSCandidate",
     "NormalTSCandidateCatalog",
     "TwoStageExactConeEvaluation",
     "assert_synthetic_endpoints_are_normal_breakpoints",
+    "benchmark_exact_region_witnesses",
     "canonical_component_intervals",
     "close_components_through_suffix",
     "evaluate_two_stage_exact_cones",
@@ -954,6 +1740,7 @@ __all__ = [
     "grouped_values",
     "initial_material_components",
     "scan_exact_closed_cones",
+    "scan_exact_region_witnesses",
     "uf_find",
     "uf_union",
 ]

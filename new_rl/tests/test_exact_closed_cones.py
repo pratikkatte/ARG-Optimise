@@ -7,11 +7,17 @@ import tskit
 
 from arg.new_rl import build_synthetic_full_arg
 from arg.new_rl.exact_closed_cones import (
+    _witness_rank,
     assert_synthetic_endpoints_are_normal_breakpoints,
     canonical_component_intervals,
     evaluate_two_stage_exact_cones,
     generate_normal_ts_candidates,
+    scan_exact_region_witnesses,
 )
+from arg.new_rl.normal_ts_edge_closed_regions import (
+    scan_normal_ts_edge_closed_regions,
+)
+from arg.new_rl.trace import build_fast_trace_from_full_arg
 
 
 SOURCE_25KB = "arg/validation/output/tsinfer/l25kb_dated.trees"
@@ -38,6 +44,26 @@ _SIGNATURE_FIELDS = (
     "node_ids",
     "edge_ids",
     "terminal_lineage_ids",
+)
+
+_WITNESS_CERTIFICATE_FIELDS = (
+    "left",
+    "right",
+    "boundary_step",
+    "boundary_time",
+    "lower_frontier_anchor_node_ids",
+    "frontier_segments",
+    "suffix_event_indices",
+    "event_count",
+    "recombination_event_count",
+    "coalescence_event_count",
+    "node_ids",
+    "edge_ids",
+    "terminal_lineage_ids",
+    "separation_event_index",
+    "separation_event_time",
+    "separation_event_kind",
+    "separation_event_node_ids",
 )
 
 
@@ -122,6 +148,76 @@ def test_synthetic_conversion_preserves_normal_breakpoints_on_25kb_fixture():
     assert_synthetic_endpoints_are_normal_breakpoints(normal_ts, synthetic_ts)
 
 
+def test_witness_ranking_prefers_events_then_frontier_then_oldest_cut():
+    def candidate(event_count, frontier_count, boundary_step):
+        return {
+            "event_count": event_count,
+            "lower_frontier_anchor_node_ids": tuple(range(frontier_count)),
+            "boundary_step": boundary_step,
+        }
+
+    assert _witness_rank(candidate(2, 9, 4)) < _witness_rank(candidate(3, 1, 20))
+    assert _witness_rank(candidate(2, 3, 4)) < _witness_rank(candidate(2, 4, 20))
+    assert _witness_rank(candidate(2, 3, 20)) < _witness_rank(candidate(2, 3, 4))
+
+
+def test_incremental_exact_region_witnesses_match_the_25kb_oracle():
+    normal_regions = scan_normal_ts_edge_closed_regions(SOURCE_25KB).regions
+    synthetic_ts = build_synthetic_full_arg(SOURCE_25KB).tree_sequence
+    trace = build_fast_trace_from_full_arg(
+        synthetic_ts, require_unique_event_times=True
+    )
+
+    incremental = scan_exact_region_witnesses(trace, normal_regions)
+    reference = scan_exact_region_witnesses(
+        trace, normal_regions, algorithm="reference"
+    )
+
+    assert len(incremental.regions) == 2
+    assert len(incremental.valid_witnesses) == 1
+    assert incremental.valid_witnesses[0]["witness_cut_step"] == 17
+    assert incremental.valid_witnesses[0]["witness_internal_event_count"] == 8
+    assert incremental.valid_witnesses[0]["witness_frontier_node_count"] == 5
+    assert incremental.regions[1]["status"] == "no_valid_witness"
+    assert incremental.regions[1]["witness"] is None
+    assert incremental.regions[1]["rejection_diagnostics"]["support_mismatch"] > 0
+    assert incremental.diagnostics["event_insertions"] == trace.num_steps
+    assert incremental.diagnostics["edge_insertions"] == trace.revealed_edge_ids.size
+    assert incremental.diagnostics["suffix_rebuilds"] == 0
+    assert reference.diagnostics["suffix_rebuilds"] == trace.num_steps + 1
+
+    for incremental_region, reference_region in zip(
+        incremental.regions, reference.regions
+    ):
+        assert incremental_region["status"] == reference_region["status"]
+        if incremental_region["status"] == "valid":
+            for field in _WITNESS_CERTIFICATE_FIELDS:
+                assert incremental_region["witness"][field] == (
+                    reference_region["witness"][field]
+                )
+
+
+def test_exact_region_witnesses_require_equal_half_open_boundaries():
+    synthetic_ts = build_synthetic_full_arg(SOURCE_25KB).tree_sequence
+    trace = build_fast_trace_from_full_arg(
+        synthetic_ts, require_unique_event_times=True
+    )
+    result = scan_exact_region_witnesses(
+        trace,
+        (
+            {"region_id": "exact", "left": 386.0, "right": 23963.0},
+            {"region_id": "contained", "left": 1000.0, "right": 20000.0},
+            {"region_id": "touching", "left": 23963.0, "right": 25000.0},
+        ),
+    )
+
+    assert [region["status"] for region in result.regions] == [
+        "valid",
+        "no_valid_witness",
+        "no_valid_witness",
+    ]
+
+
 def test_two_stage_25kb_matches_the_established_exact_oracle():
     evaluation = evaluate_two_stage_exact_cones(SOURCE_25KB)
 
@@ -155,3 +251,20 @@ def test_two_stage_1mb_matches_the_established_exact_oracle():
         evaluation.normal_tree_sequence,
         evaluation.synthetic_arg,
     )
+
+    normal_regions = scan_normal_ts_edge_closed_regions(SOURCE_1MB).regions
+    incremental = scan_exact_region_witnesses(evaluation.trace, normal_regions)
+    reference = scan_exact_region_witnesses(
+        evaluation.trace, normal_regions, algorithm="reference"
+    )
+    assert len(incremental.valid_witnesses) == 25
+    assert len(reference.valid_witnesses) == 25
+    for incremental_region, reference_region in zip(
+        incremental.regions, reference.regions
+    ):
+        assert incremental_region["status"] == reference_region["status"]
+        if incremental_region["status"] == "valid":
+            for field in _WITNESS_CERTIFICATE_FIELDS:
+                assert incremental_region["witness"][field] == (
+                    reference_region["witness"][field]
+                )
