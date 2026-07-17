@@ -1,5 +1,20 @@
 """Step-by-step replay helpers for full-ARG tskit tree sequences."""
 
+from .exact_closed_cones import (
+    DEFAULT_ADJACENCY_TIERS,
+    ExactConeScanResult,
+    NormalTSCandidate,
+    NormalTSCandidateCatalog,
+    TwoStageExactConeEvaluation,
+    evaluate_two_stage_exact_cones,
+    generate_normal_ts_candidates,
+    scan_exact_closed_cones,
+)
+from .normal_ts_edge_closed_regions import (
+    NormalEdgeClosedRegionScan,
+    normal_edge_components_at_cut,
+    scan_normal_ts_edge_closed_regions,
+)
 from .synthetic_full_arg import (
     NODE_IS_RE_EVENT,
     SYNTHETIC_FULL_ARG_PROVENANCE_NAME,
@@ -21,13 +36,24 @@ __all__ = [
     "ARGEvent",
     "ActiveLineage",
     "CompactActiveFrontier",
+    "DEFAULT_ADJACENCY_TIERS",
+    "ExactConeScanResult",
     "FastARGState",
     "FastARGTrace",
     "NODE_IS_RE_EVENT",
+    "NormalEdgeClosedRegionScan",
+    "NormalTSCandidate",
+    "NormalTSCandidateCatalog",
     "SYNTHETIC_FULL_ARG_PROVENANCE_NAME",
     "SyntheticFullARGResult",
     "TraceState",
+    "TwoStageExactConeEvaluation",
     "build_fast_trace_from_full_arg",
     "build_synthetic_full_arg",
+    "evaluate_two_stage_exact_cones",
+    "generate_normal_ts_candidates",
     "get_synthetic_full_arg_provenance",
+    "normal_edge_components_at_cut",
+    "scan_exact_closed_cones",
+    "scan_normal_ts_edge_closed_regions",
 ]
