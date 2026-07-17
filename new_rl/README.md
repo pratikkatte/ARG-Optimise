@@ -56,8 +56,14 @@ python -m pytest -q arg/new_rl/tests
 The canonical notebook is also configured to use the `phylogfn_311` Jupyter
 kernel.
 
-The canonical input used by the notebook is:
+The notebook starts from the ordinary inferred tree sequence:
 
 ```text
-arg/validation/output/tsinfer/l25kb_dated_synthetic_full_arg.trees
+arg/validation/output/tsinfer/l25kb_dated.trees
+```
+
+It converts, saves, reloads, and traces this generated artifact:
+
+```text
+arg/validation/output/tsinfer/l25kb_dated_new_rl_synthetic_full_arg.trees
 ```
