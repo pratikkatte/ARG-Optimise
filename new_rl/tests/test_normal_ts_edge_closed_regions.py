@@ -3,6 +3,7 @@ import pytest
 import tskit
 
 from arg.new_rl.normal_ts_edge_closed_regions import (
+    benchmark_normal_ts_edge_closed_regions,
     normal_edge_components_at_cut,
     scan_normal_ts_edge_closed_regions,
 )
@@ -10,6 +11,74 @@ from arg.new_rl.normal_ts_edge_closed_regions import (
 
 SOURCE_25KB = "arg/validation/output/tsinfer/l25kb_dated.trees"
 SOURCE_1MB = "arg/validation/output/tsinfer/l1mb_dated.trees"
+_IMPLEMENTATION_SPECIFIC_FIELDS = {"root_node_id", "component_id"}
+
+
+def _semantic_component_signature(component):
+    return tuple(
+        sorted(
+            (key, repr(value))
+            for key, value in component.items()
+            if key not in _IMPLEMENTATION_SPECIFIC_FIELDS
+        )
+    )
+
+
+def _assert_incremental_matches_reference(path):
+    reference = scan_normal_ts_edge_closed_regions(
+        path,
+        retain_per_cut_catalog=True,
+        algorithm="reference",
+    )
+    incremental = scan_normal_ts_edge_closed_regions(
+        path,
+        retain_per_cut_catalog=True,
+        algorithm="incremental",
+    )
+
+    assert len(reference.per_cut_summary) == len(incremental.per_cut_summary)
+    for reference_summary, incremental_summary in zip(
+        reference.per_cut_summary,
+        incremental.per_cut_summary,
+    ):
+        assert {
+            key: reference_summary[key]
+            for key in (
+                "cut_index",
+                "cut_time",
+                "older_edges",
+                "frontier_edges",
+                "components",
+                "edge_closed_components",
+            )
+        } == {
+            key: incremental_summary[key]
+            for key in (
+                "cut_index",
+                "cut_time",
+                "older_edges",
+                "frontier_edges",
+                "components",
+                "edge_closed_components",
+            )
+        }
+    for reference_cut, incremental_cut in zip(
+        reference.per_cut_component_catalog,
+        incremental.per_cut_component_catalog,
+    ):
+        assert sorted(
+            _semantic_component_signature(component)
+            for component in reference_cut["components"]
+        ) == sorted(
+            _semantic_component_signature(component)
+            for component in incremental_cut["components"]
+        )
+    assert sorted(
+        _semantic_component_signature(region) for region in reference.regions
+    ) == sorted(
+        _semantic_component_signature(region) for region in incremental.regions
+    )
+    return reference, incremental
 
 
 def _disjoint_half_open_tree_sequence():
@@ -96,6 +165,15 @@ def test_25kb_direct_normal_edge_regions_are_structurally_closed():
         )
 
 
+def test_incremental_scan_matches_reference_at_every_25kb_cut():
+    reference, incremental = _assert_incremental_matches_reference(SOURCE_25KB)
+
+    assert reference.raw_closed_component_count == 9
+    assert incremental.raw_closed_component_count == 9
+    assert reference.diagnostics["older_edge_visits"] == 206
+    assert incremental.diagnostics["older_edge_visits"] == 30
+
+
 @pytest.mark.slow
 def test_1mb_direct_normal_edge_regions_are_stable():
     result = scan_normal_ts_edge_closed_regions(SOURCE_1MB)
@@ -106,3 +184,24 @@ def test_1mb_direct_normal_edge_regions_are_stable():
     assert all(region["normal_edge_closed"] for region in result.regions)
     assert all(region["contiguous"] for region in result.regions)
     assert all(region["proper_subregion"] for region in result.regions)
+
+
+@pytest.mark.slow
+def test_incremental_scan_matches_reference_at_every_1mb_cut():
+    reference, incremental = _assert_incremental_matches_reference(SOURCE_1MB)
+
+    assert reference.raw_closed_component_count == 1335
+    assert incremental.raw_closed_component_count == 1335
+    assert reference.diagnostics["older_edge_visits"] == 453_635
+    assert incremental.diagnostics["older_edge_visits"] == 1_703
+    assert incremental.diagnostics["edge_overlap_pairs"] == 17_874
+
+
+@pytest.mark.slow
+def test_1mb_incremental_benchmark_exceeds_the_speed_target():
+    benchmark = benchmark_normal_ts_edge_closed_regions(SOURCE_1MB)
+
+    assert benchmark.speedup >= 5.0
+    assert benchmark.incremental_diagnostics["older_edge_visits"] == 1_703
+    assert benchmark.reference_diagnostics["older_edge_visits"] == 453_635
+    assert benchmark.incremental_peak_bytes <= benchmark.reference_peak_bytes * 1.25

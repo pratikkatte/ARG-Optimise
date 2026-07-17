@@ -24,7 +24,9 @@ This directory now has one supported workflow:
   interval as the exhaustive fallback.
 - `normal_ts_edge_closed_regions.py` is the direct normal-tree first stage: at
   each normal time cut, it finds connected older-edge components whose genomic
-  support is contiguous and has no overlapping outside older edge.
+  support is contiguous and has no overlapping outside older edge. Its default
+  reverse-time incremental scanner adds each normal edge once; the original
+  rebuild-at-every-cut scanner remains available only for parity checks.
 - `normal_ts_direct_edge_closed_regions.ipynb` runs that direct edge-closure
   scan on the 25 kb and 1 Mb normal inputs. It does not construct a
   synthetic/full ARG.

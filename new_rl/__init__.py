@@ -11,7 +11,9 @@ from .exact_closed_cones import (
     scan_exact_closed_cones,
 )
 from .normal_ts_edge_closed_regions import (
+    NormalEdgeClosedRegionBenchmark,
     NormalEdgeClosedRegionScan,
+    benchmark_normal_ts_edge_closed_regions,
     normal_edge_components_at_cut,
     scan_normal_ts_edge_closed_regions,
 )
@@ -41,6 +43,7 @@ __all__ = [
     "FastARGState",
     "FastARGTrace",
     "NODE_IS_RE_EVENT",
+    "NormalEdgeClosedRegionBenchmark",
     "NormalEdgeClosedRegionScan",
     "NormalTSCandidate",
     "NormalTSCandidateCatalog",
@@ -50,6 +53,7 @@ __all__ = [
     "TwoStageExactConeEvaluation",
     "build_fast_trace_from_full_arg",
     "build_synthetic_full_arg",
+    "benchmark_normal_ts_edge_closed_regions",
     "evaluate_two_stage_exact_cones",
     "generate_normal_ts_candidates",
     "get_synthetic_full_arg_provenance",
