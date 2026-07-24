@@ -1,51 +1,23 @@
-# Local ARG refinement experiments
+# User-anchored local ARG refinement
 
-This directory now has two supported structural workflows. Both begin by:
+This directory contains one supported structural workflow:
 
 1. represent the input as a synthetic/full ARG with explicit paired
    recombination nodes and unique event times using `synthetic_full_arg.py`;
 2. build the compact backward-time event trace in `trace.py`;
-
-The user-anchored workflow then resolves a supplied genomic interval and time
-with `local_refinement.py`, propagates interval-aware dependencies, and returns
-the mutable lineages plus an immutable exterior boundary contract.
-`local_construction.py` initializes the existing `ARGState` representation and
-applies the coalescent-with-recombination prior from `env.py` one event at a
-time. `local_splice.py` installs a terminal proposal, removes source-only
-synthetic routing nodes, remaps target mutations while preserving sample
-genotypes, validates the fixed exterior, and exports a clean whole-chromosome
-tree sequence.
-
-The automatic structural-closure workflow instead:
-
-1. proposes direct edge-closed regions from the normal tree sequence;
-2. finds one exact older-suffix cut witness for each proposed region with
-   `exact_closed_cones.py`;
-3. uses a witness's genomic interval, cut step, and frontier as the fixed
-   boundary for a later local reconstruction method.
+3. resolve a supplied genomic interval and time with `local_refinement.py`,
+   propagate interval-aware dependencies, and return the mutable lineages plus
+   an immutable exterior boundary contract;
+4. initialize the existing `ARGState` representation with
+   `local_construction.py` and apply the coalescent-with-recombination prior
+   from `env.py` one event at a time;
+5. install a terminal proposal with `local_splice.py`, remove source-only
+   synthetic routing nodes, remap target mutations while preserving sample
+   genotypes, validate the fixed exterior, and export a clean whole-chromosome
+   tree sequence.
 
 ## Files
 
-- `synthetic_arg_exact_closed_cones_25kb.ipynb` is the canonical 25 kb
-  discovery experiment. It scans every event cut and exposes the discovered
-  regions, times, frontier lineages, nodes, edges, and validation diagnostics.
-- `exact_closed_cones.py` contains the reusable exact all-cut scanner, the
-  conservative normal-tree-sequence candidate generator, and the incremental
-  existential-witness scanner. The latter adds every older event once and
-  selects the valid cut with the fewest internal events and frontier nodes.
-- `normal_ts_two_stage_exact_closed_cones.ipynb` compares the 25 kb and 1 Mb
-  fixtures. It reports candidate counts and recall for topology adjacency tiers
-  1/2/4/8/16/32, then confirms 100% recall using every proper normal-breakpoint
-  interval as the exhaustive fallback.
-- `normal_ts_edge_closed_regions.py` is the direct normal-tree first stage: at
-  each normal time cut, it finds connected older-edge components whose genomic
-  support is contiguous and has no overlapping outside older edge. Its default
-  reverse-time incremental scanner adds each normal edge once; the original
-  rebuild-at-every-cut scanner remains available only for parity checks.
-- `normal_ts_direct_edge_closed_regions.ipynb` runs the direct edge-closure
-  scan on the 25 kb and 1 Mb normal inputs, constructs their deterministic
-  synthetic/full ARGs, and reports one exact local-refinement witness for each
-  Stage-1 region that has one.
 - `synthetic_full_arg.py` contains the core tree-sequence conversion used by
   this workflow: topology completion, unique event times, mutation-time
   sanitization, and provenance. It has no visualization or animation
@@ -67,8 +39,9 @@ The automatic structural-closure workflow instead:
   exporting a clean refined tree sequence.
 - `benchmark_fast_trace.py` measures trace construction and cursor movement on
   larger synthetic/full ARG files.
-- `tests/` covers synthetic-ARG conversion, unique event times, event replay,
-  reversible frontier movement, and graph materialization.
+- `tests/` covers synthetic conversion, event replay, user-cut dependency
+  tracing, prior-driven forward/backward construction, clean splicing,
+  mutation preservation, and exterior validation.
 
 The current scope is structural construction and export. The randomized
 outputs are structural proposals, not posterior samples: biological prior
@@ -248,19 +221,6 @@ python -m pytest -q arg/new_rl/tests
 The canonical notebook is also configured to use the `phylogfn_311` Jupyter
 kernel.
 
-The two-stage equivalence notebook deliberately keeps its exact scan independent
-of the candidate catalog so it remains a recall oracle. The direct-region
-notebook uses the candidate-directed incremental witness scan and benchmarks it
-against that independent all-cut implementation.
-
-The notebook starts from the ordinary inferred tree sequence:
-
-```text
-arg/validation/output/tsinfer/l25kb_dated.trees
-```
-
-It converts, saves, reloads, and traces this generated artifact:
-
-```text
-arg/validation/output/tsinfer/l25kb_dated_new_rl_synthetic_full_arg.trees
-```
+`user_anchored_local_arg_traceback.ipynb` exposes configurable source,
+synthetic-output, and clean refined-output paths. It never overwrites the
+source tree sequence.

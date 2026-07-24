@@ -18,7 +18,6 @@ import math
 from typing import Any, Iterable, Literal, Mapping, Union
 
 import numpy as np
-import tskit
 
 try:
     from ..env import (
@@ -49,7 +48,6 @@ from .local_refinement import (
     LocalRefinementContext,
     PreparedLocalRefinement,
     _canonical_segments,
-    _intersect_segments,
 )
 from .synthetic_full_arg import NODE_IS_RE_EVENT
 

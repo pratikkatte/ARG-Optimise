@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 import tskit
@@ -5,7 +7,8 @@ import tskit
 from arg.new_rl import build_fast_trace_from_full_arg, build_synthetic_full_arg
 
 
-SOURCE_TREES = "arg/validation/output/tsinfer/l25kb_dated.trees"
+ARG_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_TREES = ARG_ROOT / "validation/output/tsinfer/l25kb_dated.trees"
 
 
 def _active_signature(state):

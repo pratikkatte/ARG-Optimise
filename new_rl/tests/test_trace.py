@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 import tskit
@@ -11,9 +13,14 @@ from arg.new_rl import (
 )
 
 
-SOURCE_TREES = "arg/validation/output/tsinfer/l25kb_dated.trees"
-L1MB_DATED_TREES = "arg/validation/output/tsinfer/l1mb_dated.trees"
-SIM_L1MB_TREES = "arg/validation/trees/sim_l1mb_0.trees"
+ARG_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_TREES = ARG_ROOT / "validation/output/tsinfer/l25kb_dated.trees"
+L1MB_DATED_TREES = ARG_ROOT / "validation/output/tsinfer/l1mb_dated.trees"
+SIM_L1MB_TREES = ARG_ROOT / "validation/trees/sim_l1mb_0.trees"
+LEGACY_SYNTHETIC_TREES = (
+    ARG_ROOT
+    / "validation/output/tsinfer/l25kb_dated_synthetic_full_arg.trees"
+)
 
 
 def _active_signature(state):
@@ -198,10 +205,7 @@ def test_converter_records_new_rl_provenance_and_accepts_legacy_fixture():
     assert record["software"]["name"] == SYNTHETIC_FULL_ARG_PROVENANCE_NAME
     assert record["summary"]["event_times_are_globally_unique"] is True
 
-    legacy_ts = tskit.load(
-        "arg/validation/output/tsinfer/"
-        "l25kb_dated_synthetic_full_arg.trees"
-    )
+    legacy_ts = tskit.load(str(LEGACY_SYNTHETIC_TREES))
     assert get_synthetic_full_arg_provenance(legacy_ts) is not None
 
 

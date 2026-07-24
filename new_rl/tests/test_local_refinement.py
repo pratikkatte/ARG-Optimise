@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 import tskit
@@ -10,13 +12,10 @@ from arg.new_rl import (
     resolve_trace_cut,
     trace_local_dependencies,
 )
-from arg.new_rl.exact_closed_cones import scan_exact_region_witnesses
-from arg.new_rl.normal_ts_edge_closed_regions import (
-    scan_normal_ts_edge_closed_regions,
-)
 
 
-SOURCE_25KB = "arg/validation/output/tsinfer/l25kb_dated.trees"
+ARG_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_25KB = ARG_ROOT / "validation/output/tsinfer/l25kb_dated.trees"
 
 
 def _simple_chain_tree_sequence():
@@ -199,56 +198,6 @@ def test_half_open_target_and_fixed_edge_complements_are_explicit():
                 float(trace.edge_right[edge_id]),
             ),
         )
-
-
-@pytest.fixture(scope="module")
-def exact_25kb_context():
-    conversion = build_synthetic_full_arg(SOURCE_25KB)
-    trace = build_fast_trace_from_full_arg(
-        conversion.tree_sequence,
-        require_unique_event_times=True,
-    )
-    regions = scan_normal_ts_edge_closed_regions(SOURCE_25KB).regions
-    witness_record = scan_exact_region_witnesses(
-        trace,
-        regions,
-    ).valid_witnesses[0]
-    context = trace_local_dependencies(
-        trace,
-        LocalRefinementRequest(
-            (
-                float(witness_record["left"]),
-                float(witness_record["right"]),
-            ),
-            cut_event_index=int(witness_record["witness_cut_step"]),
-        ),
-    )
-    return trace, witness_record["witness"], context
-
-
-def test_known_25kb_exact_cone_matches_the_existing_oracle(exact_25kb_context):
-    _trace, witness, context = exact_25kb_context
-
-    assert context.is_valid
-    assert context.selected_event_indices == tuple(witness["suffix_event_indices"])
-    assert context.authorized_edge_ids == tuple(sorted(witness["edge_ids"]))
-    observed_frontier = tuple(
-        sorted(
-            (lineage.node_id, left, right)
-            for lineage in context.cut_active_lineages
-            for left, right in lineage.mutable_segments
-        )
-    )
-    assert observed_frontier == tuple(sorted(witness["frontier_segments"]))
-    context_node_ids = {
-        lineage.node_id for lineage in context.active_lineages
-    }
-    assert set(witness["terminal_lineage_ids"]) <= context_node_ids
-    assert not any(
-        attachment.role == "terminal_anchor"
-        for attachment in context.boundary_attachments
-    )
-    assert not context.complexity["near_global"]
 
 
 def test_nonclosed_25kb_subregion_uses_mixed_boundaries():
