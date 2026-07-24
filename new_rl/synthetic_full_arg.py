@@ -280,16 +280,20 @@ def _find_compact_candidates(ts: tskit.TreeSequence) -> _CompactCandidates:
     child_end[:-1] = child_start[1:]
     child_end[-1] = groups.child.size
 
+    explicit_children = _explicit_recombination_children(ts)
     candidate_children: list[int] = []
     candidate_start: list[int] = []
     candidate_end: list[int] = []
     for start, end in zip(child_start, child_end):
+        child_id = int(groups.child[start])
+        if child_id in explicit_children:
+            continue
         if end - start <= 1:
             continue
         parent = groups.parent[start:end]
         if not np.any(parent != parent[0]):
             continue
-        candidate_children.append(int(groups.child[start]))
+        candidate_children.append(child_id)
         candidate_start.append(int(start))
         candidate_end.append(int(end))
 
@@ -299,6 +303,49 @@ def _find_compact_candidates(ts: tskit.TreeSequence) -> _CompactCandidates:
         group_end=np.asarray(candidate_end, dtype=np.int64),
         groups=groups,
     )
+
+
+def _explicit_recombination_children(
+    ts: tskit.TreeSequence,
+) -> set[int]:
+    """Return children already represented by valid flagged node pairs."""
+
+    tables = ts.tables
+    node_flags = np.asarray(tables.nodes.flags, dtype=np.uint32)
+    node_time = np.asarray(tables.nodes.time, dtype=np.float64)
+    recombination_nodes = np.flatnonzero(
+        (node_flags & NODE_IS_RE_EVENT) != 0
+    ).astype(np.int32)
+    if recombination_nodes.size == 0:
+        return set()
+    if recombination_nodes.size % 2:
+        raise ValueError(
+            "explicit recombination nodes must occur in consecutive pairs"
+        )
+    children_by_parent: dict[int, set[int]] = {}
+    for parent, child in zip(tables.edges.parent, tables.edges.child):
+        children_by_parent.setdefault(int(parent), set()).add(int(child))
+
+    explicit: set[int] = set()
+    for left_node, right_node in zip(
+        recombination_nodes[0::2],
+        recombination_nodes[1::2],
+    ):
+        left_node = int(left_node)
+        right_node = int(right_node)
+        left_children = children_by_parent.get(left_node, set())
+        right_children = children_by_parent.get(right_node, set())
+        if (
+            len(left_children) != 1
+            or left_children != right_children
+            or float(node_time[left_node]) != float(node_time[right_node])
+        ):
+            raise ValueError(
+                "flagged recombination nodes must be paired by matching "
+                f"time and one common child: nodes {left_node}, {right_node}"
+            )
+        explicit.update(left_children)
+    return explicit
 
 
 def _merged_edge_groups(ts: tskit.TreeSequence) -> _MergedEdgeGroups:

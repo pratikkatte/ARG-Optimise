@@ -746,10 +746,13 @@ def build_fast_trace_from_full_arg(
     source_storage: str = "compact",
     recombination_flag: int = RECOMBINATION_NODE_FLAG,
     require_unique_event_times: bool = False,
+    allow_no_recombination: bool = False,
 ) -> FastARGTrace:
     """Build a compact full-ARG replay trace for large synthetic ARG inputs.
 
     Set ``require_unique_event_times`` for continuous-time event-by-event replay.
+    Set ``allow_no_recombination`` only for a validated converted input whose
+    topology legitimately contains no recombination events.
     """
     if source_storage != "compact":
         raise ValueError("only source_storage='compact' is currently supported")
@@ -785,10 +788,11 @@ def build_fast_trace_from_full_arg(
     recombination_nodes = np.flatnonzero(
         (node_flags & recombination_flag) != 0
     ).astype(np.int32)
-    if strict and recombination_nodes.size == 0:
+    if strict and recombination_nodes.size == 0 and not allow_no_recombination:
         raise ValueError(
             "no explicit recombination nodes found; pass a full-ARG `.trees` file "
-            "or build a synthetic full ARG first"
+            "or build a synthetic full ARG first; converted inputs with no "
+            "recombination can opt in with allow_no_recombination=True"
         )
     if recombination_nodes.size % 2:
         if strict:

@@ -6,11 +6,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 from dataclasses import replace
-from evo import EvolutionModelTorch
+
+try:
+    from .evo import EvolutionModelTorch
+    from .time_env import TimeEnvFixedDelta
+except ImportError:  # Support the repository's legacy script-style imports.
+    from evo import EvolutionModelTorch
+    from time_env import TimeEnvFixedDelta
 
 import numpy as np
-
-from time_env import TimeEnvFixedDelta
 
 CHARACTERS_MAPS = {
     'DNA_WITH_GAP': {
@@ -179,6 +183,7 @@ class RecombinationChoice:
     span_end: int
     time_action: Optional[int] = None
     breakpoint: Optional[int] = None
+    delta_time: Optional[float] = None
 
     @property
     def breakpoint_count(self):
@@ -209,6 +214,9 @@ class RecombinationChoice:
         breakpoint = action.get("breakpoint")
         if breakpoint is not None and not isinstance(breakpoint, numbers.Integral):
             return None
+        delta_time = action.get("delta_time")
+        if delta_time is not None and not isinstance(delta_time, numbers.Real):
+            return None
         return cls(
             active_lineage_i=int(active_lineage_i),
             material_count=int(material_count),
@@ -216,6 +224,9 @@ class RecombinationChoice:
             span_end=int(span_end),
             time_action=int(time_action) if time_action is not None else None,
             breakpoint=int(breakpoint) if breakpoint is not None else None,
+            delta_time=(
+                float(delta_time) if delta_time is not None else None
+            ),
         )
 
     def is_valid_for(self, active_lineages):
@@ -246,6 +257,7 @@ class CoalescenceChoice:
     active_lineage_i: int
     active_lineage_j: int
     time_action: Optional[int] = None
+    delta_time: Optional[float] = None
 
     def as_dict(self):
         action = {
@@ -255,6 +267,8 @@ class CoalescenceChoice:
         }
         if self.time_action is not None:
             action["time_action"] = self.time_action
+        if self.delta_time is not None:
+            action["delta_time"] = float(self.delta_time)
         return action
 
     def is_valid_for(self, active_lineages):
@@ -281,10 +295,16 @@ class CoalescenceChoice:
         time_action = action.get("time_action")
         if time_action is not None and not isinstance(time_action, numbers.Integral):
             return None
+        delta_time = action.get("delta_time")
+        if delta_time is not None and not isinstance(delta_time, numbers.Real):
+            return None
         return cls(
             active_lineage_i=int(i),
             active_lineage_j=int(j),
             time_action=int(time_action) if time_action is not None else None,
+            delta_time=(
+                float(delta_time) if delta_time is not None else None
+            ),
         )
 
     @classmethod
@@ -454,6 +474,14 @@ class ARGState:
     prior_options: Optional[PriorActionOptions] = None
     total_active_blocks: Optional[int] = None
     current_time: float = 0.0
+    target_material: Optional[MaterialSegments] = None
+    block_boundaries: Optional[Tuple[float, ...]] = None
+    time_scale: float = 1.0
+    generated_node_start: Optional[int] = None
+    transition_records: List[Dict[str, Any]] = field(default_factory=list)
+    fixed_ancestor_schedule: List[Dict[str, Any]] = field(
+        default_factory=list
+    )
 
     def clone(self, copy_partials=False):
         all_nodes = {
@@ -472,6 +500,14 @@ class ARGState:
             is_done=self.is_done,
             total_active_blocks=self.total_active_blocks,
             current_time=float(self.current_time),
+            target_material=self.target_material,
+            block_boundaries=self.block_boundaries,
+            time_scale=float(self.time_scale),
+            generated_node_start=self.generated_node_start,
+            transition_records=copy.deepcopy(self.transition_records),
+            fixed_ancestor_schedule=copy.deepcopy(
+                self.fixed_ancestor_schedule
+            ),
         )
 
 
@@ -511,6 +547,8 @@ def action_as_dict(action):
         }
         if action.time_action is not None:
             result["time_action"] = int(action.time_action)
+        if action.delta_time is not None:
+            result["delta_time"] = float(action.delta_time)
         return result
     raise ValueError(f"Unknown ARG action: {action}")
 
@@ -555,10 +593,16 @@ class SimpleARGEnvironment:
         time_bins: Optional[int] = None,
         time_delta_bin_width: Optional[float] = None,
         reward_C: float = 30000,
+        structural_only: bool = False,
     ):
         if sequences is not None and variant_data is not None:
             raise ValueError("Pass either dense sequences or variant_data, not both")
-        self.input_mode = "vcf" if variant_data is not None else "dense"
+        self.structural_only = bool(structural_only)
+        self.input_mode = (
+            "vcf"
+            if variant_data is not None
+            else ("structural" if self.structural_only else "dense")
+        )
         self.variant_data = variant_data
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
@@ -582,6 +626,11 @@ class SimpleARGEnvironment:
                 raise ValueError("all sequences must have length sequence_length")
 
 
+        if num_sequences is None or sequence_length is None:
+            raise ValueError(
+                "num_sequences and sequence_length are required when no "
+                "sequence or variant data is supplied"
+            )
         self.num_sequences = int(num_sequences)
         self.sequence_length = int(sequence_length)
         if num_blocks is None:
@@ -623,32 +672,66 @@ class SimpleARGEnvironment:
             self.variant_positions0 = np.asarray(variant_data.positions0, dtype=np.int64)
             self.variant_boundaries = self._build_variant_boundaries(self.variant_positions0)
             self.variant_gap_lengths = self._build_variant_gap_lengths(self.variant_positions0)
-            variant_partials = np.asarray(variant_data.haplotype_partials, dtype=np.float32)
-            expected_shape = (self.num_sequences, self.num_blocks, 4)
-            if tuple(variant_partials.shape) != expected_shape:
-                raise ValueError(
-                    f"variant partials must have shape {expected_shape}, got {variant_partials.shape}"
+            if not self.structural_only:
+                variant_partials = np.asarray(
+                    variant_data.haplotype_partials,
+                    dtype=np.float32,
                 )
-            self.block_seq_arrays = torch.nn.Parameter(
-                torch.tensor(variant_partials, dtype=torch.float32, device=self.device),
-                requires_grad=False,
-            )
-            self.variant_position_tensor = torch.nn.Parameter(
-                torch.tensor(self.variant_positions0, dtype=torch.float32, device=self.device),
-                requires_grad=False,
-            )
-            self.variant_boundary_tensor = torch.nn.Parameter(
-                torch.tensor(self.variant_boundaries, dtype=torch.float32, device=self.device),
-                requires_grad=False,
-            )
-            self.variant_prev_gap_tensor = torch.nn.Parameter(
-                torch.tensor(self.variant_gap_lengths["prev"], dtype=torch.float32, device=self.device),
-                requires_grad=False,
-            )
-            self.variant_next_gap_tensor = torch.nn.Parameter(
-                torch.tensor(self.variant_gap_lengths["next"], dtype=torch.float32, device=self.device),
-                requires_grad=False,
-            )
+                expected_shape = (self.num_sequences, self.num_blocks, 4)
+                if tuple(variant_partials.shape) != expected_shape:
+                    raise ValueError(
+                        "variant partials must have shape "
+                        f"{expected_shape}, got {variant_partials.shape}"
+                    )
+                self.block_seq_arrays = torch.nn.Parameter(
+                    torch.tensor(
+                        variant_partials,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    requires_grad=False,
+                )
+                self.variant_position_tensor = torch.nn.Parameter(
+                    torch.tensor(
+                        self.variant_positions0,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    requires_grad=False,
+                )
+                self.variant_boundary_tensor = torch.nn.Parameter(
+                    torch.tensor(
+                        self.variant_boundaries,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    requires_grad=False,
+                )
+                self.variant_prev_gap_tensor = torch.nn.Parameter(
+                    torch.tensor(
+                        self.variant_gap_lengths["prev"],
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    requires_grad=False,
+                )
+                self.variant_next_gap_tensor = torch.nn.Parameter(
+                    torch.tensor(
+                        self.variant_gap_lengths["next"],
+                        dtype=torch.float32,
+                        device=self.device,
+                    ),
+                    requires_grad=False,
+                )
+            else:
+                self.block_seq_arrays = None
+                self.variant_position_tensor = None
+                self.variant_boundary_tensor = None
+                self.variant_prev_gap_tensor = None
+                self.variant_next_gap_tensor = None
+        elif self.structural_only:
+            self.seq_arrays = None
+            self.block_seq_arrays = None
         else:
             if self.sequences is None:
                 raise ValueError("dense mode requires sequences")
@@ -677,7 +760,9 @@ class SimpleARGEnvironment:
             )
         
         ## Evolution model
-        self.evolution_model = EvolutionModelTorch(self)
+        self.evolution_model = (
+            None if self.structural_only else EvolutionModelTorch(self)
+        )
 
         ## Reward function 
         self.reward_fn = ARGReward(C=reward_C)
@@ -782,7 +867,11 @@ class SimpleARGEnvironment:
         all_nodes = {}
         material_segments = MaterialSegments.full(self.num_blocks)
         material_segments_list = [material_segments] * self.num_sequences
-        partials_list = self._initial_lineages_partials_batch(material_segments_list)
+        partials_list = (
+            [None] * self.num_sequences
+            if self.structural_only
+            else self._initial_lineages_partials_batch(material_segments_list)
+        )
 
         total_time = 0.0
         for node_id in range(self.num_sequences):
@@ -815,7 +904,7 @@ class SimpleARGEnvironment:
             current_time=0.0,
         )
         state.is_done = self.is_terminal(state)
-        if state.is_done:
+        if state.is_done and not self.structural_only:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
             state.log_reward = self.compute_terminal_log_reward(state, log_likelihood)
             state.terminal_partial_correction = float(state.log_reward - state.partial_log_reward)
@@ -1209,6 +1298,13 @@ class SimpleARGEnvironment:
             next_state.accumulated_log_prior += log_prior
             next_state.partial_log_reward += log_prior
         next_state.partial_log_reward += float(partial_log_likelihood_increment)
+        if self.structural_only:
+            next_state.is_done = False
+            next_state.log_reward = None
+            next_state.terminal_partial_correction = 0.0
+            next_state.rates = None
+            next_state.prior_options = None
+            return next_state
         next_state.is_done = self.is_terminal(next_state)
         if next_state.is_done:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
@@ -1239,15 +1335,29 @@ class SimpleARGEnvironment:
         parent_id = next_state.max_node_idx + 1
         parent_segments = child_i.material_segments.union(child_j.material_segments)
         overlap_count = child_i.material_segments.intersection_count(child_j.material_segments)
-        delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
+        delta_t = (
+            float(action.delta_time)
+            if action.delta_time is not None
+            else self.time_env.time_action_to_delta(
+                action.time_action,
+                self._total_event_rate(rates),
+            )
+        )
         parent_time = float(state.current_time) + delta_t
         next_state.current_time = parent_time
-        parent_partials, partial_log_likelihood_increment = self._coalesced_parent_partials(
-            child_i,
-            child_j,
-            parent_segments,
-            parent_time,
-        )
+        if self.structural_only:
+            parent_partials = None
+            partial_log_likelihood_increment = 0.0
+        else:
+            (
+                parent_partials,
+                partial_log_likelihood_increment,
+            ) = self._coalesced_parent_partials(
+                child_i,
+                child_j,
+                parent_segments,
+                parent_time,
+            )
         parent = ARGLineage(
             node_id=parent_id,
             children=[child_i.node_id, child_j.node_id],
@@ -1300,12 +1410,31 @@ class SimpleARGEnvironment:
 
         left_parent_id = next_state.max_node_idx + 1
         right_parent_id = next_state.max_node_idx + 2
-        delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
+        delta_t = (
+            float(action.delta_time)
+            if action.delta_time is not None
+            else self.time_env.time_action_to_delta(
+                action.time_action,
+                self._total_event_rate(rates),
+            )
+        )
 
         event_time = float(state.current_time) + delta_t
         next_state.current_time = event_time
-        left_partials = self._recombined_parent_partials(child, left_segments, event_time)
-        right_partials = self._recombined_parent_partials(child, right_segments, event_time)
+        if self.structural_only:
+            left_partials = None
+            right_partials = None
+        else:
+            left_partials = self._recombined_parent_partials(
+                child,
+                left_segments,
+                event_time,
+            )
+            right_partials = self._recombined_parent_partials(
+                child,
+                right_segments,
+                event_time,
+            )
         left_parent = ARGLineage(
             node_id=left_parent_id,
             children=[child.node_id],
