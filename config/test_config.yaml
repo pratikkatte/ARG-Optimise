@@ -6,11 +6,10 @@ refinement:
   enabled: true
   arg_path: validation/output/tsinfer/l25kb_dated.trees
   checkpoint: null
-  bad_region_top_k: 3
-  bad_region_blocks: null
-  bad_region_bp: null
-  strategy: before_last_coalescence
-  terminal_backtrack_lengths: [1]
+  requests:
+    - id: region_000001
+      genomic_range: [386, 23963]
+      cut_time: 25000
 
 training:
   epochs: 2

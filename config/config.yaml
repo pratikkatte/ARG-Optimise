@@ -5,22 +5,17 @@ device: auto
 refinement:
   enabled: true
 
-  # Existing inferred ARG to backtrack into suspicious partial ARGState starts.
+  # Existing inferred ARG used as the immutable chromosome/exterior context.
   arg_path: validation/output/tsinfer/l25kb_dated.trees
 
-  # Optional global policy checkpoint. Leave null to scratch-train only from
-  # local suspicious-region partial states.
+  # Optional global policy checkpoint for shape-compatible warm-starting.
   checkpoint: null
 
-  # Region selection. Automatic top-k can be combined with manual block/BP
-  # overrides; contiguous selected blocks are merged before refinement.
-  bad_region_top_k: 3
-  bad_region_blocks: null
-  bad_region_bp: null
-
-  # Options: before_last_touch, before_first_touch, before_last_coalescence.
-  strategy: before_last_coalescence
-  terminal_backtrack_lengths: [5, 10, 25]
+  # Every range is half-open. Supply exactly one cut selector per request.
+  requests:
+    - id: region_000001
+      genomic_range: [386, 23963]
+      cut_time: 25000
 
 training:
   epochs: 3000

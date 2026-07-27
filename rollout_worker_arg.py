@@ -1,7 +1,9 @@
 import torch
 import numpy as np
-from env import SimpleTrajectory, action_as_dict
-from refinement import clone_start_state, move_state_partials_to_device
+try:
+    from .env import FixedAttachmentChoice, SimpleTrajectory, action_as_dict
+except ImportError:  # Support the repository's script-style entry points.
+    from env import FixedAttachmentChoice, SimpleTrajectory, action_as_dict
 
 
 class RolloutWorker:
@@ -68,7 +70,14 @@ class RolloutWorker:
                             "sampled action does not touch the local refinement region"
                         )
                 log_paths_pf_by_traj[traj_idx].append(total_log_pf[batch_idx])
-                log_prior = self.env.compute_cwr_event_log_prior(state, (coal_actions, recomb_actions), action)
+                if isinstance(action, FixedAttachmentChoice):
+                    log_prior = self.env.fixed_attachment_log_prior(state)
+                else:
+                    log_prior = self.env.compute_cwr_event_log_prior(
+                        state,
+                        (coal_actions, recomb_actions),
+                        action,
+                    )
 
                 next_state = self.env.apply_action(
                     state,
@@ -188,10 +197,22 @@ class RolloutWorker:
             raise ValueError(
                 f"start_states length ({len(start_states)}) must match episodes ({episodes})"
             )
-        return [
-            move_state_partials_to_device(clone_start_state(state), self.env.device)
-            for state in start_states
-        ]
+        if hasattr(self.env, "clone_state_to_device"):
+            return [
+                self.env.clone_state_to_device(state)
+                for state in start_states
+            ]
+        cloned_states = []
+        for state in start_states:
+            cloned = state.clone(copy_partials=False)
+            for lineage in cloned.all_nodes.values():
+                if lineage.partials is not None:
+                    lineage.partials = torch.as_tensor(
+                        lineage.partials,
+                        device=self.env.device,
+                    )
+            cloned_states.append(cloned)
+        return cloned_states
 
     def _states_to_padded_tree_features(self, states, device=None):
         lineage_features = [

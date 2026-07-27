@@ -4,8 +4,12 @@ import os
 import numpy as np
 import torch
 
-from models import ARGModel
-from env import RecombinationChoice
+try:
+    from .models import ARGModel
+    from .env import FixedAttachmentChoice, RecombinationChoice
+except ImportError:  # Support the repository's script-style entry points.
+    from models import ARGModel
+    from env import FixedAttachmentChoice, RecombinationChoice
 from dataclasses import replace
 
 LOSS_FN = {
@@ -128,8 +132,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
             [p.grad.norm().item() ** 2 for p in self.gradient_clipping_params if p.grad is not None]))
         self.param_norm = lambda model: math.sqrt(sum([p.norm().item() ** 2 for p in self.gradient_clipping_params]))
 
-        # scaler for AMP
-        self.scaler = torch.cuda.amp.GradScaler()
+        # Retained for checkpoint/runtime compatibility; AMP is not otherwise
+        # used by this trainer yet.
+        self.scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=self.device.type == "cuda",
+        )
 
         self.loss = 0
 
@@ -169,7 +177,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         load_result = self.load_state_dict(state_dict, strict=False)
         allowed_missing = [
             key for key in load_result.missing_keys
-            if key.startswith("arg_model.flow_head.")
+            if (
+                key.startswith("arg_model.flow_head.")
+                or key.startswith("arg_model.local_")
+            )
         ]
         unexpected = list(load_result.unexpected_keys)
         non_flow_missing = [
@@ -273,6 +284,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return next(self.arg_model.parameters()).dtype
 
     def forward(self, input_dict):
+        if bool(input_dict.get("local_mode", False)):
+            return self._forward_local(input_dict)
 
         states = input_dict.get("states")
 
@@ -335,6 +348,216 @@ class TBGFlowNetGenerator(torch.nn.Module):
         
         return total_log_pf, log_probs, choosen_actions
 
+    def _forward_local(self, input_dict):
+        states = input_dict["states"]
+        random_spec = input_dict.get("random_spec")
+        rollout = input_dict["rollout"]
+        all_actions = input_dict["input_actions"]
+
+        (
+            lineage_reps,
+            summary_reps,
+            lineage_seq_features,
+            batch_active_lineage_counts,
+        ) = self._encode_states(states)
+
+        gate_logits = self.arg_model.compute_local_gate_logits(summary_reps)
+        gate_mask = torch.tensor(
+            [
+                [
+                    bool(decision["can_generate"]),
+                    bool(decision["can_attach_fixed"]),
+                ]
+                for decision in rollout
+            ],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        masked_gate_logits = gate_logits.masked_fill(
+            ~gate_mask,
+            float("-inf"),
+        )
+        sample_gate_logits = masked_gate_logits
+        if random_spec is not None and "T" in random_spec:
+            sample_gate_logits = (
+                sample_gate_logits / float(random_spec["T"])
+            )
+        gate_actions = torch.distributions.Categorical(
+            logits=sample_gate_logits
+        ).sample()
+        gate_log_probabilities = torch.log_softmax(
+            masked_gate_logits,
+            dim=1,
+        )
+        batch_indices = torch.arange(
+            len(states),
+            dtype=torch.long,
+            device=self.device,
+        )
+        selected_gate_log_pf = gate_log_probabilities[
+            batch_indices,
+            gate_actions,
+        ]
+
+        chosen_actions = [None] * len(states)
+        total_log_pf = selected_gate_log_pf.clone()
+        generated_indices = [
+            index
+            for index, gate_action in enumerate(
+                gate_actions.detach().cpu().tolist()
+            )
+            if int(gate_action) == 0
+        ]
+        fixed_indices = [
+            index
+            for index, gate_action in enumerate(
+                gate_actions.detach().cpu().tolist()
+            )
+            if int(gate_action) == 1
+        ]
+
+        for index in fixed_indices:
+            event_time = rollout[index]["next_fixed_time"]
+            if event_time is None:
+                raise RuntimeError(
+                    "local gate selected a fixed attachment without a boundary"
+                )
+            chosen_actions[index] = FixedAttachmentChoice(
+                event_time=float(event_time)
+            )
+
+        if generated_indices:
+            generated_actions = [
+                all_actions[index] for index in generated_indices
+            ]
+            if any(not actions for actions in generated_actions):
+                raise RuntimeError(
+                    "local gate selected generation without legal actions"
+                )
+            index_tensor = torch.tensor(
+                generated_indices,
+                dtype=torch.long,
+                device=self.device,
+            )
+            generated_lineage_reps = lineage_reps.index_select(
+                0,
+                index_tensor,
+            )
+            generated_summary_reps = summary_reps.index_select(
+                0,
+                index_tensor,
+            )
+            generated_counts = batch_active_lineage_counts.index_select(
+                0,
+                index_tensor,
+            )
+            if torch.is_tensor(lineage_seq_features):
+                generated_lineage_features = (
+                    lineage_seq_features.index_select(0, index_tensor)
+                )
+            else:
+                generated_lineage_features = [
+                    lineage_seq_features[index]
+                    for index in generated_indices
+                ]
+            (
+                log_action_pf,
+                _selected_action_indices,
+                generated_chosen_actions,
+                generated_action_features,
+            ) = self.arg_model(
+                generated_actions,
+                generated_lineage_reps,
+                generated_summary_reps,
+                generated_lineage_features,
+                generated_counts,
+                random_spec,
+            )
+
+            log_breakpoint_pf = []
+            for local_index, action in enumerate(
+                generated_chosen_actions
+            ):
+                state_index = generated_indices[local_index]
+                state = states[state_index]
+                if isinstance(action, RecombinationChoice):
+                    lineage_index = int(action.active_lineage_i)
+                    lineage = state.active_lineages[lineage_index]
+                    valid_breakpoints = self.env.valid_breakpoints(
+                        state,
+                        action,
+                    )
+                    breakpoint, log_probability = self.breakpoint_model(
+                        valid_breakpoints,
+                        lineage,
+                        int(self.env.sequence_length),
+                        max(len(state.block_boundaries or ()) - 1, 1),
+                        action_context=generated_action_features[
+                            local_index
+                        ],
+                        random_spec=random_spec,
+                        state=state,
+                    )
+                    action = replace(action, breakpoint=breakpoint)
+                    generated_chosen_actions[local_index] = action
+                    log_breakpoint_pf.append(log_probability)
+                else:
+                    log_breakpoint_pf.append(
+                        log_action_pf.new_tensor(0.0)
+                    )
+            log_breakpoint_pf = torch.stack(log_breakpoint_pf)
+
+            selected_features = torch.stack(
+                generated_action_features,
+                dim=0,
+            )
+            time_logits = self.time_model(selected_features)
+            time_masks = torch.tensor(
+                [
+                    rollout[index]["time_action_mask"]
+                    for index in generated_indices
+                ],
+                dtype=torch.bool,
+                device=self.device,
+            )
+            time_actions = self.time_model.sample(
+                time_logits,
+                random_spec,
+                action_mask=time_masks,
+            )
+            log_time_pf = self.time_model.compute_log_time_pf(
+                time_logits,
+                time_actions,
+                action_mask=time_masks,
+            )
+
+            for local_index, action in enumerate(
+                generated_chosen_actions
+            ):
+                state_index = generated_indices[local_index]
+                time_action = int(
+                    time_actions[local_index].detach().cpu().item()
+                )
+                delta_time = self.env.time_action_to_delta(
+                    states[state_index],
+                    time_action,
+                )
+                chosen_actions[state_index] = replace(
+                    action,
+                    time_action=time_action,
+                    delta_time=float(delta_time),
+                )
+                total_log_pf[state_index] = (
+                    total_log_pf[state_index]
+                    + log_action_pf[local_index]
+                    + log_breakpoint_pf[local_index]
+                    + log_time_pf[local_index]
+                )
+
+        if any(action is None for action in chosen_actions):
+            raise RuntimeError("local policy failed to choose every action")
+        return total_log_pf, torch.exp(total_log_pf), chosen_actions
+
 
     def update_model(self):
         
@@ -361,6 +584,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         )
 
     def count_backward_parents(self, arg_state):
+        if bool(getattr(self.env, "is_local", False)):
+            return self.env.backward_parent_count(arg_state)
         return len(self._enumerate_inverse_arg_actions(arg_state))
 
     def _is_initial_arg_state(self, state):

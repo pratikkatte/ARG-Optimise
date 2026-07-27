@@ -356,6 +356,7 @@ class ARGLineage:
         material_segments: Optional[MaterialSegments] = None,
         num_blocks: Optional[int] = None,
         partials: Optional[Any] = None,
+        variant_indices: Optional[Sequence[int]] = None,
         sequences_indices: Optional[Sequence[int]] = None,
         event_type: Optional[str] = None,
         breakpoint: Optional[int] = None,
@@ -389,6 +390,14 @@ class ARGLineage:
             if material_mask is not None:
                 self._material_mask = np.asarray(material_mask, dtype=bool).copy()
                 self.num_blocks = int(self._material_mask.size)
+        if variant_indices is None:
+            self.variant_indices = (
+                tuple(self.material_segments.to_block_list())
+                if partials is not None
+                else ()
+            )
+        else:
+            self.variant_indices = tuple(int(value) for value in variant_indices)
 
     @property
     def material_mask(self):
@@ -449,6 +458,7 @@ class ARGLineage:
             material_segments=self.material_segments,
             num_blocks=self.num_blocks,
             partials=partials,
+            variant_indices=self.variant_indices,
             sequences_indices=list(self.sequences_indices),
             event_type=self.event_type,
             breakpoint=self.breakpoint,
@@ -465,7 +475,10 @@ class ARGState:
     all_nodes: Dict[int, ARGLineage]
     max_node_idx: int
     log_reward: Optional[float] = None
+    log_likelihood: Optional[float] = None
     accumulated_log_prior: float = 0.0
+    accumulated_log_likelihood: float = 0.0
+    outside_log_likelihood: float = 0.0
     partial_log_reward: float = 0.0
     terminal_partial_correction: float = 0.0
     is_done: bool = False
@@ -482,6 +495,66 @@ class ARGState:
     fixed_ancestor_schedule: List[Dict[str, Any]] = field(
         default_factory=list
     )
+    target_variant_indices: Tuple[int, ...] = field(default_factory=tuple)
+    variant_block_indices: Dict[int, int] = field(default_factory=dict)
+    local_breakpoint_weights: Dict[int, float] = field(default_factory=dict)
+    vcf_alignment: Dict[str, Any] = field(default_factory=dict)
+    likelihood_scope: str = "none"
+    local_context_id: Optional[str] = None
+    local_target_interval: Optional[Tuple[float, float]] = None
+    local_cut_time: Optional[float] = None
+    local_initial_time: float = 0.0
+
+    def structural_identity(self):
+        """Return a history-independent identity for an ARG construction state.
+
+        Policy caches and transition records are deliberately excluded.  The
+        latter are an undo/debugging aid and must not make two biologically
+        identical local states different GFlowNet states.
+        """
+
+        nodes = tuple(
+            (
+                int(node_id),
+                tuple(sorted(int(value) for value in lineage.children)),
+                tuple(sorted(int(value) for value in lineage.parents)),
+                tuple(
+                    (int(left), int(right))
+                    for left, right in lineage.material_segments.segments
+                ),
+                tuple(int(value) for value in lineage.variant_indices),
+                str(lineage.event_type),
+                (
+                    None
+                    if lineage.breakpoint is None
+                    else int(lineage.breakpoint)
+                ),
+                lineage.recombination_side,
+                float(lineage.time),
+            )
+            for node_id, lineage in sorted(self.all_nodes.items())
+        )
+        return (
+            self.local_context_id,
+            (
+                None
+                if self.local_target_interval is None
+                else tuple(
+                    float(value) for value in self.local_target_interval
+                )
+            ),
+            (
+                None
+                if self.local_cut_time is None
+                else float(self.local_cut_time)
+            ),
+            float(self.current_time),
+            tuple(
+                int(lineage.node_id)
+                for lineage in self.active_lineages
+            ),
+            nodes,
+        )
 
     def clone(self, copy_partials=False):
         all_nodes = {
@@ -494,7 +567,10 @@ class ARGState:
             all_nodes=all_nodes,
             max_node_idx=self.max_node_idx,
             log_reward=self.log_reward,
+            log_likelihood=self.log_likelihood,
             accumulated_log_prior=self.accumulated_log_prior,
+            accumulated_log_likelihood=self.accumulated_log_likelihood,
+            outside_log_likelihood=self.outside_log_likelihood,
             partial_log_reward=self.partial_log_reward,
             terminal_partial_correction=self.terminal_partial_correction,
             is_done=self.is_done,
@@ -508,6 +584,15 @@ class ARGState:
             fixed_ancestor_schedule=copy.deepcopy(
                 self.fixed_ancestor_schedule
             ),
+            target_variant_indices=tuple(self.target_variant_indices),
+            variant_block_indices=dict(self.variant_block_indices),
+            local_breakpoint_weights=dict(self.local_breakpoint_weights),
+            vcf_alignment=copy.deepcopy(self.vcf_alignment),
+            likelihood_scope=str(self.likelihood_scope),
+            local_context_id=self.local_context_id,
+            local_target_interval=self.local_target_interval,
+            local_cut_time=self.local_cut_time,
+            local_initial_time=float(self.local_initial_time),
         )
 
 
@@ -550,7 +635,19 @@ def action_as_dict(action):
         if action.delta_time is not None:
             result["delta_time"] = float(action.delta_time)
         return result
+    if isinstance(action, FixedAttachmentChoice):
+        return {
+            "event_type": "fixed_attachment",
+            "event_time": float(action.event_time),
+        }
     raise ValueError(f"Unknown ARG action: {action}")
+
+
+@dataclass(frozen=True)
+class FixedAttachmentChoice:
+    """Deterministic installation of the next fixed local ancestor group."""
+
+    event_time: float
 
 class ARGReward:
     """
@@ -949,11 +1046,13 @@ class SimpleARGEnvironment:
             raise ValueError(f"ARG lineage {lineage.node_id} is missing partials")
         partials = lineage.partials
         if torch.is_tensor(partials):
-            tensor = partials.to(device=self.device, dtype=torch.float32)
+            tensor = partials.to(device=self.device)
+            if not tensor.is_floating_point():
+                tensor = tensor.to(dtype=torch.float32)
         else:
             tensor = torch.as_tensor(partials, device=self.device, dtype=torch.float32)
         expected_rows = (
-            int(lineage.material_segments.count)
+            int(len(lineage.variant_indices))
             if self.is_vcf_mode
             else int(self.num_blocks)
         )
@@ -1050,11 +1149,64 @@ class SimpleARGEnvironment:
         masked = self.evolution_model.mask_partials(transitioned, parent_segments)
         return self.evolution_model.normalize_partials(masked)
 
+    def _recombined_parent_partials_indexed(
+        self,
+        child,
+        parent_segments,
+        parent_time,
+        parent_variant_indices,
+    ):
+        """Transition and select compact VCF rows by global variant ID."""
+
+        if not self.is_vcf_mode:
+            return self._recombined_parent_partials(
+                child,
+                parent_segments,
+                parent_time,
+            )
+        transitioned = self._transition_lineage_partials(child, parent_time)
+        child_indices = torch.as_tensor(
+            child.variant_indices,
+            dtype=torch.long,
+            device=transitioned.device,
+        )
+        target_indices = torch.as_tensor(
+            tuple(int(value) for value in parent_variant_indices),
+            dtype=torch.long,
+            device=transitioned.device,
+        )
+        if target_indices.numel() == 0:
+            return transitioned.new_zeros((0, 4))
+        positions = torch.searchsorted(child_indices, target_indices)
+        safe_positions = positions.clamp(max=child_indices.numel() - 1)
+        valid = (
+            (positions >= 0)
+            & (positions < child_indices.numel())
+            & (
+                child_indices.index_select(0, safe_positions)
+                == target_indices
+            )
+        )
+        if not bool(valid.all().detach().cpu().item()):
+            raise ValueError(
+                "recombination target VCF rows are not contained in the child"
+            )
+        selected = transitioned.index_select(0, positions)
+        return self.evolution_model.normalize_partials(selected)
+
     def _coalesced_parent_partials_sparse(self, child_i, child_j, parent_segments, parent_time):
-        parent_blocks = parent_segments.to_block_tensor(self.device)
+        parent_blocks = torch.as_tensor(
+            sorted(
+                set(int(value) for value in child_i.variant_indices)
+                | set(int(value) for value in child_j.variant_indices)
+            ),
+            dtype=torch.long,
+            device=self.device,
+        )
+        reference_partials = self._require_lineage_partials(child_i)
         combined = torch.ones(
             (parent_blocks.numel(), 4),
-            dtype=torch.float32,
+            dtype=reference_partials.dtype,
             device=self.device,
         )
         has_material = torch.zeros(
@@ -1067,7 +1219,11 @@ class SimpleARGEnvironment:
             child_partials = self.evolution_model.normalize_partials(
                 self._transition_lineage_partials(child, parent_time)
             )
-            child_blocks = child.block_indices_tensor(self.device)
+            child_blocks = torch.as_tensor(
+                child.variant_indices,
+                dtype=torch.long,
+                device=self.device,
+            )
             if child_blocks.numel() == 0:
                 continue
             parent_positions = torch.searchsorted(parent_blocks, child_blocks)
@@ -1084,6 +1240,34 @@ class SimpleARGEnvironment:
 
         combined = torch.where(has_material[:, None], combined, torch.zeros_like(combined))
         return self.normalize_partials_with_log_scale(combined, has_material)
+
+    def _lineage_variants_for_material(
+        self,
+        state,
+        lineage,
+        material_segments,
+    ):
+        if not self.is_vcf_mode:
+            return ()
+        if state.variant_block_indices:
+            return tuple(
+                int(variant_index)
+                for variant_index in lineage.variant_indices
+                if any(
+                    int(start)
+                    <= int(state.variant_block_indices[int(variant_index)])
+                    < int(end)
+                    for start, end in material_segments.segments
+                )
+            )
+        return tuple(
+            int(variant_index)
+            for variant_index in lineage.variant_indices
+            if any(
+                int(start) <= int(variant_index) < int(end)
+                for start, end in material_segments.segments
+            )
+        )
 
     def get_active_counts(self, state):
         if not state.active_lineages:
@@ -1297,10 +1481,14 @@ class SimpleARGEnvironment:
         if log_prior is not None:
             next_state.accumulated_log_prior += log_prior
             next_state.partial_log_reward += log_prior
+        next_state.accumulated_log_likelihood += float(
+            partial_log_likelihood_increment
+        )
         next_state.partial_log_reward += float(partial_log_likelihood_increment)
-        if self.structural_only:
+        if self.structural_only or next_state.target_material is not None:
             next_state.is_done = False
             next_state.log_reward = None
+            next_state.log_likelihood = None
             next_state.terminal_partial_correction = 0.0
             next_state.rates = None
             next_state.prior_options = None
@@ -1308,6 +1496,7 @@ class SimpleARGEnvironment:
         next_state.is_done = self.is_terminal(next_state)
         if next_state.is_done:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
+            next_state.log_likelihood = float(log_likelihood)
             next_state.log_reward = self.compute_terminal_log_reward(next_state, log_likelihood)
             next_state.terminal_partial_correction = float(
                 next_state.log_reward - next_state.partial_log_reward
@@ -1315,6 +1504,7 @@ class SimpleARGEnvironment:
             next_state.partial_log_reward = float(next_state.log_reward)
         else:
             next_state.log_reward = None
+            next_state.log_likelihood = None
             next_state.terminal_partial_correction = 0.0
         return next_state
 
@@ -1358,13 +1548,24 @@ class SimpleARGEnvironment:
                 parent_segments,
                 parent_time,
             )
+        parent_variant_indices = (
+            tuple(
+                sorted(
+                    set(int(value) for value in child_i.variant_indices)
+                    | set(int(value) for value in child_j.variant_indices)
+                )
+            )
+            if self.is_vcf_mode
+            else ()
+        )
         parent = ARGLineage(
             node_id=parent_id,
             children=[child_i.node_id, child_j.node_id],
             parents=[],
             material_segments=parent_segments,
-            num_blocks=self.num_blocks,
+            num_blocks=max(child_i.num_blocks, child_j.num_blocks),
             partials=parent_partials,
+            variant_indices=parent_variant_indices,
             sequences_indices=sorted(set(child_i.sequences_indices + child_j.sequences_indices)),
             event_type="coal",
             time=parent_time,
@@ -1372,8 +1573,9 @@ class SimpleARGEnvironment:
 
         child_i.parents.append(parent.node_id)
         child_j.parents.append(parent.node_id)
-        child_i.partials = None
-        child_j.partials = None
+        if self.structural_only:
+            child_i.partials = None
+            child_j.partials = None
         child_i.clear_runtime_caches()
         child_j.clear_runtime_caches()
         next_state.active_lineages[i] = child_i
@@ -1424,24 +1626,39 @@ class SimpleARGEnvironment:
         if self.structural_only:
             left_partials = None
             right_partials = None
+            left_variant_indices = ()
+            right_variant_indices = ()
         else:
-            left_partials = self._recombined_parent_partials(
+            left_variant_indices = self._lineage_variants_for_material(
+                state,
+                child,
+                left_segments,
+            )
+            right_variant_indices = self._lineage_variants_for_material(
+                state,
+                child,
+                right_segments,
+            )
+            left_partials = self._recombined_parent_partials_indexed(
                 child,
                 left_segments,
                 event_time,
+                left_variant_indices,
             )
-            right_partials = self._recombined_parent_partials(
+            right_partials = self._recombined_parent_partials_indexed(
                 child,
                 right_segments,
                 event_time,
+                right_variant_indices,
             )
         left_parent = ARGLineage(
             node_id=left_parent_id,
             children=[child.node_id],
             parents=[],
             material_segments=left_segments,
-            num_blocks=self.num_blocks,
+            num_blocks=child.num_blocks,
             partials=left_partials,
+            variant_indices=left_variant_indices,
             sequences_indices=list(child.sequences_indices),
             event_type="recomb",
             breakpoint=breakpoint,
@@ -1453,8 +1670,9 @@ class SimpleARGEnvironment:
             children=[child.node_id],
             parents=[],
             material_segments=right_segments,
-            num_blocks=self.num_blocks,
+            num_blocks=child.num_blocks,
             partials=right_partials,
+            variant_indices=right_variant_indices,
             sequences_indices=list(child.sequences_indices),
             event_type="recomb",
             breakpoint=breakpoint,
@@ -1463,7 +1681,8 @@ class SimpleARGEnvironment:
         )
 
         child.parents = [left_parent.node_id, right_parent.node_id]
-        child.partials = None
+        if self.structural_only:
+            child.partials = None
         child.clear_runtime_caches()
         next_state.all_nodes[child.node_id] = child
         next_state.all_nodes[left_parent.node_id] = left_parent
@@ -1757,3 +1976,619 @@ class SimpleARGEnvironment:
 
     def _is_active_index(self, state, idx):
         return isinstance(idx, numbers.Integral) and 0 <= idx < len(state.active_lineages)
+
+
+class LocalARGEnvironment:
+    """Context-bound local ARG environment used by GFlowNet rollouts.
+
+    The biological implementation lives in the production ``refinement``
+    package copied from the verified ``new_rl`` workflow.  This adapter owns
+    one or more prepared interval/time contexts and exposes the same rollout
+    surface as :class:`SimpleARGEnvironment`.
+    """
+
+    _DELEGATED_MUTABLE_ATTRIBUTES = {
+        "device",
+        "seq_arrays",
+        "block_seq_arrays",
+        "variant_position_tensor",
+        "variant_boundary_tensor",
+        "variant_prev_gap_tensor",
+        "variant_next_gap_tensor",
+    }
+
+    def __init__(self, base_env, prepared_contexts, context_ids=None):
+        if not isinstance(base_env, SimpleARGEnvironment):
+            raise TypeError("base_env must be a SimpleARGEnvironment")
+        if base_env.structural_only or not base_env.is_vcf_mode:
+            raise ValueError(
+                "LocalARGEnvironment requires a likelihood-enabled phased-VCF "
+                "SimpleARGEnvironment"
+            )
+        object.__setattr__(self, "base_env", base_env)
+
+        if isinstance(prepared_contexts, dict):
+            contexts = {
+                str(context_id): prepared
+                for context_id, prepared in prepared_contexts.items()
+            }
+        else:
+            prepared_contexts = list(prepared_contexts)
+            if context_ids is None:
+                context_ids = [
+                    f"region_{index + 1:06d}"
+                    for index in range(len(prepared_contexts))
+                ]
+            if len(context_ids) != len(prepared_contexts):
+                raise ValueError(
+                    "context_ids length must match prepared_contexts length"
+                )
+            contexts = {
+                str(context_id): prepared
+                for context_id, prepared in zip(
+                    context_ids,
+                    prepared_contexts,
+                )
+            }
+        if not contexts:
+            raise ValueError("LocalARGEnvironment requires at least one context")
+        for context_id, prepared in contexts.items():
+            if not prepared.context.is_valid:
+                reasons = "; ".join(
+                    diagnostic.message
+                    for diagnostic in prepared.context.rejection_diagnostics
+                )
+                raise ValueError(
+                    f"local context {context_id!r} is invalid: {reasons}"
+                )
+        object.__setattr__(self, "prepared_contexts", contexts)
+        object.__setattr__(self, "context_ids", tuple(contexts))
+        object.__setattr__(self, "is_local", True)
+
+    def __getattr__(self, name):
+        return getattr(self.base_env, name)
+
+    def __setattr__(self, name, value):
+        if (
+            name in self._DELEGATED_MUTABLE_ATTRIBUTES
+            and "base_env" in self.__dict__
+        ):
+            setattr(self.base_env, name, value)
+            return
+        object.__setattr__(self, name, value)
+
+    @property
+    def time_metadata(self):
+        return self.base_env.time_metadata
+
+    def context_for_state(self, state):
+        context_id = getattr(state, "local_context_id", None)
+        if context_id not in self.prepared_contexts:
+            raise ValueError(
+                f"ARGState has unknown local_context_id {context_id!r}"
+            )
+        return self.prepared_contexts[context_id]
+
+    def get_initial_state(self, context_id=None):
+        try:
+            from .refinement.local_construction import initialize_local_arg_state
+        except ImportError:
+            from refinement.local_construction import initialize_local_arg_state
+
+        if context_id is None:
+            if len(self.context_ids) != 1:
+                raise ValueError(
+                    "context_id is required when the local environment owns "
+                    "multiple refinement contexts"
+                )
+            context_id = self.context_ids[0]
+        context_id = str(context_id)
+        if context_id not in self.prepared_contexts:
+            raise ValueError(f"unknown local context {context_id!r}")
+        prepared = self.prepared_contexts[context_id]
+        state = initialize_local_arg_state(prepared, self.base_env)
+        state.local_context_id = context_id
+        state.local_target_interval = tuple(
+            float(value)
+            for value in prepared.context.request.genomic_range
+        )
+        state.local_cut_time = float(state.current_time)
+        state.local_initial_time = float(state.current_time)
+        return state
+
+    def initial_states(self):
+        return [
+            self.get_initial_state(context_id)
+            for context_id in self.context_ids
+        ]
+
+    def clone_state_to_device(self, state):
+        cloned = state.clone(copy_partials=False)
+        for lineage in cloned.all_nodes.values():
+            if lineage.partials is not None:
+                lineage.partials = torch.as_tensor(
+                    lineage.partials,
+                    device=self.device,
+                )
+        return cloned
+
+    def enumerate_actions(self, state, action_filter=None):
+        try:
+            from .refinement.local_construction import enumerate_local_prior_actions
+        except ImportError:
+            from refinement.local_construction import enumerate_local_prior_actions
+
+        prepared = self.context_for_state(state)
+        options = enumerate_local_prior_actions(
+            state,
+            prepared.context,
+            self.base_env,
+        )
+        coal = list(options.coal_actions)
+        recomb = list(options.recomb_choices)
+        if action_filter is not None:
+            coal, recomb = action_filter(state, coal, recomb)
+        return coal, recomb
+
+    def enumerate_prior_options(self, state):
+        try:
+            from .refinement.local_construction import enumerate_local_prior_actions
+        except ImportError:
+            from refinement.local_construction import enumerate_local_prior_actions
+
+        prepared = self.context_for_state(state)
+        return enumerate_local_prior_actions(
+            state,
+            prepared.context,
+            self.base_env,
+        )
+
+    def compute_event_rates(self, actions, state=None):
+        if state is None:
+            return self.base_env.compute_event_rates(actions)
+        options = self.enumerate_prior_options(state)
+        return dict(options.rates)
+
+    def compute_event_probabilities(self, state, actions=None):
+        options = self.enumerate_prior_options(state)
+        rates = options.rates
+        total_rate = float(
+            rates["lambda_coal"] + rates["lambda_recomb"]
+        )
+        if total_rate <= 0.0:
+            return {"coal": 0.0, "recomb": 0.0}
+        return {
+            "coal": float(rates["lambda_coal"]) / total_rate,
+            "recomb": float(rates["lambda_recomb"]) / total_rate,
+        }
+
+    def next_fixed_ancestor_time(self, state):
+        try:
+            from .refinement import local_construction as local
+        except ImportError:
+            from refinement import local_construction as local
+
+        return local._next_fixed_ancestor_time(state)
+
+    def valid_breakpoints(self, state, action):
+        try:
+            from .refinement import local_construction as local
+        except ImportError:
+            from refinement import local_construction as local
+
+        if not isinstance(action, RecombinationChoice):
+            return ()
+        lineage = state.active_lineages[int(action.active_lineage_i)]
+        if self.is_vcf_mode:
+            return tuple(
+                int(breakpoint)
+                for breakpoint, _weight in local._vcf_breakpoints(
+                    lineage.material_segments,
+                    state,
+                    self.base_env,
+                )
+            )
+        return tuple(
+            range(
+                int(action.span_start) + 1,
+                int(action.span_end) + 1,
+            )
+        )
+
+    def _rollout_time_data(self, state, rates):
+        total_rate = float(
+            rates["lambda_coal"] + rates["lambda_recomb"]
+        )
+        next_fixed = self.next_fixed_ancestor_time(state)
+        max_delta = (
+            None
+            if next_fixed is None
+            else max(0.0, float(next_fixed) - float(state.current_time))
+        )
+        if total_rate <= 0.0:
+            mask = [False] * int(self.time_env.bins)
+        else:
+            mask = [
+                math.isfinite(
+                    self.time_env.time_action_log_probability(
+                        action,
+                        total_rate,
+                        max_delta=max_delta,
+                    )
+                )
+                for action in range(int(self.time_env.bins))
+            ]
+        return {
+            "total_rate": total_rate,
+            "next_fixed_time": next_fixed,
+            "max_delta": max_delta,
+            "time_action_mask": tuple(mask),
+            "can_generate": bool(total_rate > 0.0 and any(mask)),
+            "can_attach_fixed": next_fixed is not None,
+        }
+
+    def prepare_state_rollout_inputs(
+        self,
+        states,
+        random_spec=None,
+        action_filter=None,
+    ):
+        if not states:
+            raise ValueError("states must contain at least one ARGState")
+        actions = []
+        rollout = []
+        for state in states:
+            coal, recomb = self.enumerate_actions(
+                state,
+                action_filter=action_filter,
+            )
+            options = state.prior_options
+            if options is None:
+                options = self.enumerate_prior_options(state)
+            decision = self._rollout_time_data(state, options.rates)
+            if not decision["can_generate"] and not decision["can_attach_fixed"]:
+                raise ValueError(
+                    "nonterminal local state has no legal generated event or "
+                    "scheduled fixed attachment"
+                )
+            candidate_actions = []
+            if float(options.rates["lambda_coal"]) > 0.0:
+                candidate_actions.extend(coal)
+            if float(options.rates["lambda_recomb"]) > 0.0:
+                candidate_actions.extend(recomb)
+            actions.append(candidate_actions)
+            rollout.append(decision)
+        return {
+            "states": states,
+            "input_actions": actions,
+            "random_spec": random_spec,
+            "local_mode": True,
+            "rollout": rollout,
+        }
+
+    def time_action_to_delta(self, state, time_action):
+        options = self.enumerate_prior_options(state)
+        rollout = self._rollout_time_data(state, options.rates)
+        return self.time_env.time_action_to_delta(
+            int(time_action),
+            rollout["total_rate"],
+            max_delta=rollout["max_delta"],
+        )
+
+    def compute_cwr_event_log_prior(
+        self,
+        state,
+        combined_actions,
+        action=None,
+        rates=None,
+    ):
+        try:
+            from .refinement import local_construction as local
+        except ImportError:
+            from refinement import local_construction as local
+
+        if action is None:
+            action = combined_actions
+            combined_actions = self.enumerate_actions(state)
+        coal_actions, recomb_actions = combined_actions
+        if rates is None:
+            rates = self.enumerate_prior_options(state).rates
+        total_rate = float(
+            rates["lambda_coal"] + rates["lambda_recomb"]
+        )
+        if total_rate <= 0.0:
+            raise ValueError("generated local events require a positive rate")
+        rollout = self._rollout_time_data(state, rates)
+        wait_log_prior = self.time_env.time_action_log_probability(
+            action.time_action,
+            total_rate,
+            max_delta=rollout["max_delta"],
+        )
+        if isinstance(action, CoalescenceChoice):
+            if not action.is_valid_for(state.active_lineages):
+                raise ValueError(f"invalid local coalescence action: {action}")
+            action_log_prior = (
+                math.log(float(rates["lambda_coal"]) / total_rate)
+                - math.log(len(coal_actions))
+            )
+        elif isinstance(action, RecombinationChoice):
+            lineage = state.active_lineages[int(action.active_lineage_i)]
+            recomb_weights = [
+                local._local_recombination_weight(
+                    state.active_lineages[int(choice.active_lineage_i)],
+                    state,
+                    self.base_env,
+                )
+                for choice in recomb_actions
+            ]
+            total_recomb_weight = float(sum(recomb_weights))
+            matching = [
+                index
+                for index, choice in enumerate(recomb_actions)
+                if int(choice.active_lineage_i)
+                == int(action.active_lineage_i)
+            ]
+            if not matching or total_recomb_weight <= 0.0:
+                raise ValueError(f"invalid local recombination action: {action}")
+            lineage_weight = float(recomb_weights[matching[0]])
+            breakpoints = local._vcf_breakpoints(
+                lineage.material_segments,
+                state,
+                self.base_env,
+            )
+            breakpoint_weight = next(
+                (
+                    float(weight)
+                    for breakpoint, weight in breakpoints
+                    if int(breakpoint) == int(action.breakpoint)
+                ),
+                0.0,
+            )
+            total_breakpoint_weight = float(
+                sum(weight for _breakpoint, weight in breakpoints)
+            )
+            if breakpoint_weight <= 0.0 or total_breakpoint_weight <= 0.0:
+                raise ValueError(
+                    f"invalid local breakpoint {action.breakpoint}"
+                )
+            action_log_prior = (
+                math.log(float(rates["lambda_recomb"]) / total_rate)
+                + math.log(lineage_weight / total_recomb_weight)
+                + math.log(
+                    breakpoint_weight / total_breakpoint_weight
+                )
+            )
+        else:
+            raise ValueError(f"unsupported generated local action: {action}")
+        return float(wait_log_prior + action_log_prior)
+
+    def fixed_attachment_log_prior(self, state):
+        rates = self.enumerate_prior_options(state).rates
+        rollout = self._rollout_time_data(state, rates)
+        if not rollout["can_attach_fixed"]:
+            raise ValueError("state has no scheduled fixed attachment")
+        if rollout["total_rate"] <= 0.0:
+            return 0.0
+        return float(
+            -rollout["total_rate"] * float(rollout["max_delta"])
+        )
+
+    def apply_fixed_attachment(self, state, log_prior=None):
+        try:
+            from .refinement import local_construction as local
+        except ImportError:
+            from refinement import local_construction as local
+
+        prepared = self.context_for_state(state)
+        next_fixed_time = self.next_fixed_ancestor_time(state)
+        if next_fixed_time is None:
+            raise ValueError("state has no scheduled fixed attachment")
+        if log_prior is None:
+            log_prior = self.fixed_attachment_log_prior(state)
+        next_state = state.clone(copy_partials=False)
+        next_state.current_time = float(next_fixed_time)
+        next_state.accumulated_log_prior += float(log_prior)
+        next_state.partial_log_reward += float(log_prior)
+        next_state = local.reveal_due_fixed_ancestors(
+            next_state,
+            prepared.context,
+            next_fixed_time,
+            env=self.base_env,
+        )
+        attachment_record = dict(next_state.transition_records[-1])
+        attachment_record.update(
+            {
+                "waited_from_time": float(
+                    state.current_time * state.time_scale
+                ),
+                "waited_from_scaled_time": float(state.current_time),
+                "log_prior_increment": float(log_prior),
+                "fixed_event_survival": True,
+            }
+        )
+        undo = dict(attachment_record["_undo"])
+        undo.update(
+            {
+                "previous_current_time": float(state.current_time),
+                "previous_accumulated_log_prior": float(
+                    state.accumulated_log_prior
+                ),
+                "previous_partial_log_reward": float(
+                    state.partial_log_reward
+                ),
+                "previous_is_done": bool(state.is_done),
+            }
+        )
+        attachment_record["_undo"] = undo
+        next_state.transition_records[-1] = attachment_record
+        next_state.is_done = local.local_is_terminal(
+            next_state,
+            prepared.context,
+        )
+        if next_state.is_done and next_state.likelihood_scope != "none":
+            local._finalize_local_terminal_likelihood(
+                next_state,
+                prepared.context,
+                self.base_env,
+            )
+        return next_state
+
+    def apply_action(self, state, action, log_prior=None):
+        try:
+            from .refinement import local_construction as local
+        except ImportError:
+            from refinement import local_construction as local
+
+        if isinstance(action, FixedAttachmentChoice):
+            next_state = self.apply_fixed_attachment(
+                state,
+                log_prior=log_prior,
+            )
+        else:
+            prepared = self.context_for_state(state)
+            if log_prior is None:
+                log_prior = self.compute_cwr_event_log_prior(
+                    state,
+                    self.enumerate_actions(state),
+                    action,
+                )
+            next_state = local.apply_local_action(
+                state,
+                action,
+                prepared.context,
+                self.base_env,
+                float(log_prior),
+            )
+        restored = self.undo_transition(next_state)
+        if restored.structural_identity() != state.structural_identity():
+            raise RuntimeError(
+                "local transition failed its exact structural round-trip"
+            )
+        return next_state
+
+    def is_terminal(self, state):
+        try:
+            from .refinement.local_construction import local_is_terminal
+        except ImportError:
+            from refinement.local_construction import local_is_terminal
+
+        prepared = self.context_for_state(state)
+        return local_is_terminal(state, prepared.context)
+
+    def compute_terminal_log_likelihood(self, state):
+        try:
+            from .refinement.local_construction import (
+                compute_local_terminal_log_likelihood,
+            )
+        except ImportError:
+            from refinement.local_construction import (
+                compute_local_terminal_log_likelihood,
+            )
+
+        prepared = self.context_for_state(state)
+        return compute_local_terminal_log_likelihood(
+            state,
+            prepared.context,
+            self.base_env,
+        )
+
+    def compute_terminal_log_reward(self, state, log_likelihood=None):
+        if not self.is_terminal(state):
+            raise ValueError("local terminal reward requires a terminal state")
+        if log_likelihood is None:
+            log_likelihood = self.compute_terminal_log_likelihood(state)
+        return float(
+            self.reward_fn(
+                float(log_likelihood),
+                float(state.accumulated_log_prior),
+            )
+        )
+
+    def state_to_proposal(self, state):
+        try:
+            from .refinement.local_construction import local_state_to_proposal
+        except ImportError:
+            from refinement.local_construction import local_state_to_proposal
+
+        return local_state_to_proposal(
+            state,
+            self.context_for_state(state),
+        )
+
+    def undo_transition(self, state):
+        try:
+            from .refinement.local_construction import undo_local_transition
+        except ImportError:
+            from refinement.local_construction import undo_local_transition
+
+        prepared = self.context_for_state(state)
+        return undo_local_transition(state, prepared.context)
+
+    def backward_parent_count(self, state):
+        if len(state.transition_records) <= 1:
+            return 0
+        latest_record = state.transition_records[-1]
+        if latest_record.get("event_type") == "fixed_attachment":
+            return 1
+
+        current_time = float(state.current_time)
+        count = 0
+        for lineage in state.active_lineages:
+            if (
+                lineage.event_type == "coal"
+                and len(lineage.children) == 2
+                and math.isclose(
+                    float(lineage.time),
+                    current_time,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                count += 1
+
+        recombination_groups = {}
+        for lineage in state.active_lineages:
+            if (
+                lineage.event_type == "recomb"
+                and len(lineage.children) == 1
+                and lineage.recombination_side in {"left", "right"}
+                and math.isclose(
+                    float(lineage.time),
+                    current_time,
+                    rel_tol=1e-12,
+                    abs_tol=1e-12,
+                )
+            ):
+                key = (
+                    int(lineage.children[0]),
+                    int(lineage.breakpoint),
+                )
+                recombination_groups.setdefault(key, set()).add(
+                    lineage.recombination_side
+                )
+        count += sum(
+            sides == {"left", "right"}
+            for sides in recombination_groups.values()
+        )
+        if count <= 0:
+            raise RuntimeError(
+                "local child state has no valid structural predecessor"
+            )
+        return int(count)
+
+    def backward_log_probability(self, state):
+        count = self.backward_parent_count(state)
+        if count <= 0:
+            raise ValueError("initial local state has no backward parent")
+        return -math.log(float(count))
+
+    def get_active_counts(self, state):
+        block_count = max(
+            len(state.block_boundaries or ()) - 1,
+            0,
+        )
+        counts = np.zeros(block_count, dtype=int)
+        for lineage in state.active_lineages:
+            for start, end in lineage.material_segments.segments:
+                counts[int(start):int(end)] += 1
+        return counts

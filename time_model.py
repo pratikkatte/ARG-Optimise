@@ -37,12 +37,37 @@ class TimeModel(nn.Module):
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
 
-    def compute_log_time_pf(self, time_logits, time_actions):
+    def _masked_logits(self, time_logits, action_mask=None):
+        if action_mask is None:
+            return time_logits
+        action_mask = torch.as_tensor(
+            action_mask,
+            dtype=torch.bool,
+            device=time_logits.device,
+        )
+        if action_mask.shape != time_logits.shape:
+            raise ValueError(
+                "time action mask must match time logits shape: "
+                f"mask={tuple(action_mask.shape)} "
+                f"logits={tuple(time_logits.shape)}"
+            )
+        if not bool(action_mask.any(dim=1).all().detach().cpu().item()):
+            raise ValueError("every generated transition needs a valid time bin")
+        return time_logits.masked_fill(~action_mask, float("-inf"))
+
+    def compute_log_time_pf(
+        self,
+        time_logits,
+        time_actions,
+        action_mask=None,
+    ):
+        time_logits = self._masked_logits(time_logits, action_mask)
         batch_idx = torch.arange(time_logits.shape[0], device=time_logits.device)
         log_p = F.log_softmax(time_logits, dim=1)
         return log_p[batch_idx, time_actions]
 
-    def sample(self, time_logits, random_spec):
+    def sample(self, time_logits, random_spec, action_mask=None):
+        time_logits = self._masked_logits(time_logits, action_mask)
         if random_spec is None:
             return Categorical(logits=time_logits).sample()
         temperature = random_spec["T"]

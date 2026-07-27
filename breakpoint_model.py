@@ -323,7 +323,7 @@ class VCFBreakpointScorer(nn.Module):
             partials = torch.as_tensor(partials, device=device, dtype=dtype)
         else:
             partials = partials.to(device=device, dtype=dtype)
-        expected_shape = (int(lineage.material_segments.count), 4)
+        expected_shape = (int(len(lineage.variant_indices)), 4)
         if tuple(partials.shape) != expected_shape:
             raise ValueError(
                 f"VCF lineage partials must have shape {expected_shape}, got {tuple(partials.shape)}"
@@ -352,15 +352,26 @@ class VCFBreakpointScorer(nn.Module):
             return torch.as_tensor(fallback, device=device, dtype=dtype)
         return value.to(device=device, dtype=dtype)
 
-    def _candidate_features(self, breakpoint_tensor, lineage, device, dtype, sequence_length=None, num_blocks=None):
+    def _candidate_features(
+        self,
+        breakpoint_tensor,
+        lineage,
+        device,
+        dtype,
+        sequence_length=None,
+        num_blocks=None,
+        state=None,
+    ):
         if breakpoint_tensor.ndim != 1:
             raise ValueError(f"expected 1D breakpoint tensor, got shape {tuple(breakpoint_tensor.shape)}")
         breakpoints = breakpoint_tensor.to(device=device, dtype=torch.long)
         seq_len = max(float(self.env.sequence_length if sequence_length is None else sequence_length), 1.0)
-        block_count = max(int(self.env.num_blocks if num_blocks is None else num_blocks), 1)
-
         partials = self._lineage_partials_tensor(lineage, device, dtype)
-        lineage_blocks = lineage.block_indices_tensor(device)
+        lineage_blocks = torch.as_tensor(
+            lineage.variant_indices,
+            dtype=torch.long,
+            device=device,
+        )
         positions = self._env_tensor(
             "variant_position_tensor",
             self.env.variant_positions0,
@@ -375,32 +386,93 @@ class VCFBreakpointScorer(nn.Module):
         )
 
         max_variant_idx = max(int(positions.numel()) - 1, 0)
-        left_variant_idx = (breakpoints - 1).clamp(min=0, max=max_variant_idx)
-        right_variant_idx = breakpoints.clamp(min=0, max=max_variant_idx)
-        gap = (
-            positions.index_select(0, right_variant_idx)
-            - positions.index_select(0, left_variant_idx)
-        ).clamp_min(1.0)
+        if state is not None and state.block_boundaries is not None:
+            material_boundaries = torch.as_tensor(
+                state.block_boundaries,
+                device=device,
+                dtype=dtype,
+            )
+            max_boundary_idx = max(
+                int(material_boundaries.numel()) - 1,
+                0,
+            )
+            coord = material_boundaries.index_select(
+                0,
+                breakpoints.clamp(min=0, max=max_boundary_idx),
+            )
+            aligned_positions = positions + float(
+                getattr(state, "vcf_alignment", {}).get(
+                    "vcf_coordinate_offset",
+                    0.0,
+                )
+            )
+            right_variant_idx = torch.searchsorted(
+                aligned_positions,
+                coord,
+                right=False,
+            ).clamp(min=0, max=max_variant_idx)
+            left_variant_idx = (
+                right_variant_idx - 1
+            ).clamp(min=0, max=max_variant_idx)
+            gap = (
+                aligned_positions.index_select(0, right_variant_idx)
+                - aligned_positions.index_select(0, left_variant_idx)
+            ).clamp_min(1.0)
+        else:
+            material_boundaries = boundaries
+            max_boundary_idx = max(int(boundaries.numel()) - 1, 0)
+            coord = boundaries.index_select(
+                0,
+                breakpoints.clamp(min=0, max=max_boundary_idx),
+            )
+            left_variant_idx = (
+                breakpoints - 1
+            ).clamp(min=0, max=max_variant_idx)
+            right_variant_idx = breakpoints.clamp(
+                min=0,
+                max=max_variant_idx,
+            )
+            gap = (
+                positions.index_select(0, right_variant_idx)
+                - positions.index_select(0, left_variant_idx)
+            ).clamp_min(1.0)
 
-        max_boundary_idx = max(int(boundaries.numel()) - 1, 0)
-        coord = boundaries.index_select(0, breakpoints.clamp(min=0, max=max_boundary_idx))
         span_start = lineage.material_segments.span_start
         span_end = lineage.material_segments.span_end
         if span_start is None or span_end is None:
-            interval_start = boundaries.new_tensor(0.0)
-            interval_end = boundaries.new_tensor(float(seq_len))
+            interval_start = material_boundaries.new_tensor(0.0)
+            interval_end = material_boundaries.new_tensor(float(seq_len))
         else:
             start_idx = min(max(int(span_start), 0), max_boundary_idx)
             end_idx = min(max(int(span_end) + 1, 0), max_boundary_idx)
-            interval_start = boundaries[start_idx]
-            interval_end = boundaries[end_idx]
+            interval_start = material_boundaries[start_idx]
+            interval_end = material_boundaries[end_idx]
         interval_width = (interval_end - interval_start).clamp_min(1.0)
 
-        split_norm = breakpoints.to(dtype=dtype) / float(block_count)
+        if state is not None and state.block_boundaries is not None:
+            split_norm = coord / seq_len
+        else:
+            block_count = max(
+                int(
+                    self.env.num_blocks
+                    if num_blocks is None
+                    else num_blocks
+                ),
+                1,
+            )
+            split_norm = breakpoints.to(dtype=dtype) / float(block_count)
         gap_norm = gap / seq_len
         rel_pos = (coord - interval_start) / interval_width
-        left = self._gather_neighbor_partials(partials, lineage_blocks, breakpoints - 1)
-        right = self._gather_neighbor_partials(partials, lineage_blocks, breakpoints)
+        left = self._gather_neighbor_partials(
+            partials,
+            lineage_blocks,
+            left_variant_idx,
+        )
+        right = self._gather_neighbor_partials(
+            partials,
+            lineage_blocks,
+            right_variant_idx,
+        )
         scalar_features = torch.stack([split_norm, gap_norm, rel_pos], dim=1)
         return torch.cat([scalar_features, left, right], dim=1)
 
@@ -411,6 +483,7 @@ class VCFBreakpointScorer(nn.Module):
         sequence_length,
         num_blocks,
         action_context,
+        state=None,
     ):
         if breakpoint_tensor.numel() == 0:
             raise ValueError("Recombination action has no valid breakpoints")
@@ -429,6 +502,7 @@ class VCFBreakpointScorer(nn.Module):
             dtype,
             sequence_length=sequence_length,
             num_blocks=num_blocks,
+            state=state,
         )
         scorer_input = torch.cat([action_context, candidate_features], dim=1)
         return self.gap_scorer(scorer_input).squeeze(-1)
@@ -440,6 +514,7 @@ class VCFBreakpointScorer(nn.Module):
         sequence_length,
         num_blocks,
         action_context,
+        state=None,
     ):
         device = next(self.parameters()).device
         breakpoints = self._valid_breakpoints_tensor(valid_breakpoints, device)
@@ -449,6 +524,7 @@ class VCFBreakpointScorer(nn.Module):
             sequence_length,
             num_blocks,
             action_context,
+            state=state,
         )
 
     def forward(
@@ -459,6 +535,7 @@ class VCFBreakpointScorer(nn.Module):
         num_blocks,
         action_context,
         random_spec=None,
+        state=None,
     ):
         device = next(self.parameters()).device
         breakpoints = self._valid_breakpoints_tensor(valid_breakpoints, device)
@@ -468,6 +545,7 @@ class VCFBreakpointScorer(nn.Module):
             sequence_length,
             num_blocks,
             action_context,
+            state=state,
         )
         if random_spec is not None and "T" in random_spec:
             sample_logits = valid_logits / random_spec["T"]

@@ -1,9 +1,12 @@
 import argparse
 import copy
 import json
+import math
+import numbers
 import os
 import pickle
 import random
+import re
 
 import numpy as np
 import torch
@@ -14,17 +17,18 @@ try:
 except ImportError:
     wandb = None
 
-from env import SimpleARGEnvironment, action_as_dict
-from refinement import (
-    build_refinement_context_sets,
-    build_refinement_source,
-    parse_block_groups,
-    parse_bp_intervals,
-)
-from rollout_worker_arg import RolloutWorker
-from tb_gfn import TBGFlowNetGenerator
-from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
-from utils import VCF_PARSER_VERSION, is_vcf_path, load_sequences, load_vcf_variants
+try:
+    from .env import SimpleARGEnvironment, action_as_dict
+    from .rollout_worker_arg import RolloutWorker
+    from .tb_gfn import TBGFlowNetGenerator
+    from .time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
+    from .utils import VCF_PARSER_VERSION, is_vcf_path, load_sequences, load_vcf_variants
+except ImportError:  # Support the repository's script-style entry points.
+    from env import SimpleARGEnvironment, action_as_dict
+    from rollout_worker_arg import RolloutWorker
+    from tb_gfn import TBGFlowNetGenerator
+    from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
+    from utils import VCF_PARSER_VERSION, is_vcf_path, load_sequences, load_vcf_variants
 
 
 DEFAULT_NE = 10000
@@ -69,11 +73,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "checkpoint": None,
         "arg_path": None,
-        "bad_region_top_k": None,
-        "bad_region_blocks": None,
-        "bad_region_bp": None,
-        "strategy": "before_last_coalescence",
-        "terminal_backtrack_lengths": list(DEFAULT_TERMINAL_BACKTRACK_LENGTHS),
+        "requests": [],
     },
     "training": {
         "epochs": None,
@@ -287,25 +287,119 @@ def validate_train_config(config):
         raise ValueError("training.partial_segment_max_steps must be positive")
     training["partial_segment_max_steps"] = partial_segment_max_steps
     refinement = config.get("refinement", {})
-    refinement["terminal_backtrack_lengths"] = parse_positive_int_list(
-        refinement.get(
-            "terminal_backtrack_lengths",
-            DEFAULT_TERMINAL_BACKTRACK_LENGTHS,
-        ),
-        "refinement.terminal_backtrack_lengths",
+    legacy_fields = {
+        "bad_region_top_k",
+        "bad_region_blocks",
+        "bad_region_bp",
+        "strategy",
+        "terminal_backtrack_lengths",
+    }
+    configured_legacy_fields = sorted(
+        key
+        for key in legacy_fields
+        if key in refinement
     )
-    if refinement_enabled(config) and not refinement.get("arg_path"):
-        missing_refinement = "refinement.arg_path"
+    if configured_legacy_fields:
         raise ValueError(
-            "Missing required local refinement config value: "
-            f"{missing_refinement}. Provide it in YAML or via --local-refinement-arg."
+            "The automatic/backtracked refinement configuration was removed. "
+            "Replace "
+            + ", ".join(
+                f"refinement.{key}" for key in configured_legacy_fields
+            )
+            + " with explicit refinement.requests entries containing "
+            "genomic_range and exactly one of cut_time or cut_event_index."
         )
-    strategy = refinement.get("strategy", "before_last_coalescence")
-    if strategy not in {"before_last_touch", "before_first_touch", "before_last_coalescence"}:
-        raise ValueError(
-            "refinement.strategy must be one of 'before_last_touch', "
-            "'before_first_touch', or 'before_last_coalescence'"
-        )
+    if refinement_enabled(config):
+        if not refinement.get("arg_path"):
+            raise ValueError(
+                "Missing required local refinement config value: "
+                "refinement.arg_path."
+            )
+        if loss != "fl_subtb":
+            raise ValueError(
+                "Integrated local refinement requires training.loss: fl_subtb"
+            )
+        requests = refinement.get("requests")
+        if not isinstance(requests, list) or not requests:
+            raise ValueError(
+                "refinement.requests must be a non-empty list of explicit "
+                "interval/time requests"
+            )
+        normalized_requests = []
+        seen_ids = set()
+        for index, request in enumerate(requests):
+            if not isinstance(request, dict):
+                raise ValueError(
+                    f"refinement.requests[{index}] must be a mapping"
+                )
+            request_id = str(
+                request.get("id") or f"region_{index + 1:06d}"
+            )
+            if (
+                request_id in {".", ".."}
+                or re.fullmatch(r"[A-Za-z0-9_.-]+", request_id) is None
+            ):
+                raise ValueError(
+                    f"refinement.requests[{index}].id may contain only "
+                    "letters, numbers, '.', '_' and '-'"
+                )
+            if request_id in seen_ids:
+                raise ValueError(
+                    f"duplicate refinement request id {request_id!r}"
+                )
+            seen_ids.add(request_id)
+            genomic_range = request.get("genomic_range")
+            if (
+                not isinstance(genomic_range, (list, tuple))
+                or len(genomic_range) != 2
+            ):
+                raise ValueError(
+                    f"refinement.requests[{index}].genomic_range must be "
+                    "a two-value half-open range"
+                )
+            left, right = (float(value) for value in genomic_range)
+            if (
+                not math.isfinite(left)
+                or not math.isfinite(right)
+                or left < 0.0
+                or not left < right
+            ):
+                raise ValueError(
+                    f"refinement.requests[{index}].genomic_range must satisfy "
+                    "0 <= left < right with finite coordinates"
+                )
+            supplied = int(request.get("cut_time") is not None) + int(
+                request.get("cut_event_index") is not None
+            )
+            if supplied != 1:
+                raise ValueError(
+                    f"refinement.requests[{index}] must provide exactly one "
+                    "of cut_time or cut_event_index"
+                )
+            normalized = {
+                "id": request_id,
+                "genomic_range": [left, right],
+            }
+            if request.get("cut_time") is not None:
+                cut_time = float(request["cut_time"])
+                if not math.isfinite(cut_time):
+                    raise ValueError(
+                        f"refinement.requests[{index}].cut_time must be finite"
+                    )
+                normalized["cut_time"] = cut_time
+            else:
+                cut_event_index = request["cut_event_index"]
+                if (
+                    isinstance(cut_event_index, bool)
+                    or not isinstance(cut_event_index, numbers.Integral)
+                ):
+                    raise ValueError(
+                        f"refinement.requests[{index}].cut_event_index must be "
+                        "an integer"
+                    )
+                normalized["cut_event_index"] = int(cut_event_index)
+            normalized_requests.append(normalized)
+        refinement["requests"] = normalized_requests
 
 
 def config_to_train_kwargs(config):
@@ -357,7 +451,11 @@ def config_to_train_kwargs(config):
 
 def refinement_enabled(config):
     refinement = config.get("refinement", {})
-    return bool(refinement.get("enabled") or refinement.get("arg_path"))
+    return bool(
+        refinement.get("enabled")
+        or refinement.get("arg_path")
+        or refinement.get("requests")
+    )
 
 
 def config_to_refinement_kwargs(config):
@@ -365,14 +463,7 @@ def config_to_refinement_kwargs(config):
     return {
         "checkpoint": refinement.get("checkpoint"),
         "local_refinement_arg": refinement.get("arg_path"),
-        "bad_region_top_k": refinement.get("bad_region_top_k"),
-        "bad_region_blocks": refinement.get("bad_region_blocks"),
-        "bad_region_bp": refinement.get("bad_region_bp"),
-        "refine_strategy": refinement.get("strategy", "before_last_coalescence"),
-        "terminal_backtrack_lengths": refinement.get(
-            "terminal_backtrack_lengths",
-            list(DEFAULT_TERMINAL_BACKTRACK_LENGTHS),
-        ),
+        "requests": list(refinement.get("requests") or []),
     }
 
 
@@ -839,7 +930,7 @@ def train(
     return history
 
 
-def train_local_refinement(
+def _train_local_refinement_legacy(
     dataset_path,
     output_path,
     device,
@@ -883,6 +974,13 @@ def train_local_refinement(
     attention_dropout=DEFAULT_ATTENTION_DROPOUT,
     verbose=True,
 ):
+    from refinement import (
+        build_refinement_context_sets,
+        build_refinement_source,
+        parse_block_groups,
+        parse_bp_intervals,
+    )
+
     if not is_vcf_path(dataset_path):
         raise ValueError("local ARG refinement currently requires a VCF dataset")
     seed_everything(seed)
@@ -1580,6 +1678,17 @@ def build_checkpoint_metadata(
     }
 
 
+def train_local_refinement(*args, **kwargs):
+    """Dispatch explicit local requests to the production refinement workflow."""
+
+    try:
+        from .refinement.training import train_local_refinement as train_local
+    except ImportError:
+        from refinement.training import train_local_refinement as train_local
+
+    return train_local(*args, **kwargs)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train the simplified ARG GFlowNet demo.")
     parser.add_argument("--config", "-c", help="Path to YAML training config.")
@@ -1591,24 +1700,25 @@ def main():
     parser.add_argument(
         "--bad-region-top-k",
         type=int,
-        help="Automatically refine the top K suspicious blocks.",
+        help="Deprecated; use explicit refinement.requests in YAML.",
     )
     parser.add_argument(
         "--bad-region-blocks",
-        help="Manual block groups, e.g. '1,2,3;8-10'.",
+        help="Deprecated; use explicit refinement.requests in YAML.",
     )
     parser.add_argument(
         "--bad-region-bp",
-        help="Manual BP intervals, e.g. '1000-2500;9000-11000'.",
+        help="Deprecated; use explicit refinement.requests in YAML.",
     )
     parser.add_argument(
         "--refine-strategy",
-        default="before_last_coalescence",
+        default=None,
         choices=["before_last_touch", "before_first_touch", "before_last_coalescence"],
+        help="Deprecated; use explicit refinement.requests in YAML.",
     )
     parser.add_argument(
         "--terminal-backtrack-lengths",
-        help="Comma-separated terminal refinement backtrack offsets, e.g. '5,10,25'.",
+        help="Deprecated; use explicit refinement.requests in YAML.",
     )
     parser.add_argument("--output-path")
     parser.add_argument("--dataset-path")

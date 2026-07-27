@@ -1,29 +1,43 @@
 import argparse
+import hashlib
 import json
 import os
+import re
 
 import torch
 
-from env import SimpleARGEnvironment
-from refinement import (
-    build_refinement_contexts,
-    build_refinement_source,
-    parse_block_groups,
-    parse_bp_intervals,
-)
-from rollout_worker_arg import RolloutWorker
-from tb_gfn import TBGFlowNetGenerator
-from time_env import DEFAULT_TIME_BIN_SCHEME
-from train import (
-    DEFAULT_LOSS,
-    DEFAULT_LOG_Z_LR,
-    DEFAULT_SUBTB_LAMBDA,
-    MODEL_VERSION,
-    DEFAULT_MU_PER_BP,
-    DEFAULT_NE,
-    seed_everything,
-)
-from utils import is_vcf_path, load_vcf_variants
+try:
+    from .env import LocalARGEnvironment, SimpleARGEnvironment
+    from .rollout_worker_arg import RolloutWorker
+    from .tb_gfn import TBGFlowNetGenerator
+    from .time_env import DEFAULT_TIME_BIN_SCHEME
+    from .train import (
+        DEFAULT_LOSS,
+        DEFAULT_LOG_Z_LR,
+        DEFAULT_SUBTB_LAMBDA,
+        MODEL_VERSION,
+        DEFAULT_MU_PER_BP,
+        DEFAULT_NE,
+        seed_everything,
+    )
+    from .utils import is_vcf_path, load_vcf_variants
+    from .validation.paths import experiment_gfn_dir, validate_experiment_name
+except ImportError:  # Support the repository's script-style entry points.
+    from env import LocalARGEnvironment, SimpleARGEnvironment
+    from rollout_worker_arg import RolloutWorker
+    from tb_gfn import TBGFlowNetGenerator
+    from time_env import DEFAULT_TIME_BIN_SCHEME
+    from train import (
+        DEFAULT_LOSS,
+        DEFAULT_LOG_Z_LR,
+        DEFAULT_SUBTB_LAMBDA,
+        MODEL_VERSION,
+        DEFAULT_MU_PER_BP,
+        DEFAULT_NE,
+        seed_everything,
+    )
+    from utils import is_vcf_path, load_vcf_variants
+    from validation.paths import experiment_gfn_dir, validate_experiment_name
 
 
 REQUIRED_METADATA_KEYS = {
@@ -51,7 +65,7 @@ DENSE_METADATA_KEYS = {"sequences"}
 
 def run_inference(
     checkpoint,
-    output_dir="inferred_args",
+    output_dir=None,
     num_args=1,
     batch_size=1,
     seed=None,
@@ -63,12 +77,16 @@ def run_inference(
     bad_region_top_k=None,
     bad_region_blocks=None,
     bad_region_bp=None,
-    refine_strategy="before_last_coalescence",
+    refine_strategy=None,
+    experiment=None,
 ):
     if num_args < 1:
         raise ValueError("num_args must be at least 1")
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
+    output_dir = resolve_inference_output_dir(
+        output_dir=output_dir, experiment=experiment
+    )
     checkpoint_data = load_checkpoint(checkpoint, map_location="cpu")
     metadata = checkpoint_data.get("metadata", {})
     validate_metadata(metadata)
@@ -77,12 +95,53 @@ def run_inference(
     seed_everything(inference_seed)
 
     resolved_device = resolve_device(device)
-    env = environment_from_metadata(
+    base_env = environment_from_metadata(
         metadata,
         seed=inference_seed,
         device=resolved_device,
         dataset_path=dataset_path,
     )
+    is_local_checkpoint = (
+        metadata.get("training_mode") == "local_refinement"
+    )
+    if is_local_checkpoint:
+        resolved_dataset_path = dataset_path or metadata["dataset_path"]
+        expected_vcf_sha256 = (
+            metadata.get("vcf_identity", {}).get("sha256")
+        )
+        if (
+            expected_vcf_sha256
+            and _file_sha256(resolved_dataset_path)
+            != expected_vcf_sha256
+        ):
+            raise ValueError(
+                "VCF fingerprint does not match the local checkpoint"
+            )
+    legacy_refinement_values = {
+        "bad_region_top_k": bad_region_top_k,
+        "bad_region_blocks": bad_region_blocks,
+        "bad_region_bp": bad_region_bp,
+        "refine_strategy": refine_strategy,
+    }
+    configured_legacy = sorted(
+        key
+        for key, value in legacy_refinement_values.items()
+        if value is not None
+    )
+    if configured_legacy:
+        raise ValueError(
+            "Automatic bad-region inference options are no longer supported: "
+            + ", ".join(configured_legacy)
+            + ". Train a local checkpoint with explicit refinement.requests."
+        )
+    if is_local_checkpoint:
+        env = local_environment_from_metadata(
+            metadata,
+            base_env,
+            source_arg_path=refine_arg,
+        )
+    else:
+        env = base_env
     generator = TBGFlowNetGenerator(
         env,
         init_z_sample_count=metadata["init_z_sample_count"],
@@ -103,31 +162,27 @@ def run_inference(
 
     random_spec = build_random_spec(temperature=temperature)
     rollout_worker = RolloutWorker(env, verbose=verbose)
-    if refine_arg is not None:
-        return run_refinement_inference(
+    if is_local_checkpoint:
+        return run_local_refinement_inference(
             checkpoint=checkpoint,
             metadata=metadata,
             seed=inference_seed,
             random_spec=random_spec,
             output_dir=output_dir,
             env=env,
-            source_env=environment_from_metadata(
-                metadata,
-                seed=inference_seed,
-                device=torch.device("cpu"),
-                dataset_path=dataset_path,
-            ),
             rollout_worker=rollout_worker,
             generator=generator,
-            refine_arg=refine_arg,
             dataset_path=dataset_path or metadata.get("dataset_path"),
             num_args=num_args,
             batch_size=batch_size,
-            bad_region_top_k=bad_region_top_k,
-            bad_region_blocks=bad_region_blocks,
-            bad_region_bp=bad_region_bp,
-            refine_strategy=refine_strategy,
+            experiment=experiment,
             verbose=verbose,
+        )
+    if refine_arg is not None:
+        raise ValueError(
+            "--refine-arg requires a checkpoint trained with explicit local "
+            "refinement requests; global checkpoints cannot perform learned "
+            "local refinement directly"
         )
 
     rollout_outputs, trajectories = run_batched_rollouts(
@@ -149,6 +204,8 @@ def run_inference(
         env=env,
         rollout_outputs=rollout_outputs,
         trajectories=trajectories,
+        dataset_path=dataset_path or metadata.get("dataset_path"),
+        experiment=experiment,
     )
     manifest_path = os.path.join(output_dir, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as handle:
@@ -172,6 +229,15 @@ def resolve_device(device):
     return resolved
 
 
+def resolve_inference_output_dir(output_dir=None, experiment=None):
+    """Resolve the legacy output path or a named validation experiment path."""
+    if output_dir is not None and experiment is not None:
+        raise ValueError("use either output_dir or experiment, not both")
+    if experiment is not None:
+        return str(experiment_gfn_dir(validate_experiment_name(experiment)))
+    return "inferred_args" if output_dir is None else str(output_dir)
+
+
 def validate_metadata(metadata):
     input_mode = metadata.get("input_mode", "dense")
     required = set(REQUIRED_METADATA_KEYS)
@@ -190,11 +256,24 @@ def validate_metadata(metadata):
             "This inference path requires fixed-delta time-bin checkpoints "
             f"({DEFAULT_TIME_BIN_SCHEME}), got {metadata['time_bin_scheme']!r}."
         )
-    if metadata["model_version"] != MODEL_VERSION:
+    is_local = metadata.get("training_mode") == "local_refinement"
+    expected_model_version = (
+        "local-arg-gflownet-fl-subtb-v1" if is_local else MODEL_VERSION
+    )
+    if metadata["model_version"] != expected_model_version:
         raise ValueError(
             "Checkpoint model_version is incompatible with this sparse VCF implementation: "
-            f"expected {MODEL_VERSION!r}, got {metadata['model_version']!r}."
+            f"expected {expected_model_version!r}, got {metadata['model_version']!r}."
         )
+    if is_local:
+        missing_local = sorted(
+            {"source_arg", "refinement_requests"} - set(metadata)
+        )
+        if missing_local:
+            raise ValueError(
+                "Local checkpoint metadata is missing: "
+                + ", ".join(missing_local)
+            )
 
 
 def environment_from_metadata(metadata, seed, device=None, dataset_path=None):
@@ -234,6 +313,58 @@ def environment_from_metadata(metadata, seed, device=None, dataset_path=None):
     if device is not None:
         env_kwargs["device"] = device
     return SimpleARGEnvironment(**env_kwargs)
+
+
+def local_environment_from_metadata(
+    metadata,
+    base_env,
+    source_arg_path=None,
+):
+    try:
+        from .refinement import LocalRefinementRequest, prepare_local_refinement
+    except ImportError:
+        from refinement import LocalRefinementRequest, prepare_local_refinement
+
+    source_record = metadata["source_arg"]
+    resolved_source = source_arg_path or source_record["path"]
+    if not os.path.exists(resolved_source):
+        raise FileNotFoundError(
+            f"local checkpoint source ARG does not exist: {resolved_source}"
+        )
+    expected_fingerprint = source_record.get("sha256")
+    if (
+        expected_fingerprint
+        and _file_sha256(resolved_source) != expected_fingerprint
+    ):
+        raise ValueError(
+            "source ARG fingerprint does not match the local checkpoint"
+        )
+    prepared_contexts = {}
+    for index, record in enumerate(metadata["refinement_requests"]):
+        context_id = str(
+            record.get("id") or f"region_{index + 1:06d}"
+        )
+        if (
+            context_id in {".", ".."}
+            or re.fullmatch(r"[A-Za-z0-9_.-]+", context_id) is None
+        ):
+            raise ValueError(
+                f"invalid local checkpoint request id {context_id!r}"
+            )
+        if context_id in prepared_contexts:
+            raise ValueError(
+                f"duplicate local checkpoint request id {context_id!r}"
+            )
+        request = LocalRefinementRequest(
+            genomic_range=tuple(record["genomic_range"]),
+            cut_time=record.get("cut_time"),
+            cut_event_index=record.get("cut_event_index"),
+        )
+        prepared_contexts[context_id] = prepare_local_refinement(
+            resolved_source,
+            request,
+        )
+    return LocalARGEnvironment(base_env, prepared_contexts)
 
 
 def run_batched_rollouts(
@@ -298,7 +429,194 @@ def run_batched_rollouts(
     return rollout_outputs, trajectories
 
 
-def run_refinement_inference(
+def run_local_refinement_inference(
+    checkpoint,
+    metadata,
+    seed,
+    random_spec,
+    output_dir,
+    env,
+    rollout_worker,
+    generator,
+    dataset_path,
+    num_args,
+    batch_size,
+    experiment=None,
+    verbose=False,
+):
+    """Sample, splice, validate, and export every checkpoint request."""
+
+    try:
+        from .refinement import (
+            export_refined_tree_sequence,
+            splice_local_proposal,
+        )
+    except ImportError:
+        from refinement import (
+            export_refined_tree_sequence,
+            splice_local_proposal,
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+    request_records = {
+        str(record["id"]): record
+        for record in metadata["refinement_requests"]
+    }
+    requests_manifest = []
+    total_valid_outputs = 0
+    for context_id in env.context_ids:
+        request_dir = os.path.join(output_dir, context_id)
+        os.makedirs(request_dir, exist_ok=True)
+        initial_state = env.get_initial_state(context_id)
+        rollout_outputs, trajectories = run_batched_rollouts(
+            rollout_worker,
+            generator,
+            num_args=int(num_args),
+            batch_size=int(batch_size),
+            random_spec=random_spec,
+            verbose=verbose,
+            start_state=initial_state,
+        )
+        prepared = env.prepared_contexts[context_id]
+        trajectory_records = []
+        for index, (state, trajectory) in enumerate(
+            zip(rollout_outputs["states"], trajectories),
+            start=1,
+        ):
+            log_pf = float(
+                rollout_outputs["log_paths_pf"][index - 1].sum().item()
+            )
+            log_pb = float(
+                rollout_outputs["log_paths_pb"][index - 1].sum().item()
+            )
+            record = {
+                "index": int(index),
+                "terminal": bool(state.is_done),
+                "trajectory_length": len(trajectory),
+                "log_P_F": log_pf,
+                "log_P_B": log_pb,
+                "local_cwr_log_prior": float(
+                    state.accumulated_log_prior
+                ),
+                "whole_vcf_log_likelihood": (
+                    None
+                    if state.log_likelihood is None
+                    else float(state.log_likelihood)
+                ),
+                "log_reward": (
+                    None
+                    if state.log_reward is None
+                    else float(state.log_reward)
+                ),
+                "actions": list(trajectory.actions),
+                "prior_increments": [
+                    None if value is None else float(value)
+                    for value in trajectory.log_priors
+                ],
+                "output_file": None,
+                "topology_digest": None,
+                "splice_validation": None,
+                "failure_diagnostics": [],
+            }
+            try:
+                if not state.is_done:
+                    raise ValueError(
+                        "learned local rollout did not reach a terminal state"
+                    )
+                proposal = env.state_to_proposal(state)
+                record["topology_digest"] = proposal.topology_digest
+                if proposal.diagnostics:
+                    record["failure_diagnostics"].extend(
+                        {
+                            "code": diagnostic.code,
+                            "message": diagnostic.message,
+                            "step": diagnostic.step,
+                        }
+                        for diagnostic in proposal.diagnostics
+                    )
+                splice_result = splice_local_proposal(prepared, proposal)
+                validation = splice_result.validation
+                record["splice_validation"] = {
+                    "is_valid": bool(validation.is_valid),
+                    "errors": list(validation.errors),
+                    "warnings": list(validation.warnings),
+                    "counts": dict(validation.counts),
+                }
+                if not splice_result.is_valid:
+                    record["failure_diagnostics"].extend(
+                        {
+                            "code": "splice_validation",
+                            "message": message,
+                        }
+                        for message in validation.errors
+                    )
+                else:
+                    output_path = os.path.join(
+                        request_dir,
+                        f"arg_{index:06d}.trees",
+                    )
+                    export_refined_tree_sequence(
+                        splice_result,
+                        output_path,
+                        overwrite=False,
+                    )
+                    record["output_file"] = os.path.abspath(output_path)
+                    total_valid_outputs += 1
+            except Exception as error:
+                record["failure_diagnostics"].append(
+                    {
+                        "code": type(error).__name__,
+                        "message": str(error),
+                    }
+                )
+            trajectory_records.append(record)
+
+        request_manifest = {
+            "id": context_id,
+            "request": request_records[context_id],
+            "output_dir": os.path.abspath(request_dir),
+            "sample_count": int(num_args),
+            "valid_output_count": sum(
+                row["output_file"] is not None
+                for row in trajectory_records
+            ),
+            "trajectories": trajectory_records,
+        }
+        with open(
+            os.path.join(request_dir, "manifest.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(request_manifest, handle, indent=2)
+        requests_manifest.append(request_manifest)
+
+    manifest = {
+        "mode": "local_refinement",
+        "experiment": experiment,
+        "checkpoint": os.path.abspath(checkpoint),
+        "checkpoint_epoch": metadata.get("epoch"),
+        "checkpoint_best_loss": metadata.get("best_loss"),
+        "seed": int(seed),
+        "source_arg": dict(metadata["source_arg"]),
+        "dataset_path": os.path.abspath(dataset_path),
+        "output_dir": os.path.abspath(output_dir),
+        "num_requests": len(requests_manifest),
+        "num_args_per_request": int(num_args),
+        "num_outputs": int(total_valid_outputs),
+        "output_count": int(total_valid_outputs),
+        "random_spec": random_spec,
+        "requests": requests_manifest,
+    }
+    with open(
+        os.path.join(output_dir, "manifest.json"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(manifest, handle, indent=2)
+    return manifest
+
+
+def _run_refinement_inference_legacy(
     checkpoint,
     metadata,
     seed,
@@ -316,8 +634,16 @@ def run_refinement_inference(
     bad_region_blocks,
     bad_region_bp,
     refine_strategy,
+    experiment=None,
     verbose=False,
 ):
+    from refinement import (
+        build_refinement_contexts,
+        build_refinement_source,
+        parse_block_groups,
+        parse_bp_intervals,
+    )
+
     if not dataset_path:
         raise ValueError("refinement inference requires a VCF dataset path")
     source = build_refinement_source(
@@ -369,6 +695,8 @@ def run_refinement_inference(
             env=env,
             rollout_outputs=rollout_outputs,
             trajectories=trajectories,
+            dataset_path=dataset_path,
+            experiment=experiment,
         )
         region_manifest["refinement_context"] = context.to_manifest_record()
         with open(
@@ -388,6 +716,7 @@ def run_refinement_inference(
 
     manifest = {
         "mode": "local_refinement",
+        "experiment": experiment,
         "checkpoint": os.path.abspath(checkpoint),
         "checkpoint_epoch": int(metadata["epoch"]) if "epoch" in metadata else None,
         "checkpoint_best_loss": (
@@ -396,9 +725,11 @@ def run_refinement_inference(
         "seed": int(seed),
         "source_arg": os.path.abspath(refine_arg),
         "dataset_path": os.path.abspath(dataset_path),
+        "output_dir": os.path.abspath(output_dir),
         "num_regions": len(region_records),
         "num_args_per_region": int(num_args),
         "num_outputs": int(total_outputs),
+        "output_count": int(total_outputs),
         "random_spec": random_spec,
         "refine_strategy": str(refine_strategy),
         "regions": region_records,
@@ -422,6 +753,14 @@ def _pad_log_path_rows(rows):
     return padded
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def build_random_spec(temperature=None):
     if temperature is not None:
         if temperature <= 0:
@@ -439,6 +778,8 @@ def build_manifest(
     env,
     rollout_outputs,
     trajectories,
+    dataset_path=None,
+    experiment=None,
 ):
     states = rollout_outputs["states"]
     log_paths_pf = rollout_outputs["log_paths_pf"].detach().cpu()
@@ -467,22 +808,45 @@ def build_manifest(
         )
 
     return {
+        "experiment": experiment,
         "checkpoint": os.path.abspath(checkpoint),
         "checkpoint_epoch": int(metadata["epoch"]) if "epoch" in metadata else None,
         "checkpoint_best_loss": (
             float(metadata["best_loss"]) if "best_loss" in metadata else None
         ),
         "seed": int(seed),
+        "dataset_path": (
+            os.path.abspath(dataset_path) if dataset_path is not None else None
+        ),
+        "output_dir": os.path.abspath(output_dir),
         "num_args": len(records),
+        "output_count": len(records),
         "random_spec": random_spec,
         "outputs": records,
     }
 
 
-def main():
+def _experiment_arg(value):
+    try:
+        return validate_experiment_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def build_parser():
     parser = argparse.ArgumentParser(description="Infer ARGs from a saved ARG GFlowNet checkpoint.")
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--output-dir", default="inferred_args")
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "--output-dir",
+        default=None,
+        help="Explicit output directory (legacy default: inferred_args).",
+    )
+    output_group.add_argument(
+        "--experiment",
+        type=_experiment_arg,
+        help="Write samples to validation/output/EXPERIMENT/gfn/.",
+    )
     parser.add_argument(
         "--num-args",
         "--num-particles",
@@ -503,28 +867,37 @@ def main():
     parser.add_argument("--dataset-path", help="Override the dataset path stored in checkpoint metadata.")
     parser.add_argument(
         "--refine-arg",
-        help="Existing .trees ARG to backtrack and locally refine.",
+        help="Optional source-ARG override for a local checkpoint; its fingerprint must match.",
     )
     parser.add_argument(
         "--bad-region-top-k",
         type=int,
-        help="Automatically refine the top K suspicious blocks.",
+        help="Deprecated; use explicit checkpoint requests.",
     )
     parser.add_argument(
         "--bad-region-blocks",
-        help="Manual block groups, e.g. '1,2,3;8-10'.",
+        help="Deprecated; use explicit checkpoint requests.",
     )
     parser.add_argument(
         "--bad-region-bp",
-        help="Manual BP intervals, e.g. '1000-2500;9000-11000'.",
+        help="Deprecated; use explicit checkpoint requests.",
     )
     parser.add_argument(
         "--refine-strategy",
-        default="before_last_coalescence",
+        default=None,
         choices=["before_last_touch", "before_first_touch", "before_last_coalescence"],
+        help="Deprecated; local checkpoints reconstruct explicit requests.",
     )
     parser.add_argument("--verbose", action="store_true")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
+    resolved_output_dir = resolve_inference_output_dir(
+        output_dir=args.output_dir, experiment=args.experiment
+    )
 
     manifest = run_inference(
         checkpoint=args.checkpoint,
@@ -541,10 +914,11 @@ def main():
         bad_region_blocks=args.bad_region_blocks,
         bad_region_bp=args.bad_region_bp,
         refine_strategy=args.refine_strategy,
+        experiment=args.experiment,
     )
     print(
         f"Wrote {manifest.get('num_outputs', manifest.get('num_args', 0))} "
-        f"ARG tree sequence(s) to {args.output_dir}"
+        f"ARG tree sequence(s) to {resolved_output_dir}"
     )
 
 

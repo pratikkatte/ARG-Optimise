@@ -196,7 +196,9 @@ class EvolutionModelTorch(torch.nn.Module):
         if partials is None:
             raise ValueError("ARGLineage.partials is required")
         if torch.is_tensor(partials):
-            tensor = partials.to(dtype=torch.float32)
+            tensor = partials
+            if not tensor.is_floating_point():
+                tensor = tensor.to(dtype=torch.float32)
         else:
             tensor = torch.as_tensor(partials, dtype=torch.float32, device=self.env.block_seq_arrays.device)
         if getattr(self.env, "is_vcf_mode", False):
@@ -273,50 +275,83 @@ class EvolutionModelTorch(torch.nn.Module):
         if node_id in memo:
             return memo[node_id]
 
-        node = state.all_nodes[node_id]
-        if node_id < self.env.num_sequences:
-            partials = self._normalize_leaf_partials(
-                seq_arrays[node_id, site_start:site_end].copy()
+        # Explicit postorder traversal avoids Python's recursion limit on deep
+        # unary or near-unary inferred ARGs.
+        stack = [(int(node_id), False)]
+        relevant_by_node = {}
+        while stack:
+            current_id, expanded = stack.pop()
+            if current_id in memo:
+                continue
+            node = state.all_nodes[current_id]
+            if current_id < self.env.num_sequences:
+                partials = self._normalize_leaf_partials(
+                    seq_arrays[current_id, site_start:site_end].copy()
+                )
+                log_scale = np.zeros(site_end - site_start, dtype=float)
+                memo[current_id] = self._rescale_partials(
+                    partials,
+                    log_scale,
+                )
+                continue
+
+            if not expanded:
+                relevant_children = [
+                    int(child_id)
+                    for child_id in node.children
+                    if self._edge_covers_segment(
+                        state,
+                        current_id,
+                        child_id,
+                        block_start,
+                        block_end,
+                    )
+                ]
+                if not relevant_children:
+                    raise ValueError(
+                        f"ARG node {current_id} has no descendants for the "
+                        "requested segment"
+                    )
+                relevant_by_node[current_id] = relevant_children
+                stack.append((current_id, True))
+                for child_id in reversed(relevant_children):
+                    if child_id not in memo:
+                        stack.append((child_id, False))
+                continue
+
+            partials = np.ones(
+                (site_end - site_start, seq_arrays.shape[-1]),
+                dtype=float,
             )
             log_scale = np.zeros(site_end - site_start, dtype=float)
-            partials, log_scale = self._rescale_partials(partials, log_scale)
-            result = (partials, log_scale)
-            memo[node_id] = result
-            return result
-
-        relevant_children = [
-            child_id
-            for child_id in node.children
-            if self._edge_covers_segment(state, node_id, child_id, block_start, block_end)
-        ]
-
-        if not relevant_children:
-            raise ValueError(f"ARG node {node_id} has no descendants for the requested segment")
-
-        partials = np.ones((site_end - site_start, seq_arrays.shape[-1]), dtype=float)
-        log_scale = np.zeros(site_end - site_start, dtype=float)
-        for child_id in relevant_children:
-            child_partials, child_log_scale = self._compute_segment_partials(
-                state,
-                child_id,
-                block_start,
-                block_end,
-                site_start,
-                site_end,
-                seq_arrays,
-                memo,
-            )
-            edge_time = self._edge_length_between(state, node_id, child_id)
-            branch_length = self._branch_length_for_likelihood(edge_time)
-            transition_matrix = self._jc69_transition_matrix(branch_length)
-            child_partials = np.maximum(child_partials, self._PROB_FLOOR)
-            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-                partials *= child_partials @ transition_matrix.T
-            log_scale += child_log_scale
-            partials, log_scale = self._rescale_partials(partials, log_scale)
-        result = (partials, log_scale)
-        memo[node_id] = result
-        return result
+            for child_id in relevant_by_node[current_id]:
+                child_partials, child_log_scale = memo[child_id]
+                edge_time = self._edge_length_between(
+                    state,
+                    current_id,
+                    child_id,
+                )
+                branch_length = self._branch_length_for_likelihood(edge_time)
+                transition_matrix = self._jc69_transition_matrix(
+                    branch_length
+                )
+                child_partials = np.maximum(
+                    child_partials,
+                    self._PROB_FLOOR,
+                )
+                with np.errstate(
+                    divide="ignore",
+                    invalid="ignore",
+                    over="ignore",
+                ):
+                    partials *= child_partials @ transition_matrix.T
+                log_scale += child_log_scale
+                partials, log_scale = self._rescale_partials(
+                    partials,
+                    log_scale,
+                )
+            memo[current_id] = (partials, log_scale)
+        return memo[int(node_id)]
 
     def _edge_covers_segment(self, state, parent_id, child_id, block_start, block_end):
         parent = state.all_nodes[parent_id]
