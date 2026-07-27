@@ -11,13 +11,14 @@ root; no original upper ancestry or terminal attachment is required.
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
 from typing import Any, Iterable, Literal, Mapping, Union
 
 import numpy as np
+import torch
 
 try:
     from ..env import (
@@ -50,6 +51,11 @@ from .local_refinement import (
     _canonical_segments,
 )
 from .synthetic_full_arg import NODE_IS_RE_EVENT
+from .vcf_likelihood import (
+    compute_cut_frontier_vcf_partials,
+    compute_tree_sequence_vcf_log_likelihood,
+    resolve_vcf_tree_sequence_alignment,
+)
 
 
 Interval = tuple[float, float]
@@ -106,6 +112,12 @@ class LocalARGProposal:
     prior_log_probability: float
     transition_records: tuple[dict[str, Any], ...]
     status: Literal["terminal", "invalid"]
+    log_likelihood: float | None = None
+    outside_log_likelihood: float | None = None
+    local_log_likelihood: float | None = None
+    log_reward: float | None = None
+    likelihood_scope: Literal["whole_vcf_chromosome", "none"] = "none"
+    likelihood_alignment: dict[str, Any] = field(default_factory=dict)
     diagnostics: tuple[ConstructionDiagnostic, ...] = ()
 
     @property
@@ -188,6 +200,9 @@ class LocalSampleBatch:
 def initialize_local_arg_state(
     prepared: PreparedLocalRefinement,
     env: SimpleARGEnvironment,
+    *,
+    sample_node_to_haplotype: Mapping[int, int | str] | None = None,
+    vcf_coordinate_offset: str | float = "auto",
 ) -> ARGState:
     """Create an ``ARGState`` from target-bearing lineages at the trace cut."""
 
@@ -196,9 +211,10 @@ def initialize_local_arg_state(
             item.message for item in prepared.context.rejection_diagnostics
         )
         raise ValueError(f"local refinement context is invalid: {reasons}")
-    if not env.structural_only:
+    if not env.structural_only and not env.is_vcf_mode:
         raise ValueError(
-            "local prior construction requires structural_only=True"
+            "likelihood-enabled local construction currently requires a VCF "
+            "environment; otherwise pass structural_only=True"
         )
     if not math.isclose(
         float(env.sequence_length),
@@ -210,7 +226,36 @@ def initialize_local_arg_state(
             "environment sequence_length must equal the tree-sequence length"
         )
 
-    boundaries = _environment_block_boundaries(env)
+    endpoint_intervals: dict[int, tuple[Interval, ...]] = {}
+    for lineage in prepared.context.cut_active_lineages:
+        collapsed = _collapse_temporary_source_endpoint(
+            prepared,
+            int(lineage.node_id),
+            lineage.mutable_segments,
+        )
+        for endpoint_node_id, intervals in collapsed.items():
+            endpoint_intervals[int(endpoint_node_id)] = _canonical_segments(
+                endpoint_intervals.get(int(endpoint_node_id), ())
+                + tuple(intervals)
+            )
+    if not endpoint_intervals:
+        raise ValueError("no target-bearing cut lineage remains after routing collapse")
+
+    alignment: dict[str, Any] = {}
+    if env.is_vcf_mode:
+        alignment = resolve_vcf_tree_sequence_alignment(
+            prepared.source_tree_sequence,
+            env.variant_data,
+            sample_node_to_haplotype=sample_node_to_haplotype,
+            vcf_coordinate_offset=vcf_coordinate_offset,
+        )
+        boundaries = _local_structural_boundaries(
+            prepared,
+            endpoint_intervals,
+            alignment,
+        )
+    else:
+        boundaries = _environment_block_boundaries(env)
     target_material = _intervals_to_material(
         (prepared.context.request.genomic_range,),
         boundaries,
@@ -219,20 +264,10 @@ def initialize_local_arg_state(
         raise ValueError("the requested genomic range contains no ARG blocks")
 
     endpoint_material: dict[int, MaterialSegments] = {}
-    for lineage in prepared.context.cut_active_lineages:
-        collapsed = _collapse_temporary_source_endpoint(
-            prepared,
-            int(lineage.node_id),
-            lineage.mutable_segments,
-        )
-        for endpoint_node_id, intervals in collapsed.items():
-            material = _intervals_to_material(intervals, boundaries)
-            if material.count == 0:
-                continue
-            endpoint_material[endpoint_node_id] = (
-                endpoint_material.get(endpoint_node_id, MaterialSegments())
-                .union(material)
-            )
+    for endpoint_node_id, intervals in endpoint_intervals.items():
+        material = _intervals_to_material(intervals, boundaries)
+        if material.count:
+            endpoint_material[int(endpoint_node_id)] = material
     if not endpoint_material:
         raise ValueError("no target-bearing cut lineage remains after routing collapse")
 
@@ -240,18 +275,66 @@ def initialize_local_arg_state(
     if not time_scale > 0.0:
         raise ValueError("population_size must define a positive 2Ne time scale")
 
+    likelihood_data: dict[str, Any] | None = None
+    variant_block_indices: dict[int, int] = {}
+    local_breakpoint_weights: dict[int, float] = {}
+    if env.is_vcf_mode and not env.structural_only:
+        likelihood_data = compute_cut_frontier_vcf_partials(
+            prepared.source_tree_sequence,
+            env.variant_data,
+            endpoint_intervals,
+            prepared.context.request.genomic_range,
+            mutation_rate=float(env.mutation_rate),
+            alignment=alignment,
+        )
+        for variant_index in likelihood_data["target_variant_indices"]:
+            coordinate = float(
+                alignment["variant_coordinates"][int(variant_index)]
+            )
+            variant_block_indices[int(variant_index)] = _coordinate_block_index(
+                coordinate,
+                boundaries,
+            )
+        local_breakpoint_weights = _local_vcf_breakpoint_weights(
+            boundaries,
+            alignment,
+            prepared.context.request.genomic_range,
+        )
+
     active_lineages = []
     all_nodes: dict[int, ARGLineage] = {}
     for node_id, material in sorted(endpoint_material.items()):
-        source_node = prepared.synthetic_arg.node(node_id)
+        source_node = prepared.source_tree_sequence.node(node_id)
+        endpoint_likelihood = (
+            likelihood_data["endpoints"][int(node_id)]
+            if likelihood_data is not None
+            else None
+        )
         lineage = ARGLineage(
             node_id=node_id,
             children=[],
             parents=[],
             material_segments=material,
-            num_blocks=env.num_blocks,
-            partials=None,
-            sequences_indices=[],
+            num_blocks=len(boundaries) - 1,
+            partials=(
+                None
+                if endpoint_likelihood is None
+                else torch.as_tensor(
+                    endpoint_likelihood["partials"],
+                    dtype=torch.float64,
+                    device=env.device,
+                )
+            ),
+            variant_indices=(
+                ()
+                if endpoint_likelihood is None
+                else endpoint_likelihood["variant_indices"]
+            ),
+            sequences_indices=(
+                []
+                if endpoint_likelihood is None
+                else endpoint_likelihood["sequences_indices"]
+            ),
             event_type="cut",
             time=float(source_node.time) / time_scale,
         )
@@ -268,12 +351,26 @@ def initialize_local_arg_state(
         time_scale,
         endpoint_material,
     )
+    outside_log_likelihood = (
+        0.0
+        if likelihood_data is None
+        else float(likelihood_data["outside_log_likelihood"])
+    )
+    accumulated_log_likelihood = (
+        0.0
+        if likelihood_data is None
+        else outside_log_likelihood
+        + float(likelihood_data["inside_log_scale"])
+    )
     state = ARGState(
         active_lineages=active_lineages,
         all_nodes=all_nodes,
         max_node_idx=generated_node_start - 1,
+        log_likelihood=None,
         accumulated_log_prior=0.0,
-        partial_log_reward=0.0,
+        accumulated_log_likelihood=accumulated_log_likelihood,
+        outside_log_likelihood=outside_log_likelihood,
+        partial_log_reward=accumulated_log_likelihood,
         is_done=False,
         total_active_blocks=sum(
             lineage.material_segments.count
@@ -293,20 +390,62 @@ def initialize_local_arg_state(
                 "scaled_time": current_time,
                 "time_scale": time_scale,
                 "population_size": float(env.population_size),
+                "mutation_rate": float(env.mutation_rate),
                 "recombination_rate": float(env.recombination_rate),
                 "rho": float(env.rho),
+                "reward_C": float(env.reward_fn.C),
                 "num_blocks": int(env.num_blocks),
-                "block_mode": "vcf" if env.is_vcf_mode else "uniform",
+                "local_structural_block_count": int(len(boundaries) - 1),
+                "block_mode": "vcf_exact_local" if env.is_vcf_mode else "uniform",
+                "likelihood_scope": (
+                    "whole_vcf_chromosome"
+                    if likelihood_data is not None
+                    else "none"
+                ),
+                "outside_log_likelihood": outside_log_likelihood,
+                "inside_initial_log_scale": (
+                    0.0
+                    if likelihood_data is None
+                    else float(likelihood_data["inside_log_scale"])
+                ),
+                "vcf_coordinate_offset": alignment.get(
+                    "vcf_coordinate_offset"
+                ),
+                "vcf_path": alignment.get("vcf_path"),
+                "vcf_parser_version": alignment.get("parser_version"),
+                "sample_node_to_haplotype": alignment.get(
+                    "haplotype_index_by_sample_node"
+                ),
             }
         ],
         fixed_ancestor_schedule=schedule,
+        target_variant_indices=(
+            ()
+            if likelihood_data is None
+            else tuple(likelihood_data["target_variant_indices"])
+        ),
+        variant_block_indices=variant_block_indices,
+        local_breakpoint_weights=local_breakpoint_weights,
+        vcf_alignment=dict(alignment),
+        likelihood_scope=(
+            "whole_vcf_chromosome"
+            if likelihood_data is not None
+            else "none"
+        ),
     )
     state = reveal_due_fixed_ancestors(
         state,
         prepared.context,
         current_time,
+        env=env,
     )
     state.is_done = local_is_terminal(state, prepared.context)
+    if state.is_done and likelihood_data is not None:
+        _finalize_local_terminal_likelihood(
+            state,
+            prepared.context,
+            env,
+        )
     return state
 
 
@@ -338,11 +477,32 @@ def enumerate_local_prior_actions(
         lineage = state.active_lineages[action.active_lineage_i]
         if lineage.event_type == "fixed_source":
             continue
-        if not _has_valid_breakpoint(lineage.material_segments, env):
+        if not _has_valid_breakpoint(lineage.material_segments, state, env):
             continue
         legal_recomb.append(action)
 
-    rates = env.compute_event_rates((legal_coal, legal_recomb))
+    if env.is_vcf_mode and state.target_material is not None:
+        total_recomb_weight = sum(
+            _local_recombination_weight(
+                state.active_lineages[choice.active_lineage_i],
+                state,
+                env,
+            )
+            for choice in legal_recomb
+        )
+        total_active_material_length = (
+            float(total_recomb_weight)
+            / max(float(env.sequence_length), 1.0)
+        )
+        rates = {
+            "lambda_coal": float(len(legal_coal)),
+            "lambda_recomb": (
+                float(env.rho) / 2.0 * total_active_material_length
+            ),
+            "total_active_material_length": total_active_material_length,
+        }
+    else:
+        rates = env.compute_event_rates((legal_coal, legal_recomb))
     options = PriorActionOptions(
         coal_actions=tuple(legal_coal),
         recomb_choices=tuple(legal_recomb),
@@ -441,6 +601,7 @@ def sample_local_prior_action(
             [
                 _local_recombination_weight(
                     state.active_lineages[choice.active_lineage_i],
+                    state,
                     env,
                 )
                 for choice in options.recomb_choices
@@ -452,6 +613,7 @@ def sample_local_prior_action(
         lineage = state.active_lineages[choice.active_lineage_i]
         breakpoint, breakpoint_probability = _sample_breakpoint(
             lineage.material_segments,
+            state,
             env,
             rng,
         )
@@ -506,6 +668,7 @@ def apply_local_action(
             lineage = state.active_lineages[action.active_lineage_i]
             legal = _is_valid_breakpoint(
                 lineage.material_segments,
+                state,
                 env,
                 int(action.breakpoint),
             )
@@ -588,6 +751,10 @@ def apply_local_action(
         "time_action": int(action.time_action),
         "delta_time": float(action.delta_time),
         "log_prior_increment": float(log_prior),
+        "log_likelihood_increment": float(
+            next_state.accumulated_log_likelihood
+            - state.accumulated_log_likelihood
+        ),
         "breakpoint": breakpoint,
         "action": action_as_dict(action),
         "edge_segments": edge_segments,
@@ -598,6 +765,8 @@ def apply_local_action(
     }
     next_state.transition_records.append(record)
     next_state.is_done = local_is_terminal(next_state, context)
+    if next_state.is_done and next_state.likelihood_scope != "none":
+        _finalize_local_terminal_likelihood(next_state, context, env)
     return next_state
 
 
@@ -638,6 +807,7 @@ def advance_local_state(
         next_state,
         context,
         next_fixed_time,
+        env=env,
     )
     attachment_record = dict(next_state.transition_records[-1])
     attachment_record.update(
@@ -664,6 +834,8 @@ def advance_local_state(
     attachment_record["_undo"] = undo
     next_state.transition_records[-1] = attachment_record
     next_state.is_done = local_is_terminal(next_state, context)
+    if next_state.is_done and next_state.likelihood_scope != "none":
+        _finalize_local_terminal_likelihood(next_state, context, env)
     return next_state, attachment_record
 
 
@@ -671,6 +843,8 @@ def reveal_due_fixed_ancestors(
     state: ARGState,
     context: LocalRefinementContext,
     event_time: float,
+    *,
+    env: SimpleARGEnvironment | None = None,
 ) -> ARGState:
     """Attach due source ancestors to their active target descendants.
 
@@ -720,6 +894,7 @@ def reveal_due_fixed_ancestors(
     attached_ancestors = []
     attachment_rows: list[dict[str, Any]] = []
     edge_segments: list[dict[str, Any]] = []
+    likelihood_increment = 0.0
     for record in sorted(due, key=lambda item: (item["time"], item["node_id"])):
         node_id = int(record["node_id"])
         material = MaterialSegments.from_segments(record["segments"])
@@ -776,6 +951,25 @@ def reveal_due_fixed_ancestors(
 
         children = []
         child_sequences: set[int] = set()
+        parent_partials = None
+        parent_variant_indices: tuple[int, ...] = ()
+        if state.likelihood_scope != "none":
+            if env is None or env.structural_only or not env.is_vcf_mode:
+                raise ValueError(
+                    "likelihood-enabled fixed attachment requires its VCF "
+                    "environment"
+                )
+            (
+                parent_partials,
+                parent_variant_indices,
+                parent_increment,
+            ) = _fixed_ancestor_partials(
+                next_state,
+                attached_by_child,
+                float(record["time"]),
+                env,
+            )
+            likelihood_increment += float(parent_increment)
         retained_active: list[ARGLineage] = []
         for lineage in next_state.active_lineages:
             child_id = int(lineage.node_id)
@@ -796,6 +990,18 @@ def reveal_due_fixed_ancestors(
                 lineage.material_segments,
                 attached,
             )
+            if state.likelihood_scope != "none":
+                retained_variants = _variant_indices_for_material(
+                    lineage.variant_indices,
+                    remaining,
+                    next_state.variant_block_indices,
+                )
+                lineage.partials = _select_variant_partial_rows(
+                    lineage.partials,
+                    lineage.variant_indices,
+                    retained_variants,
+                )
+                lineage.variant_indices = retained_variants
             _set_lineage_material(lineage, remaining)
             next_state.all_nodes[child_id] = lineage
             if remaining.count:
@@ -826,7 +1032,8 @@ def reveal_due_fixed_ancestors(
                 if material.span_end is not None
                 else 0,
             ),
-            partials=None,
+            partials=parent_partials,
+            variant_indices=parent_variant_indices,
             sequences_indices=sorted(child_sequences),
             event_type="fixed_source",
             time=float(record["time"]),
@@ -841,6 +1048,8 @@ def reveal_due_fixed_ancestors(
     )
     next_state.rates = None
     next_state.prior_options = None
+    next_state.accumulated_log_likelihood += float(likelihood_increment)
+    next_state.partial_log_reward += float(likelihood_increment)
     next_state.transition_records.append(
         {
             "event_type": "fixed_attachment",
@@ -850,6 +1059,7 @@ def reveal_due_fixed_ancestors(
             "attachments": tuple(attachment_rows),
             "edge_segments": tuple(edge_segments),
             "log_prior_increment": 0.0,
+            "log_likelihood_increment": float(likelihood_increment),
             "forward_log_probability": 0.0,
             "backward_log_probability": 0.0,
             "_undo": {
@@ -902,6 +1112,14 @@ def undo_local_transition(
     previous.accumulated_log_prior = float(
         undo["previous_accumulated_log_prior"]
     )
+    previous.accumulated_log_likelihood = float(
+        undo.get("previous_accumulated_log_likelihood", 0.0)
+    )
+    previous.log_likelihood = undo.get("previous_log_likelihood")
+    previous.log_reward = undo.get("previous_log_reward")
+    previous.terminal_partial_correction = float(
+        undo.get("previous_terminal_partial_correction", 0.0)
+    )
     previous.partial_log_reward = float(undo["previous_partial_log_reward"])
     previous.total_active_blocks = int(undo["previous_total_active_blocks"])
     previous.is_done = bool(undo["previous_is_done"])
@@ -935,6 +1153,121 @@ def local_is_terminal(
         total_target_count == target.count
         and covered.segments == target.segments
     )
+
+
+def compute_local_terminal_log_likelihood(
+    state: ARGState,
+    context: LocalRefinementContext,
+    env: SimpleARGEnvironment,
+) -> float:
+    """Complete the whole-chromosome VCF likelihood at local roots."""
+
+    if not local_is_terminal(state, context):
+        raise ValueError(
+            "local terminal likelihood requires one root per target block"
+        )
+    if state.likelihood_scope == "none":
+        raise ValueError("local state was initialized without VCF likelihoods")
+    if env.structural_only or not env.is_vcf_mode:
+        raise ValueError(
+            "local terminal likelihood requires a likelihood-enabled VCF "
+            "environment"
+        )
+
+    carriers: dict[int, list[tuple[ARGLineage, int]]] = {
+        int(variant_index): []
+        for variant_index in state.target_variant_indices
+    }
+    for lineage in state.active_lineages:
+        row_by_variant = {
+            int(variant_index): row_index
+            for row_index, variant_index in enumerate(
+                lineage.variant_indices
+            )
+        }
+        for variant_index, row_index in row_by_variant.items():
+            if variant_index in carriers:
+                carriers[variant_index].append((lineage, row_index))
+
+    root_log_probability = 0.0
+    for variant_index in state.target_variant_indices:
+        rows = carriers[int(variant_index)]
+        if len(rows) != 1:
+            raise ValueError(
+                "terminal target VCF row must be carried by exactly one root: "
+                f"variant={variant_index} carrier_count={len(rows)}"
+            )
+        lineage, row_index = rows[0]
+        block_index = int(state.variant_block_indices[int(variant_index)])
+        if not lineage.material_segments.covers_interval(
+            block_index,
+            block_index + 1,
+        ):
+            raise ValueError(
+                "terminal VCF row is carried outside its structural material: "
+                f"variant={variant_index} lineage={lineage.node_id}"
+            )
+        partials = env._require_lineage_partials(lineage)
+        probability = torch.sum(partials[int(row_index)] * 0.25)
+        value = float(probability.detach().cpu().item())
+        if not value > 0.0 or not math.isfinite(value):
+            raise ValueError(
+                f"terminal root probability is invalid for VCF row "
+                f"{variant_index}"
+            )
+        root_log_probability += math.log(value)
+
+    log_likelihood = (
+        float(state.accumulated_log_likelihood)
+        + float(root_log_probability)
+    )
+    if not math.isfinite(log_likelihood):
+        raise ValueError("local terminal VCF log likelihood is non-finite")
+    return float(log_likelihood)
+
+
+def compute_local_terminal_log_reward(
+    state: ARGState,
+    context: LocalRefinementContext,
+    env: SimpleARGEnvironment,
+) -> float:
+    """Return ``C + whole VCF likelihood + local CWR prior``."""
+
+    log_likelihood = compute_local_terminal_log_likelihood(
+        state,
+        context,
+        env,
+    )
+    return float(
+        env.reward_fn(
+            log_likelihood,
+            float(state.accumulated_log_prior),
+        )
+    )
+
+
+def _finalize_local_terminal_likelihood(
+    state: ARGState,
+    context: LocalRefinementContext,
+    env: SimpleARGEnvironment,
+) -> None:
+    log_likelihood = compute_local_terminal_log_likelihood(
+        state,
+        context,
+        env,
+    )
+    log_reward = float(
+        env.reward_fn(
+            log_likelihood,
+            float(state.accumulated_log_prior),
+        )
+    )
+    state.log_likelihood = float(log_likelihood)
+    state.log_reward = log_reward
+    state.terminal_partial_correction = float(
+        log_reward - state.partial_log_reward
+    )
+    state.partial_log_reward = log_reward
 
 
 def local_state_to_proposal(
@@ -1031,6 +1364,33 @@ def local_state_to_proposal(
             prepared.context.authorized_edge_intervals
         ),
         prior_log_probability=float(state.accumulated_log_prior),
+        log_likelihood=(
+            None
+            if state.log_likelihood is None
+            else float(state.log_likelihood)
+        ),
+        outside_log_likelihood=(
+            None
+            if state.likelihood_scope == "none"
+            else float(state.outside_log_likelihood)
+        ),
+        local_log_likelihood=(
+            None
+            if state.log_likelihood is None
+            else float(state.log_likelihood)
+            - float(state.outside_log_likelihood)
+        ),
+        log_reward=(
+            None if state.log_reward is None else float(state.log_reward)
+        ),
+        likelihood_scope=(
+            "whole_vcf_chromosome"
+            if state.likelihood_scope == "whole_vcf_chromosome"
+            else "none"
+        ),
+        likelihood_alignment=_public_likelihood_alignment(
+            state.vcf_alignment
+        ),
         transition_records=tuple(
             _public_transition_record(record)
             for record in state.transition_records
@@ -1043,8 +1403,12 @@ def sample_local_trajectories(
     prepared: PreparedLocalRefinement,
     env: SimpleARGEnvironment,
     config: LocalSamplingConfig | None = None,
+    *,
+    initial_state: ARGState | None = None,
+    sample_node_to_haplotype: Mapping[int, int | str] | None = None,
+    vcf_coordinate_offset: str | float = "auto",
 ) -> LocalSampleBatch:
-    """Sample complete local ARGs from the filtered CWR prior."""
+    """Sample complete local ARGs from one cached cut-state template."""
 
     config = LocalSamplingConfig() if config is None else config
     rng = np.random.default_rng(int(config.seed))
@@ -1055,6 +1419,31 @@ def sample_local_trajectories(
     total_transitions = 0
     restarts = 0
     stopped = False
+    try:
+        if initial_state is None:
+            initial_template = initialize_local_arg_state(
+                prepared,
+                env,
+                sample_node_to_haplotype=sample_node_to_haplotype,
+                vcf_coordinate_offset=vcf_coordinate_offset,
+            )
+        else:
+            _require_local_state(initial_state)
+            initial_template = initial_state
+    except ValueError as error:
+        return LocalSampleBatch(
+            (),
+            (),
+            (
+                ConstructionDiagnostic(
+                    "initialization_failed",
+                    str(error),
+                ),
+            ),
+            int(config.seed),
+            0,
+            0,
+        )
 
     while len(proposals) < int(config.sample_count) and not stopped:
         if (
@@ -1063,16 +1452,7 @@ def sample_local_trajectories(
         ):
             break
         restarts += 1
-        try:
-            state = initialize_local_arg_state(prepared, env)
-        except ValueError as error:
-            diagnostics.append(
-                ConstructionDiagnostic(
-                    "initialization_failed",
-                    str(error),
-                )
-            )
-            break
+        state = initial_template.clone(copy_partials=False)
         trajectory = SimpleTrajectory()
         generated_events = 0
         while not state.is_done:
@@ -1127,6 +1507,7 @@ def sample_local_trajectories(
             trajectory.update(
                 record,
                 log_prior=record.get("log_prior_increment"),
+                log_reward=state.log_reward,
                 record=record,
                 active_lineages=[
                     lineage.node_id for lineage in state.active_lineages
@@ -1181,6 +1562,115 @@ def _environment_block_boundaries(
     if np.any(np.diff(values) <= 0.0):
         raise ValueError("environment block boundaries must increase")
     return tuple(float(value) for value in values)
+
+
+def _local_structural_boundaries(
+    prepared: PreparedLocalRefinement,
+    endpoint_intervals: Mapping[int, tuple[Interval, ...]],
+    alignment: Mapping[str, Any],
+) -> tuple[float, ...]:
+    """Build an exact compact physical grid for one local problem."""
+
+    left, right = (
+        float(prepared.context.request.genomic_range[0]),
+        float(prepared.context.request.genomic_range[1]),
+    )
+    values = {left, right}
+
+    def add_interval(interval_left: float, interval_right: float) -> None:
+        interval_left = max(left, float(interval_left))
+        interval_right = min(right, float(interval_right))
+        if interval_left < interval_right:
+            values.add(interval_left)
+            values.add(interval_right)
+
+    for intervals in endpoint_intervals.values():
+        for interval_left, interval_right in intervals:
+            add_interval(interval_left, interval_right)
+    for lineage in prepared.context.active_lineages:
+        for interval_left, interval_right in (
+            lineage.mutable_segments + lineage.fixed_segments
+        ):
+            add_interval(interval_left, interval_right)
+    for item in prepared.context.authorized_edge_intervals:
+        add_interval(item.left, item.right)
+    for attachment in prepared.context.boundary_attachments:
+        for interval_left, interval_right in attachment.intervals:
+            add_interval(interval_left, interval_right)
+    for breakpoint in prepared.source_tree_sequence.breakpoints():
+        breakpoint = float(breakpoint)
+        if left < breakpoint < right:
+            values.add(breakpoint)
+
+    coordinates = np.asarray(
+        alignment["variant_coordinates"],
+        dtype=np.float64,
+    )
+    if coordinates.size > 1:
+        for midpoint in (coordinates[:-1] + coordinates[1:]) / 2.0:
+            midpoint = float(midpoint)
+            if left < midpoint < right:
+                values.add(midpoint)
+
+    boundaries = tuple(sorted(values))
+    if len(boundaries) < 2 or boundaries[0] != left or boundaries[-1] != right:
+        raise RuntimeError("local structural grid does not cover the request")
+    if any(
+        not float(current) < float(next_value)
+        for current, next_value in zip(boundaries, boundaries[1:])
+    ):
+        raise RuntimeError("local structural grid is not strictly increasing")
+    return boundaries
+
+
+def _coordinate_block_index(
+    coordinate: float,
+    boundaries: tuple[float, ...],
+) -> int:
+    coordinate = float(coordinate)
+    block = bisect.bisect_right(boundaries, coordinate) - 1
+    if not 0 <= block < len(boundaries) - 1:
+        raise ValueError(
+            f"coordinate {coordinate} is outside the local structural grid"
+        )
+    if not (
+        float(boundaries[block])
+        <= coordinate
+        < float(boundaries[block + 1])
+    ):
+        raise ValueError(
+            f"coordinate {coordinate} cannot be assigned to a local block"
+        )
+    return int(block)
+
+
+def _local_vcf_breakpoint_weights(
+    boundaries: tuple[float, ...],
+    alignment: Mapping[str, Any],
+    genomic_range: Interval,
+) -> dict[int, float]:
+    """Map eligible VCF gap midpoints to exact local boundary indices."""
+
+    left, right = float(genomic_range[0]), float(genomic_range[1])
+    coordinates = np.asarray(
+        alignment["variant_coordinates"],
+        dtype=np.float64,
+    )
+    output: dict[int, float] = {}
+    if coordinates.size < 2:
+        return output
+    for left_position, right_position in zip(
+        coordinates[:-1],
+        coordinates[1:],
+    ):
+        midpoint = float((left_position + right_position) / 2.0)
+        if not left < midpoint < right:
+            continue
+        boundary_index = _boundary_index(midpoint, boundaries)
+        output[int(boundary_index)] = float(
+            max(float(right_position - left_position), 1.0)
+        )
+    return output
 
 
 def _boundary_index(
@@ -1279,13 +1769,159 @@ def _set_lineage_material(
     lineage.clear_runtime_caches()
 
 
+def _variant_indices_for_material(
+    variant_indices: Iterable[int],
+    material: MaterialSegments,
+    variant_block_indices: Mapping[int, int],
+) -> tuple[int, ...]:
+    return tuple(
+        int(variant_index)
+        for variant_index in variant_indices
+        if any(
+            int(start)
+            <= int(variant_block_indices[int(variant_index)])
+            < int(end)
+            for start, end in material.segments
+        )
+    )
+
+
+def _select_variant_partial_rows(
+    partials: Any,
+    source_variant_indices: Iterable[int],
+    target_variant_indices: Iterable[int],
+) -> torch.Tensor:
+    if partials is None:
+        raise ValueError("likelihood-enabled lineage is missing partials")
+    tensor = (
+        partials
+        if torch.is_tensor(partials)
+        else torch.as_tensor(partials, dtype=torch.float32)
+    )
+    source = tuple(int(value) for value in source_variant_indices)
+    target = tuple(int(value) for value in target_variant_indices)
+    if not target:
+        return tensor.new_zeros((0, 4))
+    position_by_variant = {
+        variant_index: row_index
+        for row_index, variant_index in enumerate(source)
+    }
+    try:
+        rows = [position_by_variant[value] for value in target]
+    except KeyError as error:
+        raise ValueError(
+            f"target VCF row {error.args[0]} is absent from the lineage"
+        ) from error
+    return tensor.index_select(
+        0,
+        torch.as_tensor(rows, dtype=torch.long, device=tensor.device),
+    )
+
+
+def _fixed_ancestor_partials(
+    state: ARGState,
+    attached_by_child: Mapping[int, MaterialSegments],
+    parent_time: float,
+    env: SimpleARGEnvironment,
+) -> tuple[torch.Tensor, tuple[int, ...], float]:
+    attached_variants_by_child = {}
+    parent_variants: set[int] = set()
+    for child_id, attached_material in attached_by_child.items():
+        child = state.all_nodes[int(child_id)]
+        variants = _variant_indices_for_material(
+            child.variant_indices,
+            attached_material,
+            state.variant_block_indices,
+        )
+        attached_variants_by_child[int(child_id)] = variants
+        parent_variants.update(variants)
+    parent_variant_indices = tuple(sorted(parent_variants))
+    if not parent_variant_indices:
+        reference = next(
+            (
+                state.all_nodes[int(child_id)].partials
+                for child_id in attached_by_child
+                if state.all_nodes[int(child_id)].partials is not None
+            ),
+            None,
+        )
+        dtype = (
+            reference.dtype
+            if torch.is_tensor(reference)
+            else torch.float64
+        )
+        return (
+            torch.empty((0, 4), dtype=dtype, device=env.device),
+            (),
+            0.0,
+        )
+
+    position_by_variant = {
+        variant_index: row_index
+        for row_index, variant_index in enumerate(parent_variant_indices)
+    }
+    reference = next(
+        state.all_nodes[int(child_id)].partials
+        for child_id, variants in attached_variants_by_child.items()
+        if variants
+    )
+    dtype = (
+        reference.dtype
+        if torch.is_tensor(reference)
+        else torch.float64
+    )
+    combined = torch.ones(
+        (len(parent_variant_indices), 4),
+        dtype=dtype,
+        device=env.device,
+    )
+    carried = torch.zeros(
+        len(parent_variant_indices),
+        dtype=torch.bool,
+        device=env.device,
+    )
+    for child_id, variants in attached_variants_by_child.items():
+        if not variants:
+            continue
+        child = state.all_nodes[int(child_id)]
+        transitioned = env._transition_lineage_partials(
+            child,
+            float(parent_time),
+        )
+        selected = _select_variant_partial_rows(
+            transitioned,
+            child.variant_indices,
+            variants,
+        )
+        parent_rows = torch.as_tensor(
+            [position_by_variant[value] for value in variants],
+            dtype=torch.long,
+            device=combined.device,
+        )
+        combined[parent_rows] = combined[parent_rows] * selected
+        carried[parent_rows] = True
+    if not bool(carried.all().detach().cpu().item()):
+        raise ValueError("fixed ancestor has an uncovered target VCF row")
+    normalized, log_scale = env.normalize_partials_with_log_scale(
+        combined,
+        carried,
+    )
+    return normalized, parent_variant_indices, float(log_scale)
+
+
 def _lineage_snapshot(lineage: ARGLineage) -> dict[str, Any]:
+    if torch.is_tensor(lineage.partials):
+        partials = lineage.partials.detach().clone()
+    else:
+        partials = lineage.partials
     return {
         "node_id": int(lineage.node_id),
         "children": tuple(int(value) for value in lineage.children),
         "parents": tuple(int(value) for value in lineage.parents),
         "material_segments": tuple(lineage.material_segments.segments),
         "num_blocks": int(lineage.num_blocks),
+        "partials": partials,
+        "variant_indices": tuple(int(value) for value in lineage.variant_indices),
         "sequences_indices": tuple(
             int(value) for value in lineage.sequences_indices
         ),
@@ -1305,7 +1941,8 @@ def _lineage_from_snapshot(snapshot: Mapping[str, Any]) -> ARGLineage:
             snapshot["material_segments"]
         ),
         num_blocks=int(snapshot["num_blocks"]),
-        partials=None,
+        partials=snapshot.get("partials"),
+        variant_indices=tuple(snapshot.get("variant_indices", ())),
         sequences_indices=tuple(
             int(value) for value in snapshot["sequences_indices"]
         ),
@@ -1330,6 +1967,14 @@ def _transition_undo_record(
         "previous_accumulated_log_prior": float(
             state.accumulated_log_prior
         ),
+        "previous_accumulated_log_likelihood": float(
+            state.accumulated_log_likelihood
+        ),
+        "previous_log_likelihood": state.log_likelihood,
+        "previous_log_reward": state.log_reward,
+        "previous_terminal_partial_correction": float(
+            state.terminal_partial_correction
+        ),
         "previous_partial_log_reward": float(state.partial_log_reward),
         "previous_total_active_blocks": int(
             state.total_active_blocks or 0
@@ -1347,6 +1992,25 @@ def _public_transition_record(record: Mapping[str, Any]) -> dict[str, Any]:
         key: value
         for key, value in record.items()
         if key != "_undo"
+    }
+
+
+def _public_likelihood_alignment(
+    alignment: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not alignment:
+        return {}
+    return {
+        "vcf_path": alignment.get("vcf_path"),
+        "vcf_parser_version": alignment.get("parser_version"),
+        "vcf_coordinate_offset": alignment.get("vcf_coordinate_offset"),
+        "matched_variant_count": alignment.get("matched_variant_count"),
+        "sample_nodes": tuple(
+            int(value) for value in alignment.get("sample_nodes", ())
+        ),
+        "haplotype_index_by_sample_node": dict(
+            alignment.get("haplotype_index_by_sample_node", {})
+        ),
     }
 
 
@@ -1574,20 +2238,37 @@ def _next_fixed_ancestor_time(state: ARGState) -> float | None:
 
 def _vcf_breakpoints(
     material: MaterialSegments,
+    state: ARGState,
     env: SimpleARGEnvironment,
 ) -> tuple[tuple[int, float], ...]:
     if material.span_start is None or material.span_end is None:
         return ()
     output = []
-    for breakpoint in range(
-        int(material.span_start) + 1,
-        int(material.span_end) + 1,
-    ):
+    candidates = (
+        sorted(state.local_breakpoint_weights)
+        if state.target_material is not None
+        else range(
+            int(material.span_start) + 1,
+            int(material.span_end) + 1,
+        )
+    )
+    for breakpoint in candidates:
+        if not (
+            int(material.span_start)
+            < int(breakpoint)
+            <= int(material.span_end)
+        ):
+            continue
         left, right = material.split(breakpoint)
         if left.count == 0 or right.count == 0:
             continue
         weight = (
-            float(env._breakpoint_gap_length(breakpoint))
+            float(
+                state.local_breakpoint_weights.get(
+                    int(breakpoint),
+                    env._breakpoint_gap_length(breakpoint),
+                )
+            )
             if env.is_vcf_mode
             else 1.0
         )
@@ -1598,6 +2279,7 @@ def _vcf_breakpoints(
 
 def _has_valid_breakpoint(
     material: MaterialSegments,
+    state: ARGState,
     env: SimpleARGEnvironment,
 ) -> bool:
     if (
@@ -1609,11 +2291,12 @@ def _has_valid_breakpoint(
         return False
     if not env.is_vcf_mode:
         return True
-    return bool(_vcf_breakpoints(material, env))
+    return bool(_vcf_breakpoints(material, state, env))
 
 
 def _is_valid_breakpoint(
     material: MaterialSegments,
+    state: ARGState,
     env: SimpleARGEnvironment,
     breakpoint: int,
 ) -> bool:
@@ -1627,32 +2310,40 @@ def _is_valid_breakpoint(
     left, right = material.split(breakpoint)
     if left.count == 0 or right.count == 0:
         return False
-    return (
-        not env.is_vcf_mode
-        or float(env._breakpoint_gap_length(breakpoint)) > 0.0
+    if not env.is_vcf_mode:
+        return True
+    return any(
+        int(value) == breakpoint and float(weight) > 0.0
+        for value, weight in _vcf_breakpoints(material, state, env)
     )
 
 
 def _local_recombination_weight(
     lineage: ARGLineage,
+    state: ARGState,
     env: SimpleARGEnvironment,
 ) -> float:
     if env.is_vcf_mode:
         return float(
-            sum(weight for _breakpoint, weight in _vcf_breakpoints(
-                lineage.material_segments,
-                env,
-            ))
+            sum(
+                weight
+                for _breakpoint, weight in _vcf_breakpoints(
+                    lineage.material_segments,
+                    state,
+                    env,
+                )
+            )
         )
     return float(lineage.material_segments.count)
 
 
 def _sample_breakpoint(
     material: MaterialSegments,
+    state: ARGState,
     env: SimpleARGEnvironment,
     rng: np.random.Generator,
 ) -> tuple[int, float]:
-    if not _has_valid_breakpoint(material, env):
+    if not _has_valid_breakpoint(material, state, env):
         raise ValueError("recombination lineage has no valid breakpoint")
     if not env.is_vcf_mode:
         count = int(material.span_end - material.span_start)
@@ -1663,7 +2354,7 @@ def _sample_breakpoint(
             )
         )
         return breakpoint, 1.0 / float(count)
-    values = _vcf_breakpoints(material, env)
+    values = _vcf_breakpoints(material, state, env)
     weights = np.asarray([weight for _value, weight in values], dtype=np.float64)
     index = int(rng.choice(len(values), p=weights / weights.sum()))
     return int(values[index][0]), float(weights[index] / weights.sum())
@@ -1725,6 +2416,8 @@ __all__ = [
     "LocalSamplingConfig",
     "advance_local_state",
     "apply_local_action",
+    "compute_local_terminal_log_likelihood",
+    "compute_local_terminal_log_reward",
     "enumerate_local_prior_actions",
     "initialize_local_arg_state",
     "local_is_terminal",

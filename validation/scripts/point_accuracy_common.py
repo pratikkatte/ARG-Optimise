@@ -53,6 +53,17 @@ class PairSegment:
         return self.right - self.left
 
 
+@dataclass(frozen=True)
+class ValidationResult:
+    """Structured result returned by reusable method adapters."""
+
+    method: str
+    method_label: str
+    metrics: dict[str, float | int | str]
+    legacy_mse: float
+    artifacts: tuple[Path, ...]
+
+
 def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--truth-dir",
@@ -145,6 +156,21 @@ def prepare_output_prefix(output_prefix: Path) -> Path:
     out_prefix = output_prefix.expanduser().resolve()
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     return out_prefix
+
+
+def clean_artifact_names(
+    out_prefix: Path, suffix_to_name: dict[str, str]
+) -> tuple[Path, ...]:
+    """Rename prefix-based legacy artifacts into a clean method directory."""
+    artifacts: list[Path] = []
+    for suffix, clean_name in suffix_to_name.items():
+        source = out_prefix.parent / f"{out_prefix.name}{suffix}"
+        if not source.exists():
+            continue
+        target = out_prefix.parent / clean_name
+        source.replace(target)
+        artifacts.append(target)
+    return tuple(sorted(artifacts))
 
 
 def load_truth_tracks(

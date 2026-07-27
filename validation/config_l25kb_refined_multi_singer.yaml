@@ -1,0 +1,32 @@
+# One-replicate, whole-chromosome comparison for sim_l25kb_0.
+# Relative paths are resolved from this validation/ directory.
+truth:
+  trees: trees/sim_l25kb_0.trees
+  ne: 10000
+  haplotypes: 8
+
+methods:
+  gfn:
+    label: Refined ARG
+    inferred_trees: output/tsinfer/l25kb_dated_local_refined.trees
+
+  tsinfer:
+    label: tsinfer+tsdate
+    inferred_trees: output/tsinfer/l25kb_dated.trees
+
+  singer:
+    label: SINGER posterior mean (100 samples)
+    input_dir: output/singer/l25kb_100_auto
+    sample_prefix: singer__
+    burnin_samples: 0
+    max_posterior_samples: 100
+
+validation:
+  skip: 1
+  max_pairs: null
+  pair_seed: 42
+  xlim: [0, 16]
+  ylim: [0, 8]
+  xlim_log: [-4, 1.5]
+  ylim_log: [-4, 1.5]
+  verbose: false

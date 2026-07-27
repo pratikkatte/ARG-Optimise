@@ -8,7 +8,10 @@ from pathlib import Path
 
 try:
     from .point_accuracy_common import (
+        ValidationResult,
         add_common_args,
+        clean_artifact_names,
+        common_metric_values,
         dataframe_from_tree_sequences,
         load_tree_sequence,
         load_tsinferdate_bed_segments,
@@ -20,7 +23,10 @@ try:
     )
 except ImportError:
     from point_accuracy_common import (
+        ValidationResult,
         add_common_args,
+        clean_artifact_names,
+        common_metric_values,
         dataframe_from_tree_sequences,
         load_tree_sequence,
         load_tsinferdate_bed_segments,
@@ -33,6 +39,21 @@ except ImportError:
 
 
 METHOD_LABEL = "tsdate"
+METHOD_NAME = "tsinfer"
+
+_CLEAN_ARTIFACTS = {
+    "_ts_pointest_lin_clean.png": "point_estimate_linear_clean.png",
+    "_ts_pointest_log_clean.png": "point_estimate_log_clean.png",
+    "_ts_pointest_lin.png": "point_estimate_linear.png",
+    "_ts_pointest_log.png": "point_estimate_log.png",
+    "meanPerSim.txt": "mean_per_sim.tsv",
+    "MSEall.txt": "mse.txt",
+    "meanMSE_lin.png": "mean_mse_linear.png",
+    "_ts_meanest_mean_lin.png": "mean_estimate_linear.png",
+    "meanest_mean_log.png": "mean_estimate_log.png",
+    "commonMetrics.tsv": "metrics.tsv",
+    "timeSummary.tsv": "time_summary.tsv",
+}
 
 
 def add_input_args(ap: argparse.ArgumentParser) -> None:
@@ -102,9 +123,17 @@ def dataframe_from_args(args: argparse.Namespace):
     return dataframe_from_tree_sequences(args, [inferred])
 
 
-def run_from_args(args: argparse.Namespace) -> float:
-    out_prefix = prepare_output_prefix(args.output_prefix)
+def evaluate_from_args(
+    args: argparse.Namespace, *, output_dir: Path | None = None
+) -> ValidationResult:
+    if output_dir is None:
+        out_prefix = prepare_output_prefix(args.output_prefix)
+    else:
+        output_dir = output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_prefix = output_dir / "result"
     xlim, ylim, xlim_log, ylim_log = plot_limits_from_args(args)
+    method_label = getattr(args, "method_label", None) or METHOD_LABEL
     df = dataframe_from_args(args)
     print(f"segments: {len(df)} rows", flush=True)
     legacy_mse = run_tsinferdate_plots(
@@ -114,22 +143,38 @@ def run_from_args(args: argparse.Namespace) -> float:
         ylim=ylim,
         xlim_log=xlim_log,
         ylim_log=ylim_log,
-        label=METHOD_LABEL,
+        label=method_label,
         tag="ts",
         vmax=1e11,
     )
     write_standard_outputs(
         df,
         out_prefix,
-        method_label=METHOD_LABEL,
+        method_label=method_label,
         legacy_mse=legacy_mse,
         xlim=xlim,
         ylim=ylim,
         xlim_log=xlim_log,
         ylim_log=ylim_log,
     )
+    metrics = common_metric_values(df, legacy_mse)
+    artifacts = (
+        clean_artifact_names(out_prefix, _CLEAN_ARTIFACTS)
+        if output_dir is not None
+        else tuple()
+    )
     print(f"MSEall = {legacy_mse}", flush=True)
-    return legacy_mse
+    return ValidationResult(
+        method=METHOD_NAME,
+        method_label=method_label,
+        metrics=metrics,
+        legacy_mse=legacy_mse,
+        artifacts=artifacts,
+    )
+
+
+def run_from_args(args: argparse.Namespace) -> float:
+    return evaluate_from_args(args).legacy_mse
 
 
 def main() -> None:

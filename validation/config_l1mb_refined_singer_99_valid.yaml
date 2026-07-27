@@ -1,0 +1,37 @@
+# Whole-chromosome coalescent-time comparison for sim_l1mb_0.
+# Relative paths are resolved from this validation/ directory.
+truth:
+  trees: trees/sim_l1mb_0.trees
+  ne: 10000
+  haplotypes: 8
+
+methods:
+  # The reusable pipeline's "gfn" slot holds the RL local-refined result.
+  gfn:
+    label: RL local refined
+    inferred_trees: output/tsinfer/l1mb_dated_local_refined.trees
+
+  tsinfer:
+    label: tsinfer+tsdate
+    inferred_trees: output/tsinfer/l1mb_dated.trees
+
+  singer:
+    # Sample 99 is excluded because tskit 1.0 rejects its mutation-parent
+    # ordering. Mutations are not used for coalescent-time scoring, but keeping
+    # the validation inputs strictly loadable avoids silently accepting a
+    # malformed tree-sequence file.
+    label: SINGER posterior mean (99 valid samples)
+    input_dir: output/singer/1mb
+    sample_prefix: sim_l1mb_0_
+    burnin_samples: 0
+    max_posterior_samples: 99
+
+validation:
+  skip: 1
+  max_pairs: null
+  pair_seed: 42
+  xlim: [0, 16]
+  ylim: [0, 8]
+  xlim_log: [-4, 1.5]
+  ylim_log: [-4, 1.5]
+  verbose: false

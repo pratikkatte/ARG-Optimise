@@ -8,7 +8,10 @@ from pathlib import Path
 
 try:
     from .point_accuracy_common import (
+        ValidationResult,
         add_common_args,
+        clean_artifact_names,
+        common_metric_values,
         dataframe_from_tree_sequences,
         load_posterior_tree_samples,
         load_singer_bed_segments,
@@ -20,7 +23,10 @@ try:
     )
 except ImportError:
     from point_accuracy_common import (
+        ValidationResult,
         add_common_args,
+        clean_artifact_names,
+        common_metric_values,
         dataframe_from_tree_sequences,
         load_posterior_tree_samples,
         load_singer_bed_segments,
@@ -33,6 +39,19 @@ except ImportError:
 
 
 METHOD_LABEL = "SINGER"
+METHOD_NAME = "singer"
+
+_CLEAN_ARTIFACTS = {
+    "meanest_lin_clean.png": "point_estimate_linear_clean.png",
+    "meanest_log_clean.png": "point_estimate_log_clean.png",
+    "meanest_lin.png": "point_estimate_linear.png",
+    "meanest_log.png": "point_estimate_log.png",
+    "MSEall.txt": "mse.txt",
+    "MeanMSE_lin.png": "mean_mse_linear.png",
+    "meanest_mean_lin.png": "mean_estimate_linear.png",
+    "commonMetrics.tsv": "metrics.tsv",
+    "timeSummary.tsv": "time_summary.tsv",
+}
 
 
 def add_input_args(ap: argparse.ArgumentParser) -> None:
@@ -118,9 +137,17 @@ def dataframe_from_args(args: argparse.Namespace):
     return dataframe_from_tree_sequences(args, samples)
 
 
-def run_from_args(args: argparse.Namespace) -> float:
-    out_prefix = prepare_output_prefix(args.output_prefix)
+def evaluate_from_args(
+    args: argparse.Namespace, *, output_dir: Path | None = None
+) -> ValidationResult:
+    if output_dir is None:
+        out_prefix = prepare_output_prefix(args.output_prefix)
+    else:
+        output_dir = output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_prefix = output_dir / "result"
     xlim, ylim, xlim_log, ylim_log = plot_limits_from_args(args)
+    method_label = getattr(args, "method_label", None) or METHOD_LABEL
     df = dataframe_from_args(args)
     print(f"segments: {len(df)} rows", flush=True)
     legacy_mse = run_singer_plots(
@@ -130,21 +157,37 @@ def run_from_args(args: argparse.Namespace) -> float:
         ylim=ylim,
         xlim_log=xlim_log,
         ylim_log=ylim_log,
-        label=METHOD_LABEL,
+        label=method_label,
         vmax=1e10,
     )
     write_standard_outputs(
         df,
         out_prefix,
-        method_label=METHOD_LABEL,
+        method_label=method_label,
         legacy_mse=legacy_mse,
         xlim=xlim,
         ylim=ylim,
         xlim_log=xlim_log,
         ylim_log=ylim_log,
     )
+    metrics = common_metric_values(df, legacy_mse)
+    artifacts = (
+        clean_artifact_names(out_prefix, _CLEAN_ARTIFACTS)
+        if output_dir is not None
+        else tuple()
+    )
     print(f"MSEall = {legacy_mse}", flush=True)
-    return legacy_mse
+    return ValidationResult(
+        method=METHOD_NAME,
+        method_label=method_label,
+        metrics=metrics,
+        legacy_mse=legacy_mse,
+        artifacts=artifacts,
+    )
+
+
+def run_from_args(args: argparse.Namespace) -> float:
+    return evaluate_from_args(args).legacy_mse
 
 
 def main() -> None:

@@ -24,6 +24,8 @@ from .local_construction import (
     LocalSamplingConfig,
     advance_local_state,
     apply_local_action,
+    compute_local_terminal_log_likelihood,
+    compute_local_terminal_log_reward,
     enumerate_local_prior_actions,
     initialize_local_arg_state,
     local_is_terminal,
@@ -32,6 +34,10 @@ from .local_construction import (
     sample_local_prior_action,
     sample_local_trajectories,
     undo_local_transition,
+)
+from .vcf_likelihood import (
+    compute_tree_sequence_vcf_log_likelihood,
+    resolve_vcf_tree_sequence_alignment,
 )
 try:
     from ..env import (
@@ -119,6 +125,9 @@ __all__ = [
     "TraceState",
     "advance_local_state",
     "apply_local_action",
+    "compute_local_terminal_log_likelihood",
+    "compute_local_terminal_log_reward",
+    "compute_tree_sequence_vcf_log_likelihood",
     "build_fast_trace_from_full_arg",
     "build_synthetic_full_arg",
     "enumerate_local_prior_actions",
@@ -129,6 +138,7 @@ __all__ = [
     "prepare_local_refinement",
     "reveal_due_fixed_ancestors",
     "resolve_trace_cut",
+    "resolve_vcf_tree_sequence_alignment",
     "sample_local_prior_action",
     "sample_local_trajectories",
     "splice_local_proposal",

@@ -1,0 +1,33 @@
+# Paths in this file are resolved relative to this validation/ directory.
+truth:
+  trees: trees/sim_l25kb_0.trees
+  ne: 10000
+  haplotypes: 8
+
+methods:
+  # With no input_dir, GFN defaults to output/<experiment>/gfn/arg_*.trees.
+  gfn:
+    sample_prefix: arg_
+
+  tsinfer:
+    inferred_trees: output/tsinfer/l25kb_dated.trees
+
+  # No SINGER output is currently checked into this repository. Put converted
+  # posterior .trees files here, or change input_dir/sample_prefix to their
+  # actual location before running the three-method comparison.
+  singer:
+    input_dir: output/singer/l25kb
+    sample_prefix: singer_
+    burnin_samples: 0
+    max_posterior_samples: null
+
+validation:
+  skip: 1
+  max_pairs: null
+  pair_seed: 42
+  xlim: [0, 16]
+  ylim: [0, 8]
+  xlim_log: [-4, 1.5]
+  ylim_log: [-4, 1.5]
+  verbose: false
+

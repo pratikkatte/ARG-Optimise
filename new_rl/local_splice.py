@@ -22,6 +22,7 @@ from .local_construction import (
     LocalARGProposal,
     LocalEventRecord,
 )
+from .vcf_likelihood import compute_tree_sequence_vcf_log_likelihood
 from .local_refinement import (
     PreparedLocalRefinement,
     _canonical_segments,
@@ -29,6 +30,10 @@ from .local_refinement import (
     _subtract_segments,
 )
 from .synthetic_full_arg import NODE_IS_RE_EVENT
+try:
+    from ..utils import load_vcf_variants
+except ImportError:  # Support the repository's legacy top-level new_rl import.
+    from utils import load_vcf_variants
 
 
 Interval = tuple[float, float]
@@ -671,6 +676,14 @@ def _build_provenance_record(
     mutation_remap: dict[str, int | bool],
 ) -> dict[str, Any]:
     request = prepared.context.request
+    initialization = next(
+        (
+            record
+            for record in proposal.transition_records
+            if record.get("event_type") == "initialization"
+        ),
+        {},
+    )
     return {
         "software": {
             "name": LOCAL_REFINEMENT_PROVENANCE_NAME,
@@ -687,7 +700,28 @@ def _build_provenance_record(
             "resolved_cut_time": float(
                 prepared.context.resolved_cut.current_time
             ),
-            "structural_proposal_only": True,
+            "structural_proposal_only": (
+                proposal.likelihood_scope == "none"
+            ),
+            "likelihood_scope": proposal.likelihood_scope,
+            "mutation_model": (
+                "JC69"
+                if proposal.likelihood_scope != "none"
+                else None
+            ),
+            "mutation_rate": initialization.get("mutation_rate"),
+            "population_size": initialization.get("population_size"),
+            "reward_C": initialization.get("reward_C"),
+            "vcf_path": initialization.get("vcf_path"),
+            "vcf_parser_version": initialization.get(
+                "vcf_parser_version"
+            ),
+            "vcf_coordinate_offset": initialization.get(
+                "vcf_coordinate_offset"
+            ),
+            "sample_node_to_haplotype": initialization.get(
+                "sample_node_to_haplotype"
+            ),
             "time_scale": (
                 next(
                     (
@@ -705,6 +739,28 @@ def _build_provenance_record(
             "generated_event_count": len(proposal.events),
             "prior_log_probability": float(
                 proposal.prior_log_probability
+            ),
+            "whole_chromosome_vcf_log_likelihood": (
+                None
+                if proposal.log_likelihood is None
+                else float(proposal.log_likelihood)
+            ),
+            "fixed_outside_vcf_log_likelihood": (
+                proposal.outside_log_likelihood
+            ),
+            "reconstructed_inside_vcf_log_likelihood": (
+                proposal.local_log_likelihood
+            ),
+            "local_cwr_log_prior": float(
+                proposal.prior_log_probability
+            ),
+            "terminal_log_reward": (
+                None
+                if proposal.log_reward is None
+                else float(proposal.log_reward)
+            ),
+            "likelihood_alignment": dict(
+                proposal.likelihood_alignment
             ),
             "topology_digest": proposal.topology_digest,
             "root_intervals": [
@@ -788,6 +844,11 @@ def validate_local_splice(
     _validate_exterior(source, refined, region, errors)
     _validate_biological_tables(source, refined, region, errors)
     _validate_mutations(refined, region, errors)
+    direct_log_likelihood = _validate_vcf_likelihood_parity(
+        proposal,
+        refined,
+        errors,
+    )
 
     expected_removed = len(removed_source_synthetic_node_ids)
     remaining_source_synthetic = [
@@ -823,13 +884,86 @@ def validate_local_splice(
             message.startswith("exterior")
             for message in errors
         ),
+        "likelihood_parity": not any(
+            message.startswith("whole-chromosome VCF likelihood")
+            for message in errors
+        ),
     }
+    if direct_log_likelihood is not None:
+        counts["independent_vcf_log_likelihood"] = float(
+            direct_log_likelihood
+        )
     return LocalValidationReport(
         is_valid=not errors,
         errors=tuple(errors),
         warnings=tuple(warnings),
         counts=counts,
     )
+
+
+def _validate_vcf_likelihood_parity(
+    proposal: LocalARGProposal,
+    refined: tskit.TreeSequence,
+    errors: list[str],
+) -> float | None:
+    """Independently rescore likelihood-enabled proposals after mutation remap."""
+
+    if proposal.log_likelihood is None:
+        return None
+    initialization = next(
+        (
+            record
+            for record in proposal.transition_records
+            if record.get("event_type") == "initialization"
+        ),
+        None,
+    )
+    if initialization is None:
+        errors.append(
+            "whole-chromosome VCF likelihood cannot be validated without "
+            "an initialization record"
+        )
+        return None
+    vcf_path = initialization.get("vcf_path")
+    mutation_rate = initialization.get("mutation_rate")
+    if not vcf_path or mutation_rate is None:
+        errors.append(
+            "whole-chromosome VCF likelihood cannot be validated without "
+            "the VCF path and mutation rate"
+        )
+        return None
+    try:
+        variant_data = load_vcf_variants(vcf_path)
+        direct = compute_tree_sequence_vcf_log_likelihood(
+            refined,
+            variant_data,
+            mutation_rate=float(mutation_rate),
+            sample_node_to_haplotype=initialization.get(
+                "sample_node_to_haplotype"
+            ),
+            vcf_coordinate_offset=initialization.get(
+                "vcf_coordinate_offset",
+                "auto",
+            ),
+        )
+    except (OSError, ValueError) as error:
+        errors.append(
+            "whole-chromosome VCF likelihood validation failed: "
+            f"{error}"
+        )
+        return None
+    if not math.isclose(
+        float(direct),
+        float(proposal.log_likelihood),
+        rel_tol=0.0,
+        abs_tol=1e-7,
+    ):
+        errors.append(
+            "whole-chromosome VCF likelihood differs from the independent "
+            "clean-tree rescore: "
+            f"incremental={proposal.log_likelihood} direct={direct}"
+        )
+    return float(direct)
 
 
 def _validate_no_dangling_target_ancestry(
