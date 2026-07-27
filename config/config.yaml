@@ -19,7 +19,8 @@ refinement:
 
 training:
   epochs: 3000
-  batch_size: 64
+  # Keep the effective batch at 64 while bounding the rollout graph held on GPU.
+  batch_size: 8
   seed: 7
   init_z_sample_count: 0
   verbose: false
@@ -31,7 +32,7 @@ training:
   subtb_lambda: 0.9
   subtb_max_span: 16
   grad_clip: 10.0
-  grad_accum_steps: 1
+  grad_accum_steps: 8
 
   eval_episodes: 32
   eval_every: 20
