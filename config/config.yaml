@@ -1,5 +1,5 @@
 dataset_path: validation/vcf/sim_l25kb_0.vcf
-output_path: runs/local_refinement_25kb
+output_path: runs/local_refinement_25kb_v5
 device: auto
 
 refinement:
@@ -14,13 +14,13 @@ refinement:
   # Every range is half-open. Supply exactly one cut selector per request.
   requests:
     - id: region_000001
-      genomic_range: [386, 23963]
+      genomic_range: [2000 , 20000]
       cut_time: 25000
 
 training:
   epochs: 3000
   # Keep the effective batch at 64 while bounding the rollout graph held on GPU.
-  batch_size: 8
+  batch_size: 32
   seed: 7
   init_z_sample_count: 0
   verbose: false
@@ -32,7 +32,7 @@ training:
   subtb_lambda: 0.9
   subtb_max_span: 16
   grad_clip: 10.0
-  grad_accum_steps: 8
+  grad_accum_steps: 1
 
   eval_episodes: 32
   eval_every: 20
@@ -44,7 +44,7 @@ environment:
   mutation_rate: 2.0e-8
   recombination_rate: 2.0e-8
   time_bins: 32
-  time_delta_bin_width: 0.001
+  time_delta_bin_width: 0.01
 
 reward:
   constant: 0
