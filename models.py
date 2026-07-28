@@ -63,20 +63,16 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        attn_mask = None
+        attn = (q @ k.transpose(-2, -1)) * self.scale
         if key_padding_mask is not None:
-            # SDPA boolean masks use True for keys that are allowed to
-            # participate in attention, the inverse of key_padding_mask.
-            attn_mask = ~key_padding_mask[:, None, None, :]
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
-            scale=self.scale,
-        )
-        x = x.transpose(1, 2).reshape(batch_size, tokens, dim)
+            attn = attn.masked_fill(
+                key_padding_mask[:, None, None, :],
+                float("-inf"),
+            )
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(batch_size, tokens, dim)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

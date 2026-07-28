@@ -569,7 +569,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
         self.opt.step()
         self.opt.zero_grad()
-        self.loss = 0
+        self.loss = torch.zeros((), device=self.device)
 
         return info
 
@@ -902,4 +902,4 @@ class TBGFlowNetGenerator(torch.nn.Module):
         loss = self.get_loss_from_rollout_outputs(rollout_outputs)
         loss = (loss / factor)
         loss.backward()
-        self.loss += loss 
+        self.loss = self.loss + loss.detach()
