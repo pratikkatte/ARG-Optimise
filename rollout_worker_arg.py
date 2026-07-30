@@ -138,6 +138,45 @@ class RolloutWorker:
             dtype=torch.long,
             device=self.device,
         )
+        sampled_actions = [
+            action
+            for trajectory in trajectories
+            for action in trajectory.actions
+        ]
+        generated_actions = [
+            action
+            for action in sampled_actions
+            if action.get("time_quantile") is not None
+        ]
+        time_diagnostic_device = (
+            torch.device("cpu")
+            if self.device.type == "mps"
+            else self.device
+        )
+        time_quantiles = torch.tensor(
+            [
+                float(action["time_quantile"])
+                for action in generated_actions
+            ],
+            dtype=torch.float64,
+            device=time_diagnostic_device,
+        )
+        time_delta_times = torch.tensor(
+            [
+                float(action["delta_time"])
+                for action in generated_actions
+            ],
+            dtype=torch.float64,
+            device=time_diagnostic_device,
+        )
+        time_log_densities = torch.tensor(
+            [
+                float(action["time_log_density"])
+                for action in generated_actions
+            ],
+            dtype=torch.float64,
+            device=time_diagnostic_device,
+        )
 
 
         data = {
@@ -148,6 +187,13 @@ class RolloutWorker:
             "trajectory_lengths": trajectory_lengths,
             "terminal_mask": terminal_mask,
             "truncated_mask": truncated_mask,
+            "time_quantiles": time_quantiles,
+            "time_delta_times": time_delta_times,
+            "time_log_densities": time_log_densities,
+            "fixed_attachment_count": sum(
+                action.get("event_type") == "fixed_attachment"
+                for action in sampled_actions
+            ),
         }
         if return_states:
             data["states"] = states

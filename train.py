@@ -21,13 +21,13 @@ try:
     from .env import SimpleARGEnvironment, action_as_dict
     from .rollout_worker_arg import RolloutWorker
     from .tb_gfn import TBGFlowNetGenerator
-    from .time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
+    from .time_env import DEFAULT_TIME_BASIS_COMPONENTS
     from .utils import VCF_PARSER_VERSION, is_vcf_path, load_sequences, load_vcf_variants
 except ImportError:  # Support the repository's script-style entry points.
     from env import SimpleARGEnvironment, action_as_dict
     from rollout_worker_arg import RolloutWorker
     from tb_gfn import TBGFlowNetGenerator
-    from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
+    from time_env import DEFAULT_TIME_BASIS_COMPONENTS
     from utils import VCF_PARSER_VERSION, is_vcf_path, load_sequences, load_vcf_variants
 
 
@@ -62,7 +62,7 @@ DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE = 256
 DEFAULT_BREAKPOINT_GAP_LAYERS = 3
 DEFAULT_BREAKPOINT_GAP_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_USE_POSITION_FEATURES = True
-MODEL_VERSION = "cwr-event-sparse-vcf-v1"
+MODEL_VERSION = "cwr-event-continuous-time-v2"
 
 
 DEFAULT_CONFIG = {
@@ -98,8 +98,6 @@ DEFAULT_CONFIG = {
         "effective_population_size": DEFAULT_NE,
         "mutation_rate": DEFAULT_MU_PER_BP,
         "recombination_rate": DEFAULT_R_PER_BP,
-        "time_bins": DEFAULT_TIME_BINS,
-        "time_delta_bin_width": DEFAULT_TIME_DELTA_BIN_WIDTH,
     },
     "reward": {
         "constant": 30000,
@@ -114,6 +112,7 @@ DEFAULT_CONFIG = {
         "transformer_heads": DEFAULT_TRANSFORMER_HEADS,
         "transformer_mlp_ratio": DEFAULT_TRANSFORMER_MLP_RATIO,
         "attention_dropout": DEFAULT_ATTENTION_DROPOUT,
+        "time_basis_components": DEFAULT_TIME_BASIS_COMPONENTS,
     },
 }
 
@@ -149,8 +148,6 @@ CLI_CONFIG_PATHS = {
     "effective_population_size": ("environment", "effective_population_size"),
     "mutation_rate": ("environment", "mutation_rate"),
     "recombination_rate": ("environment", "recombination_rate"),
-    "time_bins": ("environment", "time_bins"),
-    "time_delta_bin_width": ("environment", "time_delta_bin_width"),
     "reward_constant": ("reward", "constant"),
     "embedding_size": ("model", "embedding_size"),
     "hidden_size": ("model", "hidden_size"),
@@ -161,6 +158,7 @@ CLI_CONFIG_PATHS = {
     "transformer_heads": ("model", "transformer_heads"),
     "transformer_mlp_ratio": ("model", "transformer_mlp_ratio"),
     "attention_dropout": ("model", "attention_dropout"),
+    "time_basis_components": ("model", "time_basis_components"),
 }
 
 def seed_everything(seed):
@@ -270,6 +268,31 @@ def validate_train_config(config):
             + ". Provide them in YAML or via CLI flags."
         )
     training = config.get("training", {})
+    environment = config.get("environment", {})
+    legacy_time_fields = sorted(
+        key
+        for key in ("time_bins", "time_delta_bin_width", "time_bin_scheme")
+        if key in environment
+    )
+    if legacy_time_fields:
+        raise ValueError(
+            "Fixed-width time bins were removed in continuous-time v2. "
+            "Delete "
+            + ", ".join(
+                f"environment.{key}" for key in legacy_time_fields
+            )
+            + "; the CWR waiting-time law now determines event times."
+        )
+    model = config.get("model", {})
+    time_basis_components = int(
+        model.get(
+            "time_basis_components",
+            DEFAULT_TIME_BASIS_COMPONENTS,
+        )
+    )
+    if time_basis_components < 2:
+        raise ValueError("model.time_basis_components must be at least 2")
+    model["time_basis_components"] = time_basis_components
     loss = str(training.get("loss", DEFAULT_LOSS)).lower()
     if loss not in {"tb", "subtb", "fl_subtb"}:
         raise ValueError("training.loss must be one of 'tb', 'subtb', or 'fl_subtb'")
@@ -433,8 +456,6 @@ def config_to_train_kwargs(config):
         "eval_episodes": training["eval_episodes"],
         "eval_every": training["eval_every"],
         "partial_segment_max_steps": training["partial_segment_max_steps"],
-        "time_bins": environment["time_bins"],
-        "time_delta_bin_width": environment["time_delta_bin_width"],
         "reward_C": reward["constant"],
         "embedding_size": model["embedding_size"],
         "hidden_size": model["hidden_size"],
@@ -445,6 +466,7 @@ def config_to_train_kwargs(config):
         "transformer_heads": model["transformer_heads"],
         "transformer_mlp_ratio": model["transformer_mlp_ratio"],
         "attention_dropout": model["attention_dropout"],
+        "time_basis_components": model["time_basis_components"],
         "verbose": training["verbose"],
     }
 
@@ -542,6 +564,12 @@ def _record_rollout_metrics(metrics, rollout_mode, rollout_outputs):
             "length_sum": 0.0,
             "terminal_sum": 0.0,
             "truncated_sum": 0.0,
+            "time_count": 0,
+            "time_quantile_sum": 0.0,
+            "time_delta_sum": 0.0,
+            "time_near_boundary_sum": 0.0,
+            "time_finite_density_sum": 0.0,
+            "fixed_attachment_sum": 0,
         },
     )
     lengths = rollout_outputs["trajectory_lengths"].detach().float().cpu()
@@ -554,6 +582,21 @@ def _record_rollout_metrics(metrics, rollout_mode, rollout_outputs):
         entry["terminal_sum"] += float(terminal_mask.detach().float().cpu().sum().item())
     if truncated_mask is not None:
         entry["truncated_sum"] += float(truncated_mask.detach().float().cpu().sum().item())
+    quantiles = rollout_outputs["time_quantiles"].detach().cpu()
+    deltas = rollout_outputs["time_delta_times"].detach().cpu()
+    densities = rollout_outputs["time_log_densities"].detach().cpu()
+    entry["time_count"] += int(quantiles.numel())
+    entry["time_quantile_sum"] += float(quantiles.sum().item())
+    entry["time_delta_sum"] += float(deltas.sum().item())
+    entry["time_near_boundary_sum"] += float(
+        (quantiles >= 0.99).sum().item()
+    )
+    entry["time_finite_density_sum"] += float(
+        torch.isfinite(densities).sum().item()
+    )
+    entry["fixed_attachment_sum"] += int(
+        rollout_outputs["fixed_attachment_count"]
+    )
 
 
 def _summarize_rollout_metrics(metrics):
@@ -567,6 +610,22 @@ def _summarize_rollout_metrics(metrics):
         )
         summary[f"{prefix}_terminal_rate"] = float(entry["terminal_sum"] / trajectories)
         summary[f"{prefix}_truncated_rate"] = float(entry["truncated_sum"] / trajectories)
+        time_count = max(int(entry["time_count"]), 1)
+        summary[f"{prefix}_time_quantile_mean"] = float(
+            entry["time_quantile_sum"] / time_count
+        )
+        summary[f"{prefix}_time_delta_mean"] = float(
+            entry["time_delta_sum"] / time_count
+        )
+        summary[f"{prefix}_time_near_boundary_rate"] = float(
+            entry["time_near_boundary_sum"] / time_count
+        )
+        summary[f"{prefix}_time_finite_density_rate"] = float(
+            entry["time_finite_density_sum"] / time_count
+        )
+        summary[f"{prefix}_fixed_attachment_mean"] = float(
+            entry["fixed_attachment_sum"] / trajectories
+        )
     return summary
 
 
@@ -714,8 +773,6 @@ def train(
     eval_episodes=DEFAULT_EVAL_EPISODES,
     eval_every=DEFAULT_EVAL_EVERY,
     partial_segment_max_steps=DEFAULT_PARTIAL_SEGMENT_MAX_STEPS,
-    time_bins=DEFAULT_TIME_BINS,
-    time_delta_bin_width=DEFAULT_TIME_DELTA_BIN_WIDTH,
     reward_C=30000,
     embedding_size=DEFAULT_EMBEDDING_SIZE,
     hidden_size=DEFAULT_HIDDEN_SIZE,
@@ -726,6 +783,7 @@ def train(
     transformer_heads=DEFAULT_TRANSFORMER_HEADS,
     transformer_mlp_ratio=DEFAULT_TRANSFORMER_MLP_RATIO,
     attention_dropout=DEFAULT_ATTENTION_DROPOUT,
+    time_basis_components=DEFAULT_TIME_BASIS_COMPONENTS,
     verbose=True,
     
 ):
@@ -756,8 +814,6 @@ def train(
         recombination_rate=recombination_rate,
         population_size=effective_population_size,
         mutation_rate=mutation_rate,
-        time_bins=time_bins,
-        time_delta_bin_width=time_delta_bin_width,
         reward_C=reward_C,
     )
     model_kwargs = {
@@ -773,6 +829,7 @@ def train(
         "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
         "time_layers": int(DEFAULT_TIME_LAYERS),
         "time_dropout": float(DEFAULT_TIME_DROPOUT),
+        "time_basis_components": int(time_basis_components),
         "breakpoint_gap_hidden_size": int(DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE),
         "breakpoint_gap_layers": int(DEFAULT_BREAKPOINT_GAP_LAYERS),
         "breakpoint_gap_dropout": float(DEFAULT_BREAKPOINT_GAP_DROPOUT),
@@ -960,8 +1017,6 @@ def _train_local_refinement_legacy(
     eval_episodes=DEFAULT_EVAL_EPISODES,
     eval_every=DEFAULT_EVAL_EVERY,
     partial_segment_max_steps=DEFAULT_PARTIAL_SEGMENT_MAX_STEPS,
-    time_bins=DEFAULT_TIME_BINS,
-    time_delta_bin_width=DEFAULT_TIME_DELTA_BIN_WIDTH,
     reward_C=30000,
     embedding_size=DEFAULT_EMBEDDING_SIZE,
     hidden_size=DEFAULT_HIDDEN_SIZE,
@@ -972,6 +1027,7 @@ def _train_local_refinement_legacy(
     transformer_heads=DEFAULT_TRANSFORMER_HEADS,
     transformer_mlp_ratio=DEFAULT_TRANSFORMER_MLP_RATIO,
     attention_dropout=DEFAULT_ATTENTION_DROPOUT,
+    time_basis_components=DEFAULT_TIME_BASIS_COMPONENTS,
     verbose=True,
 ):
     from refinement import (
@@ -1006,8 +1062,6 @@ def _train_local_refinement_legacy(
         recombination_rate=recombination_rate,
         population_size=effective_population_size,
         mutation_rate=mutation_rate,
-        time_bins=time_bins,
-        time_delta_bin_width=time_delta_bin_width,
         reward_C=reward_C,
     )
     source_env = SimpleARGEnvironment(
@@ -1019,8 +1073,6 @@ def _train_local_refinement_legacy(
         recombination_rate=recombination_rate,
         population_size=effective_population_size,
         mutation_rate=mutation_rate,
-        time_bins=time_bins,
-        time_delta_bin_width=time_delta_bin_width,
         reward_C=reward_C,
     )
     model_kwargs = {
@@ -1036,6 +1088,7 @@ def _train_local_refinement_legacy(
         "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
         "time_layers": int(DEFAULT_TIME_LAYERS),
         "time_dropout": float(DEFAULT_TIME_DROPOUT),
+        "time_basis_components": int(time_basis_components),
         "breakpoint_gap_hidden_size": int(DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE),
         "breakpoint_gap_layers": int(DEFAULT_BREAKPOINT_GAP_LAYERS),
         "breakpoint_gap_dropout": float(DEFAULT_BREAKPOINT_GAP_DROPOUT),
@@ -1643,6 +1696,9 @@ def build_checkpoint_metadata(
         "rho": float(rho),
         "time": dict(time_metadata),
         **dict(time_metadata),
+        "time_basis_components": int(
+            model_kwargs["time_basis_components"]
+        ),
         "reward_C": float(reward_C),
         "effective_population_size": float(effective_population_size),
         "mutation_rate": float(mutation_rate),
@@ -1663,6 +1719,9 @@ def build_checkpoint_metadata(
         "init_z_sample_count": int(init_z_sample_count),
         "model_version": str(model_version),
     }
+    metadata["time"]["time_basis_components"] = int(
+        model_kwargs["time_basis_components"]
+    )
     if input_mode == "vcf":
         metadata.update({
             "num_variants": int(variant_data.num_variants),
@@ -1750,8 +1809,7 @@ def main():
     parser.add_argument("--eval-episodes", type=int)
     parser.add_argument("--eval-every", type=int)
     parser.add_argument("--partial-segment-max-steps", type=int)
-    parser.add_argument("--time-bins", type=int)
-    parser.add_argument("--time-delta-bin-width", type=float)
+    parser.add_argument("--time-basis-components", type=int)
     parser.add_argument("--reward-constant", type=float)
     parser.add_argument("--embedding-size", type=int)
     parser.add_argument("--hidden-size", type=int)

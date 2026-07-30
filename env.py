@@ -9,10 +9,10 @@ from dataclasses import replace
 
 try:
     from .evo import EvolutionModelTorch
-    from .time_env import TimeEnvFixedDelta
+    from .time_env import ContinuousCoalescentTime
 except ImportError:  # Support the repository's legacy script-style imports.
     from evo import EvolutionModelTorch
-    from time_env import TimeEnvFixedDelta
+    from time_env import ContinuousCoalescentTime
 
 import numpy as np
 
@@ -26,6 +26,14 @@ CHARACTERS_MAPS = {
         'N': [1., 1., 1., 1.]
     }
 }
+
+
+def _optional_real(value):
+    if value is None:
+        return None
+    if not isinstance(value, numbers.Real):
+        raise ValueError(f"expected a real-valued action field, got {value!r}")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -181,9 +189,12 @@ class RecombinationChoice:
     material_count: int
     span_start: int
     span_end: int
-    time_action: Optional[int] = None
+    time_quantile: Optional[float] = None
     breakpoint: Optional[int] = None
     delta_time: Optional[float] = None
+    waiting_rate: Optional[float] = None
+    fixed_horizon: Optional[float] = None
+    time_log_density: Optional[float] = None
 
     @property
     def breakpoint_count(self):
@@ -208,8 +219,10 @@ class RecombinationChoice:
         span_end = action.get("span_end")
         if not isinstance(active_lineage_i, numbers.Integral) or not isinstance(material_count, numbers.Integral) or not isinstance(span_start, numbers.Integral) or not isinstance(span_end, numbers.Integral):
             return None
-        time_action = action.get("time_action")
-        if time_action is not None and not isinstance(time_action, numbers.Integral):
+        time_quantile = action.get("time_quantile")
+        if time_quantile is not None and not isinstance(
+            time_quantile, numbers.Real
+        ):
             return None
         breakpoint = action.get("breakpoint")
         if breakpoint is not None and not isinstance(breakpoint, numbers.Integral):
@@ -222,10 +235,17 @@ class RecombinationChoice:
             material_count=int(material_count),
             span_start=int(span_start),
             span_end=int(span_end),
-            time_action=int(time_action) if time_action is not None else None,
+            time_quantile=(
+                float(time_quantile) if time_quantile is not None else None
+            ),
             breakpoint=int(breakpoint) if breakpoint is not None else None,
             delta_time=(
                 float(delta_time) if delta_time is not None else None
+            ),
+            waiting_rate=_optional_real(action.get("waiting_rate")),
+            fixed_horizon=_optional_real(action.get("fixed_horizon")),
+            time_log_density=_optional_real(
+                action.get("time_log_density")
             ),
         )
 
@@ -256,8 +276,11 @@ class RecombinationChoice:
 class CoalescenceChoice:
     active_lineage_i: int
     active_lineage_j: int
-    time_action: Optional[int] = None
+    time_quantile: Optional[float] = None
     delta_time: Optional[float] = None
+    waiting_rate: Optional[float] = None
+    fixed_horizon: Optional[float] = None
+    time_log_density: Optional[float] = None
 
     def as_dict(self):
         action = {
@@ -265,10 +288,16 @@ class CoalescenceChoice:
             "active_lineage_i": self.active_lineage_i,
             "active_lineage_j": self.active_lineage_j,
         }
-        if self.time_action is not None:
-            action["time_action"] = self.time_action
+        if self.time_quantile is not None:
+            action["time_quantile"] = float(self.time_quantile)
         if self.delta_time is not None:
             action["delta_time"] = float(self.delta_time)
+        if self.waiting_rate is not None:
+            action["waiting_rate"] = float(self.waiting_rate)
+        if self.fixed_horizon is not None:
+            action["fixed_horizon"] = float(self.fixed_horizon)
+        if self.time_log_density is not None:
+            action["time_log_density"] = float(self.time_log_density)
         return action
 
     def is_valid_for(self, active_lineages):
@@ -292,8 +321,10 @@ class CoalescenceChoice:
         j = action.get("active_lineage_j")
         if not isinstance(i, numbers.Integral) or not isinstance(j, numbers.Integral):
             return None
-        time_action = action.get("time_action")
-        if time_action is not None and not isinstance(time_action, numbers.Integral):
+        time_quantile = action.get("time_quantile")
+        if time_quantile is not None and not isinstance(
+            time_quantile, numbers.Real
+        ):
             return None
         delta_time = action.get("delta_time")
         if delta_time is not None and not isinstance(delta_time, numbers.Real):
@@ -301,9 +332,16 @@ class CoalescenceChoice:
         return cls(
             active_lineage_i=int(i),
             active_lineage_j=int(j),
-            time_action=int(time_action) if time_action is not None else None,
+            time_quantile=(
+                float(time_quantile) if time_quantile is not None else None
+            ),
             delta_time=(
                 float(delta_time) if delta_time is not None else None
+            ),
+            waiting_rate=_optional_real(action.get("waiting_rate")),
+            fixed_horizon=_optional_real(action.get("fixed_horizon")),
+            time_log_density=_optional_real(
+                action.get("time_log_density")
             ),
         )
 
@@ -630,16 +668,33 @@ def action_as_dict(action):
             "span_start": int(action.span_start),
             "span_end": int(action.span_end),
         }
-        if action.time_action is not None:
-            result["time_action"] = int(action.time_action)
+        if action.time_quantile is not None:
+            result["time_quantile"] = float(action.time_quantile)
         if action.delta_time is not None:
             result["delta_time"] = float(action.delta_time)
+        if action.waiting_rate is not None:
+            result["waiting_rate"] = float(action.waiting_rate)
+        if action.fixed_horizon is not None:
+            result["fixed_horizon"] = float(action.fixed_horizon)
+        if action.time_log_density is not None:
+            result["time_log_density"] = float(
+                action.time_log_density
+            )
         return result
     if isinstance(action, FixedAttachmentChoice):
-        return {
+        result = {
             "event_type": "fixed_attachment",
             "event_time": float(action.event_time),
         }
+        if action.waiting_rate is not None:
+            result["waiting_rate"] = float(action.waiting_rate)
+        if action.fixed_horizon is not None:
+            result["fixed_horizon"] = float(action.fixed_horizon)
+        if action.survival_log_probability is not None:
+            result["survival_log_probability"] = float(
+                action.survival_log_probability
+            )
+        return result
     raise ValueError(f"Unknown ARG action: {action}")
 
 
@@ -648,6 +703,9 @@ class FixedAttachmentChoice:
     """Deterministic installation of the next fixed local ancestor group."""
 
     event_time: float
+    waiting_rate: Optional[float] = None
+    fixed_horizon: Optional[float] = None
+    survival_log_probability: Optional[float] = None
 
 class ARGReward:
     """
@@ -665,11 +723,12 @@ class ARGReward:
 
 class SimpleARGEnvironment:
     """
-    Minimal discrete coalescent-with-recombination ARG prototype.
+    Minimal coalescent-with-recombination ARG implementation.
 
-    This intentionally avoids eete3, continuous breakpoints, and full continuous
-    coalescent-with-recombination simulation. Terminal states are rewarded by the
-    canonical CWR prior plus a learned-time JC69 sequence likelihood.
+    Event choices use the existing finite candidate set, while waiting times
+    follow the exact continuous constant-Ne CWR law. Terminal states are
+    rewarded by the canonical CWR prior plus a learned-time JC69 sequence
+    likelihood.
     """
 
     def __init__(
@@ -687,8 +746,6 @@ class SimpleARGEnvironment:
         seed: Optional[int] = 7,
         bp_per_blocks: int = 1,
         device: Optional[torch.device] = 'cpu',
-        time_bins: Optional[int] = None,
-        time_delta_bin_width: Optional[float] = None,
         reward_C: float = 30000,
         structural_only: bool = False,
     ):
@@ -750,13 +807,8 @@ class SimpleARGEnvironment:
             else 4 * self.population_size * self.recombination_rate * self.sequence_length
         )
 
-        ## Time environment
-        time_env_kwargs = {}
-        if time_bins is not None:
-            time_env_kwargs["bins"] = int(time_bins)
-        if time_delta_bin_width is not None:
-            time_env_kwargs["delta_bin_width"] = float(time_delta_bin_width)
-        self.time_env = TimeEnvFixedDelta(**time_env_kwargs)
+        ## Exact constant-Ne coalescent-with-recombination waiting-time law.
+        self.time_env = ContinuousCoalescentTime()
 
         self.rng = random.Random(seed)
 
@@ -867,9 +919,10 @@ class SimpleARGEnvironment:
     @property
     def time_metadata(self):
         return {
-            "time_bin_scheme": type(self.time_env).__name__,
-            "time_bins": int(self.time_env.bins),
-            "time_delta_bin_width": float(self.time_env.delta_bin_width),
+            "time_scheme": self.time_env.scheme,
+            "time_density": self.time_env.density,
+            "time_reference_measure": self.time_env.reference_measure,
+            "demography_model": self.time_env.demography_model,
         }
 
     @property
@@ -1525,14 +1578,17 @@ class SimpleARGEnvironment:
         parent_id = next_state.max_node_idx + 1
         parent_segments = child_i.material_segments.union(child_j.material_segments)
         overlap_count = child_i.material_segments.intersection_count(child_j.material_segments)
-        delta_t = (
-            float(action.delta_time)
-            if action.delta_time is not None
-            else self.time_env.time_action_to_delta(
-                action.time_action,
+        if action.delta_time is None:
+            if action.time_quantile is None:
+                raise ValueError(
+                    "coalescence action requires time_quantile or delta_time"
+                )
+            delta_t = self.time_env.quantile_to_delta(
+                action.time_quantile,
                 self._total_event_rate(rates),
             )
-        )
+        else:
+            delta_t = float(action.delta_time)
         parent_time = float(state.current_time) + delta_t
         next_state.current_time = parent_time
         if self.structural_only:
@@ -1612,14 +1668,17 @@ class SimpleARGEnvironment:
 
         left_parent_id = next_state.max_node_idx + 1
         right_parent_id = next_state.max_node_idx + 2
-        delta_t = (
-            float(action.delta_time)
-            if action.delta_time is not None
-            else self.time_env.time_action_to_delta(
-                action.time_action,
+        if action.delta_time is None:
+            if action.time_quantile is None:
+                raise ValueError(
+                    "recombination action requires time_quantile or delta_time"
+                )
+            delta_t = self.time_env.quantile_to_delta(
+                action.time_quantile,
                 self._total_event_rate(rates),
             )
-        )
+        else:
+            delta_t = float(action.delta_time)
 
         event_time = float(state.current_time) + delta_t
         next_state.current_time = event_time
@@ -1778,10 +1837,17 @@ class SimpleARGEnvironment:
                 breakpoint=action_dict["breakpoint"],
             )
 
-        time_action = self.time_env.sample_action_from_prior(
-            self._total_event_rate(state.rates), self.rng
+        total_rate = self._total_event_rate(state.rates)
+        time_quantile = self.time_env.sample_prior_quantile(self.rng)
+        delta_time = self.time_env.quantile_to_delta(
+            time_quantile,
+            total_rate,
         )
-        chosen_action = replace(chosen_action, time_action=time_action)
+        chosen_action = replace(
+            chosen_action,
+            time_quantile=time_quantile,
+            delta_time=delta_time,
+        )
         log_prior = self.compute_cwr_event_log_prior(state, combined_actions, chosen_action)
         return chosen_action, log_prior
 
@@ -1813,7 +1879,20 @@ class SimpleARGEnvironment:
         total_rate = self._total_event_rate(rates)
         recomb_total_weight = sum(self._recomb_weight(choice) for choice in recomb_actions)
 
-        wait_log_prior = self.time_env.time_action_log_probability(action.time_action, total_rate)
+        delta_time = action.delta_time
+        if delta_time is None:
+            if action.time_quantile is None:
+                raise ValueError(
+                    "generated ARG action requires continuous event time"
+                )
+            delta_time = self.time_env.quantile_to_delta(
+                action.time_quantile,
+                total_rate,
+            )
+        wait_log_prior = self.time_env.waiting_time_log_density(
+            delta_time,
+            total_rate,
+        )
 
         if isinstance(action, CoalescenceChoice) and CoalescenceChoice.is_valid_for(action, state.active_lineages):
             action_log_prior = math.log((rates["lambda_coal"] / total_rate) / len(coal_actions))
@@ -2205,25 +2284,36 @@ class LocalARGEnvironment:
             if next_fixed is None
             else max(0.0, float(next_fixed) - float(state.current_time))
         )
-        if total_rate <= 0.0:
-            mask = [False] * int(self.time_env.bins)
+        horizon_has_mass = (
+            max_delta is None or float(max_delta) > 1e-15
+        )
+        if total_rate > 0.0 and max_delta is not None:
+            generated_prior_mass = self.time_env.generated_probability(
+                total_rate,
+                max_delta=max_delta,
+            )
+            survival_prior_mass = self.time_env.survival_probability(
+                total_rate,
+                max_delta,
+            )
+        elif total_rate > 0.0:
+            generated_prior_mass = 1.0
+            survival_prior_mass = 0.0
         else:
-            mask = [
-                math.isfinite(
-                    self.time_env.time_action_log_probability(
-                        action,
-                        total_rate,
-                        max_delta=max_delta,
-                    )
-                )
-                for action in range(int(self.time_env.bins))
-            ]
+            generated_prior_mass = 0.0
+            survival_prior_mass = 1.0 if max_delta is not None else 0.0
+        can_generate = bool(
+            total_rate > 0.0
+            and horizon_has_mass
+            and generated_prior_mass > 0.0
+        )
         return {
             "total_rate": total_rate,
             "next_fixed_time": next_fixed,
             "max_delta": max_delta,
-            "time_action_mask": tuple(mask),
-            "can_generate": bool(total_rate > 0.0 and any(mask)),
+            "generated_prior_mass": float(generated_prior_mass),
+            "survival_prior_mass": float(survival_prior_mass),
+            "can_generate": can_generate,
             "can_attach_fixed": next_fixed is not None,
         }
 
@@ -2266,11 +2356,20 @@ class LocalARGEnvironment:
             "rollout": rollout,
         }
 
-    def time_action_to_delta(self, state, time_action):
+    def time_quantile_to_delta(self, state, time_quantile):
         options = self.enumerate_prior_options(state)
         rollout = self._rollout_time_data(state, options.rates)
-        return self.time_env.time_action_to_delta(
-            int(time_action),
+        return self.time_env.quantile_to_delta(
+            float(time_quantile),
+            rollout["total_rate"],
+            max_delta=rollout["max_delta"],
+        )
+
+    def delta_to_time_quantile(self, state, delta_time):
+        options = self.enumerate_prior_options(state)
+        rollout = self._rollout_time_data(state, options.rates)
+        return self.time_env.delta_to_quantile(
+            float(delta_time),
             rollout["total_rate"],
             max_delta=rollout["max_delta"],
         )
@@ -2299,8 +2398,19 @@ class LocalARGEnvironment:
         if total_rate <= 0.0:
             raise ValueError("generated local events require a positive rate")
         rollout = self._rollout_time_data(state, rates)
-        wait_log_prior = self.time_env.time_action_log_probability(
-            action.time_action,
+        delta_time = action.delta_time
+        if delta_time is None:
+            if action.time_quantile is None:
+                raise ValueError(
+                    "generated local action requires continuous event time"
+                )
+            delta_time = self.time_env.quantile_to_delta(
+                action.time_quantile,
+                total_rate,
+                max_delta=rollout["max_delta"],
+            )
+        wait_log_prior = self.time_env.waiting_time_log_density(
+            delta_time,
             total_rate,
             max_delta=rollout["max_delta"],
         )
@@ -2383,8 +2493,14 @@ class LocalARGEnvironment:
         next_fixed_time = self.next_fixed_ancestor_time(state)
         if next_fixed_time is None:
             raise ValueError("state has no scheduled fixed attachment")
+        rates = self.enumerate_prior_options(state).rates
+        rollout = self._rollout_time_data(state, rates)
         if log_prior is None:
-            log_prior = self.fixed_attachment_log_prior(state)
+            log_prior = (
+                0.0
+                if rollout["total_rate"] <= 0.0
+                else -rollout["total_rate"] * float(rollout["max_delta"])
+            )
         next_state = state.clone(copy_partials=False)
         next_state.current_time = float(next_fixed_time)
         next_state.accumulated_log_prior += float(log_prior)
@@ -2404,6 +2520,9 @@ class LocalARGEnvironment:
                 "waited_from_scaled_time": float(state.current_time),
                 "log_prior_increment": float(log_prior),
                 "fixed_event_survival": True,
+                "waiting_rate": float(rollout["total_rate"]),
+                "fixed_horizon": float(rollout["max_delta"]),
+                "survival_log_probability": float(log_prior),
             }
         )
         undo = dict(attachment_record["_undo"])

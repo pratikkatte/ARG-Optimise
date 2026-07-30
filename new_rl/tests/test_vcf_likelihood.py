@@ -72,7 +72,6 @@ def _environment(variant_data, *, reward_c=0.0):
         mutation_rate=2e-8,
         recombination_rate=2e-8,
         reward_C=reward_c,
-        time_delta_bin_width=1e-5,
         seed=1,
     )
 
@@ -176,7 +175,7 @@ def test_local_coalescence_likelihood_matches_clean_splice(tmp_path):
         CoalescenceChoice(
             action.active_lineage_i,
             action.active_lineage_j,
-            time_action=0,
+            time_quantile=0.5,
             delta_time=0.01,
         ),
         prepared.context,
@@ -223,7 +222,7 @@ def test_recombination_partitions_vcf_rows_and_undo_is_exact(tmp_path):
             span_start=choice.span_start,
             span_end=choice.span_end,
             breakpoint=1,
-            time_action=0,
+            time_quantile=0.5,
             delta_time=0.005,
         ),
         prepared.context,

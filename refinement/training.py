@@ -23,17 +23,19 @@ try:
     from ..env import LocalARGEnvironment, SimpleARGEnvironment
     from ..rollout_worker_arg import RolloutWorker
     from ..tb_gfn import TBGFlowNetGenerator
+    from ..time_env import DEFAULT_TIME_BASIS_COMPONENTS
     from ..utils import VCF_PARSER_VERSION, is_vcf_path, load_vcf_variants
 except ImportError:  # Support the repository's script-style entry points.
     from env import LocalARGEnvironment, SimpleARGEnvironment
     from rollout_worker_arg import RolloutWorker
     from tb_gfn import TBGFlowNetGenerator
+    from time_env import DEFAULT_TIME_BASIS_COMPONENTS
     from utils import VCF_PARSER_VERSION, is_vcf_path, load_vcf_variants
 
 from .local_refinement import LocalRefinementRequest, prepare_local_refinement
 
 
-LOCAL_MODEL_VERSION = "local-arg-gflownet-fl-subtb-v1"
+LOCAL_MODEL_VERSION = "local-arg-gflownet-continuous-time-v2"
 CONTEXT_FEATURE_SCHEMA = (
     "target_left_fraction",
     "target_right_fraction",
@@ -94,8 +96,6 @@ def train_local_refinement(
     eval_episodes=8,
     eval_every=10,
     partial_segment_max_steps=16,
-    time_bins=32,
-    time_delta_bin_width=0.001,
     reward_C=30000,
     embedding_size=32,
     hidden_size=64,
@@ -106,6 +106,7 @@ def train_local_refinement(
     transformer_heads=4,
     transformer_mlp_ratio=2.0,
     attention_dropout=0.0,
+    time_basis_components=DEFAULT_TIME_BASIS_COMPONENTS,
     verbose=True,
 ):
     """Train one conditional local policy across explicit interval/time contexts."""
@@ -131,8 +132,6 @@ def train_local_refinement(
         recombination_rate=float(recombination_rate),
         population_size=float(effective_population_size),
         mutation_rate=float(mutation_rate),
-        time_bins=int(time_bins),
-        time_delta_bin_width=float(time_delta_bin_width),
         reward_C=float(reward_C),
     )
 
@@ -159,6 +158,7 @@ def train_local_refinement(
         "time_hidden_size": 256,
         "time_layers": 3,
         "time_dropout": 0.0,
+        "time_basis_components": int(time_basis_components),
         "breakpoint_gap_hidden_size": 256,
         "breakpoint_gap_layers": 3,
         "breakpoint_gap_dropout": 0.0,
@@ -584,8 +584,16 @@ def _build_metadata(
             "eval_every": int(eval_every),
             "init_z_sample_count": int(init_z_sample_count),
             "partial_segment_max_steps": int(partial_segment_max_steps),
-            "time": dict(local_env.time_metadata),
+            "time": {
+                **dict(local_env.time_metadata),
+                "time_basis_components": int(
+                    model_kwargs["time_basis_components"]
+                ),
+            },
             **dict(local_env.time_metadata),
+            "time_basis_components": int(
+                model_kwargs["time_basis_components"]
+            ),
             "prior": {
                 "effective_population_size": float(
                     effective_population_size
@@ -618,6 +626,34 @@ def _load_shape_compatible_weights(generator, checkpoint):
 
 
 def _validate_source_checkpoint(metadata, env):
+    if metadata.get("model_version") != "cwr-event-continuous-time-v2":
+        raise ValueError(
+            "local continuous-time v2 training can only warm-start from a "
+            "global continuous-time v2 checkpoint"
+        )
+    time_mismatches = [
+        f"{key}: checkpoint={metadata.get(key)!r} environment={expected!r}"
+        for key, expected in env.time_metadata.items()
+        if metadata.get(key) != expected
+    ]
+    if time_mismatches:
+        raise ValueError(
+            "source checkpoint continuous-time metadata does not match the "
+            "local environment: " + "; ".join(time_mismatches)
+        )
+    basis_components = metadata.get("time_basis_components")
+    model_basis_components = (metadata.get("model") or {}).get(
+        "time_basis_components"
+    )
+    if (
+        basis_components is None
+        or model_basis_components is None
+        or int(basis_components) != int(model_basis_components)
+        or int(basis_components) < 2
+    ):
+        raise ValueError(
+            "source checkpoint has incompatible continuous-time basis metadata"
+        )
     mismatches = []
     for key, expected in (
         ("num_sequences", env.num_sequences),
@@ -636,6 +672,9 @@ def _validate_source_checkpoint(metadata, env):
 
 
 def _rollout_metrics(mode, outputs):
+    quantiles = outputs["time_quantiles"].detach().cpu()
+    deltas = outputs["time_delta_times"].detach().cpu()
+    densities = outputs["time_log_densities"].detach().cpu()
     return {
         "mode": str(mode),
         "length_mean": float(
@@ -647,6 +686,16 @@ def _rollout_metrics(mode, outputs):
         "truncated_rate": float(
             outputs["truncated_mask"].detach().float().mean().cpu().item()
         ),
+        "time_count": int(quantiles.numel()),
+        "time_quantile_sum": float(quantiles.sum().item()),
+        "time_delta_sum": float(deltas.sum().item()),
+        "time_near_boundary_sum": float(
+            (quantiles >= 0.99).sum().item()
+        ),
+        "time_finite_density_sum": float(
+            torch.isfinite(densities).sum().item()
+        ),
+        "fixed_attachment_count": int(outputs["fixed_attachment_count"]),
     }
 
 
@@ -664,6 +713,29 @@ def _merge_rollout_metrics(rows):
         )
         result[f"train_{mode}_truncated_rate"] = float(
             np.mean([row["truncated_rate"] for row in selected])
+        )
+        time_count = max(
+            sum(row["time_count"] for row in selected),
+            1,
+        )
+        result[f"train_{mode}_time_quantile_mean"] = float(
+            sum(row["time_quantile_sum"] for row in selected)
+            / time_count
+        )
+        result[f"train_{mode}_time_delta_mean"] = float(
+            sum(row["time_delta_sum"] for row in selected)
+            / time_count
+        )
+        result[f"train_{mode}_time_near_boundary_rate"] = float(
+            sum(row["time_near_boundary_sum"] for row in selected)
+            / time_count
+        )
+        result[f"train_{mode}_time_finite_density_rate"] = float(
+            sum(row["time_finite_density_sum"] for row in selected)
+            / time_count
+        )
+        result[f"train_{mode}_fixed_attachment_mean"] = float(
+            np.mean([row["fixed_attachment_count"] for row in selected])
         )
     return result
 

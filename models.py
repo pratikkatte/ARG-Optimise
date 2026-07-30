@@ -2,10 +2,12 @@ try:
     from .env import CoalescenceChoice, MaterialSegments, RecombinationChoice
     from .breakpoint_model import BreakpointSplitPositionCNN, VCFBreakpointScorer
     from .time_model import TimeModel
+    from .time_env import DEFAULT_TIME_BASIS_COMPONENTS
 except ImportError:  # Support the repository's script-style entry points.
     from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
     from breakpoint_model import BreakpointSplitPositionCNN, VCFBreakpointScorer
     from time_model import TimeModel
+    from time_env import DEFAULT_TIME_BASIS_COMPONENTS
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -231,6 +233,7 @@ class ARGModel(nn.Module):
         time_hidden_size=256,
         time_layers=3,
         time_dropout=0.0,
+        time_basis_components=DEFAULT_TIME_BASIS_COMPONENTS,
         breakpoint_gap_hidden_size=256,
         breakpoint_gap_layers=3,
         breakpoint_gap_dropout=0.0,
@@ -315,10 +318,10 @@ class ARGModel(nn.Module):
             ).to(self.device)
 
         self.time_scorer = TimeModel(
-            embedding_size * 4,
+            embedding_size * 4 + TimeModel.CONTEXT_FEATURE_DIM,
             time_hidden_size,
             time_dropout,
-            env.time_env.bins,
+            time_basis_components,
             layers=time_layers,
         )
         self.logsoftmax = nn.LogSoftmax(dim=1)

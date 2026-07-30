@@ -10,7 +10,12 @@ try:
     from .env import LocalARGEnvironment, SimpleARGEnvironment
     from .rollout_worker_arg import RolloutWorker
     from .tb_gfn import TBGFlowNetGenerator
-    from .time_env import DEFAULT_TIME_BIN_SCHEME
+    from .time_env import (
+        DEFAULT_DEMOGRAPHY_MODEL,
+        DEFAULT_TIME_DENSITY,
+        DEFAULT_TIME_SCHEME,
+        TIME_REFERENCE_MEASURE,
+    )
     from .train import (
         DEFAULT_LOSS,
         DEFAULT_LOG_Z_LR,
@@ -26,7 +31,12 @@ except ImportError:  # Support the repository's script-style entry points.
     from env import LocalARGEnvironment, SimpleARGEnvironment
     from rollout_worker_arg import RolloutWorker
     from tb_gfn import TBGFlowNetGenerator
-    from time_env import DEFAULT_TIME_BIN_SCHEME
+    from time_env import (
+        DEFAULT_DEMOGRAPHY_MODEL,
+        DEFAULT_TIME_DENSITY,
+        DEFAULT_TIME_SCHEME,
+        TIME_REFERENCE_MEASURE,
+    )
     from train import (
         DEFAULT_LOSS,
         DEFAULT_LOG_Z_LR,
@@ -45,9 +55,11 @@ REQUIRED_METADATA_KEYS = {
     "sequence_length",
     "num_blocks",
     "rho",
-    "time_bin_scheme",
-    "time_bins",
-    "time_delta_bin_width",
+    "time_scheme",
+    "time_density",
+    "time_basis_components",
+    "time_reference_measure",
+    "demography_model",
     "seed",
     "init_z_sample_count",
     "model_version",
@@ -239,6 +251,15 @@ def resolve_inference_output_dir(output_dir=None, experiment=None):
 
 
 def validate_metadata(metadata):
+    if (
+        "time_bin_scheme" in metadata
+        or "time_bins" in metadata
+        or "time_delta_bin_width" in metadata
+    ):
+        raise ValueError(
+            "Fixed-bin v1 checkpoints are incompatible with continuous-time "
+            "v2 inference and must be retrained."
+        )
     input_mode = metadata.get("input_mode", "dense")
     required = set(REQUIRED_METADATA_KEYS)
     if input_mode == "vcf":
@@ -251,18 +272,46 @@ def validate_metadata(metadata):
             "Checkpoint metadata is missing fields required for inference: "
             + ", ".join(missing)
         )
-    if metadata["time_bin_scheme"] != DEFAULT_TIME_BIN_SCHEME:
+    expected_time_metadata = {
+        "time_scheme": DEFAULT_TIME_SCHEME,
+        "time_density": DEFAULT_TIME_DENSITY,
+        "time_reference_measure": TIME_REFERENCE_MEASURE,
+        "demography_model": DEFAULT_DEMOGRAPHY_MODEL,
+    }
+    mismatched_time = [
+        f"{key}: expected={expected!r} got={metadata.get(key)!r}"
+        for key, expected in expected_time_metadata.items()
+        if metadata.get(key) != expected
+    ]
+    if mismatched_time:
         raise ValueError(
-            "This inference path requires fixed-delta time-bin checkpoints "
-            f"({DEFAULT_TIME_BIN_SCHEME}), got {metadata['time_bin_scheme']!r}."
+            "Checkpoint continuous-time metadata is incompatible: "
+            + "; ".join(mismatched_time)
+        )
+    basis_components = int(metadata["time_basis_components"])
+    if basis_components < 2:
+        raise ValueError(
+            "Checkpoint time_basis_components must be at least 2"
+        )
+    model_basis = int(
+        (metadata.get("model") or {}).get(
+            "time_basis_components",
+            basis_components,
+        )
+    )
+    if model_basis != basis_components:
+        raise ValueError(
+            "Checkpoint time basis metadata does not match the model"
         )
     is_local = metadata.get("training_mode") == "local_refinement"
     expected_model_version = (
-        "local-arg-gflownet-fl-subtb-v1" if is_local else MODEL_VERSION
+        "local-arg-gflownet-continuous-time-v2"
+        if is_local
+        else MODEL_VERSION
     )
     if metadata["model_version"] != expected_model_version:
         raise ValueError(
-            "Checkpoint model_version is incompatible with this sparse VCF implementation: "
+            "Checkpoint model_version is incompatible with continuous-time v2: "
             f"expected {expected_model_version!r}, got {metadata['model_version']!r}."
         )
     if is_local:
@@ -299,8 +348,6 @@ def environment_from_metadata(metadata, seed, device=None, dataset_path=None):
         "sequence_length": int(metadata["sequence_length"]),
         "num_blocks": int(metadata["num_blocks"]),
         "rho": float(metadata["rho"]),
-        "time_bins": int(metadata["time_bins"]),
-        "time_delta_bin_width": float(metadata["time_delta_bin_width"]),
         "population_size": float(
             metadata.get("effective_population_size", DEFAULT_NE)
         ),

@@ -188,14 +188,17 @@ At each step, the filtered CWR prior uses the number of legal overlapping
 coalescence pairs and `rho / 2` times active target material length.
 Coalescence pairs are uniform. Recombining lineages are material-weighted, and
 breakpoints are uniform over legal block boundaries (physical-gap-weighted in
-VCF mode). Waiting time is sampled in the existing `TimeEnvFixedDelta` bins.
-If a cross-window source ancestor is reached first, the local event survival
-mass is recorded. Every fixed ancestor tied at that time is then connected to
-the active lineages carrying material descended from its cut endpoints. Those
-material pieces are replaced by the ancestor in the active frontier before
-another local event is sampled. A fixed ancestor is never inserted as an
-independent lineage with no descendants. If its required descendant material
-is unavailable, the transition is rejected.
+VCF mode). Waiting time follows the exact constant-\(N_e\) exponential CWR law
+in \(2N_e\)-scaled time. A generated event is represented by a continuous
+conditional-CDF quantile, so there is no time-bin width or quantization. If a
+cross-window source ancestor is reached first, its exact exponential survival
+mass is recorded and the ancestor is revealed at its fixed boundary time.
+Every fixed ancestor tied at that time is then connected to the active lineages
+carrying material descended from its cut endpoints. Those material pieces are
+replaced by the ancestor in the active frontier before another local event is
+sampled. A fixed ancestor is never inserted as an independent lineage with no
+descendants. If its required descendant material is unavailable, the
+transition is rejected.
 
 `undo_local_transition(state, context)` exactly reverses the most recent
 coalescence, recombination, or fixed-ancestor attachment. Fixed attachments

@@ -6,10 +6,18 @@ import torch
 
 try:
     from .models import ARGModel
-    from .env import FixedAttachmentChoice, RecombinationChoice
+    from .env import (
+        CoalescenceChoice,
+        FixedAttachmentChoice,
+        RecombinationChoice,
+    )
 except ImportError:  # Support the repository's script-style entry points.
     from models import ARGModel
-    from env import FixedAttachmentChoice, RecombinationChoice
+    from env import (
+        CoalescenceChoice,
+        FixedAttachmentChoice,
+        RecombinationChoice,
+    )
 from dataclasses import replace
 
 LOSS_FN = {
@@ -173,6 +181,22 @@ class TBGFlowNetGenerator(torch.nn.Module):
             if isinstance(path, dict)
             else self._torch_load(path, map_location=map_location)
         )
+        metadata = dict(checkpoint.get("metadata") or {})
+        if (
+            any(
+                key in metadata
+                for key in (
+                    "time_bin_scheme",
+                    "time_bins",
+                    "time_delta_bin_width",
+                )
+            )
+            or str(metadata.get("model_version", "")).endswith("-v1")
+        ):
+            raise ValueError(
+                "Fixed-bin v1 checkpoints are incompatible with "
+                "continuous-time v2 and must be retrained."
+            )
         state_dict = checkpoint.get("generator_state_dict", checkpoint)
         load_result = self.load_state_dict(state_dict, strict=False)
         allowed_missing = [
@@ -283,6 +307,59 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def _model_dtype(self):
         return next(self.arg_model.parameters()).dtype
 
+    def _sample_continuous_times(
+        self,
+        selected_action_features,
+        rates,
+        max_deltas,
+        random_spec,
+    ):
+        context_features = self.time_model.context_features(
+            rates,
+            max_deltas,
+            device=self.device,
+            dtype=selected_action_features.dtype,
+        )
+        mixture_logits = self.time_model(
+            torch.cat(
+                [selected_action_features, context_features],
+                dim=-1,
+            )
+        )
+        time_quantiles = self.time_model.sample(
+            mixture_logits,
+            random_spec,
+        )
+        delta_times = []
+        generated_masses = []
+        for quantile, rate, max_delta in zip(
+            time_quantiles.detach().cpu().tolist(),
+            rates,
+            max_deltas,
+        ):
+            delta_times.append(
+                self.env.time_env.quantile_to_delta(
+                    float(quantile),
+                    float(rate),
+                    max_delta=max_delta,
+                )
+            )
+            generated_masses.append(
+                self.env.time_env.generated_probability(
+                    float(rate),
+                    max_delta=max_delta,
+                )
+            )
+        log_time_pf = self.time_model.log_time_density(
+            mixture_logits,
+            time_quantiles,
+            delta_times,
+            rates,
+            generated_masses,
+            random_spec=random_spec,
+        )
+        return time_quantiles, delta_times, log_time_pf
+
     def forward(self, input_dict):
         if bool(input_dict.get("local_mode", False)):
             return self._forward_local(input_dict)
@@ -332,15 +409,37 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         log_breakpoint_pf = torch.stack(log_p_breakpoints)
 
-        selected_action_features = torch.stack(choosen_action_features, dim=0)  # shape: [B, F]
-        time_logits = self.time_model(selected_action_features)
-        time_actions = self.time_model.sample(time_logits, random_spec)
+        selected_action_features = torch.stack(
+            choosen_action_features,
+            dim=0,
+        )
+        rates = [
+            self.env._total_event_rate(state.rates)
+            for state in states
+        ]
+        time_quantiles, delta_times, log_time_pf = (
+            self._sample_continuous_times(
+                selected_action_features,
+                rates,
+                [None] * len(states),
+                random_spec,
+            )
+        )
 
         for batch_idx, action in enumerate(choosen_actions):
-            time = int(time_actions[batch_idx].detach().cpu().item())
-            choosen_actions[batch_idx] = replace(action, time_action=time)
-
-        log_time_pf = self.time_model.compute_log_time_pf(time_logits, time_actions)
+            time_quantile = float(
+                time_quantiles[batch_idx].detach().cpu().item()
+            )
+            choosen_actions[batch_idx] = replace(
+                action,
+                time_quantile=time_quantile,
+                delta_time=float(delta_times[batch_idx]),
+                waiting_rate=float(rates[batch_idx]),
+                fixed_horizon=None,
+                time_log_density=float(
+                    log_time_pf[batch_idx].detach().cpu().item()
+                ),
+            )
 
         total_log_pf = log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
 
@@ -422,8 +521,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 raise RuntimeError(
                     "local gate selected a fixed attachment without a boundary"
                 )
+            horizon = float(rollout[index]["max_delta"])
+            waiting_rate = float(rollout[index]["total_rate"])
             chosen_actions[index] = FixedAttachmentChoice(
-                event_time=float(event_time)
+                event_time=float(event_time),
+                waiting_rate=waiting_rate,
+                fixed_horizon=horizon,
+                survival_log_probability=-waiting_rate * horizon,
             )
 
         if generated_indices:
@@ -511,41 +615,46 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 generated_action_features,
                 dim=0,
             )
-            time_logits = self.time_model(selected_features)
-            time_masks = torch.tensor(
-                [
-                    rollout[index]["time_action_mask"]
-                    for index in generated_indices
-                ],
-                dtype=torch.bool,
-                device=self.device,
-            )
-            time_actions = self.time_model.sample(
-                time_logits,
-                random_spec,
-                action_mask=time_masks,
-            )
-            log_time_pf = self.time_model.compute_log_time_pf(
-                time_logits,
-                time_actions,
-                action_mask=time_masks,
+            rates = [
+                float(rollout[index]["total_rate"])
+                for index in generated_indices
+            ]
+            max_deltas = [
+                rollout[index]["max_delta"]
+                for index in generated_indices
+            ]
+            time_quantiles, delta_times, log_time_pf = (
+                self._sample_continuous_times(
+                    selected_features,
+                    rates,
+                    max_deltas,
+                    random_spec,
+                )
             )
 
             for local_index, action in enumerate(
                 generated_chosen_actions
             ):
                 state_index = generated_indices[local_index]
-                time_action = int(
-                    time_actions[local_index].detach().cpu().item()
-                )
-                delta_time = self.env.time_action_to_delta(
-                    states[state_index],
-                    time_action,
+                time_quantile = float(
+                    time_quantiles[local_index].detach().cpu().item()
                 )
                 chosen_actions[state_index] = replace(
                     action,
-                    time_action=time_action,
-                    delta_time=float(delta_time),
+                    time_quantile=time_quantile,
+                    delta_time=float(delta_times[local_index]),
+                    waiting_rate=float(rates[local_index]),
+                    fixed_horizon=(
+                        None
+                        if max_deltas[local_index] is None
+                        else float(max_deltas[local_index])
+                    ),
+                    time_log_density=float(
+                        log_time_pf[local_index]
+                        .detach()
+                        .cpu()
+                        .item()
+                    ),
                 )
                 total_log_pf[state_index] = (
                     total_log_pf[state_index]
@@ -725,7 +834,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
         parent_state.current_time = self._max_node_time(parent_state)
         delta_t = float(state.current_time) - float(parent_state.current_time)
         rates = self.env.enumerate_prior_options(parent_state).rates
-        forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
+        forward_action["time_quantile"] = (
+            self.env.time_env.delta_to_quantile(
+                delta_t,
+                self.env._total_event_rate(rates),
+            )
+        )
+        forward_action["delta_time"] = delta_t
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 
@@ -753,8 +868,35 @@ class TBGFlowNetGenerator(torch.nn.Module):
         }
         parent_state.current_time = self._max_node_time(parent_state)
         delta_t = float(state.current_time) - float(parent_state.current_time)
-        rates = self.env.enumerate_prior_options(parent_state).rates
-        forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
+        prior_options = self.env.enumerate_prior_options(parent_state)
+        rates = prior_options.rates
+        total_rate = self.env._total_event_rate(rates)
+        reconstructed_choice = next(
+            (
+                choice
+                for choice in prior_options.recomb_choices
+                if int(choice.active_lineage_i)
+                == int(forward_action["active_lineage_i"])
+            ),
+            None,
+        )
+        if reconstructed_choice is None:
+            raise RuntimeError(
+                "backward recombination has no matching forward candidate"
+            )
+        forward_action.update(
+            {
+                "material_count": int(
+                    reconstructed_choice.material_count
+                ),
+                "span_start": int(reconstructed_choice.span_start),
+                "span_end": int(reconstructed_choice.span_end),
+            }
+        )
+        forward_action["time_quantile"] = (
+            self.env.time_env.delta_to_quantile(delta_t, total_rate)
+        )
+        forward_action["delta_time"] = delta_t
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 
@@ -764,9 +906,24 @@ class TBGFlowNetGenerator(torch.nn.Module):
         parent_state.action_options = None
         parent_state.rates = None
         parent_state.prior_options = None
+        parent_state.total_active_blocks = sum(
+            lineage.material_segments.count
+            for lineage in parent_state.active_lineages
+        )
         parent_state.is_done = self.env.is_terminal(parent_state)
 
-        log_prior = self.env.compute_cwr_event_log_prior(parent_state, forward_action)
+        reconstructed_action = (
+            CoalescenceChoice.from_action(forward_action)
+            or RecombinationChoice.from_action(forward_action)
+        )
+        if reconstructed_action is None:
+            raise RuntimeError(
+                "backward reconstruction produced an invalid forward action"
+            )
+        log_prior = self.env.compute_cwr_event_log_prior(
+            parent_state,
+            reconstructed_action,
+        )
         if math.isfinite(log_prior):
             parent_state.accumulated_log_prior = child_state.accumulated_log_prior - log_prior
         parent_state.action_options = None

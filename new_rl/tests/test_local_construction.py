@@ -90,7 +90,6 @@ def _environment(
     *,
     recombination_rate=0.0,
     rho=None,
-    time_delta_bin_width=1e-5,
 ):
     return SimpleARGEnvironment(
         num_sequences=ts.num_samples,
@@ -100,7 +99,6 @@ def _environment(
         recombination_rate=recombination_rate,
         rho=rho,
         structural_only=True,
-        time_delta_bin_width=time_delta_bin_width,
     )
 
 
@@ -134,7 +132,7 @@ def _apply_coalescence_for_nodes(state, prepared, env, left_id, right_id):
     )
     return apply_local_action(
         state,
-        replace(action, time_action=0, delta_time=1e-6),
+        replace(action, time_quantile=0.5, delta_time=1e-6),
         prepared.context,
         env,
         log_prior=0.0,
@@ -250,8 +248,10 @@ def test_sampled_action_log_probability_matches_filtered_cwr_prior():
     total_rate = (
         options.rates["lambda_coal"] + options.rates["lambda_recomb"]
     )
-    event_masses = env.time_env.time_action_probabilities(total_rate)
-    expected = math.log(event_masses[action.time_action])
+    expected = env.time_env.waiting_time_log_density(
+        action.delta_time,
+        total_rate,
+    )
     if isinstance(action, CoalescenceChoice):
         expected += math.log(options.rates["lambda_coal"] / total_rate)
         expected -= math.log(len(options.coal_actions))
@@ -284,15 +284,15 @@ def test_bounded_wait_and_fixed_attachment_win_at_equal_time_and_undo():
     options = enumerate_local_prior_actions(state, prepared.context, env)
     total_rate = options.rates["lambda_coal"] + options.rates["lambda_recomb"]
     next_fixed = state.fixed_ancestor_schedule[0]["time"]
-    event_masses, survival = env.time_env.bounded_waiting_distribution(
+    generated, survival = env.time_env.bounded_waiting_distribution(
         total_rate,
         next_fixed - state.current_time,
     )
-    assert sum(event_masses) + survival == pytest.approx(1.0)
+    assert generated + survival == pytest.approx(1.0)
 
     action = replace(
         options.coal_actions[0],
-        time_action=0,
+        time_quantile=0.5,
         delta_time=next_fixed - state.current_time,
     )
     with pytest.raises(ValueError, match="cannot skip"):
@@ -339,6 +339,23 @@ def test_bounded_wait_and_fixed_attachment_win_at_equal_time_and_undo():
     )
 
 
+def test_coincident_fixed_boundary_disables_continuous_generation():
+    source, prepared = _simple_prepared()
+    env = _environment(source, rho=2.0)
+    state = initialize_local_arg_state(prepared, env)
+    state.current_time = float(state.fixed_ancestor_schedule[0]["time"])
+
+    action, log_prior = sample_local_prior_action(
+        state,
+        prepared.context,
+        env,
+        np.random.default_rng(31),
+    )
+
+    assert action is None
+    assert log_prior == pytest.approx(0.0)
+
+
 def test_structural_coalescence_matches_environment_core():
     source, prepared = _simple_prepared()
     env = _environment(source)
@@ -346,7 +363,7 @@ def test_structural_coalescence_matches_environment_core():
     options = enumerate_local_prior_actions(state, prepared.context, env)
     action = replace(
         options.coal_actions[0],
-        time_action=0,
+        time_quantile=0.5,
         delta_time=1e-6,
     )
 
@@ -384,7 +401,7 @@ def test_sampled_structural_actions_have_exact_backward_transitions():
             prepared.context,
             env,
         ).coal_actions[0],
-        time_action=0,
+        time_quantile=0.5,
         delta_time=1e-6,
     )
     after_coal = apply_local_action(
@@ -416,7 +433,7 @@ def test_sampled_structural_actions_have_exact_backward_transitions():
             env,
         ).recomb_choices[0],
         breakpoint=5,
-        time_action=0,
+        time_quantile=0.5,
         delta_time=1e-6,
     )
     after_recomb = apply_local_action(
@@ -451,7 +468,7 @@ def test_recombination_conserves_blocks_and_terminal_is_one_root_per_block():
     action = replace(
         options.recomb_choices[0],
         breakpoint=5,
-        time_action=0,
+        time_quantile=0.5,
         delta_time=1e-6,
     )
     state = apply_local_action(
@@ -567,7 +584,7 @@ def test_sample_splice_keeps_local_events_genotypes_and_fixed_exterior(tmp_path)
             env,
         ).recomb_choices[0],
         breakpoint=5,
-        time_action=0,
+        time_quantile=0.5,
         delta_time=1e-6,
     )
     state = apply_local_action(
@@ -690,7 +707,7 @@ def prepared_25kb():
         source,
         LocalRefinementRequest((386.0, 23_963.0), cut_time=25_000.0),
     )
-    env = _environment(source, time_delta_bin_width=0.001)
+    env = _environment(source)
     return source, prepared, env
 
 

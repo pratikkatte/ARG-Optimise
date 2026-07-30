@@ -542,34 +542,43 @@ def sample_local_prior_action(
         if next_fixed_time is None
         else max(0.0, float(next_fixed_time - state.current_time))
     )
+    if max_delta is not None and max_delta <= 1e-15:
+        return None, -total_rate * max_delta
     if max_delta is None:
-        event_masses = tuple(
-            env.time_env.time_action_probabilities(total_rate)
-        )
+        generated_mass = 1.0
         survival_mass = 0.0
     else:
-        event_masses, survival_mass = (
+        generated_mass, survival_mass = (
             env.time_env.bounded_waiting_distribution(
                 total_rate,
                 max_delta,
             )
         )
 
-    outcomes = np.asarray(
-        event_masses + ((survival_mass,) if max_delta is not None else ()),
-        dtype=np.float64,
+    generate_event = bool(
+        rng.choice(
+            2,
+            p=np.asarray(
+                [generated_mass, survival_mass],
+                dtype=np.float64,
+            ),
+        )
+        == 0
     )
-    outcome = int(rng.choice(outcomes.size, p=outcomes / outcomes.sum()))
-    if max_delta is not None and outcome == len(event_masses):
+    if not generate_event:
         return None, math.log(survival_mass) if survival_mass > 0.0 else -math.inf
 
-    time_action = outcome
-    delta_time = env.time_env.time_action_to_delta(
-        time_action,
+    time_quantile = env.time_env.sample_prior_quantile(rng)
+    delta_time = env.time_env.quantile_to_delta(
+        time_quantile,
         total_rate,
         max_delta=max_delta,
     )
-    wait_log_probability = math.log(event_masses[time_action])
+    wait_log_probability = env.time_env.waiting_time_log_density(
+        delta_time,
+        total_rate,
+        max_delta=max_delta,
+    )
 
     lambda_coal = float(options.rates["lambda_coal"])
     lambda_recomb = float(options.rates["lambda_recomb"])
@@ -585,7 +594,7 @@ def sample_local_prior_action(
         action_index = int(rng.integers(len(options.coal_actions)))
         action = replace(
             options.coal_actions[action_index],
-            time_action=time_action,
+            time_quantile=time_quantile,
             delta_time=float(delta_time),
         )
         choice_log_probability = (
@@ -620,7 +629,7 @@ def sample_local_prior_action(
         action = replace(
             choice,
             breakpoint=int(breakpoint),
-            time_action=time_action,
+            time_quantile=time_quantile,
             delta_time=float(delta_time),
         )
         choice_log_probability = (
@@ -645,6 +654,13 @@ def apply_local_action(
         raise ValueError("cannot apply an action to a terminal local state")
     if action.delta_time is None or not float(action.delta_time) > 0.0:
         raise ValueError("local prior action requires a positive delta_time")
+    if (
+        action.time_quantile is None
+        or not 0.0 < float(action.time_quantile) < 1.0
+    ):
+        raise ValueError(
+            "local prior action requires time_quantile inside (0, 1)"
+        )
 
     options = enumerate_local_prior_actions(state, context, env)
     if isinstance(action, CoalescenceChoice):
@@ -748,8 +764,29 @@ def apply_local_action(
         "scaled_time": float(next_state.current_time),
         "input_node_ids": input_node_ids,
         "created_node_ids": created_node_ids,
-        "time_action": int(action.time_action),
+        "time_quantile": float(action.time_quantile),
         "delta_time": float(action.delta_time),
+        "waiting_rate": float(
+            options.rates["lambda_coal"]
+            + options.rates["lambda_recomb"]
+        ),
+        "fixed_horizon": (
+            None
+            if next_fixed_time is None
+            else float(next_fixed_time - state.current_time)
+        ),
+        "time_log_prior_density": float(
+            env.time_env.waiting_time_log_density(
+                action.delta_time,
+                options.rates["lambda_coal"]
+                + options.rates["lambda_recomb"],
+                max_delta=(
+                    None
+                    if next_fixed_time is None
+                    else float(next_fixed_time - state.current_time)
+                ),
+            )
+        ),
         "log_prior_increment": float(log_prior),
         "log_likelihood_increment": float(
             next_state.accumulated_log_likelihood
@@ -810,6 +847,11 @@ def advance_local_state(
         env=env,
     )
     attachment_record = dict(next_state.transition_records[-1])
+    rates = state.prior_options.rates
+    total_rate = float(
+        rates["lambda_coal"] + rates["lambda_recomb"]
+    )
+    fixed_horizon = float(next_fixed_time - state.current_time)
     attachment_record.update(
         {
             "waited_from_time": float(
@@ -818,6 +860,9 @@ def advance_local_state(
             "waited_from_scaled_time": float(state.current_time),
             "log_prior_increment": float(log_prior),
             "fixed_event_survival": True,
+            "waiting_rate": total_rate,
+            "fixed_horizon": fixed_horizon,
+            "survival_log_probability": float(log_prior),
         }
     )
     undo = dict(attachment_record["_undo"])
@@ -2231,7 +2276,7 @@ def _next_fixed_ancestor_time(state: ARGState) -> float | None:
         float(record["time"])
         for record in state.fixed_ancestor_schedule
         if int(record["node_id"]) not in state.all_nodes
-        and float(record["time"]) > float(state.current_time) + 1e-15
+        and float(record["time"]) >= float(state.current_time)
     ]
     return min(times) if times else None
 

@@ -43,8 +43,6 @@ environment:
   effective_population_size: 10000
   mutation_rate: 2.0e-8
   recombination_rate: 2.0e-8
-  time_bins: 32
-  time_delta_bin_width: 0.001
 
 reward:
   constant: 0
@@ -61,3 +59,4 @@ model:
   transformer_heads: 4
   transformer_mlp_ratio: 2.0
   attention_dropout: 0.05
+  time_basis_components: 16
