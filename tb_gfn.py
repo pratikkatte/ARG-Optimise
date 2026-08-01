@@ -1059,4 +1059,4 @@ class TBGFlowNetGenerator(torch.nn.Module):
         loss = self.get_loss_from_rollout_outputs(rollout_outputs)
         loss = (loss / factor)
         loss.backward()
-        self.loss += loss 
+        self.loss = self.loss + loss.detach()
