@@ -1,0 +1,61 @@
+dataset_path: validation/vcf/sim_l1mb_0.vcf
+output_path: runs/local_refinement_1mb_batch4
+device: auto
+
+refinement:
+  enabled: true
+  arg_path: validation/output/tsinfer/l1mb_dated.trees
+  checkpoint: null
+
+  # Half-open interval [left, right); this request is exactly 100 kb.
+  # Supply exactly one of cut_time or cut_event_index.
+  requests:
+    - id: region_000001
+      genomic_range: [14000, 114000]
+      cut_time: 25000
+
+training:
+  epochs: 3000
+
+  # Effective batch size: 4 x 4 = 16.
+  batch_size: 4
+  grad_accum_steps: 4
+
+  seed: 7
+  init_z_sample_count: 0
+  verbose: true
+  wandb: true
+
+  policy_lr: 0.0001
+  log_z_lr: 0.001
+  loss: fl_subtb
+  subtb_lambda: 0.9
+  subtb_max_span: 16
+  grad_clip: 10.0
+
+  eval_episodes: 0
+  eval_every: 0
+  partial_segment_max_steps: 16
+
+environment:
+  bp_per_blocks: 1
+  effective_population_size: 10000
+  mutation_rate: 2.0e-8
+  recombination_rate: 2.0e-8
+
+reward:
+  constant: 0
+
+model:
+  embedding_size: 64
+  hidden_size: 128
+  dropout: 0.05
+
+  breakpoint_hidden_dim: 128
+  breakpoint_dropout: 0.05
+
+  transformer_depth: 4
+  transformer_heads: 4
+  transformer_mlp_ratio: 2.0
+  attention_dropout: 0.05
+  time_basis_components: 16

@@ -22,13 +22,25 @@ try:
     from .rollout_worker_arg import RolloutWorker
     from .tb_gfn import TBGFlowNetGenerator
     from .time_env import DEFAULT_TIME_BASIS_COMPONENTS
-    from .utils import VCF_PARSER_VERSION, is_vcf_path, load_sequences, load_vcf_variants
+    from .utils import (
+        VCF_PARSER_VERSION,
+        is_vcf_path,
+        load_sequences,
+        load_vcf_variants,
+        validate_local_refinement_span,
+    )
 except ImportError:  # Support the repository's script-style entry points.
     from env import SimpleARGEnvironment, action_as_dict
     from rollout_worker_arg import RolloutWorker
     from tb_gfn import TBGFlowNetGenerator
     from time_env import DEFAULT_TIME_BASIS_COMPONENTS
-    from utils import VCF_PARSER_VERSION, is_vcf_path, load_sequences, load_vcf_variants
+    from utils import (
+        VCF_PARSER_VERSION,
+        is_vcf_path,
+        load_sequences,
+        load_vcf_variants,
+        validate_local_refinement_span,
+    )
 
 
 DEFAULT_NE = 10000
@@ -296,6 +308,22 @@ def validate_train_config(config):
     loss = str(training.get("loss", DEFAULT_LOSS)).lower()
     if loss not in {"tb", "subtb", "fl_subtb"}:
         raise ValueError("training.loss must be one of 'tb', 'subtb', or 'fl_subtb'")
+    for field_name in ("batch_size", "grad_accum_steps"):
+        try:
+            parsed_value = int(training.get(field_name))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"training.{field_name} must be a positive integer") from exc
+        if parsed_value <= 0:
+            raise ValueError(f"training.{field_name} must be a positive integer")
+        training[field_name] = parsed_value
+    for field_name in ("eval_episodes", "eval_every"):
+        try:
+            parsed_value = int(training.get(field_name))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"training.{field_name} must be a non-negative integer") from exc
+        if parsed_value < 0:
+            raise ValueError(f"training.{field_name} must be a non-negative integer")
+        training[field_name] = parsed_value
     subtb_lambda = float(training.get("subtb_lambda", DEFAULT_SUBTB_LAMBDA))
     if subtb_lambda <= 0.0:
         raise ValueError("training.subtb_lambda must be positive")
@@ -391,6 +419,10 @@ def validate_train_config(config):
                     f"refinement.requests[{index}].genomic_range must satisfy "
                     "0 <= left < right with finite coordinates"
                 )
+            validate_local_refinement_span(
+                (left, right),
+                field_name=f"refinement.requests[{index}].genomic_range",
+            )
             supplied = int(request.get("cut_time") is not None) + int(
                 request.get("cut_event_index") is not None
             )
@@ -503,7 +535,12 @@ def train_epoch(
     start_state_sampler=None,
     rollout_logger=None,
 ):
-    grad_accum_steps = max(int(grad_accum_steps), 1)
+    batch_size = int(batch_size)
+    grad_accum_steps = int(grad_accum_steps)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be a positive integer")
     rollout_metrics = {}
 
     for accum_idx in range(grad_accum_steps):
@@ -790,6 +827,12 @@ def train(
     seed_everything(seed)
     device = torch.device(device)
     loss_mode = str(loss_mode).lower()
+    batch_size = int(batch_size)
+    grad_accum_steps = int(grad_accum_steps)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be a positive integer")
 
     variant_data = None
     if is_vcf_path(dataset_path):

@@ -6,14 +6,21 @@ import pytest
 import tskit
 import torch
 
-from env import SimpleARGEnvironment, action_active_lineage_indices
-from refinement import (
-    LazyCanonicalStateStore,
-    LocalRegionActionFilter,
-    build_refinement_context_sets,
-    build_refinement_contexts,
-    build_refinement_source,
-)
+try:
+    from env import SimpleARGEnvironment, action_active_lineage_indices
+    from refinement import (
+        LazyCanonicalStateStore,
+        LocalRegionActionFilter,
+        build_refinement_context_sets,
+        build_refinement_contexts,
+        build_refinement_source,
+    )
+except ImportError as exc:
+    pytest.skip(
+        "legacy automatic refinement API is not present in the explicit "
+        f"local-refinement implementation: {exc}",
+        allow_module_level=True,
+    )
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from train import (

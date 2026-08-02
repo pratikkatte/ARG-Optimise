@@ -12,7 +12,13 @@ from env import (
     SimpleARGEnvironment,
 )
 from models import ARGModel
-from utils import load_vcf_variants
+from train import load_train_config, validate_train_config
+from utils import (
+    MAX_LOCAL_REFINEMENT_SPAN_BP,
+    MAX_SUPPORTED_VCF_BYTES,
+    load_vcf_variants,
+    validate_local_refinement_span,
+)
 
 
 def write_vcf(tmp_path, body_rows, header_extra=""):
@@ -106,6 +112,84 @@ def test_load_vcf_haploidizes_phased_diploid_samples(tmp_path):
 def test_load_vcf_rejects_unsupported_v1_records(tmp_path, bad_row, match):
     with pytest.raises(ValueError, match=match):
         load_vcf_variants(write_vcf(tmp_path, [bad_row]))
+
+
+def test_load_vcf_rejects_oversized_input(tmp_path):
+    path = tmp_path / "oversized.vcf"
+    path.write_text(
+        "##fileformat=VCFv4.2\n" + ("#" * MAX_SUPPORTED_VCF_BYTES),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="supported 1 MB limit"):
+        load_vcf_variants(path)
+
+
+def test_load_vcf_accepts_exact_1mb_boundary(tmp_path):
+    path = tmp_path / "exact_1mb.vcf"
+    prefix = "##fileformat=VCFv4.2\n##contig=<ID=1,length=100>\n"
+    header = "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts0\n"
+    record = "1\t10\t.\tA\tC\t.\tPASS\t.\tGT\t0|1\n"
+    pad_prefix = "##pad="
+    fixed_text = prefix + header + record
+    padding_bytes = (
+        MAX_SUPPORTED_VCF_BYTES
+        - len(fixed_text.encode("utf-8"))
+        - len(pad_prefix.encode("utf-8"))
+        - len("\n".encode("utf-8"))
+    )
+    assert padding_bytes > 0
+    path.write_text(
+        prefix + pad_prefix + ("x" * padding_bytes) + "\n" + header + record,
+        encoding="utf-8",
+    )
+
+    assert path.stat().st_size == MAX_SUPPORTED_VCF_BYTES
+    data = load_vcf_variants(path)
+
+    assert data.num_variants == 1
+
+
+def test_local_refinement_span_limit_accepts_exact_100kb_boundary():
+    span = validate_local_refinement_span(
+        (14_000, 14_000 + MAX_LOCAL_REFINEMENT_SPAN_BP)
+    )
+
+    assert span == pytest.approx(MAX_LOCAL_REFINEMENT_SPAN_BP)
+
+
+def test_train_config_rejects_oversized_local_refinement_region():
+    config = load_train_config()
+    config["dataset_path"] = "dummy.vcf"
+    config["output_path"] = "dummy_out"
+    config["training"]["epochs"] = 1
+    config["training"]["loss"] = "fl_subtb"
+    config["refinement"].update(
+        {
+            "enabled": True,
+            "arg_path": "dummy.trees",
+            "requests": [
+                {
+                    "genomic_range": [0, MAX_LOCAL_REFINEMENT_SPAN_BP + 1],
+                    "cut_time": 1.0,
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="local refinement limit"):
+        validate_train_config(config)
+
+
+def test_train_config_rejects_zero_grad_accumulation():
+    config = load_train_config()
+    config["dataset_path"] = "dummy.vcf"
+    config["output_path"] = "dummy_out"
+    config["training"]["epochs"] = 1
+    config["training"]["grad_accum_steps"] = 0
+
+    with pytest.raises(ValueError, match="grad_accum_steps"):
+        validate_train_config(config)
 
 
 def test_material_segments_and_lineage_block_tensor_cache():

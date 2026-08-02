@@ -9,6 +9,7 @@ tree sequence produced by the splice step.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 import numpy as np
@@ -21,6 +22,170 @@ except ImportError:  # Support legacy top-level ``new_rl`` imports.
 
 
 _PROB_FLOOR = 1e-300
+
+
+@dataclass(frozen=True)
+class EndpointVCFPartials:
+    """Cached VCF partial rows for one cut-frontier endpoint."""
+
+    variant_indices: tuple[int, ...]
+    partials: np.ndarray
+    sequences_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        variant_indices = tuple(int(value) for value in self.variant_indices)
+        partials = np.asarray(self.partials, dtype=np.float64)
+        if partials.ndim != 2 or partials.shape[1] != len(BASES):
+            raise ValueError(
+                "endpoint VCF partials must have shape "
+                f"(rows, {len(BASES)}), got {partials.shape}"
+            )
+        if partials.shape[0] != len(variant_indices):
+            raise ValueError(
+                "endpoint VCF partial row count must match variant_indices"
+            )
+        object.__setattr__(self, "variant_indices", variant_indices)
+        object.__setattr__(self, "partials", partials)
+        object.__setattr__(
+            self,
+            "sequences_indices",
+            tuple(int(value) for value in self.sequences_indices),
+        )
+
+    @property
+    def row_count(self) -> int:
+        return int(len(self.variant_indices))
+
+    def to_legacy_dict(self) -> dict[str, Any]:
+        return {
+            "variant_indices": tuple(self.variant_indices),
+            "partials": self.partials,
+            "sequences_indices": tuple(self.sequences_indices),
+        }
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        return {
+            "variant_count": int(self.row_count),
+            "partial_shape": [int(value) for value in self.partials.shape],
+            "sequences_indices": list(self.sequences_indices),
+        }
+
+
+@dataclass(frozen=True)
+class RegionLocalVCFView:
+    """Exact local view of a whole-chromosome VCF likelihood.
+
+    Target variants remain mutable in local rollout states. Outside variants are
+    already scored against the fixed exterior source ARG and cached as a
+    constant contribution to the whole-VCF terminal likelihood.
+    """
+
+    genomic_range: tuple[float, float]
+    endpoints: Mapping[int, EndpointVCFPartials]
+    target_variant_indices: tuple[int, ...]
+    outside_variant_indices: tuple[int, ...]
+    outside_log_likelihood: float
+    inside_log_scale: float
+    alignment: Mapping[str, Any]
+    global_variant_count: int
+
+    def __post_init__(self) -> None:
+        left, right = (float(value) for value in self.genomic_range)
+        if not math.isfinite(left) or not math.isfinite(right) or not left < right:
+            raise ValueError("region-local VCF view requires a finite non-empty range")
+        target = tuple(int(value) for value in self.target_variant_indices)
+        outside = tuple(int(value) for value in self.outside_variant_indices)
+        target_set = set(target)
+        outside_set = set(outside)
+        if len(target_set) != len(target) or len(outside_set) != len(outside):
+            raise ValueError("region-local VCF view variant indices must be unique")
+        if target_set.intersection(outside_set):
+            raise ValueError("target and outside VCF variants must be disjoint")
+        expected_variants = set(range(int(self.global_variant_count)))
+        if target_set | outside_set != expected_variants:
+            raise ValueError(
+                "target plus outside VCF variants must cover the full VCF"
+            )
+        endpoints = {
+            int(node_id): (
+                endpoint
+                if isinstance(endpoint, EndpointVCFPartials)
+                else EndpointVCFPartials(**endpoint)
+            )
+            for node_id, endpoint in self.endpoints.items()
+        }
+        for node_id, endpoint in endpoints.items():
+            extra = set(endpoint.variant_indices) - target_set
+            if extra:
+                raise ValueError(
+                    "endpoint VCF partials carry non-target variants: "
+                    f"endpoint={node_id} variants={sorted(extra)}"
+                )
+        object.__setattr__(self, "genomic_range", (left, right))
+        object.__setattr__(self, "target_variant_indices", target)
+        object.__setattr__(self, "outside_variant_indices", outside)
+        object.__setattr__(self, "endpoints", endpoints)
+        object.__setattr__(
+            self,
+            "outside_log_likelihood",
+            float(self.outside_log_likelihood),
+        )
+        object.__setattr__(self, "inside_log_scale", float(self.inside_log_scale))
+        object.__setattr__(self, "alignment", dict(self.alignment))
+        object.__setattr__(
+            self,
+            "global_variant_count",
+            int(self.global_variant_count),
+        )
+
+    @property
+    def target_variant_count(self) -> int:
+        return int(len(self.target_variant_indices))
+
+    @property
+    def outside_variant_count(self) -> int:
+        return int(len(self.outside_variant_indices))
+
+    @property
+    def endpoint_variant_row_count(self) -> int:
+        return int(sum(endpoint.row_count for endpoint in self.endpoints.values()))
+
+    def endpoint_for_node(self, node_id: int) -> EndpointVCFPartials:
+        return self.endpoints[int(node_id)]
+
+    def to_legacy_dict(self) -> dict[str, Any]:
+        return {
+            "endpoints": {
+                int(node_id): endpoint.to_legacy_dict()
+                for node_id, endpoint in self.endpoints.items()
+            },
+            "target_variant_indices": tuple(self.target_variant_indices),
+            "outside_variant_indices": tuple(self.outside_variant_indices),
+            "outside_log_likelihood": float(self.outside_log_likelihood),
+            "inside_log_scale": float(self.inside_log_scale),
+            "alignment": dict(self.alignment),
+        }
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        return {
+            "likelihood_scope": "whole_vcf_chromosome",
+            "genomic_range": [float(value) for value in self.genomic_range],
+            "global_variant_count": int(self.global_variant_count),
+            "target_variant_count": int(self.target_variant_count),
+            "outside_variant_count": int(self.outside_variant_count),
+            "cached_exterior_likelihood": True,
+            "outside_log_likelihood": float(self.outside_log_likelihood),
+            "inside_log_scale": float(self.inside_log_scale),
+            "endpoint_count": int(len(self.endpoints)),
+            "endpoint_variant_row_count": int(self.endpoint_variant_row_count),
+            "endpoint_variant_row_count_by_node": {
+                str(node_id): int(endpoint.row_count)
+                for node_id, endpoint in sorted(self.endpoints.items())
+            },
+            "vcf_coordinate_offset": self.alignment.get("vcf_coordinate_offset"),
+            "vcf_path": self.alignment.get("vcf_path"),
+            "vcf_parser_version": self.alignment.get("parser_version"),
+        }
 
 
 def resolve_vcf_tree_sequence_alignment(
@@ -238,7 +403,7 @@ def compute_cut_frontier_vcf_partials(
     *,
     mutation_rate: float,
     alignment: Mapping[str, Any],
-) -> dict[str, Any]:
+    ) -> RegionLocalVCFView:
     """Prune fixed younger ancestry to the cut endpoints.
 
     The returned partial rows are normalized independently at every VCF site.
@@ -335,25 +500,27 @@ def compute_cut_frontier_vcf_partials(
     endpoint_records = {}
     for node_id in sorted(endpoint_intervals):
         rows = rows_by_endpoint[int(node_id)]
-        endpoint_records[int(node_id)] = {
-            "variant_indices": tuple(variants_by_endpoint[int(node_id)]),
-            "partials": (
+        endpoint_records[int(node_id)] = EndpointVCFPartials(
+            variant_indices=tuple(variants_by_endpoint[int(node_id)]),
+            partials=(
                 np.stack(rows, axis=0)
                 if rows
                 else np.empty((0, 4), dtype=np.float64)
             ),
-            "sequences_indices": tuple(
+            sequences_indices=tuple(
                 sorted(samples_by_endpoint[int(node_id)])
             ),
-        }
-    return {
-        "endpoints": endpoint_records,
-        "target_variant_indices": target_indices,
-        "outside_variant_indices": outside_indices,
-        "outside_log_likelihood": float(outside_log_likelihood),
-        "inside_log_scale": float(inside_log_scale),
-        "alignment": dict(alignment),
-    }
+        )
+    return RegionLocalVCFView(
+        genomic_range=(left, right),
+        endpoints=endpoint_records,
+        target_variant_indices=target_indices,
+        outside_variant_indices=outside_indices,
+        outside_log_likelihood=float(outside_log_likelihood),
+        inside_log_scale=float(inside_log_scale),
+        alignment=dict(alignment),
+        global_variant_count=int(variant_data.num_variants),
+    )
 
 
 def prune_vcf_variant(
@@ -543,6 +710,8 @@ def _jc69_transition_matrix(branch_length: float) -> np.ndarray:
 
 
 __all__ = [
+    "EndpointVCFPartials",
+    "RegionLocalVCFView",
     "compute_cut_frontier_vcf_partials",
     "compute_tree_sequence_vcf_log_likelihood",
     "prune_vcf_variant",

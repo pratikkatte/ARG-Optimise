@@ -36,6 +36,9 @@ from .local_construction import (
     undo_local_transition,
 )
 from .vcf_likelihood import (
+    EndpointVCFPartials,
+    RegionLocalVCFView,
+    compute_cut_frontier_vcf_partials,
     compute_tree_sequence_vcf_log_likelihood,
     resolve_vcf_tree_sequence_alignment,
 )
@@ -98,6 +101,7 @@ __all__ = [
     "ConstructionDiagnostic",
     "ContextLineage",
     "DependencyDiagnostic",
+    "EndpointVCFPartials",
     "FastARGState",
     "FastARGTrace",
     "LOCAL_REFINEMENT_PROVENANCE_NAME",
@@ -116,6 +120,7 @@ __all__ = [
     "PreparedLocalRefinement",
     "PriorActionOptions",
     "ResolvedTraceCut",
+    "RegionLocalVCFView",
     "RecombinationChoice",
     "SYNTHETIC_FULL_ARG_PROVENANCE_NAME",
     "SelectedARGEvent",
@@ -127,6 +132,7 @@ __all__ = [
     "apply_local_action",
     "compute_local_terminal_log_likelihood",
     "compute_local_terminal_log_reward",
+    "compute_cut_frontier_vcf_partials",
     "compute_tree_sequence_vcf_log_likelihood",
     "build_fast_trace_from_full_arg",
     "build_synthetic_full_arg",

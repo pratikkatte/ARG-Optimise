@@ -1,4 +1,5 @@
 import gzip
+import math
 import os
 import pickle
 import re
@@ -10,6 +11,8 @@ import torch
 BASES = ("A", "C", "G", "T")
 BASE_TO_INDEX = {base: idx for idx, base in enumerate(BASES)}
 VCF_PARSER_VERSION = "strict-phased-diploid-biallelic-snp-v1"
+MAX_SUPPORTED_VCF_BYTES = 1_000_000
+MAX_LOCAL_REFINEMENT_SPAN_BP = 100_000.0
 
 
 @dataclass(frozen=True)
@@ -77,10 +80,14 @@ def is_vcf_path(path):
     return path.endswith(".vcf") or path.endswith(".vcf.gz")
 
 
-def load_vcf_variants(vcf_path):
+def load_vcf_variants(vcf_path, max_bytes=MAX_SUPPORTED_VCF_BYTES):
     import numpy as np
 
     vcf_path = os.path.abspath(str(vcf_path))
+    max_bytes = _normalize_optional_positive_int(max_bytes, "max_bytes")
+    if max_bytes is not None and not vcf_path.endswith(".gz"):
+        _raise_if_file_too_large(vcf_path, max_bytes)
+
     sample_ids = None
     contig_id = None
     sequence_length = None
@@ -89,9 +96,19 @@ def load_vcf_variants(vcf_path):
     refs = []
     alts = []
     alleles_by_haplotype = []
+    uncompressed_bytes = 0
 
     with _open_text_maybe_gzip(vcf_path) as handle:
         for line_number, raw_line in enumerate(handle, start=1):
+            if max_bytes is not None:
+                uncompressed_bytes += len(raw_line.encode("utf-8"))
+                if uncompressed_bytes > max_bytes:
+                    raise ValueError(
+                        "VCF input exceeds the supported 1 MB limit "
+                        f"({uncompressed_bytes:,} bytes read from {vcf_path}). "
+                        "Provide a VCF of at most 1,000,000 bytes, or explicitly "
+                        "raise the limit only after profiling memory and runtime."
+                    )
             line = raw_line.rstrip("\n")
             if not line:
                 continue
@@ -211,6 +228,53 @@ def load_vcf_variants(vcf_path):
         haplotype_partials=haplotype_partials,
         parser_version=VCF_PARSER_VERSION,
     )
+
+
+def validate_local_refinement_span(
+    genomic_range,
+    *,
+    field_name="genomic_range",
+    max_span_bp=MAX_LOCAL_REFINEMENT_SPAN_BP,
+):
+    if not isinstance(genomic_range, (list, tuple)) or len(genomic_range) != 2:
+        raise ValueError(f"{field_name} must be a two-value half-open range")
+    left, right = (float(value) for value in genomic_range)
+    if (
+        not math.isfinite(left)
+        or not math.isfinite(right)
+        or left < 0.0
+        or right <= left
+    ):
+        raise ValueError(f"{field_name} must satisfy 0 <= left < right with finite coordinates")
+    span = float(right - left)
+    if span > float(max_span_bp):
+        raise ValueError(
+            f"{field_name} spans {span:g} bp, which exceeds the supported "
+            f"local refinement limit of {float(max_span_bp):g} bp. Split the "
+            "request or explicitly raise the limit only after profiling memory "
+            "and runtime."
+        )
+    return span
+
+
+def _normalize_optional_positive_int(value, field_name):
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be a positive integer or None")
+    return parsed
+
+
+def _raise_if_file_too_large(path, max_bytes):
+    size = os.path.getsize(path)
+    if size > int(max_bytes):
+        raise ValueError(
+            "VCF input exceeds the supported 1 MB limit "
+            f"({size:,} bytes on disk at {path}). Provide a VCF of at most "
+            "1,000,000 bytes, or explicitly raise the limit only after "
+            "profiling memory and runtime."
+        )
 
 
 def _open_text_maybe_gzip(path):

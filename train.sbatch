@@ -1,11 +1,6 @@
 #!/bin/bash
 #
-# Train ARG GFlowNet on Phoenix GPU node.
-#
-# Submit from this directory (logs/ must exist before sbatch):
-#   sbatch train.sbatch
-#
-#SBATCH --job-name=local_refinement_25kb_v2
+#SBATCH --job-name=local_refinement
 #SBATCH --partition=gpu
 #SBATCH --account=standard
 #SBATCH --qos=normal
@@ -15,10 +10,14 @@
 #SBATCH --gpus=1
 #SBATCH --mem=200G
 #SBATCH --time=48:00:00
-#SBATCH --mail-type=BEGIN,END
+
+#SBATCH --array=0
+
+#SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=pkatte@ucsc.edu
-#SBATCH --output=logs/train_%j.out
-#SBATCH --error=logs/train_%j.err
+
+#SBATCH --output=logs/train_%A_%a.out
+#SBATCH --error=logs/train_%A_%a.err
 
 set -euo pipefail
 
@@ -28,12 +27,25 @@ source /private/home/pkatte/anaconda3/etc/profile.d/conda.sh
 conda activate phylogfn_orig
 
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-echo "Job ID: ${SLURM_JOB_ID}"
-echo "Node: ${SLURM_NODELIST}"
-echo "Start: $(date)"
+CONFIGS=(
+    # config/config.yaml
+    config/config_1mb.yaml
+)
+
+CONFIG=${CONFIGS[$SLURM_ARRAY_TASK_ID]}
+
+echo "=============================="
+echo "Array Task : ${SLURM_ARRAY_TASK_ID}"
+echo "Job ID     : ${SLURM_JOB_ID}"
+echo "Config     : ${CONFIG}"
+echo "Node       : ${SLURM_NODELIST}"
+echo "Start      : $(date)"
+echo "=============================="
+
 nvidia-smi || true
 
-python train.py --config config/config.yaml
+python train.py --config "${CONFIG}"
 
-echo "End: $(date)"
+echo "Finished: $(date)"

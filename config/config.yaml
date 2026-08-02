@@ -1,17 +1,11 @@
 dataset_path: validation/vcf/sim_l25kb_0.vcf
-output_path: runs/local_refinement_25kb
+output_path: runs/local_refinement_25kb_v3
 device: auto
 
 refinement:
   enabled: true
-
-  # Existing inferred ARG used as the immutable chromosome/exterior context.
   arg_path: validation/output/tsinfer/l25kb_dated.trees
-
-  # Optional global policy checkpoint for shape-compatible warm-starting.
   checkpoint: null
-
-  # Every range is half-open. Supply exactly one cut selector per request.
   requests:
     - id: region_000001
       genomic_range: [386, 23963]
@@ -19,44 +13,23 @@ refinement:
 
 training:
   epochs: 3000
-  # Keep the effective batch at 64 while bounding the rollout graph held on GPU.
+
+  # Effective batch = 8 x 8 = 64
   batch_size: 8
+  grad_accum_steps: 8
+
   seed: 7
   init_z_sample_count: 0
   verbose: false
   wandb: true
 
-  policy_lr: 0.0001
+  policy_lr: 0.0003
   log_z_lr: 0.001
   loss: fl_subtb
   subtb_lambda: 0.9
   subtb_max_span: 16
   grad_clip: 10.0
-  grad_accum_steps: 8
 
-  eval_episodes: 32
+  eval_episodes: 64
   eval_every: 20
   partial_segment_max_steps: 16
-
-environment:
-  bp_per_blocks: 1
-  effective_population_size: 10000
-  mutation_rate: 2.0e-8
-  recombination_rate: 2.0e-8
-
-reward:
-  constant: 0
-
-model:
-  embedding_size: 64
-  hidden_size: 128
-  dropout: 0.05
-
-  breakpoint_hidden_dim: 128
-  breakpoint_dropout: 0.05
-
-  transformer_depth: 4
-  transformer_heads: 4
-  transformer_mlp_ratio: 2.0
-  attention_dropout: 0.05
-  time_basis_components: 16

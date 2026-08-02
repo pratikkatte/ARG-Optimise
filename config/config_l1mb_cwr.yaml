@@ -6,7 +6,7 @@ refinement:
   arg_path: validation/output/tsinfer/l1mb_dated.trees
   requests:
     - id: region_000001
-      genomic_range: [14000, 190000]
+      genomic_range: [14000, 114000]
       cut_time: 25000
 
 training:

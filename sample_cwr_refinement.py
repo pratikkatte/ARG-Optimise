@@ -24,7 +24,7 @@ try:
         sample_local_trajectories,
         splice_local_proposal,
     )
-    from .utils import is_vcf_path, load_vcf_variants
+    from .utils import is_vcf_path, load_vcf_variants, validate_local_refinement_span
 except ImportError:  # Support ``python sample_cwr_refinement.py``.
     package_parent = str(Path(__file__).resolve().parent.parent)
     if package_parent not in sys.path:
@@ -38,7 +38,7 @@ except ImportError:  # Support ``python sample_cwr_refinement.py``.
         sample_local_trajectories,
         splice_local_proposal,
     )
-    from arg.utils import is_vcf_path, load_vcf_variants
+    from arg.utils import is_vcf_path, load_vcf_variants, validate_local_refinement_span
 
 
 DEFAULT_SEED = 7
@@ -382,6 +382,10 @@ def _normalized_request_specs(
                     else None
                 ),
             }
+        )
+        validate_local_refinement_span(
+            normalized[-1]["genomic_range"],
+            field_name=f"request {context_id!r} genomic_range",
         )
     return normalized
 

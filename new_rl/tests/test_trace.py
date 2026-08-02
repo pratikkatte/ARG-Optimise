@@ -205,6 +205,8 @@ def test_converter_records_new_rl_provenance_and_accepts_legacy_fixture():
     assert record["software"]["name"] == SYNTHETIC_FULL_ARG_PROVENANCE_NAME
     assert record["summary"]["event_times_are_globally_unique"] is True
 
+    if not LEGACY_SYNTHETIC_TREES.exists():
+        pytest.skip(f"legacy synthetic full-ARG fixture is missing: {LEGACY_SYNTHETIC_TREES}")
     legacy_ts = tskit.load(str(LEGACY_SYNTHETIC_TREES))
     assert get_synthetic_full_arg_provenance(legacy_ts) is not None
 

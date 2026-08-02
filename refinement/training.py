@@ -24,13 +24,23 @@ try:
     from ..rollout_worker_arg import RolloutWorker
     from ..tb_gfn import TBGFlowNetGenerator
     from ..time_env import DEFAULT_TIME_BASIS_COMPONENTS
-    from ..utils import VCF_PARSER_VERSION, is_vcf_path, load_vcf_variants
+    from ..utils import (
+        VCF_PARSER_VERSION,
+        is_vcf_path,
+        load_vcf_variants,
+        validate_local_refinement_span,
+    )
 except ImportError:  # Support the repository's script-style entry points.
     from env import LocalARGEnvironment, SimpleARGEnvironment
     from rollout_worker_arg import RolloutWorker
     from tb_gfn import TBGFlowNetGenerator
     from time_env import DEFAULT_TIME_BASIS_COMPONENTS
-    from utils import VCF_PARSER_VERSION, is_vcf_path, load_vcf_variants
+    from utils import (
+        VCF_PARSER_VERSION,
+        is_vcf_path,
+        load_vcf_variants,
+        validate_local_refinement_span,
+    )
 
 from .local_refinement import LocalRefinementRequest, prepare_local_refinement
 
@@ -117,6 +127,12 @@ def train_local_refinement(
         raise ValueError("local refinement training currently requires a phased VCF")
     if not requests:
         raise ValueError("at least one explicit local refinement request is required")
+    batch_size = int(batch_size)
+    grad_accum_steps = int(grad_accum_steps)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be a positive integer")
     if int(partial_segment_max_steps) <= 0:
         raise ValueError("partial_segment_max_steps must be positive")
 
@@ -265,12 +281,12 @@ def train_local_refinement(
         for epoch in range(int(epochs_num)):
             sampled_context_ids = []
             rollout_metrics = []
-            for _accumulation in range(max(int(grad_accum_steps), 1)):
+            for _accumulation in range(grad_accum_steps):
                 rollout_mode = (
                     "partial" if rollout_index % 2 == 0 else "terminal"
                 )
                 rollout_index += 1
-                context_ids = sampler.sample(int(batch_size))
+                context_ids = sampler.sample(batch_size)
                 sampled_context_ids.extend(context_ids)
                 start_states = [
                     initial_states[context_id]
@@ -278,7 +294,7 @@ def train_local_refinement(
                 ]
                 outputs, _trajectories = worker.rollout(
                     generator,
-                    episodes=int(batch_size),
+                    episodes=batch_size,
                     start_states=start_states,
                     max_steps=(
                         int(partial_segment_max_steps)
@@ -288,7 +304,7 @@ def train_local_refinement(
                 )
                 generator.accumulate_loss(
                     outputs,
-                    factor=max(int(grad_accum_steps), 1),
+                    factor=grad_accum_steps,
                 )
                 rollout_metrics.append(
                     _rollout_metrics(rollout_mode, outputs)
@@ -462,6 +478,10 @@ def _prepare_contexts(source_arg_path, request_specs):
             cut_time=spec.get("cut_time"),
             cut_event_index=spec.get("cut_event_index"),
         )
+        validate_local_refinement_span(
+            request.genomic_range,
+            field_name=f"local refinement request {context_id!r} genomic_range",
+        )
         prepared = prepare_local_refinement(source_arg_path, request)
         if not prepared.context.is_valid:
             reasons = "; ".join(
@@ -552,6 +572,10 @@ def _build_metadata(
                     context_id: state.vcf_alignment
                     for context_id, state in initial_states.items()
                 },
+            },
+            "region_vcf_views": {
+                context_id: _initial_region_vcf_view_record(state)
+                for context_id, state in initial_states.items()
             },
             "source_arg": {
                 "path": os.path.abspath(source_arg_path),
@@ -675,6 +699,7 @@ def _rollout_metrics(mode, outputs):
     quantiles = outputs["time_quantiles"].detach().cpu()
     deltas = outputs["time_delta_times"].detach().cpu()
     densities = outputs["time_log_densities"].detach().cpu()
+    active_variant_rows = _active_variant_row_counts(outputs)
     return {
         "mode": str(mode),
         "length_mean": float(
@@ -696,6 +721,12 @@ def _rollout_metrics(mode, outputs):
             torch.isfinite(densities).sum().item()
         ),
         "fixed_attachment_count": int(outputs["fixed_attachment_count"]),
+        "active_variant_rows_mean": float(
+            np.mean(active_variant_rows) if active_variant_rows else 0.0
+        ),
+        "active_variant_rows_max": int(
+            max(active_variant_rows) if active_variant_rows else 0
+        ),
     }
 
 
@@ -713,6 +744,12 @@ def _merge_rollout_metrics(rows):
         )
         result[f"train_{mode}_truncated_rate"] = float(
             np.mean([row["truncated_rate"] for row in selected])
+        )
+        result[f"train_{mode}_active_variant_rows_mean"] = float(
+            np.mean([row["active_variant_rows_mean"] for row in selected])
+        )
+        result[f"train_{mode}_active_variant_rows_max"] = int(
+            max(row["active_variant_rows_max"] for row in selected)
         )
         time_count = max(
             sum(row["time_count"] for row in selected),
@@ -738,6 +775,26 @@ def _merge_rollout_metrics(rows):
             np.mean([row["fixed_attachment_count"] for row in selected])
         )
     return result
+
+
+def _initial_region_vcf_view_record(state):
+    for record in state.transition_records:
+        if record.get("event_type") == "initialization":
+            return record.get("region_vcf_view")
+    return None
+
+
+def _active_variant_row_counts(outputs):
+    rows = []
+    for path in outputs.get("trajectory_states", ()):
+        for state in path:
+            rows.append(
+                sum(
+                    len(getattr(lineage, "variant_indices", ()))
+                    for lineage in state.active_lineages
+                )
+            )
+    return rows
 
 
 def _seed_everything(seed):

@@ -52,6 +52,7 @@ from .local_refinement import (
 )
 from .synthetic_full_arg import NODE_IS_RE_EVENT
 from .vcf_likelihood import (
+    RegionLocalVCFView,
     compute_cut_frontier_vcf_partials,
     compute_tree_sequence_vcf_log_likelihood,
     resolve_vcf_tree_sequence_alignment,
@@ -275,7 +276,7 @@ def initialize_local_arg_state(
     if not time_scale > 0.0:
         raise ValueError("population_size must define a positive 2Ne time scale")
 
-    likelihood_data: dict[str, Any] | None = None
+    likelihood_data: RegionLocalVCFView | None = None
     variant_block_indices: dict[int, int] = {}
     local_breakpoint_weights: dict[int, float] = {}
     if env.is_vcf_mode and not env.structural_only:
@@ -287,7 +288,7 @@ def initialize_local_arg_state(
             mutation_rate=float(env.mutation_rate),
             alignment=alignment,
         )
-        for variant_index in likelihood_data["target_variant_indices"]:
+        for variant_index in likelihood_data.target_variant_indices:
             coordinate = float(
                 alignment["variant_coordinates"][int(variant_index)]
             )
@@ -306,7 +307,7 @@ def initialize_local_arg_state(
     for node_id, material in sorted(endpoint_material.items()):
         source_node = prepared.source_tree_sequence.node(node_id)
         endpoint_likelihood = (
-            likelihood_data["endpoints"][int(node_id)]
+            likelihood_data.endpoint_for_node(int(node_id))
             if likelihood_data is not None
             else None
         )
@@ -320,7 +321,7 @@ def initialize_local_arg_state(
                 None
                 if endpoint_likelihood is None
                 else torch.as_tensor(
-                    endpoint_likelihood["partials"],
+                    endpoint_likelihood.partials,
                     dtype=torch.float64,
                     device=env.device,
                 )
@@ -328,12 +329,12 @@ def initialize_local_arg_state(
             variant_indices=(
                 ()
                 if endpoint_likelihood is None
-                else endpoint_likelihood["variant_indices"]
+                else endpoint_likelihood.variant_indices
             ),
             sequences_indices=(
                 []
                 if endpoint_likelihood is None
-                else endpoint_likelihood["sequences_indices"]
+                else endpoint_likelihood.sequences_indices
             ),
             event_type="cut",
             time=float(source_node.time) / time_scale,
@@ -354,13 +355,13 @@ def initialize_local_arg_state(
     outside_log_likelihood = (
         0.0
         if likelihood_data is None
-        else float(likelihood_data["outside_log_likelihood"])
+        else float(likelihood_data.outside_log_likelihood)
     )
     accumulated_log_likelihood = (
         0.0
         if likelihood_data is None
         else outside_log_likelihood
-        + float(likelihood_data["inside_log_scale"])
+        + float(likelihood_data.inside_log_scale)
     )
     state = ARGState(
         active_lineages=active_lineages,
@@ -406,7 +407,12 @@ def initialize_local_arg_state(
                 "inside_initial_log_scale": (
                     0.0
                     if likelihood_data is None
-                    else float(likelihood_data["inside_log_scale"])
+                    else float(likelihood_data.inside_log_scale)
+                ),
+                "region_vcf_view": (
+                    None
+                    if likelihood_data is None
+                    else likelihood_data.to_summary_dict()
                 ),
                 "vcf_coordinate_offset": alignment.get(
                     "vcf_coordinate_offset"
@@ -422,7 +428,7 @@ def initialize_local_arg_state(
         target_variant_indices=(
             ()
             if likelihood_data is None
-            else tuple(likelihood_data["target_variant_indices"])
+            else tuple(likelihood_data.target_variant_indices)
         ),
         variant_block_indices=variant_block_indices,
         local_breakpoint_weights=local_breakpoint_weights,
@@ -439,6 +445,7 @@ def initialize_local_arg_state(
         current_time,
         env=env,
     )
+    _assert_local_vcf_view_consistency(state, where="initialization")
     state.is_done = local_is_terminal(state, prepared.context)
     if state.is_done and likelihood_data is not None:
         _finalize_local_terminal_likelihood(
@@ -801,6 +808,7 @@ def apply_local_action(
         },
     }
     next_state.transition_records.append(record)
+    _assert_local_vcf_view_consistency(next_state, where=kind)
     next_state.is_done = local_is_terminal(next_state, context)
     if next_state.is_done and next_state.likelihood_scope != "none":
         _finalize_local_terminal_likelihood(next_state, context, env)
@@ -1113,6 +1121,10 @@ def reveal_due_fixed_ancestors(
             },
         }
     )
+    _assert_local_vcf_view_consistency(
+        next_state,
+        where="fixed_attachment",
+    )
     return next_state
 
 
@@ -1218,6 +1230,7 @@ def compute_local_terminal_log_likelihood(
             "local terminal likelihood requires a likelihood-enabled VCF "
             "environment"
         )
+    _assert_local_vcf_view_consistency(state, where="terminal_likelihood")
 
     carriers: dict[int, list[tuple[ARGLineage, int]]] = {
         int(variant_index): []
@@ -1861,6 +1874,32 @@ def _select_variant_partial_rows(
         0,
         torch.as_tensor(rows, dtype=torch.long, device=tensor.device),
     )
+
+
+def _assert_local_vcf_view_consistency(state: ARGState, *, where: str) -> None:
+    if state.likelihood_scope == "none":
+        return
+    target = set(int(value) for value in state.target_variant_indices)
+    for lineage in state.active_lineages:
+        lineage_variants = tuple(int(value) for value in lineage.variant_indices)
+        extra = sorted(set(lineage_variants) - target)
+        if extra:
+            raise ValueError(
+                "local VCF lineage carries variants outside the region-local "
+                f"view at {where}: lineage={lineage.node_id} variants={extra}"
+            )
+        if lineage.partials is None:
+            raise ValueError(
+                "likelihood-enabled local VCF lineage is missing partials at "
+                f"{where}: lineage={lineage.node_id}"
+            )
+        row_count = int(lineage.partials.shape[0])
+        if row_count != len(lineage_variants):
+            raise ValueError(
+                "local VCF lineage partial row count does not match variants "
+                f"at {where}: lineage={lineage.node_id} "
+                f"rows={row_count} variants={len(lineage_variants)}"
+            )
 
 
 def _fixed_ancestor_partials(

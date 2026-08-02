@@ -7,6 +7,7 @@ truth:
 methods:
   # With no input_dir, GFN defaults to output/<experiment>/gfn/arg_*.trees.
   gfn:
+    input_dir: ../runs/local_refinement_25kb_v3/inference/region_000001
     sample_prefix: arg_
 
   tsinfer:
@@ -17,7 +18,7 @@ methods:
   # actual location before running the three-method comparison.
   singer:
     input_dir: output/singer/l25kb
-    sample_prefix: singer_
+    sample_prefix: sim_l25kb_0_
     burnin_samples: 0
     max_posterior_samples: null
 

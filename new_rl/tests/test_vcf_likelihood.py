@@ -11,7 +11,9 @@ from arg.models import ARGModel
 from arg.new_rl import (
     LocalRefinementRequest,
     LocalSamplingConfig,
+    RegionLocalVCFView,
     apply_local_action,
+    compute_cut_frontier_vcf_partials,
     compute_tree_sequence_vcf_log_likelihood,
     enumerate_local_prior_actions,
     export_refined_tree_sequence,
@@ -138,6 +140,46 @@ def test_iterative_jc69_likelihood_matches_hand_calculation(tmp_path):
     assert observed == pytest.approx(2.0 * math.log(per_site), abs=1e-12)
 
 
+def test_region_local_vcf_view_partitions_target_and_exterior(tmp_path):
+    ts = _two_sample_tree()
+    data = load_vcf_variants(_write_vcf(tmp_path))
+    alignment = resolve_vcf_tree_sequence_alignment(ts, data)
+    endpoint_intervals = {
+        0: ((1.5, 8.5),),
+        1: ((1.5, 8.5),),
+    }
+
+    view = compute_cut_frontier_vcf_partials(
+        ts,
+        data,
+        endpoint_intervals,
+        (1.5, 4.0),
+        mutation_rate=2e-8,
+        alignment=alignment,
+    )
+
+    assert isinstance(view, RegionLocalVCFView)
+    assert view.target_variant_indices == (0,)
+    assert view.outside_variant_indices == (1,)
+    assert view.target_variant_count == 1
+    assert view.outside_variant_count == 1
+    assert view.endpoint_variant_row_count == 2
+    assert view.outside_log_likelihood == pytest.approx(
+        compute_tree_sequence_vcf_log_likelihood(
+            ts,
+            data,
+            mutation_rate=2e-8,
+            alignment=alignment,
+            variant_indices=(1,),
+        )
+    )
+    summary = view.to_summary_dict()
+    assert summary["likelihood_scope"] == "whole_vcf_chromosome"
+    assert summary["cached_exterior_likelihood"] is True
+    assert summary["target_variant_count"] == 1
+    assert summary["outside_variant_count"] == 1
+
+
 def test_local_grid_and_cut_partials_separate_structure_from_vcf_rows(
     tmp_path,
 ):
@@ -151,6 +193,11 @@ def test_local_grid_and_cut_partials_separate_structure_from_vcf_rows(
     assert state.target_variant_indices == (0, 1)
     assert state.variant_block_indices == {0: 0, 1: 1}
     assert state.local_breakpoint_weights == {1: 5.0}
+    view_record = state.transition_records[0]["region_vcf_view"]
+    assert view_record["global_variant_count"] == 2
+    assert view_record["target_variant_count"] == 2
+    assert view_record["outside_variant_count"] == 0
+    assert view_record["endpoint_variant_row_count"] == 4
     assert all(
         lineage.material_segments.count == 2
         and lineage.variant_indices == (0, 1)
@@ -315,6 +362,10 @@ def test_sparse_state_flow_encoder_accepts_geometry_only_lineages(tmp_path):
             mutation_rate=env.mutation_rate,
         )
     )
+    view_record = state.transition_records[0]["region_vcf_view"]
+    assert view_record["target_variant_count"] == 0
+    assert view_record["outside_variant_count"] == 2
+    assert view_record["endpoint_variant_row_count"] == 0
 
     model = ARGModel(
         env,
