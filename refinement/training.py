@@ -62,6 +62,7 @@ LINEAGE_ROLE_SCHEMA = (
     "generated_recombination",
     "fixed_source",
 )
+PARTIAL_START_MODES = ("initial", "terminal_prefix_mixture")
 
 
 class SeededContextSampler:
@@ -78,6 +79,66 @@ class SeededContextSampler:
             self.rng.choice(self.context_ids)
             for _ in range(int(count))
         ]
+
+
+class TerminalPrefixSampler:
+    """Select reproducible on-policy partial starts from terminal paths."""
+
+    def __init__(self, seed: int):
+        self.rng = random.Random(int(seed))
+        self.boundary_cursor = 0
+
+    def sample(
+        self,
+        trajectory_states,
+        trajectory_actions,
+        count: int,
+        max_steps: int,
+        boundary_fraction: float,
+    ):
+        sources = []
+        boundaries = []
+        for trajectory_index, (states, actions) in enumerate(
+            zip(trajectory_states, trajectory_actions)
+        ):
+            for state_index in range(len(actions)):
+                sources.append((trajectory_index, state_index))
+            for action_index, action in enumerate(actions):
+                if action.get("event_type") == "fixed_attachment":
+                    boundaries.append((trajectory_index, action_index))
+        if not sources:
+            raise ValueError("terminal trajectories contain no nonterminal prefixes")
+
+        requested_boundary = 0
+        if boundaries and float(boundary_fraction) > 0.0:
+            requested_boundary = min(
+                int(count),
+                max(1, int(round(int(count) * float(boundary_fraction)))),
+            )
+
+        selected = []
+        for _ in range(requested_boundary):
+            trajectory_index, action_index = boundaries[
+                self.boundary_cursor % len(boundaries)
+            ]
+            self.boundary_cursor += 1
+            earliest = max(0, action_index - int(max_steps) + 1)
+            state_index = self.rng.randint(earliest, action_index)
+            selected.append((trajectory_index, state_index, True))
+        for _ in range(int(count) - len(selected)):
+            trajectory_index, state_index = self.rng.choice(sources)
+            selected.append((trajectory_index, state_index, False))
+        self.rng.shuffle(selected)
+
+        return {
+            "start_states": [
+                trajectory_states[trajectory_index][state_index]
+                for trajectory_index, state_index, _ in selected
+            ],
+            "source_trajectory_indices": [row[0] for row in selected],
+            "start_steps": [row[1] for row in selected],
+            "boundary_targeted": [row[2] for row in selected],
+        }
 
 
 def train_local_refinement(
@@ -107,6 +168,8 @@ def train_local_refinement(
     eval_episodes=8,
     eval_every=10,
     partial_segment_max_steps=16,
+    partial_start_mode="initial",
+    partial_boundary_fraction=0.5,
     reward_C=30000,
     embedding_size=32,
     hidden_size=64,
@@ -141,6 +204,20 @@ def train_local_refinement(
         raise ValueError("grad_accum_steps must be a positive integer")
     if int(partial_segment_max_steps) <= 0:
         raise ValueError("partial_segment_max_steps must be positive")
+    partial_start_mode = str(partial_start_mode).lower()
+    if partial_start_mode not in PARTIAL_START_MODES:
+        raise ValueError(
+            "partial_start_mode must be one of "
+            + ", ".join(repr(value) for value in PARTIAL_START_MODES)
+        )
+    if partial_start_mode == "terminal_prefix_mixture" and grad_accum_steps % 2:
+        raise ValueError(
+            "terminal_prefix_mixture requires an even grad_accum_steps so each "
+            "terminal batch is paired with a partial batch"
+        )
+    partial_boundary_fraction = float(partial_boundary_fraction)
+    if not 0.0 <= partial_boundary_fraction <= 1.0:
+        raise ValueError("partial_boundary_fraction must be between 0 and 1")
 
     _seed_everything(int(seed))
     device = torch.device(device)
@@ -292,6 +369,8 @@ def train_local_refinement(
         eval_every=eval_every,
         init_z_sample_count=init_z_sample_count,
         partial_segment_max_steps=partial_segment_max_steps,
+        partial_start_mode=partial_start_mode,
+        partial_boundary_fraction=partial_boundary_fraction,
         terminal_requires_exhausted_fixed_schedule=(
             terminal_requires_exhausted_fixed_schedule
         ),
@@ -303,6 +382,7 @@ def train_local_refinement(
 
     worker = RolloutWorker(local_env, verbose=verbose)
     sampler = SeededContextSampler(local_env.context_ids, int(seed))
+    prefix_sampler = TerminalPrefixSampler(int(seed) + 200000)
     rollout_index = 0
     history = []
     best_loss = float("inf")
@@ -318,17 +398,35 @@ def train_local_refinement(
         for epoch in range(int(epochs_num)):
             sampled_context_ids = []
             rollout_metrics = []
+            terminal_prefix_source = None
+            terminal_context_ids = None
             for _accumulation in range(grad_accum_steps):
-                rollout_mode = (
-                    "partial" if rollout_index % 2 == 0 else "terminal"
-                )
+                if partial_start_mode == "terminal_prefix_mixture":
+                    rollout_mode = "terminal" if rollout_index % 2 == 0 else "partial"
+                else:
+                    rollout_mode = "partial" if rollout_index % 2 == 0 else "terminal"
                 rollout_index += 1
-                context_ids = sampler.sample(batch_size)
+                prefix_info = None
+                if rollout_mode == "partial" and terminal_prefix_source is not None:
+                    prefix_info = prefix_sampler.sample(
+                        terminal_prefix_source["trajectory_states"],
+                        terminal_prefix_source["trajectory_actions"],
+                        count=batch_size,
+                        max_steps=partial_segment_max_steps,
+                        boundary_fraction=partial_boundary_fraction,
+                    )
+                    context_ids = [
+                        terminal_context_ids[index]
+                        for index in prefix_info["source_trajectory_indices"]
+                    ]
+                    start_states = prefix_info["start_states"]
+                else:
+                    context_ids = sampler.sample(batch_size)
+                    start_states = [
+                        initial_states[context_id]
+                        for context_id in context_ids
+                    ]
                 sampled_context_ids.extend(context_ids)
-                start_states = [
-                    initial_states[context_id]
-                    for context_id in context_ids
-                ]
                 outputs, _trajectories = worker.rollout(
                     generator,
                     episodes=batch_size,
@@ -343,9 +441,21 @@ def train_local_refinement(
                     outputs,
                     factor=grad_accum_steps,
                 )
-                rollout_metrics.append(
-                    _rollout_metrics(rollout_mode, outputs)
-                )
+                metric_row = _rollout_metrics(rollout_mode, outputs)
+                if prefix_info is not None:
+                    metric_row["start_step_sum"] = float(sum(prefix_info["start_steps"]))
+                    metric_row["start_count"] = len(prefix_info["start_steps"])
+                    metric_row["boundary_targeted_sum"] = sum(prefix_info["boundary_targeted"])
+                rollout_metrics.append(metric_row)
+                if rollout_mode == "terminal" and partial_start_mode == "terminal_prefix_mixture":
+                    terminal_prefix_source = {
+                        "trajectory_states": outputs["trajectory_states"],
+                        "trajectory_actions": outputs["trajectory_actions"],
+                    }
+                    terminal_context_ids = list(context_ids)
+                elif rollout_mode == "partial":
+                    terminal_prefix_source = None
+                    terminal_context_ids = None
 
             info = dict(generator.update_model())
             info["epoch"] = int(epoch)
@@ -518,9 +628,24 @@ def evaluate_local_refinement(
                         "terminal": bool(
                             outputs["terminal_mask"][0].detach().cpu().item()
                         ),
+                        "fixed_attachments": int(
+                            outputs["fixed_attachment_counts"][0].item()
+                        ),
+                        "coalescences": int(outputs["coalescence_counts"][0].item()),
+                        "recombinations": int(outputs["recombination_counts"][0].item()),
+                        "first_fixed_attachment_step": next(
+                            (
+                                action_index + 1
+                                for action_index, action in enumerate(
+                                    outputs["trajectory_actions"][0]
+                                )
+                                if action.get("event_type") == "fixed_attachment"
+                            ),
+                            None,
+                        ),
                     }
                 )
-        return {
+        result = {
             "eval_local_loss_mean": float(
                 np.mean([row["loss"] for row in rows])
             ),
@@ -531,6 +656,32 @@ def evaluate_local_refinement(
                 np.mean([row["terminal"] for row in rows])
             ),
         }
+        for mode in ("partial", "terminal"):
+            selected = [row for row in rows if row["mode"] == mode]
+            if not selected:
+                continue
+            result[f"eval_{mode}_trajectory_length_mean"] = float(
+                np.mean([row["length"] for row in selected])
+            )
+            result[f"eval_{mode}_fixed_attachment_mean"] = float(
+                np.mean([row["fixed_attachments"] for row in selected])
+            )
+            result[f"eval_{mode}_coalescence_mean"] = float(
+                np.mean([row["coalescences"] for row in selected])
+            )
+            result[f"eval_{mode}_recombination_mean"] = float(
+                np.mean([row["recombinations"] for row in selected])
+            )
+            first_steps = [
+                row["first_fixed_attachment_step"]
+                for row in selected
+                if row["first_fixed_attachment_step"] is not None
+            ]
+            if first_steps:
+                result[f"eval_{mode}_first_fixed_attachment_step_mean"] = float(
+                    np.mean(first_steps)
+                )
+        return result
     finally:
         random.setstate(python_state)
         np.random.set_state(numpy_state)
@@ -636,6 +787,8 @@ def _build_metadata(
     eval_every,
     init_z_sample_count,
     partial_segment_max_steps,
+    partial_start_mode="initial",
+    partial_boundary_fraction=0.5,
     terminal_requires_exhausted_fixed_schedule=False,
 ):
     return _json_safe(
@@ -699,6 +852,8 @@ def _build_metadata(
             "eval_every": int(eval_every),
             "init_z_sample_count": int(init_z_sample_count),
             "partial_segment_max_steps": int(partial_segment_max_steps),
+            "partial_start_mode": str(partial_start_mode),
+            "partial_boundary_fraction": float(partial_boundary_fraction),
             "terminal_requires_exhausted_fixed_schedule": bool(
                 terminal_requires_exhausted_fixed_schedule
             ),
@@ -826,6 +981,7 @@ def _rollout_metrics(mode, outputs):
     entropies = outputs["time_policy_entropies"].detach().cpu()
     effective_components = outputs["time_effective_components"].detach().cpu()
     active_variant_rows = _active_variant_row_counts(outputs)
+    trajectory_count = int(outputs["trajectory_lengths"].numel())
     return {
         "mode": str(mode),
         "length_mean": float(
@@ -855,7 +1011,13 @@ def _rollout_metrics(mode, outputs):
                 torch.isfinite(effective_components)
             ].sum().item()
         ),
-        "fixed_attachment_count": int(outputs["fixed_attachment_count"]),
+        "trajectory_count": trajectory_count,
+        "fixed_attachment_count": int(outputs["fixed_attachment_counts"].sum().item()),
+        "coalescence_count": int(outputs["coalescence_counts"].sum().item()),
+        "recombination_count": int(outputs["recombination_counts"].sum().item()),
+        "start_step_sum": 0.0,
+        "start_count": 0,
+        "boundary_targeted_sum": 0,
         "active_variant_rows_mean": float(
             np.mean(active_variant_rows) if active_variant_rows else 0.0
         ),
@@ -918,9 +1080,31 @@ def _merge_rollout_metrics(rows):
             sum(row["time_effective_components_sum"] for row in selected)
             / entropy_count
         )
-        result[f"train_{mode}_fixed_attachment_mean"] = float(
-            np.mean([row["fixed_attachment_count"] for row in selected])
+        trajectory_count = max(
+            sum(row["trajectory_count"] for row in selected),
+            1,
         )
+        result[f"train_{mode}_fixed_attachment_mean"] = float(
+            sum(row["fixed_attachment_count"] for row in selected)
+            / trajectory_count
+        )
+        result[f"train_{mode}_coalescence_mean"] = float(
+            sum(row["coalescence_count"] for row in selected)
+            / trajectory_count
+        )
+        result[f"train_{mode}_recombination_mean"] = float(
+            sum(row["recombination_count"] for row in selected)
+            / trajectory_count
+        )
+        start_count = sum(row["start_count"] for row in selected)
+        if start_count:
+            result[f"train_{mode}_start_step_mean"] = float(
+                sum(row["start_step_sum"] for row in selected) / start_count
+            )
+            result[f"train_{mode}_boundary_targeted_rate"] = float(
+                sum(row["boundary_targeted_sum"] for row in selected)
+                / start_count
+            )
     return result
 
 

@@ -148,6 +148,20 @@ class RolloutWorker:
             for action in sampled_actions
             if action.get("time_quantile") is not None
         ]
+        event_type_counts = {
+            event_type: torch.tensor(
+                [
+                    sum(
+                        action.get("event_type") == event_type
+                        for action in trajectory.actions
+                    )
+                    for trajectory in trajectories
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+            for event_type in ("coal", "recomb", "fixed_attachment")
+        }
         time_diagnostic_device = (
             torch.device("cpu")
             if self.device.type == "mps"
@@ -233,6 +247,9 @@ class RolloutWorker:
                 action.get("event_type") == "fixed_attachment"
                 for action in sampled_actions
             ),
+            "coalescence_counts": event_type_counts["coal"],
+            "recombination_counts": event_type_counts["recomb"],
+            "fixed_attachment_counts": event_type_counts["fixed_attachment"],
         }
         if return_states:
             data["states"] = states

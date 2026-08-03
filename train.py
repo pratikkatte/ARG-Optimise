@@ -59,6 +59,9 @@ DEFAULT_LOSS = "tb"
 DEFAULT_SUBTB_LAMBDA = 0.9
 DEFAULT_SUBTB_MAX_SPAN = None
 DEFAULT_PARTIAL_SEGMENT_MAX_STEPS = 16
+DEFAULT_PARTIAL_START_MODE = "initial"
+DEFAULT_PARTIAL_BOUNDARY_FRACTION = 0.5
+PARTIAL_START_MODES = ("initial", "terminal_prefix_mixture")
 DEFAULT_TERMINAL_BACKTRACK_LENGTHS = (5, 10, 25)
 DEFAULT_EMBEDDING_SIZE = 32
 DEFAULT_HIDDEN_SIZE = 64
@@ -112,6 +115,8 @@ DEFAULT_CONFIG = {
         "eval_episodes": DEFAULT_EVAL_EPISODES,
         "eval_every": DEFAULT_EVAL_EVERY,
         "partial_segment_max_steps": DEFAULT_PARTIAL_SEGMENT_MAX_STEPS,
+        "partial_start_mode": DEFAULT_PARTIAL_START_MODE,
+        "partial_boundary_fraction": DEFAULT_PARTIAL_BOUNDARY_FRACTION,
     },
     "environment": {
         "bp_per_blocks": 1,
@@ -169,6 +174,8 @@ CLI_CONFIG_PATHS = {
     "eval_episodes": ("training", "eval_episodes"),
     "eval_every": ("training", "eval_every"),
     "partial_segment_max_steps": ("training", "partial_segment_max_steps"),
+    "partial_start_mode": ("training", "partial_start_mode"),
+    "partial_boundary_fraction": ("training", "partial_boundary_fraction"),
     "bp_per_blocks": ("environment", "bp_per_blocks"),
     "effective_population_size": ("environment", "effective_population_size"),
     "mutation_rate": ("environment", "mutation_rate"),
@@ -383,6 +390,39 @@ def validate_train_config(config):
     if partial_segment_max_steps <= 0:
         raise ValueError("training.partial_segment_max_steps must be positive")
     training["partial_segment_max_steps"] = partial_segment_max_steps
+    partial_start_mode = str(
+        training.get("partial_start_mode", DEFAULT_PARTIAL_START_MODE)
+    ).lower()
+    if partial_start_mode not in PARTIAL_START_MODES:
+        raise ValueError(
+            "training.partial_start_mode must be one of "
+            + ", ".join(repr(value) for value in PARTIAL_START_MODES)
+        )
+    training["partial_start_mode"] = partial_start_mode
+    if (
+        partial_start_mode == "terminal_prefix_mixture"
+        and training["grad_accum_steps"] % 2
+    ):
+        raise ValueError(
+            "training.partial_start_mode='terminal_prefix_mixture' requires "
+            "an even training.grad_accum_steps"
+        )
+    try:
+        partial_boundary_fraction = float(
+            training.get(
+                "partial_boundary_fraction",
+                DEFAULT_PARTIAL_BOUNDARY_FRACTION,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "training.partial_boundary_fraction must be a number between 0 and 1"
+        ) from exc
+    if not 0.0 <= partial_boundary_fraction <= 1.0:
+        raise ValueError(
+            "training.partial_boundary_fraction must be between 0 and 1"
+        )
+    training["partial_boundary_fraction"] = partial_boundary_fraction
     refinement = config.get("refinement", {})
     legacy_fields = {
         "bad_region_top_k",
@@ -547,6 +587,8 @@ def config_to_train_kwargs(config):
         "eval_episodes": training["eval_episodes"],
         "eval_every": training["eval_every"],
         "partial_segment_max_steps": training["partial_segment_max_steps"],
+        "partial_start_mode": training["partial_start_mode"],
+        "partial_boundary_fraction": training["partial_boundary_fraction"],
         "reward_C": reward["constant"],
         "embedding_size": model["embedding_size"],
         "hidden_size": model["hidden_size"],
@@ -2006,6 +2048,11 @@ def main():
     parser.add_argument("--eval-episodes", type=int)
     parser.add_argument("--eval-every", type=int)
     parser.add_argument("--partial-segment-max-steps", type=int)
+    parser.add_argument(
+        "--partial-start-mode",
+        choices=list(PARTIAL_START_MODES),
+    )
+    parser.add_argument("--partial-boundary-fraction", type=float)
     parser.add_argument("--time-basis-components", type=int)
     parser.add_argument("--reward-constant", type=float)
     parser.add_argument("--embedding-size", type=int)
