@@ -587,11 +587,11 @@ def sample_local_prior_action(
         max_delta=max_delta,
     )
     if next_fixed_time is not None:
-        delta_time = env.time_env.clamp_delta_before_absolute_boundary(
+        delta_time = env.time_env.event_time_after_delta(
             delta_time,
             state.current_time,
             next_fixed_time,
-        )
+        ) - float(state.current_time)
     wait_log_probability = env.time_env.waiting_time_log_density(
         delta_time,
         total_rate,
@@ -729,11 +729,19 @@ def apply_local_action(
         raise ValueError("the requested action is not locally authorized")
 
     next_fixed_time = _next_fixed_ancestor_time(state)
-    event_time = float(state.current_time) + float(action.delta_time)
-    if next_fixed_time is not None and not event_time < next_fixed_time:
+    try:
+        event_time = env.time_env.event_time_after_delta(
+            action.delta_time,
+            state.current_time,
+            next_fixed_time,
+        )
+    except ValueError as exc:
         raise ValueError(
             "sampled local event cannot skip a scheduled fixed ancestor"
-        )
+        ) from exc
+    canonical_delta_time = event_time - float(state.current_time)
+    if canonical_delta_time != float(action.delta_time):
+        action = replace(action, delta_time=canonical_delta_time)
 
     previous_max_node = int(state.max_node_idx)
     input_lineages: tuple[ARGLineage, ...]
@@ -1230,7 +1238,10 @@ def local_is_terminal(
             "local_terminal_requires_exhausted_fixed_schedule",
             False,
         )
-        and state.fixed_ancestor_schedule
+        and any(
+            int(record["node_id"]) not in state.all_nodes
+            for record in state.fixed_ancestor_schedule
+        )
     ):
         return False
     target = state.target_material

@@ -217,14 +217,20 @@ def test_reference_and_production_semantic_parity(prepared_contexts):
         abs=1e-8,
     )
     terminal_clone = prod_state.clone()
+    unrevealed_node_id = max(terminal_clone.all_nodes) + 1
     terminal_clone.fixed_ancestor_schedule = [
-        {"time": float(terminal_clone.current_time) + 1.0}
+        {
+            "node_id": unrevealed_node_id,
+            "time": float(terminal_clone.current_time) + 1.0,
+        }
     ]
     assert local_env.is_terminal(terminal_clone)
     terminal_clone.local_terminal_requires_exhausted_fixed_schedule = True
     assert not local_env.is_terminal(terminal_clone)
     assert terminal_clone.clone().local_terminal_requires_exhausted_fixed_schedule
-    terminal_clone.fixed_ancestor_schedule = []
+    terminal_clone.fixed_ancestor_schedule[0]["node_id"] = next(
+        iter(terminal_clone.all_nodes)
+    )
     assert local_env.is_terminal(terminal_clone)
 
     ref_proposal = reference.local_state_to_proposal(

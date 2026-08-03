@@ -300,6 +300,36 @@ def test_continuous_prior_rollout_exports_strict_parent_child_times():
     )
 
 
+def test_subnormal_wait_is_promoted_to_a_representable_parent_time():
+    env = SimpleARGEnvironment(
+        sequences=["A", "A"],
+        bp_per_blocks=1,
+        recombination_rate=0.0,
+        seed=29,
+        device="cpu",
+    )
+    state = env.get_initial_state()
+    current_time = 1.5036792925154019
+    state.current_time = current_time
+    for lineage in state.active_lineages:
+        lineage.time = current_time
+
+    next_state = env.apply_coalescence(
+        state,
+        CoalescenceChoice(
+            0,
+            1,
+            delta_time=math.nextafter(0.0, 1.0),
+        ),
+    )
+
+    expected_parent_time = math.nextafter(current_time, math.inf)
+    parent = next_state.active_lineages[0]
+    assert next_state.current_time == expected_parent_time
+    assert parent.time == expected_parent_time
+    assert parent.time > current_time
+
+
 def test_zero_horizon_and_invalid_times_are_rejected():
     clock = ContinuousCoalescentTime()
 

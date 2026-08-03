@@ -1645,7 +1645,10 @@ class SimpleARGEnvironment:
             )
         else:
             delta_t = float(action.delta_time)
-        parent_time = float(state.current_time) + delta_t
+        parent_time = self.time_env.event_time_after_delta(
+            delta_t,
+            state.current_time,
+        )
         next_state.current_time = parent_time
         if self.structural_only:
             parent_partials = None
@@ -1736,7 +1739,10 @@ class SimpleARGEnvironment:
         else:
             delta_t = float(action.delta_time)
 
-        event_time = float(state.current_time) + delta_t
+        event_time = self.time_env.event_time_after_delta(
+            delta_t,
+            state.current_time,
+        )
         next_state.current_time = event_time
         if self.structural_only:
             left_partials = None
@@ -1899,6 +1905,10 @@ class SimpleARGEnvironment:
             time_quantile,
             total_rate,
         )
+        delta_time = self.time_env.event_time_after_delta(
+            delta_time,
+            state.current_time,
+        ) - float(state.current_time)
         chosen_action = replace(
             chosen_action,
             time_quantile=time_quantile,
@@ -2429,11 +2439,21 @@ class LocalARGEnvironment:
     def time_quantile_to_delta(self, state, time_quantile):
         options = self.enumerate_prior_options(state)
         rollout = self._rollout_time_data(state, options.rates)
-        return self.time_env.quantile_to_delta(
+        delta_time = self.time_env.quantile_to_delta(
             float(time_quantile),
             rollout["total_rate"],
             max_delta=rollout["max_delta"],
         )
+        boundary_time = (
+            None
+            if rollout["max_delta"] is None
+            else self.next_fixed_ancestor_time(state)
+        )
+        return self.time_env.event_time_after_delta(
+            delta_time,
+            state.current_time,
+            boundary_time,
+        ) - float(state.current_time)
 
     def delta_to_time_quantile(self, state, delta_time):
         options = self.enumerate_prior_options(state)

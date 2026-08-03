@@ -48,7 +48,7 @@ nvidia-smi || true
 
 python benchmark_gflownet_workflow.py \
     --config "${CONFIG}" \
-    --output-dir runs/config_1mb_local_refinement_1000 \
+    --output-dir runs/config_1mb_local_refinement_1000_terminal_requires_exhausted_fixed_schedule_true \
     --epochs 1000 \
     --device cuda
 

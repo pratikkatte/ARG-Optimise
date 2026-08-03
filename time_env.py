@@ -119,6 +119,8 @@ class ContinuousCoalescentTime:
         """
 
         delta = self._validate_delta(delta)
+        if not delta > 0.0:
+            raise ValueError("event delta must be strictly positive")
         current_time = float(current_time)
         boundary_time = float(boundary_time)
         if not math.isfinite(current_time) or not math.isfinite(boundary_time):
@@ -144,6 +146,44 @@ class ContinuousCoalescentTime:
                     "no representable continuous event time exists before boundary"
                 )
         return min(delta, strict_delta)
+
+    def event_time_after_delta(
+        self,
+        delta,
+        current_time,
+        boundary_time=None,
+    ):
+        """Convert a positive wait to a strictly later representable time.
+
+        A positive subnormal ``delta`` can disappear when added to a much
+        larger absolute ARG time.  Event times, unlike relative waits, must be
+        strictly ordered, so promote that numerical edge case to the next
+        representable float.  When a fixed-ancestor boundary is supplied, the
+        promoted time must still remain strictly before it.
+        """
+
+        delta = self._validate_delta(delta)
+        current_time = float(current_time)
+        if not math.isfinite(current_time):
+            raise ValueError("current_time must be finite")
+
+        if boundary_time is not None:
+            boundary_time = float(boundary_time)
+            delta = self.clamp_delta_before_absolute_boundary(
+                delta,
+                current_time,
+                boundary_time,
+            )
+
+        event_time = current_time + delta
+        if not event_time > current_time:
+            event_time = math.nextafter(current_time, math.inf)
+
+        if boundary_time is not None and not event_time < boundary_time:
+            raise ValueError(
+                "no representable continuous event time exists before boundary"
+            )
+        return event_time
 
     def delta_to_quantile(self, delta, rate, max_delta=None):
         delta = self._validate_delta(delta)

@@ -416,16 +416,16 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 float(rate),
                 max_delta=max_delta,
             )
-            if max_delta is not None:
-                boundary_time = self.env.next_fixed_ancestor_time(state)
-                if boundary_time is not None:
-                    delta_time = (
-                        self.env.time_env.clamp_delta_before_absolute_boundary(
-                            delta_time,
-                            state.current_time,
-                            boundary_time,
-                        )
-                    )
+            boundary_time = (
+                None
+                if max_delta is None
+                else self.env.next_fixed_ancestor_time(state)
+            )
+            delta_time = self.env.time_env.event_time_after_delta(
+                delta_time,
+                state.current_time,
+                boundary_time,
+            ) - float(state.current_time)
             delta_times.append(delta_time)
             generated_masses.append(
                 self.env.time_env.generated_probability(

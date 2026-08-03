@@ -4,14 +4,14 @@
 # peaked before the end of training, so the final epoch may not be the best one.
 
 dataset_path: validation/vcf/sim_l1mb_0.vcf
-output_path: runs/local_refinement_1mb_full_context_1000
+output_path: runs/local_refinement_1mb_full_context_1000_terminal_requires_exhausted_fixed_schedule_true
 device: cuda
 
 refinement:
   enabled: true
   arg_path: validation/output/tsinfer/l1mb_dated.trees
   checkpoint: null
-  terminal_requires_exhausted_fixed_schedule: false
+  terminal_requires_exhausted_fixed_schedule: true
 
   # Half-open 100 kb target interval [left, right).
   requests:
