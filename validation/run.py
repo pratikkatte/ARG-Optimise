@@ -1,4 +1,4 @@
-"""Run GFN, tsinfer+tsdate, and SINGER validation for one experiment."""
+"""Run configured ARG point-accuracy validation methods for one experiment."""
 
 from __future__ import annotations
 
@@ -81,10 +81,14 @@ def _method_args(
         burnin_samples=method.burnin_samples,
         max_posterior_samples=method.max_posterior_samples,
         method_label=method.label,
+        region_start=None if options.region is None else options.region[0],
+        region_end=None if options.region is None else options.region[1],
     )
 
 
-def _summary_rows(results: list[ValidationResult]) -> list[dict[str, object]]:
+def _summary_rows(
+    results: list[ValidationResult], *, ne: float
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for result in results:
         rows.append(
@@ -95,6 +99,21 @@ def _summary_rows(results: list[ValidationResult]) -> list[dict[str, object]]:
                 "total_length": result.metrics["total_length"],
                 "weighted_mse": result.metrics["weighted_mse"],
                 "weighted_rmse": result.metrics["weighted_rmse"],
+                "weighted_rmse_generations": (
+                    float(result.metrics["weighted_rmse"]) * 2.0 * ne
+                ),
+                "weighted_log_rmse": result.metrics.get(
+                    "weighted_log_rmse", float("nan")
+                ),
+                "weighted_log_correlation": result.metrics.get(
+                    "weighted_log_correlation", float("nan")
+                ),
+                "weighted_spearman_correlation": result.metrics.get(
+                    "weighted_spearman_correlation", float("nan")
+                ),
+                "posterior_95pct_coverage": result.metrics.get(
+                    "posterior_95pct_coverage", float("nan")
+                ),
                 "weighted_mae": result.metrics["weighted_mae"],
                 "weighted_bias": result.metrics["weighted_bias"],
                 "legacy_mseall": result.metrics["legacy_mseall"],
@@ -110,7 +129,8 @@ def _write_comparison_plot(rows: list[dict[str, object]], path: Path) -> None:
     ]
     values = [float(row["weighted_rmse"]) for row in rows]
     fig, ax = plt.subplots(figsize=(7.0, 4.75))
-    bars = ax.bar(labels, values, color=("C0", "C1", "C2"))
+    colors = [f"C{index % 10}" for index in range(len(rows))]
+    bars = ax.bar(labels, values, color=colors)
     ax.set_ylabel("Weighted RMSE (t / 2Ne)")
     ax.set_title("ARG point-accuracy comparison")
     finite_values = [value for value in values if value == value]
@@ -179,7 +199,8 @@ def _write_manifest(
         },
         "validation": asdict(config.validation),
         "methods": {
-            name: _method_manifest(config.methods[name]) for name in METHOD_NAMES
+            name: _method_manifest(method)
+            for name, method in config.methods.items()
         },
         "results": {
             result.method: {
@@ -226,7 +247,7 @@ def run_validation(
     force: bool = False,
     method_runners: Mapping[str, Callable[..., ValidationResult]] | None = None,
 ) -> Path:
-    """Run and atomically publish a complete three-method comparison."""
+    """Run and atomically publish the configured method comparison."""
     preflight_config(config)
     experiment_root = experiment_dir(
         config.experiment, output_root=config.output_root
@@ -244,12 +265,14 @@ def run_validation(
     runners = METHOD_RUNNERS if method_runners is None else method_runners
     try:
         results: list[ValidationResult] = []
-        for method_name in METHOD_NAMES:
+        for method_name, method in config.methods.items():
             print(f"Validating {method_name} ...", flush=True)
             method_dir = staging_dir / method_name
-            args = _method_args(
-                config, config.methods[method_name], method_dir
-            )
+            if method_name not in runners:
+                raise RuntimeError(
+                    f"no validation runner is registered for {method_name}"
+                )
+            args = _method_args(config, method, method_dir)
             result = runners[method_name](args, output_dir=method_dir)
             if result.method != method_name:
                 raise RuntimeError(
@@ -257,7 +280,7 @@ def run_validation(
                 )
             results.append(result)
 
-        rows = _summary_rows(results)
+        rows = _summary_rows(results, ne=config.truth.ne)
         pd.DataFrame(rows).to_csv(
             staging_dir / "summary.tsv",
             sep="\t",
@@ -277,7 +300,7 @@ def run_validation(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate GFN, tsinfer+tsdate, and SINGER outputs for one experiment."
+            "Validate configured ARG point-accuracy methods for one experiment."
         )
     )
     parser.add_argument(

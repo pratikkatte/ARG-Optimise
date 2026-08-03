@@ -1,0 +1,15 @@
+truth:
+  trees: trees/sim_l1mb_0.trees
+  ne: 10000
+  haplotypes: 8
+methods:
+  gfn:
+    label: E full context, seed 7
+    input_dir: ../runs/time_context_E_full_seed7/inference/region_400kb_500kb
+    sample_prefix: arg_
+    max_posterior_samples: 16
+validation:
+  region: [400000, 500000]
+  skip: 1
+  pair_seed: 42
+  verbose: false

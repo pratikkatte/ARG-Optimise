@@ -1,0 +1,15 @@
+truth:
+  trees: trees/sim_l1mb_0.trees
+  ne: 10000
+  haplotypes: 8
+methods:
+  gfn:
+    label: A baseline context, time LR 1e-2, seed 7
+    input_dir: ../runs/time_context_A_baseline_timelr1e2_seed7/inference/region_400kb_500kb
+    sample_prefix: arg_
+    max_posterior_samples: 16
+validation:
+  region: [400000, 500000]
+  skip: 1
+  pair_seed: 42
+  verbose: false

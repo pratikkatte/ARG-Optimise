@@ -23,6 +23,7 @@ VALIDATION_KEYS = {
     "xlim_log",
     "ylim_log",
     "verbose",
+    "region",
 }
 METHOD_KEYS = {
     "label",
@@ -75,6 +76,7 @@ class ValidationOptions:
     xlim_log: str = "-4,1.5"
     ylim_log: str = "-4,1.5"
     verbose: bool = False
+    region: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -324,6 +326,20 @@ def _parse_validation(data: Any) -> ValidationOptions:
         if max_pairs_value is None
         else _integer(max_pairs_value, "validation.max_pairs", minimum=1)
     )
+    region_value = validation.get("region")
+    region: tuple[float, float] | None = None
+    if region_value is not None:
+        if not isinstance(region_value, (list, tuple)) or len(region_value) != 2:
+            raise ConfigurationError(
+                "validation.region must be a two-number [left, right] interval"
+            )
+        left = _number(region_value[0], "validation.region[0]")
+        right = _number(region_value[1], "validation.region[1]")
+        if left < 0 or right <= left:
+            raise ConfigurationError(
+                "validation.region must satisfy 0 <= left < right"
+            )
+        region = (left, right)
     return ValidationOptions(
         skip=_integer(validation.get("skip", 1), "validation.skip", minimum=1),
         max_pairs=max_pairs,
@@ -341,6 +357,7 @@ def _parse_validation(data: Any) -> ValidationOptions:
         verbose=_boolean(
             validation.get("verbose", False), "validation.verbose"
         ),
+        region=region,
     )
 
 
@@ -364,15 +381,15 @@ def load_config(
     truth = _parse_truth(_required(root, "truth", "config"), source.parent)
     methods_raw = _mapping(_required(root, "methods", "config"), "methods")
     unknown_methods = sorted(set(methods_raw) - set(METHOD_NAMES))
-    missing_methods = sorted(set(METHOD_NAMES) - set(methods_raw))
     if unknown_methods:
         raise ConfigurationError(
             f"methods contains unknown method(s): {', '.join(unknown_methods)}"
         )
-    if missing_methods:
-        raise ConfigurationError(
-            f"methods is missing required method(s): {', '.join(missing_methods)}"
-        )
+    if not methods_raw:
+        raise ConfigurationError("methods must configure at least one method")
+    configured_method_names = [
+        name for name in METHOD_NAMES if name in methods_raw
+    ]
     methods = {
         name: _parse_method(
             name,
@@ -381,7 +398,7 @@ def load_config(
             experiment=experiment,
             output_root=Path(output_root).resolve(),
         )
-        for name in METHOD_NAMES
+        for name in configured_method_names
     }
     return PipelineConfig(
         source=source,

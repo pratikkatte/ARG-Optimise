@@ -117,6 +117,7 @@ class LocalARGProposal:
     outside_log_likelihood: float | None = None
     local_log_likelihood: float | None = None
     log_reward: float | None = None
+    absolute_log_reward: float | None = None
     likelihood_scope: Literal["whole_vcf_chromosome", "none"] = "none"
     likelihood_alignment: dict[str, Any] = field(default_factory=dict)
     diagnostics: tuple[ConstructionDiagnostic, ...] = ()
@@ -371,7 +372,11 @@ def initialize_local_arg_state(
         accumulated_log_prior=0.0,
         accumulated_log_likelihood=accumulated_log_likelihood,
         outside_log_likelihood=outside_log_likelihood,
-        partial_log_reward=accumulated_log_likelihood,
+        # Match the conditional local reward used at termination: fixed
+        # exterior likelihood is excluded from every partial reward.
+        partial_log_reward=(
+            accumulated_log_likelihood - outside_log_likelihood
+        ),
         is_done=False,
         total_active_blocks=sum(
             lineage.material_segments.count
@@ -581,6 +586,12 @@ def sample_local_prior_action(
         total_rate,
         max_delta=max_delta,
     )
+    if next_fixed_time is not None:
+        delta_time = env.time_env.clamp_delta_before_absolute_boundary(
+            delta_time,
+            state.current_time,
+            next_fixed_time,
+        )
     wait_log_probability = env.time_env.waiting_time_log_density(
         delta_time,
         total_rate,
@@ -598,7 +609,24 @@ def sample_local_prior_action(
     if event_type == 0:
         if not options.coal_actions:
             raise RuntimeError("coalescence rate is positive without legal pairs")
-        action_index = int(rng.integers(len(options.coal_actions)))
+        weights = np.asarray(
+            [
+                _local_coalescence_weight(
+                    state.active_lineages[choice.active_lineage_i],
+                    state.active_lineages[choice.active_lineage_j],
+                    state,
+                )
+                for choice in options.coal_actions
+            ],
+            dtype=np.float64,
+        )
+        total_weight = float(weights.sum())
+        if not total_weight > 0.0:
+            weights = np.ones(len(options.coal_actions), dtype=np.float64)
+            total_weight = float(weights.sum())
+        action_index = int(
+            rng.choice(len(options.coal_actions), p=weights / total_weight)
+        )
         action = replace(
             options.coal_actions[action_index],
             time_quantile=time_quantile,
@@ -606,7 +634,7 @@ def sample_local_prior_action(
         )
         choice_log_probability = (
             math.log(lambda_coal / total_rate)
-            - math.log(len(options.coal_actions))
+            + math.log(float(weights[action_index]) / total_weight)
         )
     else:
         if not options.recomb_choices:
@@ -1174,6 +1202,7 @@ def undo_local_transition(
     )
     previous.log_likelihood = undo.get("previous_log_likelihood")
     previous.log_reward = undo.get("previous_log_reward")
+    previous.absolute_log_reward = undo.get("previous_absolute_log_reward")
     previous.terminal_partial_correction = float(
         undo.get("previous_terminal_partial_correction", 0.0)
     )
@@ -1195,6 +1224,15 @@ def local_is_terminal(
     """Return whether each target block is carried by exactly one root."""
 
     _require_local_state(state)
+    if (
+        getattr(
+            state,
+            "local_terminal_requires_exhausted_fixed_schedule",
+            False,
+        )
+        and state.fixed_ancestor_schedule
+    ):
+        return False
     target = state.target_material
     if target is None or target.count == 0:
         return False
@@ -1289,18 +1327,24 @@ def compute_local_terminal_log_reward(
     context: LocalRefinementContext,
     env: SimpleARGEnvironment,
 ) -> float:
-    """Return ``C + whole VCF likelihood + local CWR prior``."""
+    """Return the reference-centered conditional local log reward.
+
+    The absolute posterior remains available on terminal states/proposals;
+    this value removes the fixed reward constant and exterior VCF likelihood.
+    """
 
     log_likelihood = compute_local_terminal_log_likelihood(
         state,
         context,
         env,
     )
+    absolute_log_reward = float(
+        env.reward_fn(log_likelihood, float(state.accumulated_log_prior))
+    )
     return float(
-        env.reward_fn(
-            log_likelihood,
-            float(state.accumulated_log_prior),
-        )
+        absolute_log_reward
+        - float(env.reward_fn.C)
+        - float(state.outside_log_likelihood)
     )
 
 
@@ -1314,13 +1358,19 @@ def _finalize_local_terminal_likelihood(
         context,
         env,
     )
-    log_reward = float(
+    absolute_log_reward = float(
         env.reward_fn(
             log_likelihood,
             float(state.accumulated_log_prior),
         )
     )
+    log_reward = float(
+        absolute_log_reward
+        - float(env.reward_fn.C)
+        - float(state.outside_log_likelihood)
+    )
     state.log_likelihood = float(log_likelihood)
+    state.absolute_log_reward = absolute_log_reward
     state.log_reward = log_reward
     state.terminal_partial_correction = float(
         log_reward - state.partial_log_reward
@@ -1440,6 +1490,11 @@ def local_state_to_proposal(
         ),
         log_reward=(
             None if state.log_reward is None else float(state.log_reward)
+        ),
+        absolute_log_reward=(
+            None
+            if state.absolute_log_reward is None
+            else float(state.absolute_log_reward)
         ),
         likelihood_scope=(
             "whole_vcf_chromosome"
@@ -1601,6 +1656,393 @@ def sample_local_trajectories(
         int(total_transitions),
         int(restarts),
     )
+
+
+def build_source_copy_proposal(
+    prepared: PreparedLocalRefinement,
+) -> LocalARGProposal:
+    """Return a no-op local proposal that exactly restores source ancestry."""
+
+    edges = tuple(
+        LocalEdgeRecord(
+            float(item.left),
+            float(item.right),
+            int(item.parent_node_id),
+            int(item.child_node_id),
+        )
+        for item in prepared.context.authorized_edge_intervals
+    )
+    return LocalARGProposal(
+        genomic_range=prepared.context.request.genomic_range,
+        cut_time=float(prepared.context.resolved_cut.current_time),
+        nodes=(),
+        edges=edges,
+        events=(),
+        root_intervals=_source_root_intervals(prepared),
+        authorized_edge_intervals=tuple(prepared.context.authorized_edge_intervals),
+        prior_log_probability=0.0,
+        transition_records=(),
+        status="terminal",
+    )
+
+
+def build_vcf_distance_topology_proposal(
+    prepared: PreparedLocalRefinement,
+    env: SimpleARGEnvironment,
+    *,
+    window_bp: float | None = 5000.0,
+    merge_power: float = 8.0,
+    root_time_scale: float = 1.0,
+    minimum_branch_length: float = 1e-3,
+    sample_node_to_haplotype: Mapping[int, int | str] | None = None,
+    vcf_coordinate_offset: str | float = "auto",
+) -> LocalARGProposal:
+    """Build a source-anchored topology-changing proposal from VCF distances.
+
+    Each local grid interval is assigned an independent UPGMA-style tree over
+    the fixed cut endpoints active on that interval.  The distances use only
+    observed haplotypes from the VCF; truth tree sequences are not consulted.
+    """
+
+    if not env.is_vcf_mode or env.variant_data is None:
+        raise ValueError("VCF-distance topology proposals require a VCF environment")
+    if window_bp is not None:
+        window_bp = float(window_bp)
+        if not math.isfinite(window_bp) or window_bp <= 0.0:
+            raise ValueError("window_bp must be positive or None")
+    merge_power = float(merge_power)
+    root_time_scale = float(root_time_scale)
+    minimum_branch_length = float(minimum_branch_length)
+    if not math.isfinite(merge_power) or merge_power <= 0.0:
+        raise ValueError("merge_power must be positive")
+    if not math.isfinite(root_time_scale) or root_time_scale <= 0.0:
+        raise ValueError("root_time_scale must be positive")
+    if (
+        not math.isfinite(minimum_branch_length)
+        or minimum_branch_length <= 0.0
+    ):
+        raise ValueError("minimum_branch_length must be positive")
+
+    state = initialize_local_arg_state(
+        prepared,
+        env,
+        sample_node_to_haplotype=sample_node_to_haplotype,
+        vcf_coordinate_offset=vcf_coordinate_offset,
+    )
+    if state.block_boundaries is None:
+        raise ValueError("local state is missing block boundaries")
+    alignment = state.vcf_alignment
+    haplotype_by_sample_node = {
+        int(node_id): int(haplotype_index)
+        for node_id, haplotype_index in alignment[
+            "haplotype_index_by_sample_node"
+        ].items()
+    }
+    coordinates = np.asarray(
+        alignment["variant_coordinates"],
+        dtype=np.float64,
+    )
+    haplotypes = np.argmax(
+        np.asarray(env.variant_data.haplotype_partials, dtype=np.float32),
+        axis=2,
+    )
+    target_left, target_right = (
+        float(prepared.context.request.genomic_range[0]),
+        float(prepared.context.request.genomic_range[1]),
+    )
+    target_variant_indices = np.flatnonzero(
+        (coordinates >= target_left) & (coordinates < target_right)
+    )
+    if target_variant_indices.size == 0:
+        raise ValueError("requested interval contains no VCF variants")
+
+    source_node_time = np.asarray(
+        prepared.source_tree_sequence.tables.nodes.time,
+        dtype=np.float64,
+    )
+    next_node_id = int(prepared.synthetic_arg.num_nodes) + 1_000_000
+    node_records: list[LocalNodeRecord] = []
+    edge_records: list[LocalEdgeRecord] = []
+    root_intervals: list[tuple[float, float, int]] = []
+    cut_time = float(prepared.context.resolved_cut.current_time)
+
+    active_by_block = _active_endpoints_by_block(state)
+    cursor = target_left
+    for block_index, (left, right) in enumerate(
+        zip(state.block_boundaries[:-1], state.block_boundaries[1:])
+    ):
+        left = float(left)
+        right = float(right)
+        if right <= target_left or left >= target_right:
+            continue
+        left = max(left, target_left)
+        right = min(right, target_right)
+        if not left < right:
+            continue
+        if not math.isclose(left, cursor, rel_tol=0.0, abs_tol=1e-9):
+            raise RuntimeError("local block grid does not partition the target")
+        endpoints = active_by_block.get(int(block_index), ())
+        if not endpoints:
+            raise RuntimeError(
+                "no active cut endpoint covers local block "
+                f"{block_index} [{left}, {right})"
+            )
+        mid = (left + right) / 2.0
+        if len(endpoints) == 1:
+            root_intervals.append((left, right, int(endpoints[0])))
+            cursor = right
+            continue
+
+        variant_indices = _local_distance_variant_indices(
+            coordinates,
+            target_variant_indices,
+            mid,
+            target_left,
+            target_right,
+            window_bp,
+        )
+        clusters = [
+            {
+                "node": int(node_id),
+                "samples": _endpoint_haplotype_indices(
+                    prepared,
+                    int(node_id),
+                    mid,
+                    haplotype_by_sample_node,
+                ),
+                "time": float(source_node_time[int(node_id)]),
+                "size": 1,
+            }
+            for node_id in endpoints
+        ]
+        for cluster in clusters:
+            cluster["size"] = max(len(cluster["samples"]), 1)
+
+        source_root_time = _source_tree_root_time(prepared, mid)
+        root_time = cut_time + root_time_scale * max(
+            source_root_time - cut_time,
+            minimum_branch_length * float(len(clusters)),
+        )
+        merge_count = 0
+        total_merges = len(clusters) - 1
+        while len(clusters) > 1:
+            first, second = _closest_vcf_clusters(
+                clusters,
+                haplotypes,
+                variant_indices,
+            )
+            if second < first:
+                first, second = second, first
+            right_cluster = clusters.pop(second)
+            left_cluster = clusters.pop(first)
+            merge_count += 1
+            fraction = (merge_count / total_merges) ** merge_power
+            parent_time = cut_time + fraction * (root_time - cut_time)
+            parent_time = max(
+                parent_time,
+                float(left_cluster["time"]) + minimum_branch_length,
+                float(right_cluster["time"]) + minimum_branch_length,
+            )
+            parent_node_id = next_node_id
+            next_node_id += 1
+            node_records.append(
+                LocalNodeRecord(
+                    node_id=parent_node_id,
+                    kind="coalescence",
+                    time=float(parent_time),
+                    flags=0,
+                )
+            )
+            edge_records.append(
+                LocalEdgeRecord(
+                    left,
+                    right,
+                    parent_node_id,
+                    int(left_cluster["node"]),
+                )
+            )
+            edge_records.append(
+                LocalEdgeRecord(
+                    left,
+                    right,
+                    parent_node_id,
+                    int(right_cluster["node"]),
+                )
+            )
+            clusters.append(
+                {
+                    "node": parent_node_id,
+                    "samples": tuple(
+                        sorted(
+                            set(left_cluster["samples"])
+                            | set(right_cluster["samples"])
+                        )
+                    ),
+                    "time": float(parent_time),
+                    "size": (
+                        int(left_cluster["size"])
+                        + int(right_cluster["size"])
+                    ),
+                }
+            )
+        root_intervals.append((left, right, int(clusters[0]["node"])))
+        cursor = right
+
+    if not math.isclose(cursor, target_right, rel_tol=0.0, abs_tol=1e-9):
+        raise RuntimeError("local block grid does not cover the target")
+    return LocalARGProposal(
+        genomic_range=prepared.context.request.genomic_range,
+        cut_time=cut_time,
+        nodes=tuple(node_records),
+        edges=tuple(edge_records),
+        events=(),
+        root_intervals=tuple(root_intervals),
+        authorized_edge_intervals=tuple(prepared.context.authorized_edge_intervals),
+        prior_log_probability=0.0,
+        transition_records=(),
+        status="terminal",
+    )
+
+
+def _source_root_intervals(
+    prepared: PreparedLocalRefinement,
+    node_map: Mapping[int, int] | None = None,
+) -> tuple[tuple[float, float, int], ...]:
+    node_map = {} if node_map is None else {int(k): int(v) for k, v in node_map.items()}
+    left_bound, right_bound = prepared.context.request.genomic_range
+    intervals: list[tuple[float, float, int]] = []
+    for tree in prepared.source_tree_sequence.trees():
+        left = max(float(tree.interval.left), float(left_bound))
+        right = min(float(tree.interval.right), float(right_bound))
+        if not left < right:
+            continue
+        roots = tuple(int(root) for root in tree.roots)
+        if len(roots) != 1:
+            raise ValueError(
+                "source-copy local proposal requires one source root per "
+                f"target marginal tree, got {roots} on [{left}, {right})"
+            )
+        root = node_map.get(roots[0], roots[0])
+        if (
+            intervals
+            and intervals[-1][2] == root
+            and math.isclose(intervals[-1][1], left, rel_tol=0.0, abs_tol=1e-9)
+        ):
+            previous_left, _, _ = intervals[-1]
+            intervals[-1] = (previous_left, right, root)
+        else:
+            intervals.append((left, right, root))
+    return tuple(intervals)
+
+
+def _active_endpoints_by_block(state: ARGState) -> dict[int, tuple[int, ...]]:
+    if state.block_boundaries is None:
+        raise ValueError("local state is missing block boundaries")
+    by_block: dict[int, list[int]] = {
+        block_index: []
+        for block_index in range(len(state.block_boundaries) - 1)
+    }
+    for lineage in state.active_lineages:
+        node_id = int(lineage.node_id)
+        for start, end in lineage.material_segments.segments:
+            for block_index in range(int(start), int(end)):
+                by_block.setdefault(block_index, []).append(node_id)
+    return {
+        block_index: tuple(sorted(set(node_ids)))
+        for block_index, node_ids in by_block.items()
+        if node_ids
+    }
+
+
+def _endpoint_haplotype_indices(
+    prepared: PreparedLocalRefinement,
+    node_id: int,
+    coordinate: float,
+    haplotype_by_sample_node: Mapping[int, int],
+) -> tuple[int, ...]:
+    tree = prepared.source_tree_sequence.at(float(coordinate))
+    return tuple(
+        int(haplotype_by_sample_node[int(sample_node)])
+        for sample_node in tree.samples(int(node_id))
+        if int(sample_node) in haplotype_by_sample_node
+    )
+
+
+def _source_tree_root_time(
+    prepared: PreparedLocalRefinement,
+    coordinate: float,
+) -> float:
+    tree = prepared.source_tree_sequence.at(float(coordinate))
+    node_times = prepared.source_tree_sequence.tables.nodes.time
+    roots = tuple(int(root) for root in tree.roots)
+    if not roots:
+        raise ValueError("source tree has no root")
+    return max(float(node_times[root]) for root in roots)
+
+
+def _local_distance_variant_indices(
+    coordinates: np.ndarray,
+    target_variant_indices: np.ndarray,
+    midpoint: float,
+    target_left: float,
+    target_right: float,
+    window_bp: float | None,
+) -> np.ndarray:
+    if window_bp is None:
+        return target_variant_indices
+    left = max(float(target_left), float(midpoint) - float(window_bp))
+    right = min(float(target_right), float(midpoint) + float(window_bp))
+    local = np.flatnonzero((coordinates >= left) & (coordinates < right))
+    if local.size < 8:
+        return target_variant_indices
+    return local
+
+
+def _closest_vcf_clusters(
+    clusters: list[dict[str, Any]],
+    haplotypes: np.ndarray,
+    variant_indices: np.ndarray,
+) -> tuple[int, int]:
+    best: tuple[float, int, int, int, int] | None = None
+    best_pair: tuple[int, int] | None = None
+    for first_index in range(len(clusters)):
+        first = clusters[first_index]
+        for second_index in range(first_index + 1, len(clusters)):
+            second = clusters[second_index]
+            distance = _cluster_hamming_distance(
+                first["samples"],
+                second["samples"],
+                haplotypes,
+                variant_indices,
+            )
+            tie_break = (
+                distance,
+                int(first["size"]) + int(second["size"]),
+                int(first["node"]),
+                int(second["node"]),
+                second_index,
+            )
+            if best is None or tie_break < best:
+                best = tie_break
+                best_pair = (first_index, second_index)
+    if best_pair is None:
+        raise ValueError("at least two clusters are required")
+    return best_pair
+
+
+def _cluster_hamming_distance(
+    left_samples: Iterable[int],
+    right_samples: Iterable[int],
+    haplotypes: np.ndarray,
+    variant_indices: np.ndarray,
+) -> float:
+    left = np.asarray(tuple(int(value) for value in left_samples), dtype=np.int64)
+    right = np.asarray(tuple(int(value) for value in right_samples), dtype=np.int64)
+    if left.size == 0 or right.size == 0 or variant_indices.size == 0:
+        return 0.5
+    left_values = haplotypes[left[:, None], variant_indices[None, :]]
+    right_values = haplotypes[right[:, None], variant_indices[None, :]]
+    return float(np.mean(left_values[:, None, :] != right_values[None, :, :]))
 
 
 def _environment_block_boundaries(
@@ -1793,6 +2235,32 @@ def _block_coordinate(state: ARGState, block_index: int) -> float:
     if boundaries is None:
         raise ValueError("local ARG state is missing block boundaries")
     return float(boundaries[int(block_index)])
+
+
+def _material_physical_length(
+    state: ARGState,
+    material: MaterialSegments,
+) -> float:
+    boundaries = state.block_boundaries
+    if boundaries is None:
+        return float(material.count)
+    length = 0.0
+    for start, end in material.segments:
+        length += max(float(boundaries[int(end)]) - float(boundaries[int(start)]), 0.0)
+    return float(length)
+
+
+def _local_coalescence_weight(
+    left: ARGLineage,
+    right: ARGLineage,
+    state: ARGState,
+) -> float:
+    overlap = left.material_segments.intersection(right.material_segments)
+    if state.target_material is not None:
+        overlap = overlap.intersection(state.target_material)
+    if overlap.count <= 0:
+        return 0.0
+    return max(_material_physical_length(state, overlap), 1.0)
 
 
 def _subtract_material(
@@ -2056,6 +2524,7 @@ def _transition_undo_record(
         ),
         "previous_log_likelihood": state.log_likelihood,
         "previous_log_reward": state.log_reward,
+        "previous_absolute_log_reward": state.absolute_log_reward,
         "previous_terminal_partial_correction": float(
             state.terminal_partial_correction
         ),
@@ -2500,6 +2969,8 @@ __all__ = [
     "LocalSamplingConfig",
     "advance_local_state",
     "apply_local_action",
+    "build_source_copy_proposal",
+    "build_vcf_distance_topology_proposal",
     "compute_local_terminal_log_likelihood",
     "compute_local_terminal_log_reward",
     "enumerate_local_prior_actions",

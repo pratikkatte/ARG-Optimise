@@ -10,8 +10,8 @@ refinement:
   # Half-open interval [left, right); this request is exactly 100 kb.
   # Supply exactly one of cut_time or cut_event_index.
   requests:
-    - id: region_000001
-      genomic_range: [14000, 114000]
+    - id: region_100kb_200kb
+      genomic_range: [100000, 200000]
       cut_time: 25000
 
 training:

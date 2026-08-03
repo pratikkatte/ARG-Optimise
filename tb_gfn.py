@@ -1,5 +1,6 @@
 import math
 import os
+import tempfile
 
 import numpy as np
 import torch
@@ -25,6 +26,7 @@ LOSS_FN = {
     'HUBER': torch.nn.HuberLoss(delta=1.0),
 }
 LOSS_MODES = {"tb", "subtb", "fl_subtb"}
+CHECKPOINT_FORMAT_VERSION = 2
 
 class TBGFlowNetGenerator(torch.nn.Module):
     def __init__(
@@ -39,6 +41,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         grad_clip=10.0,
         model_kwargs=None,
         policy_lr=None,
+        time_policy_lr=None,
         log_z_lr=None,
         initialize_z_from_prior=True,
         loss_mode="tb",
@@ -82,6 +85,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if log_z_lr is not None:
             z_lr = log_z_lr
         self.arg_model_lr = float(arg_model_lr)
+        self.time_policy_lr = (
+            None if time_policy_lr is None else float(time_policy_lr)
+        )
+        if self.time_policy_lr is not None and self.time_policy_lr <= 0.0:
+            raise ValueError("time_policy_lr must be positive when provided")
         self.z_lr = float(z_lr)
         self.loss_mode = str(loss_mode).lower()
         if self.loss_mode not in LOSS_MODES:
@@ -117,7 +125,24 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.arg_model_params = list(self.arg_model.parameters())
         self.policy_params = self.arg_model_params
 
-        params = [{'params': self.arg_model_params, 'lr': self.arg_model_lr}]
+        if self.time_policy_lr is None:
+            params = [{'params': self.arg_model_params, 'lr': self.arg_model_lr}]
+        else:
+            time_parameter_ids = {
+                id(parameter) for parameter in self.time_model.parameters()
+            }
+            non_time_parameters = [
+                parameter
+                for parameter in self.arg_model_params
+                if id(parameter) not in time_parameter_ids
+            ]
+            params = [
+                {'params': non_time_parameters, 'lr': self.arg_model_lr},
+                {
+                    'params': list(self.time_model.parameters()),
+                    'lr': self.time_policy_lr,
+                },
+            ]
         if self.loss_mode == "tb":
             params.append({'params': [self._Z], 'lr': self.z_lr})
 
@@ -154,24 +179,50 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.log_z_target_sum = 0.0
         self.log_z_target_count = 0
         self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
+        self.last_time_subtb_diagnostics = {}
 
 
     def _encode_states(self, states):
         return self.arg_model._encode_states(states)
 
 
-    def save(self, path, metadata=None):
+    def save(self, path, metadata=None, training_state=None):
+        """Atomically save a portable training/inference checkpoint.
+
+        Model metadata is kept separate from mutable training state so
+        inference only needs to inspect ``metadata`` and the model weights.
+        ``opt_state_dict`` remains the canonical optimizer key for backward
+        compatibility with existing checkpoints.
+        """
         directory = os.path.dirname(os.path.abspath(path))
         if directory:
             os.makedirs(directory, exist_ok=True)
-        torch.save(
-            {
-                "generator_state_dict": self.state_dict(),
-                "opt_state_dict": self.opt.state_dict(),
-                "metadata": dict(metadata or {}),
-            },
-            path,
-        )
+        payload = {
+            "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
+            "generator_state_dict": self.state_dict(),
+            "opt_state_dict": self.opt.state_dict(),
+            "metadata": dict(metadata or {}),
+            "training_state": dict(training_state or {}),
+        }
+        if self.scheduler is not None:
+            payload["scheduler_state_dict"] = self.scheduler.state_dict()
+        if self.scaler is not None:
+            payload["scaler_state_dict"] = self.scaler.state_dict()
+
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=directory,
+                prefix=f".{os.path.basename(path)}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = handle.name
+            torch.save(payload, temporary_path)
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     def load(self, path, load_optimizer=True, map_location=None):
         if map_location is None:
@@ -222,6 +273,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if load_optimizer and "opt_state_dict" in checkpoint:
             self.opt.load_state_dict(checkpoint["opt_state_dict"])
             self._move_optimizer_state_to_device()
+        if (
+            load_optimizer
+            and self.scheduler is not None
+            and "scheduler_state_dict" in checkpoint
+        ):
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if load_optimizer and "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
         return checkpoint.get("metadata", {})
 
     def _move_optimizer_state_to_device(self):
@@ -232,7 +291,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
     def _torch_load(self, path, map_location=None):
         try:
-            return torch.load(path, map_location=map_location, weights_only=False)
+            return torch.load(path, map_location=map_location, weights_only=True)
         except TypeError:
             return torch.load(path, map_location=map_location)
 
@@ -310,6 +369,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def _sample_continuous_times(
         self,
         selected_action_features,
+        states,
+        selected_actions,
         rates,
         max_deltas,
         random_spec,
@@ -320,9 +381,21 @@ class TBGFlowNetGenerator(torch.nn.Module):
             device=self.device,
             dtype=selected_action_features.dtype,
         )
+        biological_context, context_diagnostics = (
+            self.arg_model.build_time_context(
+                states,
+                selected_actions,
+                max_deltas,
+                dtype=selected_action_features.dtype,
+            )
+        )
         mixture_logits = self.time_model(
             torch.cat(
-                [selected_action_features, context_features],
+                [
+                    selected_action_features,
+                    context_features,
+                    biological_context,
+                ],
                 dim=-1,
             )
         )
@@ -332,18 +405,28 @@ class TBGFlowNetGenerator(torch.nn.Module):
         )
         delta_times = []
         generated_masses = []
-        for quantile, rate, max_delta in zip(
+        for quantile, rate, max_delta, state in zip(
             time_quantiles.detach().cpu().tolist(),
             rates,
             max_deltas,
+            states,
         ):
-            delta_times.append(
-                self.env.time_env.quantile_to_delta(
-                    float(quantile),
-                    float(rate),
-                    max_delta=max_delta,
-                )
+            delta_time = self.env.time_env.quantile_to_delta(
+                float(quantile),
+                float(rate),
+                max_delta=max_delta,
             )
+            if max_delta is not None:
+                boundary_time = self.env.next_fixed_ancestor_time(state)
+                if boundary_time is not None:
+                    delta_time = (
+                        self.env.time_env.clamp_delta_before_absolute_boundary(
+                            delta_time,
+                            state.current_time,
+                            boundary_time,
+                        )
+                    )
+            delta_times.append(delta_time)
             generated_masses.append(
                 self.env.time_env.generated_probability(
                     float(rate),
@@ -358,7 +441,17 @@ class TBGFlowNetGenerator(torch.nn.Module):
             generated_masses,
             random_spec=random_spec,
         )
-        return time_quantiles, delta_times, log_time_pf
+        mixture_diagnostics = self.time_model.mixture_diagnostics(
+            mixture_logits,
+            random_spec=random_spec,
+        )
+        return (
+            time_quantiles,
+            delta_times,
+            log_time_pf,
+            context_diagnostics,
+            mixture_diagnostics,
+        )
 
     def forward(self, input_dict):
         if bool(input_dict.get("local_mode", False)):
@@ -417,9 +510,17 @@ class TBGFlowNetGenerator(torch.nn.Module):
             self.env._total_event_rate(state.rates)
             for state in states
         ]
-        time_quantiles, delta_times, log_time_pf = (
+        (
+            time_quantiles,
+            delta_times,
+            log_time_pf,
+            time_context_diagnostics,
+            time_mixture_diagnostics,
+        ) = (
             self._sample_continuous_times(
                 selected_action_features,
+                states,
+                choosen_actions,
                 rates,
                 [None] * len(states),
                 random_spec,
@@ -438,6 +539,21 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 fixed_horizon=None,
                 time_log_density=float(
                     log_time_pf[batch_idx].detach().cpu().item()
+                ),
+                time_policy_entropy=float(
+                    time_mixture_diagnostics["entropy"][batch_idx]
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
+                time_effective_components=float(
+                    time_mixture_diagnostics["effective_components"][batch_idx]
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
+                time_context_diagnostics=dict(
+                    time_context_diagnostics[batch_idx]
                 ),
             )
 
@@ -461,6 +577,34 @@ class TBGFlowNetGenerator(torch.nn.Module):
         ) = self._encode_states(states)
 
         gate_logits = self.arg_model.compute_local_gate_logits(summary_reps)
+        prior_gate_weight = float(
+            getattr(self.arg_model, "local_prior_gate_logit_bias", 0.0)
+        )
+        if prior_gate_weight != 0.0:
+            epsilon = torch.finfo(gate_logits.dtype).tiny
+            prior_gate_rows = []
+            for decision in rollout:
+                generated_mass = (
+                    float(decision["generated_prior_mass"])
+                    if bool(decision["can_generate"])
+                    else 0.0
+                )
+                fixed_mass = (
+                    float(decision["survival_prior_mass"])
+                    if bool(decision["can_attach_fixed"])
+                    else 0.0
+                )
+                prior_gate_rows.append(
+                    [
+                        math.log(max(generated_mass, float(epsilon))),
+                        math.log(max(fixed_mass, float(epsilon))),
+                    ]
+                )
+            gate_logits = gate_logits + prior_gate_weight * torch.as_tensor(
+                prior_gate_rows,
+                dtype=gate_logits.dtype,
+                device=self.device,
+            )
         gate_mask = torch.tensor(
             [
                 [
@@ -500,6 +644,9 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         chosen_actions = [None] * len(states)
         total_log_pf = selected_gate_log_pf.clone()
+        component_action = torch.zeros_like(selected_gate_log_pf)
+        component_breakpoint = torch.zeros_like(selected_gate_log_pf)
+        component_time = torch.zeros_like(selected_gate_log_pf)
         generated_indices = [
             index
             for index, gate_action in enumerate(
@@ -623,9 +770,17 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 rollout[index]["max_delta"]
                 for index in generated_indices
             ]
-            time_quantiles, delta_times, log_time_pf = (
+            (
+                time_quantiles,
+                delta_times,
+                log_time_pf,
+                time_context_diagnostics,
+                time_mixture_diagnostics,
+            ) = (
                 self._sample_continuous_times(
                     selected_features,
+                    [states[index] for index in generated_indices],
+                    generated_chosen_actions,
                     rates,
                     max_deltas,
                     random_spec,
@@ -639,10 +794,29 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 time_quantile = float(
                     time_quantiles[local_index].detach().cpu().item()
                 )
+                diagnostics = dict(time_context_diagnostics[local_index])
+                sampled_delta = float(delta_times[local_index])
+                lower_distance = sampled_delta
+                upper_distance = (
+                    None
+                    if max_deltas[local_index] is None
+                    else max(float(max_deltas[local_index]) - sampled_delta, 0.0)
+                )
+                diagnostics.update(
+                    {
+                        "sampled_quantile": time_quantile,
+                        "sampled_delta_time": sampled_delta,
+                        "sampled_event_time": float(states[state_index].current_time)
+                        + sampled_delta,
+                        "distance_to_lower_bound": lower_distance,
+                        "distance_to_upper_bound": upper_distance,
+                        "normalized_sample_location": time_quantile,
+                    }
+                )
                 chosen_actions[state_index] = replace(
                     action,
                     time_quantile=time_quantile,
-                    delta_time=float(delta_times[local_index]),
+                    delta_time=sampled_delta,
                     waiting_rate=float(rates[local_index]),
                     fixed_horizon=(
                         None
@@ -655,6 +829,19 @@ class TBGFlowNetGenerator(torch.nn.Module):
                         .cpu()
                         .item()
                     ),
+                    time_policy_entropy=float(
+                        time_mixture_diagnostics["entropy"][local_index]
+                        .detach()
+                        .cpu()
+                        .item()
+                    ),
+                    time_effective_components=float(
+                        time_mixture_diagnostics["effective_components"][local_index]
+                        .detach()
+                        .cpu()
+                        .item()
+                    ),
+                    time_context_diagnostics=diagnostics,
                 )
                 total_log_pf[state_index] = (
                     total_log_pf[state_index]
@@ -662,18 +849,34 @@ class TBGFlowNetGenerator(torch.nn.Module):
                     + log_breakpoint_pf[local_index]
                     + log_time_pf[local_index]
                 )
+                component_action[state_index] = log_action_pf[local_index]
+                component_breakpoint[state_index] = log_breakpoint_pf[local_index]
+                component_time[state_index] = log_time_pf[local_index]
 
         if any(action is None for action in chosen_actions):
             raise RuntimeError("local policy failed to choose every action")
+        self.last_forward_log_components = {
+            "gate": selected_gate_log_pf.detach(),
+            "atomic_action": component_action.detach(),
+            "breakpoint": component_breakpoint.detach(),
+            "time": component_time.detach(),
+            "total": total_log_pf.detach(),
+        }
         return total_log_pf, torch.exp(total_log_pf), chosen_actions
 
 
     def update_model(self):
-        
+        time_gradient_squared = sum(
+            parameter.grad.norm().item() ** 2
+            for parameter in self.time_model.parameters()
+            if parameter.grad is not None
+        )
         info = {'grad_norm': self.grad_norm(self),
+                'time_head_grad_norm': math.sqrt(time_gradient_squared),
                 # 'z_grad_norm': self._Z.grad.norm().item(),
                 'param_norm': self.param_norm(self),
                 'loss': self.loss.detach().cpu().numpy().tolist()}
+        info.update(self.last_time_subtb_diagnostics)
         
         torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
         self.opt.step()
@@ -987,7 +1190,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
             log_flows_by_traj.append(flat_log_flows[cursor:next_cursor])
             cursor = next_cursor
 
-        return self._subtb_loss_from_log_flows(
+        loss = self._subtb_loss_from_log_flows(
             log_flows_by_traj,
             rollout_outputs["log_paths_pf"],
             rollout_outputs["log_paths_pb"],
@@ -995,6 +1198,138 @@ class TBGFlowNetGenerator(torch.nn.Module):
             self.subtb_lambda,
             self.subtb_max_span,
         )
+        self.last_time_subtb_diagnostics = self._time_subtb_diagnostics(
+            log_flows_by_traj,
+            rollout_outputs["log_paths_pf"],
+            rollout_outputs["log_paths_pb"],
+            rollout_outputs["trajectory_lengths"],
+            rollout_outputs.get("trajectory_actions", ()),
+            self.subtb_lambda,
+            self.subtb_max_span,
+        )
+        return loss
+
+    @staticmethod
+    def _time_subtb_diagnostics(
+        log_flows_by_traj,
+        log_paths_pf,
+        log_paths_pb,
+        trajectory_lengths,
+        trajectory_actions,
+        subtb_lambda,
+        subtb_max_span,
+    ):
+        """Summarize SubTB residuals spanning generated time actions."""
+
+        lengths = (
+            trajectory_lengths.detach().cpu().tolist()
+            if torch.is_tensor(trajectory_lengths)
+            else list(trajectory_lengths)
+        )
+        residuals = []
+        weights = []
+        one_step = []
+        terminal_reaching = []
+        for traj_idx, length_value in enumerate(lengths):
+            length = int(length_value)
+            actions = (
+                trajectory_actions[traj_idx]
+                if traj_idx < len(trajectory_actions)
+                else ()
+            )
+            time_mask = [
+                action.get("time_quantile") is not None
+                for action in actions[:length]
+            ]
+            if not any(time_mask):
+                continue
+            zero = log_paths_pf.new_zeros(1)
+            pf_prefix = torch.cat(
+                [zero, torch.cumsum(log_paths_pf[traj_idx, :length], dim=0)]
+            )
+            pb_prefix = torch.cat(
+                [zero, torch.cumsum(log_paths_pb[traj_idx, :length], dim=0)]
+            )
+            flows = log_flows_by_traj[traj_idx]
+            for start in range(length):
+                max_end = length + 1
+                if subtb_max_span is not None:
+                    max_end = min(
+                        max_end,
+                        start + int(subtb_max_span) + 1,
+                    )
+                for end in range(start + 1, max_end):
+                    if not any(time_mask[start:end]):
+                        continue
+                    residual = (
+                        flows[start]
+                        + pf_prefix[end]
+                        - pf_prefix[start]
+                        - flows[end]
+                        - pb_prefix[end]
+                        + pb_prefix[start]
+                    ).detach()
+                    residuals.append(residual)
+                    weights.append(float(subtb_lambda) ** (end - start))
+                    if end - start == 1:
+                        one_step.append(residual)
+                    if end == length:
+                        terminal_reaching.append(residual)
+        if not residuals:
+            return {
+                "time_subtb_count": 0,
+                "time_subtb_residual_mean": 0.0,
+                "time_subtb_residual_variance": 0.0,
+                "time_subtb_squared_residual_mean": 0.0,
+                "time_subtb_one_step_squared_residual_mean": 0.0,
+                "time_subtb_terminal_squared_residual_mean": 0.0,
+            }
+        values = torch.stack(residuals).to(torch.float64)
+        weight_tensor = torch.as_tensor(
+            weights,
+            dtype=torch.float64,
+            device=values.device,
+        )
+        weight_total = weight_tensor.sum().clamp_min(
+            torch.finfo(weight_tensor.dtype).tiny
+        )
+        weighted_mean = torch.sum(values * weight_tensor) / weight_total
+
+        def mean_square(items):
+            if not items:
+                return 0.0
+            return float(
+                torch.stack(items)
+                .to(torch.float64)
+                .square()
+                .mean()
+                .cpu()
+                .item()
+            )
+
+        return {
+            "time_subtb_count": int(values.numel()),
+            "time_subtb_residual_mean": float(weighted_mean.cpu().item()),
+            "time_subtb_residual_variance": float(
+                (
+                    torch.sum(
+                        weight_tensor * (values - weighted_mean).square()
+                    )
+                    / weight_total
+                )
+                .cpu()
+                .item()
+            ),
+            "time_subtb_squared_residual_mean": float(
+                (torch.sum(weight_tensor * values.square()) / weight_total)
+                .cpu()
+                .item()
+            ),
+            "time_subtb_one_step_squared_residual_mean": mean_square(one_step),
+            "time_subtb_terminal_squared_residual_mean": mean_square(
+                terminal_reaching
+            ),
+        }
 
     @staticmethod
     def _subtb_loss_from_log_flows(

@@ -85,6 +85,22 @@ def test_equal_bernstein_weights_are_the_uniform_cwr_quantile_density():
         basis_components=16,
         layers=1,
     )
+
+
+def test_bernstein_samples_keep_numerical_distance_from_time_boundaries():
+    model = BernsteinBetaTimeModel(
+        input_dim=4,
+        hidden_dim=8,
+        dropout=0.0,
+        basis_components=16,
+        layers=0,
+    )
+    logits = torch.full((4096, 16), -100.0)
+    logits[:, -1] = 100.0
+    samples = model.sample(logits)
+
+    assert torch.all(samples >= model.NUMERICAL_QUANTILE_EPSILON)
+    assert torch.all(samples <= 1.0 - model.NUMERICAL_QUANTILE_EPSILON)
     logits = model(torch.zeros(101, 4))
     quantiles = torch.linspace(
         1e-8,
@@ -309,6 +325,28 @@ def test_extreme_bounded_quantile_remains_strictly_inside_horizon():
     delta = clock.quantile_to_delta(quantile, 1e-4, horizon)
 
     assert 0.0 < delta < horizon
+
+
+def test_relative_delta_is_clamped_before_absolute_boundary_after_addition():
+    clock = ContinuousCoalescentTime()
+    current_time = 2.153765749262881
+    boundary_time = 2.153775484494678
+    relative_horizon = boundary_time - current_time
+    relative_delta = math.nextafter(relative_horizon, 0.0)
+
+    # Although the relative delta is open, absolute addition rounds onto the
+    # fixed-ancestor boundary for this real refinement-scale example.
+    assert relative_delta < relative_horizon
+    assert current_time + relative_delta == boundary_time
+
+    clamped = clock.clamp_delta_before_absolute_boundary(
+        relative_delta,
+        current_time,
+        boundary_time,
+    )
+
+    assert 0.0 < clamped < relative_horizon
+    assert current_time + clamped < boundary_time
 
 
 def test_time_context_features_avoid_rate_horizon_product_underflow():

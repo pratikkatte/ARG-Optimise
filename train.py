@@ -22,6 +22,7 @@ try:
     from .rollout_worker_arg import RolloutWorker
     from .tb_gfn import TBGFlowNetGenerator
     from .time_env import DEFAULT_TIME_BASIS_COMPONENTS
+    from .time_context import TIME_CONTEXT_MODES
     from .utils import (
         VCF_PARSER_VERSION,
         is_vcf_path,
@@ -34,6 +35,7 @@ except ImportError:  # Support the repository's script-style entry points.
     from rollout_worker_arg import RolloutWorker
     from tb_gfn import TBGFlowNetGenerator
     from time_env import DEFAULT_TIME_BASIS_COMPONENTS
+    from time_context import TIME_CONTEXT_MODES
     from utils import (
         VCF_PARSER_VERSION,
         is_vcf_path,
@@ -70,10 +72,14 @@ DEFAULT_ATTENTION_DROPOUT = 0.0
 DEFAULT_TIME_HIDDEN_SIZE = 256
 DEFAULT_TIME_LAYERS = 3
 DEFAULT_TIME_DROPOUT = 0.0
+DEFAULT_TIME_CONTEXT_MODE = "baseline"
 DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE = 256
 DEFAULT_BREAKPOINT_GAP_LAYERS = 3
 DEFAULT_BREAKPOINT_GAP_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_USE_POSITION_FEATURES = True
+DEFAULT_LOCAL_COALESCENCE_SIMILARITY_BIAS = 0.0
+DEFAULT_LOCAL_PRIOR_ACTION_LOGIT_BIAS = 0.0
+DEFAULT_LOCAL_PRIOR_GATE_LOGIT_BIAS = 0.0
 MODEL_VERSION = "cwr-event-continuous-time-v2"
 
 
@@ -86,6 +92,7 @@ DEFAULT_CONFIG = {
         "checkpoint": None,
         "arg_path": None,
         "requests": [],
+        "terminal_requires_exhausted_fixed_schedule": False,
     },
     "training": {
         "epochs": None,
@@ -95,6 +102,7 @@ DEFAULT_CONFIG = {
         "verbose": False,
         "wandb": True,
         "policy_lr": DEFAULT_POLICY_LR,
+        "time_policy_lr": None,
         "log_z_lr": DEFAULT_LOG_Z_LR,
         "loss": DEFAULT_LOSS,
         "subtb_lambda": DEFAULT_SUBTB_LAMBDA,
@@ -125,6 +133,10 @@ DEFAULT_CONFIG = {
         "transformer_mlp_ratio": DEFAULT_TRANSFORMER_MLP_RATIO,
         "attention_dropout": DEFAULT_ATTENTION_DROPOUT,
         "time_basis_components": DEFAULT_TIME_BASIS_COMPONENTS,
+        "time_context_mode": DEFAULT_TIME_CONTEXT_MODE,
+        "local_coalescence_similarity_bias": DEFAULT_LOCAL_COALESCENCE_SIMILARITY_BIAS,
+        "local_prior_action_logit_bias": DEFAULT_LOCAL_PRIOR_ACTION_LOGIT_BIAS,
+        "local_prior_gate_logit_bias": DEFAULT_LOCAL_PRIOR_GATE_LOGIT_BIAS,
     },
 }
 
@@ -147,6 +159,7 @@ CLI_CONFIG_PATHS = {
     "verbose": ("training", "verbose"),
     "wandb": ("training", "wandb"),
     "policy_lr": ("training", "policy_lr"),
+    "time_policy_lr": ("training", "time_policy_lr"),
     "log_z_lr": ("training", "log_z_lr"),
     "loss": ("training", "loss"),
     "subtb_lambda": ("training", "subtb_lambda"),
@@ -171,6 +184,19 @@ CLI_CONFIG_PATHS = {
     "transformer_mlp_ratio": ("model", "transformer_mlp_ratio"),
     "attention_dropout": ("model", "attention_dropout"),
     "time_basis_components": ("model", "time_basis_components"),
+    "time_context_mode": ("model", "time_context_mode"),
+    "local_coalescence_similarity_bias": (
+        "model",
+        "local_coalescence_similarity_bias",
+    ),
+    "local_prior_action_logit_bias": (
+        "model",
+        "local_prior_action_logit_bias",
+    ),
+    "local_prior_gate_logit_bias": (
+        "model",
+        "local_prior_gate_logit_bias",
+    ),
 }
 
 def seed_everything(seed):
@@ -305,6 +331,26 @@ def validate_train_config(config):
     if time_basis_components < 2:
         raise ValueError("model.time_basis_components must be at least 2")
     model["time_basis_components"] = time_basis_components
+    time_context_mode = str(
+        model.get("time_context_mode", DEFAULT_TIME_CONTEXT_MODE)
+    ).lower()
+    if time_context_mode not in TIME_CONTEXT_MODES:
+        raise ValueError(
+            "model.time_context_mode must be one of "
+            + ", ".join(repr(value) for value in TIME_CONTEXT_MODES)
+        )
+    model["time_context_mode"] = time_context_mode
+    for field_name in (
+        "local_coalescence_similarity_bias",
+        "local_prior_action_logit_bias",
+        "local_prior_gate_logit_bias",
+    ):
+        try:
+            model[field_name] = float(
+                model.get(field_name, DEFAULT_CONFIG["model"][field_name])
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"model.{field_name} must be a number") from exc
     loss = str(training.get("loss", DEFAULT_LOSS)).lower()
     if loss not in {"tb", "subtb", "fl_subtb"}:
         raise ValueError("training.loss must be one of 'tb', 'subtb', or 'fl_subtb'")
@@ -361,6 +407,18 @@ def validate_train_config(config):
             "genomic_range and exactly one of cut_time or cut_event_index."
         )
     if refinement_enabled(config):
+        terminal_requires_fixed = refinement.get(
+            "terminal_requires_exhausted_fixed_schedule",
+            False,
+        )
+        if not isinstance(terminal_requires_fixed, bool):
+            raise ValueError(
+                "refinement.terminal_requires_exhausted_fixed_schedule must be "
+                "true or false"
+            )
+        refinement[
+            "terminal_requires_exhausted_fixed_schedule"
+        ] = terminal_requires_fixed
         if not refinement.get("arg_path"):
             raise ValueError(
                 "Missing required local refinement config value: "
@@ -479,6 +537,7 @@ def config_to_train_kwargs(config):
         "mutation_rate": environment["mutation_rate"],
         "recombination_rate": environment["recombination_rate"],
         "policy_lr": training["policy_lr"],
+        "time_policy_lr": training.get("time_policy_lr"),
         "log_z_lr": training["log_z_lr"],
         "loss_mode": str(training["loss"]).lower(),
         "subtb_lambda": training["subtb_lambda"],
@@ -499,6 +558,22 @@ def config_to_train_kwargs(config):
         "transformer_mlp_ratio": model["transformer_mlp_ratio"],
         "attention_dropout": model["attention_dropout"],
         "time_basis_components": model["time_basis_components"],
+        "time_context_mode": model.get(
+            "time_context_mode",
+            DEFAULT_TIME_CONTEXT_MODE,
+        ),
+        "local_coalescence_similarity_bias": model.get(
+            "local_coalescence_similarity_bias",
+            DEFAULT_LOCAL_COALESCENCE_SIMILARITY_BIAS,
+        ),
+        "local_prior_action_logit_bias": model.get(
+            "local_prior_action_logit_bias",
+            DEFAULT_LOCAL_PRIOR_ACTION_LOGIT_BIAS,
+        ),
+        "local_prior_gate_logit_bias": model.get(
+            "local_prior_gate_logit_bias",
+            DEFAULT_LOCAL_PRIOR_GATE_LOGIT_BIAS,
+        ),
         "verbose": training["verbose"],
     }
 
@@ -518,6 +593,12 @@ def config_to_refinement_kwargs(config):
         "checkpoint": refinement.get("checkpoint"),
         "local_refinement_arg": refinement.get("arg_path"),
         "requests": list(refinement.get("requests") or []),
+        "terminal_requires_exhausted_fixed_schedule": bool(
+            refinement.get(
+                "terminal_requires_exhausted_fixed_schedule",
+                False,
+            )
+        ),
     }
 
 
@@ -677,8 +758,10 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
     torch_state = torch.random.get_rng_state()
     cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     env_rng_state = env.rng.getstate() if hasattr(env.rng, "getstate") else None
+    was_training = generator.training
 
     try:
+        generator.eval()
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -786,6 +869,7 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             torch.cuda.set_rng_state_all(cuda_states)
         if env_rng_state is not None:
             env.rng.setstate(env_rng_state)
+        generator.train(was_training)
 
 def train(
     dataset_path,
@@ -801,6 +885,7 @@ def train(
     mutation_rate=DEFAULT_MU_PER_BP,
     recombination_rate=DEFAULT_R_PER_BP,
     policy_lr=DEFAULT_POLICY_LR,
+    time_policy_lr=None,
     log_z_lr=DEFAULT_LOG_Z_LR,
     loss_mode=DEFAULT_LOSS,
     subtb_lambda=DEFAULT_SUBTB_LAMBDA,
@@ -821,6 +906,9 @@ def train(
     transformer_mlp_ratio=DEFAULT_TRANSFORMER_MLP_RATIO,
     attention_dropout=DEFAULT_ATTENTION_DROPOUT,
     time_basis_components=DEFAULT_TIME_BASIS_COMPONENTS,
+    local_coalescence_similarity_bias=DEFAULT_LOCAL_COALESCENCE_SIMILARITY_BIAS,
+    local_prior_action_logit_bias=DEFAULT_LOCAL_PRIOR_ACTION_LOGIT_BIAS,
+    local_prior_gate_logit_bias=DEFAULT_LOCAL_PRIOR_GATE_LOGIT_BIAS,
     verbose=True,
     
 ):
@@ -869,6 +957,9 @@ def train(
         "transformer_heads": int(transformer_heads),
         "transformer_mlp_ratio": float(transformer_mlp_ratio),
         "attention_dropout": float(attention_dropout),
+        "local_coalescence_similarity_bias": float(local_coalescence_similarity_bias),
+        "local_prior_action_logit_bias": float(local_prior_action_logit_bias),
+        "local_prior_gate_logit_bias": float(local_prior_gate_logit_bias),
         "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
         "time_layers": int(DEFAULT_TIME_LAYERS),
         "time_dropout": float(DEFAULT_TIME_DROPOUT),
@@ -885,6 +976,7 @@ def train(
         device=device,
         verbose=verbose,
         policy_lr=policy_lr,
+        time_policy_lr=time_policy_lr,
         log_z_lr=log_z_lr,
         grad_clip=grad_clip,
         model_kwargs=model_kwargs,
@@ -901,9 +993,11 @@ def train(
     checkpoints_path = os.path.join(output_path, "checkpoints")
     os.makedirs(checkpoints_path, exist_ok=True)
     best_checkpoint_path = os.path.join(checkpoints_path, "best.pt")
+    last_checkpoint_path = os.path.join(checkpoints_path, "last.pt")
 
     history = []
     best_loss = float("inf")
+    best_metric_name = None
     wandb_run = None
     
     print(f"use_wandb: {use_wandb}")
@@ -917,6 +1011,9 @@ def train(
             "mutation_rate": float(mutation_rate),
             "recombination_rate": float(recombination_rate),
             "policy_lr": float(policy_lr),
+            "time_policy_lr": (
+                None if time_policy_lr is None else float(time_policy_lr)
+            ),
             "log_z_lr": float(log_z_lr),
             "loss": loss_mode,
             "subtb_lambda": float(subtb_lambda),
@@ -974,40 +1071,91 @@ def train(
             if wandb_run is not None:
                 wandb.log(info, step=epoch + 1)
 
-            if loss < best_loss:
-                best_loss = loss
-                metadata = build_checkpoint_metadata(
-                    epoch=epoch,
-                    best_loss=best_loss,
-                    log_z=log_z,
-                    sequences=sequences,
-                    variant_data=variant_data,
-                    dataset_path=dataset_path,
-                    input_mode=input_mode,
-                    sequence_length=sequence_length,
-                    bp_per_blocks=bp_per_blocks,
-                    time_metadata=env.time_metadata,
-                    reward_C=reward_C,
-                    rho=env.rho,
-                    effective_population_size=effective_population_size,
-                    mutation_rate=mutation_rate,
-                    recombination_rate=recombination_rate,
-                    policy_lr=policy_lr,
-                    log_z_lr=log_z_lr,
-                    loss_mode=loss_mode,
-                    subtb_lambda=subtb_lambda,
-                    subtb_max_span=subtb_max_span,
-                    grad_clip=grad_clip,
-                    grad_accum_steps=grad_accum_steps,
-                    eval_episodes=eval_episodes,
-                    eval_every=eval_every,
-                    model_kwargs=model_kwargs,
-                    seed=seed,
-                    init_z_sample_count=init_z_sample_count,
-                    model_version=MODEL_VERSION,
+            eval_metric_names = (
+                "eval_tb_mse",
+                "eval_subtb_mse",
+                "eval_fl_subtb_mse",
+            )
+            selection_metric_name = next(
+                (name for name in eval_metric_names if name in info),
+                None,
+            )
+            if selection_metric_name is None and int(eval_episodes) <= 0:
+                selection_metric_name = "loss"
+            selection_value = (
+                None
+                if selection_metric_name is None
+                else float(info[selection_metric_name])
+            )
+            is_best = (
+                selection_value is not None
+                and math.isfinite(selection_value)
+                and selection_value < best_loss
+            )
+            if is_best:
+                best_loss = selection_value
+                best_metric_name = selection_metric_name
+
+            metadata = build_checkpoint_metadata(
+                epoch=epoch,
+                best_loss=best_loss,
+                log_z=log_z,
+                sequences=sequences,
+                variant_data=variant_data,
+                dataset_path=dataset_path,
+                input_mode=input_mode,
+                sequence_length=sequence_length,
+                bp_per_blocks=bp_per_blocks,
+                time_metadata=env.time_metadata,
+                reward_C=reward_C,
+                rho=env.rho,
+                effective_population_size=effective_population_size,
+                mutation_rate=mutation_rate,
+                recombination_rate=recombination_rate,
+                policy_lr=policy_lr,
+                log_z_lr=log_z_lr,
+                loss_mode=loss_mode,
+                subtb_lambda=subtb_lambda,
+                subtb_max_span=subtb_max_span,
+                grad_clip=grad_clip,
+                grad_accum_steps=grad_accum_steps,
+                eval_episodes=eval_episodes,
+                eval_every=eval_every,
+                model_kwargs=model_kwargs,
+                seed=seed,
+                init_z_sample_count=init_z_sample_count,
+                model_version=MODEL_VERSION,
+            )
+            metadata.update(
+                {
+                    "selection_metric": best_metric_name,
+                    "selection_value": (
+                        None if not math.isfinite(best_loss) else float(best_loss)
+                    ),
+                }
+            )
+            training_state = {
+                "epoch": int(epoch),
+                "epoch_number": int(epoch) + 1,
+                "best_metric": best_metric_name,
+                "best_metric_value": (
+                    None if not math.isfinite(best_loss) else float(best_loss)
+                ),
+            }
+            if is_best:
+                generator.save(
+                    best_checkpoint_path,
+                    metadata={**metadata, "checkpoint_kind": "best"},
+                    training_state=training_state,
                 )
-                generator.save(best_checkpoint_path, metadata=metadata)
                 info["best_checkpoint_path"] = best_checkpoint_path
+            if epoch == int(epochs_num) - 1:
+                generator.save(
+                    last_checkpoint_path,
+                    metadata={**metadata, "checkpoint_kind": "last"},
+                    training_state=training_state,
+                )
+                info["last_checkpoint_path"] = last_checkpoint_path
 
             eval_text = ""
             if "eval_tb_mse" in info:
@@ -1071,6 +1219,9 @@ def _train_local_refinement_legacy(
     transformer_mlp_ratio=DEFAULT_TRANSFORMER_MLP_RATIO,
     attention_dropout=DEFAULT_ATTENTION_DROPOUT,
     time_basis_components=DEFAULT_TIME_BASIS_COMPONENTS,
+    local_coalescence_similarity_bias=DEFAULT_LOCAL_COALESCENCE_SIMILARITY_BIAS,
+    local_prior_action_logit_bias=DEFAULT_LOCAL_PRIOR_ACTION_LOGIT_BIAS,
+    local_prior_gate_logit_bias=DEFAULT_LOCAL_PRIOR_GATE_LOGIT_BIAS,
     verbose=True,
 ):
     from refinement import (
@@ -1128,6 +1279,9 @@ def _train_local_refinement_legacy(
         "transformer_heads": int(transformer_heads),
         "transformer_mlp_ratio": float(transformer_mlp_ratio),
         "attention_dropout": float(attention_dropout),
+        "local_coalescence_similarity_bias": float(local_coalescence_similarity_bias),
+        "local_prior_action_logit_bias": float(local_prior_action_logit_bias),
+        "local_prior_gate_logit_bias": float(local_prior_gate_logit_bias),
         "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
         "time_layers": int(DEFAULT_TIME_LAYERS),
         "time_dropout": float(DEFAULT_TIME_DROPOUT),
@@ -1626,7 +1780,7 @@ def _format_block_tuple(blocks):
 
 def load_checkpoint(path, map_location=None):
     try:
-        return torch.load(path, map_location=map_location, weights_only=False)
+        return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=map_location)
 

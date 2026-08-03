@@ -8,11 +8,28 @@ directory in an activated Python 3.11+ environment.
 
 ```bash
 python infer.py \
-  --checkpoint runs/my-model/checkpoints/best.pt \
+  --checkpoint runs/my-model \
   --experiment l25kb-trial-01 \
   --num-args 100 \
   --batch-size 10
 ```
+
+Training writes checkpoints with distinct meanings:
+
+- `checkpoints/best.pt` is the lowest validation-loss checkpoint (or the
+  lowest training-loss checkpoint when evaluation is disabled) and is the
+  checkpoint to use for inference.
+- `checkpoints/last.pt` is the most recent model/optimizer state for final-epoch
+  comparison or debugging; it is not automatically the best inference model.
+- `checkpoints/epoch_*.pt` are optional benchmark snapshots enabled with
+  `--checkpoint-every`.
+
+`--checkpoint` accepts the exact `.pt` file, the `checkpoints/` directory, or
+the run directory; directory inputs resolve to `best.pt`. Checkpoints include
+the exact model/environment metadata needed to reconstruct the inference
+model. VCF and source-ARG files remain external and local checkpoints verify
+their stored fingerprints before inference. Only load checkpoints from a
+trusted source because they use PyTorch serialization.
 
 This writes:
 

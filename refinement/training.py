@@ -97,6 +97,7 @@ def train_local_refinement(
     mutation_rate=2e-8,
     recombination_rate=2e-8,
     policy_lr=1e-3,
+    time_policy_lr=None,
     log_z_lr=1e-3,
     loss_mode="fl_subtb",
     subtb_lambda=0.9,
@@ -117,7 +118,12 @@ def train_local_refinement(
     transformer_mlp_ratio=2.0,
     attention_dropout=0.0,
     time_basis_components=DEFAULT_TIME_BASIS_COMPONENTS,
+    time_context_mode="baseline",
+    local_coalescence_similarity_bias=0.0,
+    local_prior_action_logit_bias=0.0,
+    local_prior_gate_logit_bias=0.0,
     verbose=True,
+    terminal_requires_exhausted_fixed_schedule=False,
 ):
     """Train one conditional local policy across explicit interval/time contexts."""
 
@@ -155,7 +161,13 @@ def train_local_refinement(
         local_refinement_arg,
         requests,
     )
-    local_env = LocalARGEnvironment(base_env, prepared_contexts)
+    local_env = LocalARGEnvironment(
+        base_env,
+        prepared_contexts,
+        terminal_requires_exhausted_fixed_schedule=(
+            terminal_requires_exhausted_fixed_schedule
+        ),
+    )
     initial_states = {
         context_id: local_env.get_initial_state(context_id)
         for context_id in local_env.context_ids
@@ -171,10 +183,20 @@ def train_local_refinement(
         "transformer_heads": int(transformer_heads),
         "transformer_mlp_ratio": float(transformer_mlp_ratio),
         "attention_dropout": float(attention_dropout),
+        "local_coalescence_similarity_bias": float(
+            local_coalescence_similarity_bias
+        ),
+        "local_prior_action_logit_bias": float(
+            local_prior_action_logit_bias
+        ),
+        "local_prior_gate_logit_bias": float(
+            local_prior_gate_logit_bias
+        ),
         "time_hidden_size": 256,
         "time_layers": 3,
         "time_dropout": 0.0,
         "time_basis_components": int(time_basis_components),
+        "time_context_mode": str(time_context_mode).lower(),
         "breakpoint_gap_hidden_size": 256,
         "breakpoint_gap_layers": 3,
         "breakpoint_gap_dropout": 0.0,
@@ -186,8 +208,14 @@ def train_local_refinement(
         checkpoint_data = _load_checkpoint(checkpoint, map_location="cpu")
         checkpoint_metadata = dict(checkpoint_data.get("metadata") or {})
         _validate_source_checkpoint(checkpoint_metadata, base_env)
+        requested_time_context_mode = str(time_context_mode).lower()
         if checkpoint_metadata.get("model"):
             model_kwargs = dict(checkpoint_metadata["model"])
+            # Old checkpoints have no biological context and remain exactly
+            # loadable as baseline. A requested richer context deliberately
+            # reinitializes only shape-incompatible time-head parameters via
+            # the existing shape-compatible warm-start path.
+            model_kwargs["time_context_mode"] = requested_time_context_mode
         source_checkpoint = {
             "path": os.path.abspath(checkpoint),
             "sha256": _file_sha256(checkpoint),
@@ -202,6 +230,9 @@ def train_local_refinement(
         device=device,
         verbose=verbose,
         policy_lr=float(policy_lr),
+        time_policy_lr=(
+            None if time_policy_lr is None else float(time_policy_lr)
+        ),
         log_z_lr=float(log_z_lr),
         grad_clip=float(grad_clip),
         model_kwargs=model_kwargs,
@@ -221,6 +252,7 @@ def train_local_refinement(
     checkpoint_dir = os.path.join(output_path, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_checkpoint_path = os.path.join(checkpoint_dir, "best.pt")
+    last_checkpoint_path = os.path.join(checkpoint_dir, "last.pt")
     for request_record in request_records:
         request_dir = os.path.join(
             output_path,
@@ -250,6 +282,7 @@ def train_local_refinement(
         mutation_rate=mutation_rate,
         recombination_rate=recombination_rate,
         policy_lr=policy_lr,
+        time_policy_lr=time_policy_lr,
         log_z_lr=log_z_lr,
         subtb_lambda=subtb_lambda,
         subtb_max_span=subtb_max_span,
@@ -259,6 +292,9 @@ def train_local_refinement(
         eval_every=eval_every,
         init_z_sample_count=init_z_sample_count,
         partial_segment_max_steps=partial_segment_max_steps,
+        terminal_requires_exhausted_fixed_schedule=(
+            terminal_requires_exhausted_fixed_schedule
+        ),
     )
     _write_json(
         os.path.join(output_path, "refinement_context_manifest.json"),
@@ -270,6 +306,7 @@ def train_local_refinement(
     rollout_index = 0
     history = []
     best_loss = float("inf")
+    best_metric_name = None
     wandb_run = None
     if use_wandb:
         if wandb is None:
@@ -345,19 +382,65 @@ def train_local_refinement(
             if wandb_run is not None:
                 wandb.log(_json_safe(info), step=epoch + 1)
             loss = float(info["loss"])
-            if math.isfinite(loss) and loss < best_loss:
-                best_loss = loss
-                checkpoint_metadata = {
-                    **metadata_base,
-                    "epoch": int(epoch),
-                    "best_loss": float(best_loss),
-                    "log_f_start_mean": float(info["log_f_start_mean"]),
-                }
+            selection_metric_name = (
+                "eval_local_loss_mean"
+                if "eval_local_loss_mean" in info
+                else ("loss" if int(eval_episodes) <= 0 else None)
+            )
+            selection_value = (
+                None
+                if selection_metric_name is None
+                else float(info[selection_metric_name])
+            )
+            is_best = (
+                selection_value is not None
+                and math.isfinite(selection_value)
+                and selection_value < best_loss
+            )
+            if is_best:
+                best_loss = selection_value
+                best_metric_name = selection_metric_name
+
+            checkpoint_metadata = {
+                **metadata_base,
+                "epoch": int(epoch),
+                "epoch_number": int(epoch) + 1,
+                "best_loss": (
+                    None if not math.isfinite(best_loss) else float(best_loss)
+                ),
+                "selection_metric": best_metric_name,
+                "selection_value": (
+                    None if not math.isfinite(best_loss) else float(best_loss)
+                ),
+                "log_f_start_mean": float(info["log_f_start_mean"]),
+            }
+            training_state = {
+                "epoch": int(epoch),
+                "epoch_number": int(epoch) + 1,
+                "best_metric": best_metric_name,
+                "best_metric_value": checkpoint_metadata["selection_value"],
+                "rollout_index": int(rollout_index),
+            }
+            if is_best:
                 generator.save(
                     best_checkpoint_path,
-                    metadata=checkpoint_metadata,
+                    metadata={
+                        **checkpoint_metadata,
+                        "checkpoint_kind": "best",
+                    },
+                    training_state=training_state,
                 )
                 info["best_checkpoint_path"] = best_checkpoint_path
+            if epoch == int(epochs_num) - 1:
+                generator.save(
+                    last_checkpoint_path,
+                    metadata={
+                        **checkpoint_metadata,
+                        "checkpoint_kind": "last",
+                    },
+                    training_state=training_state,
+                )
+                info["last_checkpoint_path"] = last_checkpoint_path
 
             print(
                 f"Epoch {epoch + 1} local_fl_subtb_loss={loss:.4f} "
@@ -396,9 +479,11 @@ def evaluate_local_refinement(
         if hasattr(worker.env.rng, "getstate")
         else None
     )
+    was_training = generator.training
     sampler = random.Random(int(seed))
     rows = []
     try:
+        generator.eval()
         _seed_everything(int(seed))
         if hasattr(worker.env.rng, "seed"):
             worker.env.rng.seed(int(seed))
@@ -454,6 +539,7 @@ def evaluate_local_refinement(
             torch.cuda.set_rng_state_all(cuda_states)
         if env_rng_state is not None:
             worker.env.rng.setstate(env_rng_state)
+        generator.train(was_training)
 
 
 def _prepare_contexts(source_arg_path, request_specs):
@@ -540,6 +626,7 @@ def _build_metadata(
     mutation_rate,
     recombination_rate,
     policy_lr,
+    time_policy_lr,
     log_z_lr,
     subtb_lambda,
     subtb_max_span,
@@ -549,6 +636,7 @@ def _build_metadata(
     eval_every,
     init_z_sample_count,
     partial_segment_max_steps,
+    terminal_requires_exhausted_fixed_schedule=False,
 ):
     return _json_safe(
         {
@@ -596,6 +684,9 @@ def _build_metadata(
             "mutation_rate": float(mutation_rate),
             "recombination_rate": float(recombination_rate),
             "policy_lr": float(policy_lr),
+            "time_policy_lr": (
+                None if time_policy_lr is None else float(time_policy_lr)
+            ),
             "log_z_lr": float(log_z_lr),
             "loss": "fl_subtb",
             "subtb_lambda": float(subtb_lambda),
@@ -608,6 +699,9 @@ def _build_metadata(
             "eval_every": int(eval_every),
             "init_z_sample_count": int(init_z_sample_count),
             "partial_segment_max_steps": int(partial_segment_max_steps),
+            "terminal_requires_exhausted_fixed_schedule": bool(
+                terminal_requires_exhausted_fixed_schedule
+            ),
             "time": {
                 **dict(local_env.time_metadata),
                 "time_basis_components": int(
@@ -650,10 +744,40 @@ def _load_shape_compatible_weights(generator, checkpoint):
 
 
 def _validate_source_checkpoint(metadata, env):
-    if metadata.get("model_version") != "cwr-event-continuous-time-v2":
+    model_version = metadata.get("model_version")
+    if model_version == LOCAL_MODEL_VERSION:
+        if metadata.get("training_mode") != "local_refinement":
+            raise ValueError(
+                "local checkpoint warm-start requires training_mode='local_refinement'"
+            )
+        mismatches = []
+        for key, expected in (
+            ("num_sequences", env.num_sequences),
+            ("sequence_length", env.sequence_length),
+            ("num_blocks", env.num_blocks),
+        ):
+            if key in metadata and int(metadata[key]) != int(expected):
+                mismatches.append(
+                    f"{key}: checkpoint={metadata[key]} environment={expected}"
+                )
+        time_mismatches = [
+            f"{key}: checkpoint={metadata.get(key)!r} environment={expected!r}"
+            for key, expected in env.time_metadata.items()
+            if metadata.get(key) != expected
+        ]
+        if mismatches or time_mismatches:
+            details = mismatches + time_mismatches
+            raise ValueError(
+                "local checkpoint is not compatible with this refinement "
+                "environment: " + "; ".join(details)
+            )
+        return
+
+    if model_version != "cwr-event-continuous-time-v2":
         raise ValueError(
             "local continuous-time v2 training can only warm-start from a "
-            "global continuous-time v2 checkpoint"
+            "global continuous-time v2 checkpoint or a compatible local "
+            "refinement checkpoint"
         )
     time_mismatches = [
         f"{key}: checkpoint={metadata.get(key)!r} environment={expected!r}"
@@ -699,6 +823,8 @@ def _rollout_metrics(mode, outputs):
     quantiles = outputs["time_quantiles"].detach().cpu()
     deltas = outputs["time_delta_times"].detach().cpu()
     densities = outputs["time_log_densities"].detach().cpu()
+    entropies = outputs["time_policy_entropies"].detach().cpu()
+    effective_components = outputs["time_effective_components"].detach().cpu()
     active_variant_rows = _active_variant_row_counts(outputs)
     return {
         "mode": str(mode),
@@ -719,6 +845,15 @@ def _rollout_metrics(mode, outputs):
         ),
         "time_finite_density_sum": float(
             torch.isfinite(densities).sum().item()
+        ),
+        "time_entropy_sum": float(
+            entropies[torch.isfinite(entropies)].sum().item()
+        ),
+        "time_entropy_count": int(torch.isfinite(entropies).sum().item()),
+        "time_effective_components_sum": float(
+            effective_components[
+                torch.isfinite(effective_components)
+            ].sum().item()
         ),
         "fixed_attachment_count": int(outputs["fixed_attachment_count"]),
         "active_variant_rows_mean": float(
@@ -771,6 +906,18 @@ def _merge_rollout_metrics(rows):
             sum(row["time_finite_density_sum"] for row in selected)
             / time_count
         )
+        entropy_count = max(
+            sum(row["time_entropy_count"] for row in selected),
+            1,
+        )
+        result[f"train_{mode}_time_policy_entropy_mean"] = float(
+            sum(row["time_entropy_sum"] for row in selected)
+            / entropy_count
+        )
+        result[f"train_{mode}_time_effective_components_mean"] = float(
+            sum(row["time_effective_components_sum"] for row in selected)
+            / entropy_count
+        )
         result[f"train_{mode}_fixed_attachment_mean"] = float(
             np.mean([row["fixed_attachment_count"] for row in selected])
         )
@@ -810,7 +957,7 @@ def _load_checkpoint(path, map_location=None):
         return torch.load(
             path,
             map_location=map_location,
-            weights_only=False,
+            weights_only=True,
         )
     except TypeError:
         return torch.load(path, map_location=map_location)

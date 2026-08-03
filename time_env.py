@@ -104,6 +104,47 @@ class ContinuousCoalescentTime:
             delta = min(delta, math.nextafter(max_delta, 0.0))
         return delta
 
+    def clamp_delta_before_absolute_boundary(
+        self,
+        delta,
+        current_time,
+        boundary_time,
+    ):
+        """Keep ``current_time + delta`` strictly below an absolute boundary.
+
+        ``quantile_to_delta`` already returns a delta strictly below a relative
+        horizon.  At large absolute times, however, adding that open delta can
+        round back onto the boundary.  Canonicalize only that numerical edge
+        case to the immediately preceding representable event time.
+        """
+
+        delta = self._validate_delta(delta)
+        current_time = float(current_time)
+        boundary_time = float(boundary_time)
+        if not math.isfinite(current_time) or not math.isfinite(boundary_time):
+            raise ValueError("absolute event-time bounds must be finite")
+        if not current_time < boundary_time:
+            raise ValueError("absolute boundary must be after current_time")
+        if current_time + delta < boundary_time:
+            return delta
+
+        strict_event_time = math.nextafter(boundary_time, current_time)
+        strict_delta = strict_event_time - current_time
+        if not strict_delta > 0.0:
+            raise ValueError(
+                "no representable continuous event time exists before boundary"
+            )
+        # Subtraction followed by addition can itself round upward on unusual
+        # exponent boundaries.  Step the delta inward until the invariant is
+        # satisfied; this normally executes zero times.
+        while current_time + strict_delta >= boundary_time:
+            strict_delta = math.nextafter(strict_delta, 0.0)
+            if not strict_delta > 0.0:
+                raise ValueError(
+                    "no representable continuous event time exists before boundary"
+                )
+        return min(delta, strict_delta)
+
     def delta_to_quantile(self, delta, rate, max_delta=None):
         delta = self._validate_delta(delta)
         rate = self._validate_rate(rate)

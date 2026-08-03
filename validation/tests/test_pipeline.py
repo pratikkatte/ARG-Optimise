@@ -15,6 +15,7 @@ from validation.configuration import (
 )
 from validation.run import ResultExistsError, run_validation
 from validation.scripts.point_accuracy_common import ValidationResult
+from validation.scripts.point_accuracy_common import clip_dataframe_to_region
 
 
 def _dump_yaml(path: Path, data: dict) -> Path:
@@ -97,6 +98,47 @@ def test_load_config_resolves_paths_and_default_gfn(tmp_path):
     preflight_config(config)
 
 
+def test_config_parses_region_and_rejects_invalid_bounds(tmp_path):
+    output_root = tmp_path / "outputs"
+    truth, tsinfer, singer_dir = _touch_inputs(
+        tmp_path, output_root, "trial-region"
+    )
+    raw = _base_config(truth, tsinfer, singer_dir)
+    raw["validation"]["region"] = [25, 75]
+    config = load_config(
+        _dump_yaml(tmp_path / "region.yaml", raw),
+        "trial-region",
+        output_root=output_root,
+    )
+    assert config.validation.region == (25.0, 75.0)
+
+    raw["validation"]["region"] = [75, 25]
+    with pytest.raises(ConfigurationError, match="0 <= left < right"):
+        load_config(
+            _dump_yaml(tmp_path / "bad-region.yaml", raw),
+            "trial-region",
+            output_root=output_root,
+        )
+
+
+def test_region_filter_clips_boundary_segments_and_weights():
+    frame = pd.DataFrame(
+        {
+            "chr": ["1", "1", "1"],
+            "start": [0, 40, 80],
+            "end": [40, 80, 120],
+            "Simulated": [1.0, 2.0, 3.0],
+            "PosteriorMean": [1.0, 2.0, 3.0],
+            "PosteriorMedian": [1.0, 2.0, 3.0],
+            "len": [40.0, 40.0, 40.0],
+        }
+    )
+    clipped = clip_dataframe_to_region(frame, 25.0, 95.0)
+    assert clipped["start"].tolist() == [25.0, 40.0, 80.0]
+    assert clipped["end"].tolist() == [40.0, 80.0, 95.0]
+    assert clipped["len"].sum() == pytest.approx(70.0)
+
+
 def test_config_rejects_unknown_and_ambiguous_method_keys(tmp_path):
     output_root = tmp_path / "outputs"
     truth, tsinfer, singer_dir = _touch_inputs(
@@ -116,8 +158,18 @@ def test_config_rejects_unknown_and_ambiguous_method_keys(tmp_path):
 
     raw = _base_config(truth, tsinfer, singer_dir)
     del raw["methods"]["singer"]
+    config = load_config(
+        _dump_yaml(tmp_path / "two_methods.yaml", raw),
+        "trial",
+        output_root=output_root,
+    )
+    assert list(config.methods) == ["gfn", "tsinfer"]
+    preflight_config(config)
+
+    raw = _base_config(truth, tsinfer, singer_dir)
+    raw["methods"] = {}
     config_path = _dump_yaml(tmp_path / "missing.yaml", raw)
-    with pytest.raises(ConfigurationError, match="missing required method"):
+    with pytest.raises(ConfigurationError, match="at least one method"):
         load_config(config_path, "trial", output_root=output_root)
 
 
@@ -207,6 +259,37 @@ def test_runner_dispatches_all_methods_and_protects_results(tmp_path):
     replaced = run_validation(config, force=True, method_runners=runners)
     assert replaced == results_dir
     assert not list((output_root / experiment).glob(".results-*"))
+
+
+def test_runner_dispatches_configured_method_subset(tmp_path):
+    experiment = "trial-subset"
+    output_root = tmp_path / "outputs"
+    truth, tsinfer, singer_dir = _touch_inputs(
+        tmp_path, output_root, experiment
+    )
+    raw = _base_config(truth, tsinfer, singer_dir)
+    del raw["methods"]["singer"]
+    config = load_config(
+        _dump_yaml(tmp_path / "validation.yaml", raw),
+        experiment,
+        output_root=output_root,
+    )
+    seen: list[tuple[str, object, object]] = []
+    runners = {
+        name: _fake_runner(name, seen)
+        for name in ("gfn", "tsinfer", "singer")
+    }
+
+    results_dir = run_validation(config, method_runners=runners)
+
+    assert [entry[0] for entry in seen] == ["gfn", "tsinfer"]
+    summary = pd.read_csv(results_dir / "summary.tsv", sep="\t")
+    assert summary["method"].tolist() == ["gfn", "tsinfer"]
+    manifest = yaml.safe_load(
+        (results_dir / "run_manifest.yaml").read_text(encoding="utf-8")
+    )
+    assert list(manifest["methods"]) == ["gfn", "tsinfer"]
+    assert set(manifest["results"]) == {"gfn", "tsinfer"}
 
 
 def test_failed_method_does_not_publish_results(tmp_path):
@@ -310,6 +393,24 @@ def test_inference_experiment_path_and_cli_exclusion():
                 "trial",
             ]
         )
+
+
+def test_inference_checkpoint_directory_resolves_best(tmp_path):
+    run_dir = tmp_path / "run"
+    checkpoint = run_dir / "checkpoints" / "best.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+
+    assert infer.resolve_checkpoint_path(run_dir) == str(checkpoint.resolve())
+    assert infer.resolve_checkpoint_path(checkpoint.parent) == str(
+        checkpoint.resolve()
+    )
+    assert infer.resolve_checkpoint_path(checkpoint) == str(checkpoint.resolve())
+
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    with pytest.raises(FileNotFoundError, match="No best.pt"):
+        infer.resolve_checkpoint_path(empty_dir)
 
 
 def test_inference_manifest_records_resolved_context(tmp_path):

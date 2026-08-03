@@ -1,0 +1,28 @@
+# Ten-epoch CUDA comparison for learned local refinement on half-open interval
+# [100000, 200000) with cut_time=25000.
+truth:
+  trees: trees/sim_l1mb_0.trees
+  ne: 10000
+  haplotypes: 8
+
+methods:
+  gfn:
+    label: Learned local refinement cut25000 train10 [100kb,200kb)
+    input_dir: ../runs/diagnostic_region_100kb_200kb_cut25000_train10/inference/region_100kb_200kb
+    sample_prefix: arg_
+    burnin_samples: 0
+    max_posterior_samples: 16
+
+  tsinfer:
+    label: tsinfer+tsdate
+    inferred_trees: output/tsinfer/l1mb_dated.trees
+
+validation:
+  skip: 1
+  max_pairs: null
+  pair_seed: 42
+  xlim: [0, 16]
+  ylim: [0, 8]
+  xlim_log: [-4, 1.5]
+  ylim_log: [-4, 1.5]
+  verbose: false

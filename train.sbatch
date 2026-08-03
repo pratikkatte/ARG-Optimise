@@ -7,11 +7,11 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gpus=1
 #SBATCH --mem=200G
 #SBATCH --time=48:00:00
-
 #SBATCH --array=0
+#SBATCH --gres=gpu:A100:1
+
 
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=pkatte@ucsc.edu
@@ -31,7 +31,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 CONFIGS=(
     # config/config.yaml
-    config/config_1mb.yaml
+    config/config_1mb_local_refinement_1000.yaml
 )
 
 CONFIG=${CONFIGS[$SLURM_ARRAY_TASK_ID]}
@@ -46,6 +46,10 @@ echo "=============================="
 
 nvidia-smi || true
 
-python train.py --config "${CONFIG}"
+python benchmark_gflownet_workflow.py \
+    --config "${CONFIG}" \
+    --output-dir runs/config_1mb_local_refinement_1000 \
+    --epochs 1000 \
+    --device cuda
 
 echo "Finished: $(date)"

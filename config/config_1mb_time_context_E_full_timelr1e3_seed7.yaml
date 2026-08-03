@@ -1,0 +1,52 @@
+dataset_path: validation/vcf/sim_l1mb_0.vcf
+output_path: runs/time_context_E_full_timelr1e3_seed7
+device: cuda
+refinement:
+  enabled: true
+  arg_path: validation/output/tsinfer/l1mb_dated.trees
+  checkpoint: null
+  terminal_requires_exhausted_fixed_schedule: false
+  requests:
+    - id: region_400kb_500kb
+      genomic_range: [400000, 500000]
+      cut_time: 25000
+training:
+  epochs: 10
+  batch_size: 1
+  grad_accum_steps: 4
+  seed: 7
+  init_z_sample_count: 0
+  verbose: true
+  wandb: false
+  policy_lr: 0.0001
+  time_policy_lr: 0.001
+  log_z_lr: 0.001
+  loss: fl_subtb
+  subtb_lambda: 0.9
+  subtb_max_span: 16
+  grad_clip: 10.0
+  eval_episodes: 4
+  eval_every: 5
+  partial_segment_max_steps: 16
+environment:
+  bp_per_blocks: 1
+  effective_population_size: 10000
+  mutation_rate: 2.0e-8
+  recombination_rate: 2.0e-8
+reward:
+  constant: 0
+model:
+  embedding_size: 64
+  hidden_size: 128
+  dropout: 0.05
+  breakpoint_hidden_dim: 128
+  breakpoint_dropout: 0.05
+  transformer_depth: 4
+  transformer_heads: 4
+  transformer_mlp_ratio: 2.0
+  attention_dropout: 0.05
+  time_basis_components: 16
+  time_context_mode: full
+  local_coalescence_similarity_bias: 0.0
+  local_prior_action_logit_bias: 0.0
+  local_prior_gate_logit_bias: 0.0

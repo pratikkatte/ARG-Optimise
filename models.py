@@ -3,11 +3,23 @@ try:
     from .breakpoint_model import BreakpointSplitPositionCNN, VCFBreakpointScorer
     from .time_model import TimeModel
     from .time_env import DEFAULT_TIME_BASIS_COMPONENTS
+    from .time_context import (
+        TIME_CONTEXT_VERSION,
+        build_time_context,
+        time_context_dim,
+        time_context_feature_names,
+    )
 except ImportError:  # Support the repository's script-style entry points.
     from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
     from breakpoint_model import BreakpointSplitPositionCNN, VCFBreakpointScorer
     from time_model import TimeModel
     from time_env import DEFAULT_TIME_BASIS_COMPONENTS
+    from time_context import (
+        TIME_CONTEXT_VERSION,
+        build_time_context,
+        time_context_dim,
+        time_context_feature_names,
+    )
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -234,10 +246,14 @@ class ARGModel(nn.Module):
         time_layers=3,
         time_dropout=0.0,
         time_basis_components=DEFAULT_TIME_BASIS_COMPONENTS,
+        time_context_mode="baseline",
         breakpoint_gap_hidden_size=256,
         breakpoint_gap_layers=3,
         breakpoint_gap_dropout=0.0,
         breakpoint_use_position_features=True,
+        local_coalescence_similarity_bias=0.0,
+        local_prior_action_logit_bias=0.0,
+        local_prior_gate_logit_bias=0.0,
     ):
         super().__init__()
         self.env = env
@@ -245,6 +261,14 @@ class ARGModel(nn.Module):
         self.input_mode = getattr(env, "input_mode", "dense")
         self.local_mode = bool(getattr(env, "is_local", False))
         self.embedding_size = int(embedding_size)
+        self.local_coalescence_similarity_bias = float(
+            local_coalescence_similarity_bias
+        )
+        self.local_prior_action_logit_bias = float(local_prior_action_logit_bias)
+        self.local_prior_gate_logit_bias = float(local_prior_gate_logit_bias)
+        self.time_context_mode = str(time_context_mode).lower()
+        self.time_context_dim = time_context_dim(self.time_context_mode)
+        self.time_context_version = TIME_CONTEXT_VERSION
         if int(embedding_size) % int(transformer_heads) != 0:
             raise ValueError(
                 "embedding_size must be divisible by transformer_heads "
@@ -318,13 +342,56 @@ class ARGModel(nn.Module):
             ).to(self.device)
 
         self.time_scorer = TimeModel(
-            embedding_size * 4 + TimeModel.CONTEXT_FEATURE_DIM,
+            embedding_size * 4
+            + TimeModel.CONTEXT_FEATURE_DIM
+            + self.time_context_dim,
             time_hidden_size,
             time_dropout,
             time_basis_components,
             layers=time_layers,
         )
         self.logsoftmax = nn.LogSoftmax(dim=1)
+
+    @property
+    def time_context_feature_names(self):
+        return time_context_feature_names(self.time_context_mode)
+
+    def build_time_context(
+        self,
+        states,
+        selected_actions,
+        max_deltas,
+        *,
+        dtype,
+    ):
+        """Return post-breakpoint biological time features and diagnostics."""
+
+        if not (
+            len(states) == len(selected_actions) == len(max_deltas)
+        ):
+            raise ValueError(
+                "states, selected_actions, and max_deltas must have equal length"
+            )
+        contexts = [
+            build_time_context(
+                state,
+                action,
+                self.env,
+                max_delta=max_delta,
+                mode=self.time_context_mode,
+                device=self.device,
+                dtype=dtype,
+            )
+            for state, action, max_delta in zip(
+                states,
+                selected_actions,
+                max_deltas,
+            )
+        ]
+        return (
+            torch.stack([context.features for context in contexts], dim=0),
+            [dict(context.diagnostics) for context in contexts],
+        )
 
     def _build_source_sequence_features(self):
         return self.env.block_seq_arrays.detach().to(dtype=torch.float32).clone()
@@ -966,7 +1033,8 @@ class ARGModel(nn.Module):
         self,
         candidate_actions,
         lineage_reps,
-        summary_reps
+        summary_reps,
+        state_contexts=None,
         ):
         batch_size = len(candidate_actions)
         max_candidates = max(len(actions) for actions in candidate_actions)
@@ -987,11 +1055,223 @@ class ARGModel(nn.Module):
             )
             features[batch_idx, :n] = state_action_features
         logits = self.action_scorer(features.reshape(-1, feat_dim)).reshape(batch_size, max_candidates).squeeze(-1)
+        if (
+            self.local_mode
+            and self.local_prior_action_logit_bias != 0.0
+            and state_contexts is not None
+        ):
+            logits = logits + self._local_prior_action_bias(
+                candidate_actions,
+                state_contexts,
+                max_candidates,
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+        if (
+            self.local_mode
+            and self.input_mode == "vcf"
+            and self.local_coalescence_similarity_bias != 0.0
+            and state_contexts is not None
+        ):
+            logits = logits + self._local_similarity_bias(
+                candidate_actions,
+                state_contexts,
+                max_candidates,
+                dtype=logits.dtype,
+                device=logits.device,
+            )
 
         counts = torch.tensor(candidate_counts, device=self.device)
         valid = torch.arange(max_candidates, device=self.device).unsqueeze(0) < counts.unsqueeze(1)
         masked_logits = logits.masked_fill(~valid, -1e9)
         return masked_logits, features
+
+    def _local_similarity_bias(
+        self,
+        candidate_actions,
+        states,
+        max_candidates,
+        *,
+        dtype,
+        device,
+    ):
+        rows = torch.zeros(
+            len(candidate_actions),
+            int(max_candidates),
+            dtype=dtype,
+            device=device,
+        )
+        weight = float(self.local_coalescence_similarity_bias)
+        for batch_idx, actions in enumerate(candidate_actions):
+            if batch_idx >= len(states):
+                break
+            state = states[batch_idx]
+            if not hasattr(state, "active_lineages"):
+                continue
+            cache = self._local_lineage_similarity_cache(state, dtype, device)
+            for action_idx, action in enumerate(actions):
+                if not isinstance(action, CoalescenceChoice):
+                    continue
+                score = self._coalescence_similarity_score(
+                    state,
+                    action,
+                    cache,
+                    dtype,
+                    device,
+                )
+                rows[batch_idx, action_idx] = weight * score
+        return rows
+
+    def _local_prior_action_bias(
+        self,
+        candidate_actions,
+        states,
+        max_candidates,
+        *,
+        dtype,
+        device,
+    ):
+        rows = torch.zeros(
+            len(candidate_actions),
+            int(max_candidates),
+            dtype=dtype,
+            device=device,
+        )
+        weight = float(self.local_prior_action_logit_bias)
+        epsilon = torch.finfo(dtype).tiny
+        for batch_idx, actions in enumerate(candidate_actions):
+            if batch_idx >= len(states):
+                break
+            state = states[batch_idx]
+            coal_actions = [
+                action for action in actions if isinstance(action, CoalescenceChoice)
+            ]
+            recomb_actions = [
+                action for action in actions if isinstance(action, RecombinationChoice)
+            ]
+            options = getattr(state, "prior_options", None)
+            if options is None and hasattr(self.env, "enumerate_prior_options"):
+                options = self.env.enumerate_prior_options(state)
+            rates = getattr(options, "rates", None) or {}
+            lambda_coal = max(float(rates.get("lambda_coal", len(coal_actions))), 0.0)
+            lambda_recomb = max(float(rates.get("lambda_recomb", 0.0)), 0.0)
+            total_rate = lambda_coal + lambda_recomb
+            if total_rate <= 0.0:
+                continue
+            coal_weights = [
+                self._local_coalescence_overlap_weight(state, action)
+                for action in coal_actions
+            ]
+            coal_total = float(sum(coal_weights))
+            if coal_actions and not coal_total > 0.0:
+                coal_weights = [1.0] * len(coal_actions)
+                coal_total = float(len(coal_actions))
+            recomb_weights = [
+                self._local_recombination_action_weight(state, action)
+                for action in recomb_actions
+            ]
+            recomb_total = float(sum(recomb_weights))
+            if recomb_actions and not recomb_total > 0.0:
+                recomb_weights = [1.0] * len(recomb_actions)
+                recomb_total = float(len(recomb_actions))
+            coal_index = 0
+            recomb_index = 0
+            for action_idx, action in enumerate(actions):
+                probability = 0.0
+                if isinstance(action, CoalescenceChoice):
+                    if lambda_coal > 0.0 and coal_total > 0.0:
+                        probability = (
+                            lambda_coal
+                            / total_rate
+                            * float(coal_weights[coal_index])
+                            / coal_total
+                        )
+                    coal_index += 1
+                elif isinstance(action, RecombinationChoice):
+                    if lambda_recomb > 0.0 and recomb_total > 0.0:
+                        probability = (
+                            lambda_recomb
+                            / total_rate
+                            * float(recomb_weights[recomb_index])
+                            / recomb_total
+                        )
+                    recomb_index += 1
+                if probability > 0.0:
+                    rows[batch_idx, action_idx] = weight * torch.log(
+                        torch.as_tensor(
+                            max(float(probability), float(epsilon)),
+                            dtype=dtype,
+                            device=device,
+                        )
+                    )
+        return rows
+
+    def _local_lineage_similarity_cache(self, state, dtype, device):
+        cache = []
+        for lineage in state.active_lineages:
+            variants = tuple(int(variant) for variant in lineage.variant_indices)
+            partials = self._lineage_partials_tensor(lineage).to(
+                dtype=dtype,
+                device=device,
+            )
+            cache.append(
+                {
+                    "variants": variants,
+                    "variant_set": set(variants),
+                    "positions": {
+                        int(variant): index
+                        for index, variant in enumerate(variants)
+                    },
+                    "partials": partials,
+                }
+            )
+        return cache
+
+    def _coalescence_similarity_score(self, state, action, cache, dtype, device):
+        left = cache[int(action.active_lineage_i)]
+        right = cache[int(action.active_lineage_j)]
+        common_variants = sorted(left["variant_set"].intersection(right["variant_set"]))
+        if not common_variants:
+            return torch.zeros((), dtype=dtype, device=device)
+        left_index = torch.as_tensor(
+            [left["positions"][variant] for variant in common_variants],
+            dtype=torch.long,
+            device=device,
+        )
+        right_index = torch.as_tensor(
+            [right["positions"][variant] for variant in common_variants],
+            dtype=torch.long,
+            device=device,
+        )
+        compatibility = (
+            left["partials"].index_select(0, left_index)
+            * right["partials"].index_select(0, right_index)
+        ).sum(dim=1)
+        mean_compatibility = compatibility.clamp(0.0, 1.0).mean()
+        return 2.0 * mean_compatibility - 1.0
+
+    def _local_coalescence_overlap_weight(self, state, action):
+        left = state.active_lineages[int(action.active_lineage_i)]
+        right = state.active_lineages[int(action.active_lineage_j)]
+        overlap = left.material_segments.intersection(right.material_segments)
+        target = getattr(state, "target_material", None)
+        if target is not None:
+            overlap = overlap.intersection(target)
+        return max(self._local_material_physical_length(state, overlap), 0.0)
+
+    def _local_recombination_action_weight(self, state, action):
+        lineage = state.active_lineages[int(action.active_lineage_i)]
+        return max(self._local_material_physical_length(state, lineage.material_segments), 0.0)
+
+    @staticmethod
+    def _local_material_physical_length(state, material):
+        boundaries = getattr(state, "block_boundaries", None)
+        if boundaries is None:
+            return float(getattr(material, "count", 0))
+        length = 0.0
+        for start, end in material.segments:
+            length += max(float(boundaries[int(end)]) - float(boundaries[int(start)]), 0.0)
+        return float(length)
 
     def _select_breakpoints(self, action):
         """
@@ -1059,6 +1339,11 @@ class ARGModel(nn.Module):
             all_candidate_actions,
             lineage_reps,
             summary_reps,
+            state_contexts=(
+                lineage_seq_features
+                if self.local_mode and isinstance(lineage_seq_features, list)
+                else None
+            ),
         )
         
         # Vectorize processing instead of multiple for-loops.

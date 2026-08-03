@@ -1,0 +1,26 @@
+# Whole-chromosome baseline recheck for sim_l1mb_0.
+# The gfn slot intentionally points at the unmodified baseline so the same
+# baseline metric is reported in the gfn and tsinfer rows.
+truth:
+  trees: trees/sim_l1mb_0.trees
+  ne: 10000
+  haplotypes: 8
+
+methods:
+  gfn:
+    label: tsinfer+tsdate baseline copy
+    inferred_trees: output/tsinfer/l1mb_dated.trees
+
+  tsinfer:
+    label: tsinfer+tsdate
+    inferred_trees: output/tsinfer/l1mb_dated.trees
+
+validation:
+  skip: 1
+  max_pairs: null
+  pair_seed: 42
+  xlim: [0, 16]
+  ylim: [0, 8]
+  xlim_log: [-4, 1.5]
+  ylim_log: [-4, 1.5]
+  verbose: false

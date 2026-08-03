@@ -3,13 +3,14 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping
 
 import torch
 
 try:
     from .env import LocalARGEnvironment, SimpleARGEnvironment
     from .rollout_worker_arg import RolloutWorker
-    from .tb_gfn import TBGFlowNetGenerator
+    from .tb_gfn import CHECKPOINT_FORMAT_VERSION, TBGFlowNetGenerator
     from .time_env import (
         DEFAULT_DEMOGRAPHY_MODEL,
         DEFAULT_TIME_DENSITY,
@@ -30,7 +31,7 @@ try:
 except ImportError:  # Support the repository's script-style entry points.
     from env import LocalARGEnvironment, SimpleARGEnvironment
     from rollout_worker_arg import RolloutWorker
-    from tb_gfn import TBGFlowNetGenerator
+    from tb_gfn import CHECKPOINT_FORMAT_VERSION, TBGFlowNetGenerator
     from time_env import (
         DEFAULT_DEMOGRAPHY_MODEL,
         DEFAULT_TIME_DENSITY,
@@ -99,6 +100,7 @@ def run_inference(
     output_dir = resolve_inference_output_dir(
         output_dir=output_dir, experiment=experiment
     )
+    checkpoint = resolve_checkpoint_path(checkpoint)
     checkpoint_data = load_checkpoint(checkpoint, map_location="cpu")
     metadata = checkpoint_data.get("metadata", {})
     validate_metadata(metadata)
@@ -227,9 +229,46 @@ def run_inference(
 
 def load_checkpoint(path, map_location=None):
     try:
-        return torch.load(path, map_location=map_location, weights_only=False)
+        checkpoint = torch.load(
+            path,
+            map_location=map_location,
+            weights_only=True,
+        )
     except TypeError:
-        return torch.load(path, map_location=map_location)
+        checkpoint = torch.load(path, map_location=map_location)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("Checkpoint must contain a mapping payload")
+    format_version = int(checkpoint.get("checkpoint_format_version", 1))
+    if format_version > CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            "Checkpoint format is newer than this code supports: "
+            f"checkpoint={format_version}, supported={CHECKPOINT_FORMAT_VERSION}"
+        )
+    if "generator_state_dict" not in checkpoint:
+        raise ValueError(
+            "Checkpoint is missing generator_state_dict; use a checkpoint "
+            "created by TBGFlowNetGenerator.save"
+        )
+    return checkpoint
+
+
+def resolve_checkpoint_path(path):
+    """Resolve a checkpoint file or a run/checkpoint directory to best.pt."""
+    resolved = os.path.abspath(os.path.expanduser(os.fspath(path)))
+    if os.path.isdir(resolved):
+        candidates = (
+            os.path.join(resolved, "checkpoints", "best.pt"),
+            os.path.join(resolved, "best.pt"),
+        )
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        raise FileNotFoundError(
+            f"No best.pt checkpoint found under directory: {resolved}"
+        )
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"Checkpoint does not exist: {resolved}")
+    return resolved
 
 
 def resolve_device(device):
@@ -411,7 +450,16 @@ def local_environment_from_metadata(
             resolved_source,
             request,
         )
-    return LocalARGEnvironment(base_env, prepared_contexts)
+    return LocalARGEnvironment(
+        base_env,
+        prepared_contexts,
+        terminal_requires_exhausted_fixed_schedule=bool(
+            metadata.get(
+                "terminal_requires_exhausted_fixed_schedule",
+                False,
+            )
+        ),
+    )
 
 
 def run_batched_rollouts(
@@ -554,6 +602,11 @@ def run_local_refinement_inference(
                     None
                     if state.log_reward is None
                     else float(state.log_reward)
+                ),
+                "absolute_log_reward": (
+                    None
+                    if state.absolute_log_reward is None
+                    else float(state.absolute_log_reward)
                 ),
                 "actions": list(trajectory.actions),
                 "prior_increments": [
@@ -882,7 +935,14 @@ def _experiment_arg(value):
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Infer ARGs from a saved ARG GFlowNet checkpoint.")
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help=(
+            "Checkpoint file, run directory, or checkpoints directory. "
+            "Directories resolve to best.pt."
+        ),
+    )
     output_group = parser.add_mutually_exclusive_group()
     output_group.add_argument(
         "--output-dir",

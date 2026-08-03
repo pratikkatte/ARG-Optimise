@@ -16,6 +16,9 @@ class BernsteinBetaTimeModel(nn.Module):
     """
 
     CONTEXT_FEATURE_DIM = 4
+    # Leaving more than one machine epsilon at the open endpoints prevents
+    # ``current_time + delta`` from rounding onto a fixed-ancestor boundary.
+    NUMERICAL_QUANTILE_EPSILON = 1e-12
 
     def __init__(
         self,
@@ -143,8 +146,26 @@ class BernsteinBetaTimeModel(nn.Module):
                 component,
             ).to(device=sample_device, dtype=torch.float64)
         quantiles = Beta(alpha, beta).sample()
-        epsilon = torch.finfo(quantiles.dtype).eps
+        epsilon = max(
+            torch.finfo(quantiles.dtype).eps,
+            self.NUMERICAL_QUANTILE_EPSILON,
+        )
         return quantiles.clamp(min=epsilon, max=1.0 - epsilon)
+
+    def mixture_diagnostics(self, mixture_logits, random_spec=None):
+        """Return categorical entropy and effective component count."""
+
+        tempered = self._tempered_logits(mixture_logits, random_spec)
+        log_probabilities = F.log_softmax(tempered, dim=-1)
+        probabilities = torch.exp(log_probabilities)
+        entropy = -torch.sum(
+            probabilities * log_probabilities,
+            dim=-1,
+        )
+        return {
+            "entropy": entropy,
+            "effective_components": torch.exp(entropy),
+        }
 
     def _log_quantile_density_float64(
         self,

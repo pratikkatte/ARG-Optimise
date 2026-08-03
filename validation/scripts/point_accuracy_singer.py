@@ -11,6 +11,7 @@ try:
         ValidationResult,
         add_common_args,
         clean_artifact_names,
+        clip_dataframe_to_region,
         common_metric_values,
         dataframe_from_tree_sequences,
         load_posterior_tree_samples,
@@ -26,6 +27,7 @@ except ImportError:
         ValidationResult,
         add_common_args,
         clean_artifact_names,
+        clip_dataframe_to_region,
         common_metric_values,
         dataframe_from_tree_sequences,
         load_posterior_tree_samples,
@@ -148,7 +150,11 @@ def evaluate_from_args(
         out_prefix = output_dir / "result"
     xlim, ylim, xlim_log, ylim_log = plot_limits_from_args(args)
     method_label = getattr(args, "method_label", None) or METHOD_LABEL
-    df = dataframe_from_args(args)
+    df = clip_dataframe_to_region(
+        dataframe_from_args(args),
+        getattr(args, "region_start", None),
+        getattr(args, "region_end", None),
+    )
     print(f"segments: {len(df)} rows", flush=True)
     legacy_mse = run_singer_plots(
         df,

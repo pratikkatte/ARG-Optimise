@@ -239,6 +239,7 @@ def run_cwr_refinement_sampler(
                     ),
                     "whole_vcf_log_likelihood": proposal.log_likelihood,
                     "log_reward": proposal.log_reward,
+                    "absolute_log_reward": proposal.absolute_log_reward,
                     "event_counts": dict(sorted(event_counts.items())),
                     "num_trees": int(tree_sequence.num_trees),
                     "num_nodes": int(tree_sequence.num_nodes),

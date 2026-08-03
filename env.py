@@ -195,6 +195,9 @@ class RecombinationChoice:
     waiting_rate: Optional[float] = None
     fixed_horizon: Optional[float] = None
     time_log_density: Optional[float] = None
+    time_policy_entropy: Optional[float] = None
+    time_effective_components: Optional[float] = None
+    time_context_diagnostics: Optional[Dict[str, Any]] = None
 
     @property
     def breakpoint_count(self):
@@ -247,6 +250,17 @@ class RecombinationChoice:
             time_log_density=_optional_real(
                 action.get("time_log_density")
             ),
+            time_policy_entropy=_optional_real(
+                action.get("time_policy_entropy")
+            ),
+            time_effective_components=_optional_real(
+                action.get("time_effective_components")
+            ),
+            time_context_diagnostics=(
+                None
+                if action.get("time_context_diagnostics") is None
+                else dict(action["time_context_diagnostics"])
+            ),
         )
 
     def is_valid_for(self, active_lineages):
@@ -281,6 +295,9 @@ class CoalescenceChoice:
     waiting_rate: Optional[float] = None
     fixed_horizon: Optional[float] = None
     time_log_density: Optional[float] = None
+    time_policy_entropy: Optional[float] = None
+    time_effective_components: Optional[float] = None
+    time_context_diagnostics: Optional[Dict[str, Any]] = None
 
     def as_dict(self):
         action = {
@@ -298,6 +315,16 @@ class CoalescenceChoice:
             action["fixed_horizon"] = float(self.fixed_horizon)
         if self.time_log_density is not None:
             action["time_log_density"] = float(self.time_log_density)
+        if self.time_policy_entropy is not None:
+            action["time_policy_entropy"] = float(self.time_policy_entropy)
+        if self.time_effective_components is not None:
+            action["time_effective_components"] = float(
+                self.time_effective_components
+            )
+        if self.time_context_diagnostics is not None:
+            action["time_context_diagnostics"] = dict(
+                self.time_context_diagnostics
+            )
         return action
 
     def is_valid_for(self, active_lineages):
@@ -342,6 +369,17 @@ class CoalescenceChoice:
             fixed_horizon=_optional_real(action.get("fixed_horizon")),
             time_log_density=_optional_real(
                 action.get("time_log_density")
+            ),
+            time_policy_entropy=_optional_real(
+                action.get("time_policy_entropy")
+            ),
+            time_effective_components=_optional_real(
+                action.get("time_effective_components")
+            ),
+            time_context_diagnostics=(
+                None
+                if action.get("time_context_diagnostics") is None
+                else dict(action["time_context_diagnostics"])
             ),
         )
 
@@ -513,6 +551,7 @@ class ARGState:
     all_nodes: Dict[int, ARGLineage]
     max_node_idx: int
     log_reward: Optional[float] = None
+    absolute_log_reward: Optional[float] = None
     log_likelihood: Optional[float] = None
     accumulated_log_prior: float = 0.0
     accumulated_log_likelihood: float = 0.0
@@ -542,6 +581,7 @@ class ARGState:
     local_target_interval: Optional[Tuple[float, float]] = None
     local_cut_time: Optional[float] = None
     local_initial_time: float = 0.0
+    local_terminal_requires_exhausted_fixed_schedule: bool = False
 
     def structural_identity(self):
         """Return a history-independent identity for an ARG construction state.
@@ -605,6 +645,7 @@ class ARGState:
             all_nodes=all_nodes,
             max_node_idx=self.max_node_idx,
             log_reward=self.log_reward,
+            absolute_log_reward=self.absolute_log_reward,
             log_likelihood=self.log_likelihood,
             accumulated_log_prior=self.accumulated_log_prior,
             accumulated_log_likelihood=self.accumulated_log_likelihood,
@@ -631,6 +672,9 @@ class ARGState:
             local_target_interval=self.local_target_interval,
             local_cut_time=self.local_cut_time,
             local_initial_time=float(self.local_initial_time),
+            local_terminal_requires_exhausted_fixed_schedule=bool(
+                self.local_terminal_requires_exhausted_fixed_schedule
+            ),
         )
 
 
@@ -679,6 +723,18 @@ def action_as_dict(action):
         if action.time_log_density is not None:
             result["time_log_density"] = float(
                 action.time_log_density
+            )
+        if action.time_policy_entropy is not None:
+            result["time_policy_entropy"] = float(
+                action.time_policy_entropy
+            )
+        if action.time_effective_components is not None:
+            result["time_effective_components"] = float(
+                action.time_effective_components
+            )
+        if action.time_context_diagnostics is not None:
+            result["time_context_diagnostics"] = dict(
+                action.time_context_diagnostics
             )
         return result
     if isinstance(action, FixedAttachmentChoice):
@@ -2076,7 +2132,13 @@ class LocalARGEnvironment:
         "variant_next_gap_tensor",
     }
 
-    def __init__(self, base_env, prepared_contexts, context_ids=None):
+    def __init__(
+        self,
+        base_env,
+        prepared_contexts,
+        context_ids=None,
+        terminal_requires_exhausted_fixed_schedule=False,
+    ):
         if not isinstance(base_env, SimpleARGEnvironment):
             raise TypeError("base_env must be a SimpleARGEnvironment")
         if base_env.structural_only or not base_env.is_vcf_mode:
@@ -2123,6 +2185,11 @@ class LocalARGEnvironment:
         object.__setattr__(self, "prepared_contexts", contexts)
         object.__setattr__(self, "context_ids", tuple(contexts))
         object.__setattr__(self, "is_local", True)
+        object.__setattr__(
+            self,
+            "terminal_requires_exhausted_fixed_schedule",
+            bool(terminal_requires_exhausted_fixed_schedule),
+        )
 
     def __getattr__(self, name):
         return getattr(self.base_env, name)
@@ -2173,6 +2240,9 @@ class LocalARGEnvironment:
         )
         state.local_cut_time = float(state.current_time)
         state.local_initial_time = float(state.current_time)
+        state.local_terminal_requires_exhausted_fixed_schedule = bool(
+            self.terminal_requires_exhausted_fixed_schedule
+        )
         return state
 
     def initial_states(self):
@@ -2417,9 +2487,33 @@ class LocalARGEnvironment:
         if isinstance(action, CoalescenceChoice):
             if not action.is_valid_for(state.active_lineages):
                 raise ValueError(f"invalid local coalescence action: {action}")
+            coal_weights = [
+                local._local_coalescence_weight(
+                    state.active_lineages[int(choice.active_lineage_i)],
+                    state.active_lineages[int(choice.active_lineage_j)],
+                    state,
+                )
+                for choice in coal_actions
+            ]
+            total_coal_weight = float(sum(coal_weights))
+            matching = [
+                index
+                for index, choice in enumerate(coal_actions)
+                if {
+                    int(choice.active_lineage_i),
+                    int(choice.active_lineage_j),
+                }
+                == {
+                    int(action.active_lineage_i),
+                    int(action.active_lineage_j),
+                }
+            ]
+            if not matching or total_coal_weight <= 0.0:
+                raise ValueError(f"invalid local coalescence action: {action}")
+            pair_weight = float(coal_weights[matching[0]])
             action_log_prior = (
                 math.log(float(rates["lambda_coal"]) / total_rate)
-                - math.log(len(coal_actions))
+                + math.log(pair_weight / total_coal_weight)
             )
         elif isinstance(action, RecombinationChoice):
             lineage = state.active_lineages[int(action.active_lineage_i)]
@@ -2616,11 +2710,20 @@ class LocalARGEnvironment:
             raise ValueError("local terminal reward requires a terminal state")
         if log_likelihood is None:
             log_likelihood = self.compute_terminal_log_likelihood(state)
-        return float(
+        # Local trajectories are trained against the conditional score of the
+        # reconstructed region.  The reward constant and likelihood of the
+        # immutable exterior are context-specific additive constants, so they
+        # cannot rank local proposals and need not be learned by the flow.
+        absolute_log_reward = float(
             self.reward_fn(
                 float(log_likelihood),
                 float(state.accumulated_log_prior),
             )
+        )
+        return float(
+            absolute_log_reward
+            - float(self.reward_fn.C)
+            - float(state.outside_log_likelihood)
         )
 
     def state_to_proposal(self, state):

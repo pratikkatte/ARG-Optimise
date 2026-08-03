@@ -759,6 +759,11 @@ def _build_provenance_record(
                 if proposal.log_reward is None
                 else float(proposal.log_reward)
             ),
+            "absolute_terminal_log_reward": (
+                None
+                if proposal.absolute_log_reward is None
+                else float(proposal.absolute_log_reward)
+            ),
             "likelihood_alignment": dict(
                 proposal.likelihood_alignment
             ),

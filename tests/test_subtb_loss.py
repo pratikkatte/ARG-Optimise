@@ -3,7 +3,7 @@ import torch
 
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
-from tb_gfn import TBGFlowNetGenerator
+from tb_gfn import CHECKPOINT_FORMAT_VERSION, TBGFlowNetGenerator
 
 
 def tiny_generator(loss_mode="subtb", sequences=None):
@@ -127,6 +127,32 @@ def test_old_checkpoint_without_flow_head_loads():
     target.load({"generator_state_dict": old_state}, load_optimizer=False)
 
     assert "arg_model.flow_head.0.weight" in target.state_dict()
+
+
+def test_checkpoint_contains_versioned_inference_and_training_state(tmp_path):
+    _, source = tiny_generator(loss_mode="tb")
+    checkpoint_path = tmp_path / "checkpoints" / "best.pt"
+
+    source.save(
+        checkpoint_path,
+        metadata={"model_version": "test", "checkpoint_kind": "best"},
+        training_state={"epoch": 3, "best_metric_value": 1.25},
+    )
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert checkpoint["checkpoint_format_version"] == CHECKPOINT_FORMAT_VERSION
+    assert checkpoint["metadata"]["checkpoint_kind"] == "best"
+    assert checkpoint["training_state"] == {
+        "epoch": 3,
+        "best_metric_value": 1.25,
+    }
+    assert "generator_state_dict" in checkpoint
+    assert "opt_state_dict" in checkpoint
+    assert not list(checkpoint_path.parent.glob(".*.tmp"))
 
 
 def test_tb_rejects_capped_nonterminal_rollout_outputs():

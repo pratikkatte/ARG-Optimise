@@ -47,6 +47,8 @@ class PairSegment:
     truth: float
     posterior_mean: float
     posterior_median: float
+    posterior_low: float = float("nan")
+    posterior_high: float = float("nan")
 
     @property
     def length(self) -> float:
@@ -110,6 +112,36 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--xlim-log", default="-4,1.5")
     ap.add_argument("--ylim-log", default="-4,1.5")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--region-start", type=float, default=None)
+    ap.add_argument("--region-end", type=float, default=None)
+
+
+def clip_dataframe_to_region(
+    df: pd.DataFrame,
+    region_start: float | None,
+    region_end: float | None,
+) -> pd.DataFrame:
+    """Clip aligned genomic segments to a half-open validation interval."""
+    if region_start is None and region_end is None:
+        return df
+    if region_start is None or region_end is None or region_end <= region_start:
+        raise ValueError("region requires finite bounds satisfying start < end")
+    clipped = df[
+        (df["end"].to_numpy(dtype=float) > region_start)
+        & (df["start"].to_numpy(dtype=float) < region_end)
+    ].copy()
+    if clipped.empty:
+        raise RuntimeError(
+            f"No aligned segments overlap validation region [{region_start}, {region_end})"
+        )
+    clipped["start"] = np.maximum(
+        clipped["start"].to_numpy(dtype=float), region_start
+    )
+    clipped["end"] = np.minimum(
+        clipped["end"].to_numpy(dtype=float), region_end
+    )
+    clipped["len"] = clipped["end"] - clipped["start"]
+    return clipped[clipped["len"] > 0].reset_index(drop=True)
 
 
 def require_truth_args(args: argparse.Namespace) -> None:
@@ -428,6 +460,8 @@ def combine_pair_segments(
                 truth=truth_val,
                 posterior_mean=float(np.mean(finite_vals)),
                 posterior_median=float(np.median(finite_vals)),
+                posterior_low=float(np.quantile(finite_vals, 0.025)),
+                posterior_high=float(np.quantile(finite_vals, 0.975)),
             )
         )
     return segments
@@ -483,6 +517,8 @@ def segments_to_dataframe(segments: list[PairSegment]) -> pd.DataFrame:
         "Simulated",
         "PosteriorMean",
         "PosteriorMedian",
+        "PosteriorLow",
+        "PosteriorHigh",
         "len",
     ]
     if not segments:
@@ -495,6 +531,8 @@ def segments_to_dataframe(segments: list[PairSegment]) -> pd.DataFrame:
             "Simulated": [s.truth for s in segments],
             "PosteriorMean": [s.posterior_mean for s in segments],
             "PosteriorMedian": [s.posterior_median for s in segments],
+            "PosteriorLow": [s.posterior_low for s in segments],
+            "PosteriorHigh": [s.posterior_high for s in segments],
             "len": [s.length for s in segments],
         },
         columns=columns,
@@ -994,21 +1032,81 @@ def common_metric_values(df: pd.DataFrame, legacy_mse: float) -> dict[str, float
             "total_length": 0.0,
             "weighted_mse": float("nan"),
             "weighted_rmse": float("nan"),
+            "weighted_log_rmse": float("nan"),
+            "weighted_log_correlation": float("nan"),
+            "weighted_spearman_correlation": float("nan"),
+            "posterior_95pct_coverage": float("nan"),
             "weighted_mae": float("nan"),
             "weighted_bias": float("nan"),
             "legacy_mseall": legacy_mse,
         }
     diff = post - sim
     mse = float(np.sum((diff**2) * weights) / total_weight)
+    positive = (sim > 0) & (post > 0)
+    if np.any(positive):
+        log_weights = weights[positive]
+        log_diff = np.log(post[positive]) - np.log(sim[positive])
+        log_rmse = math.sqrt(
+            float(np.sum((log_diff**2) * log_weights) / log_weights.sum())
+        )
+    else:
+        log_rmse = float("nan")
+    if np.any(positive) and np.sum(positive) >= 2:
+        log_sim = np.log(sim[positive])
+        log_post = np.log(post[positive])
+        log_weights = weights[positive]
+        log_corr = _weighted_correlation(log_sim, log_post, log_weights)
+    else:
+        log_corr = float("nan")
+    sim_ranks = pd.Series(sim).rank(method="average").to_numpy(dtype=float)
+    post_ranks = pd.Series(post).rank(method="average").to_numpy(dtype=float)
+    spearman = _weighted_correlation(sim_ranks, post_ranks, weights)
+    coverage = float("nan")
+    if {"PosteriorLow", "PosteriorHigh"}.issubset(df.columns):
+        finite_frame = df.loc[
+            np.isfinite(df["Simulated"].to_numpy(dtype=float))
+            & np.isfinite(df["PosteriorLow"].to_numpy(dtype=float))
+            & np.isfinite(df["PosteriorHigh"].to_numpy(dtype=float))
+            & np.isfinite(df["len"].to_numpy(dtype=float))
+            & (df["len"].to_numpy(dtype=float) > 0)
+        ]
+        if not finite_frame.empty:
+            covered = (
+                (finite_frame["Simulated"] >= finite_frame["PosteriorLow"])
+                & (finite_frame["Simulated"] <= finite_frame["PosteriorHigh"])
+            ).to_numpy(dtype=float)
+            coverage_weights = finite_frame["len"].to_numpy(dtype=float)
+            coverage = float(np.average(covered, weights=coverage_weights))
     return {
         "n_segments": int(len(df)),
         "total_length": total_weight,
         "weighted_mse": mse,
         "weighted_rmse": math.sqrt(mse),
+        "weighted_log_rmse": log_rmse,
+        "weighted_log_correlation": log_corr,
+        "weighted_spearman_correlation": spearman,
+        "posterior_95pct_coverage": coverage,
         "weighted_mae": float(np.sum(np.abs(diff) * weights) / total_weight),
         "weighted_bias": float(np.sum(diff * weights) / total_weight),
         "legacy_mseall": legacy_mse,
     }
+
+
+def _weighted_correlation(
+    left: np.ndarray, right: np.ndarray, weights: np.ndarray
+) -> float:
+    total = float(weights.sum())
+    if total <= 0 or len(weights) < 2:
+        return float("nan")
+    left_mean = float(np.sum(left * weights) / total)
+    right_mean = float(np.sum(right * weights) / total)
+    left_centered = left - left_mean
+    right_centered = right - right_mean
+    covariance = float(np.sum(weights * left_centered * right_centered) / total)
+    left_variance = float(np.sum(weights * left_centered**2) / total)
+    right_variance = float(np.sum(weights * right_centered**2) / total)
+    denominator = math.sqrt(left_variance * right_variance)
+    return covariance / denominator if denominator > 0 else float("nan")
 
 
 def write_common_metrics(

@@ -1,0 +1,29 @@
+# Frozen pre-change time-head baseline for the breakpoint-aware conditioning
+# experiment. Inference uses checkpoint epoch 9, seed 7, and 16 posterior ARGs.
+truth:
+  trees: trees/sim_l1mb_0.trees
+  ne: 10000
+  haplotypes: 8
+
+methods:
+  gfn:
+    label: Atomic-action Bernstein baseline seed 7 [400kb,500kb)
+    input_dir: ../runs/breakpoint_time_baseline_seed7/inference/region_400kb_500kb
+    sample_prefix: arg_
+    burnin_samples: 0
+    max_posterior_samples: 16
+
+  tsinfer:
+    label: tsinfer+tsdate
+    inferred_trees: output/tsinfer/l1mb_dated.trees
+
+validation:
+  region: [400000, 500000]
+  skip: 1
+  max_pairs: null
+  pair_seed: 42
+  xlim: [0, 16]
+  ylim: [0, 8]
+  xlim_log: [-4, 1.5]
+  ylim_log: [-4, 1.5]
+  verbose: false

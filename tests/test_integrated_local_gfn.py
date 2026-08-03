@@ -23,12 +23,14 @@ from arg.refinement.training import (
     SeededContextSampler,
     _load_shape_compatible_weights,
 )
+from arg.refinement import local_construction as production_local
 from arg.refinement.training import train_local_refinement
 from arg.infer import run_inference
 from arg.validation.scripts.point_accuracy_common import (
     common_metric_values,
     dataframe_from_tree_sequences,
 )
+from arg.time_context import build_time_context, time_context_dim
 
 
 ARG_ROOT = Path(__file__).resolve().parents[1]
@@ -99,6 +101,31 @@ def _state_signature(state):
             for node_id, lineage in sorted(state.all_nodes.items())
         ),
     )
+
+
+def test_provisional_likelihood_time_context_is_finite(prepared_contexts):
+    base_env = _base_env(recombination_rate=2e-8)
+    local_env = LocalARGEnvironment(
+        base_env,
+        {"region_000001": prepared_contexts["generated"]},
+    )
+    state = local_env.get_initial_state("region_000001")
+    coal, recomb = local_env.enumerate_actions(state)
+    action = (coal + recomb)[0]
+    if hasattr(action, "breakpoint"):
+        valid = local_env.valid_breakpoints(state, action)
+        action = replace(action, breakpoint=int(valid[0]))
+    rollout = local_env.prepare_state_rollout_inputs([state])["rollout"][0]
+    result = build_time_context(
+        state,
+        action,
+        local_env,
+        max_delta=rollout["max_delta"],
+        mode="likelihood",
+    )
+    assert result.features.shape == (time_context_dim("likelihood"),)
+    assert torch.isfinite(result.features).all()
+    assert math.isfinite(result.diagnostics["provisional_likelihood_spread"])
 
 
 def test_reference_and_production_semantic_parity(prepared_contexts):
@@ -177,11 +204,29 @@ def test_reference_and_production_semantic_parity(prepared_contexts):
         rel=1e-10,
         abs=1e-8,
     )
-    assert prod_state.log_reward == pytest.approx(
+    assert prod_state.absolute_log_reward == pytest.approx(
         ref_state.log_reward,
         rel=1e-10,
         abs=1e-8,
     )
+    assert prod_state.log_reward == pytest.approx(
+        ref_state.log_reward
+        - base_env.reward_fn.C
+        - prod_state.outside_log_likelihood,
+        rel=1e-10,
+        abs=1e-8,
+    )
+    terminal_clone = prod_state.clone()
+    terminal_clone.fixed_ancestor_schedule = [
+        {"time": float(terminal_clone.current_time) + 1.0}
+    ]
+    assert local_env.is_terminal(terminal_clone)
+    terminal_clone.local_terminal_requires_exhausted_fixed_schedule = True
+    assert not local_env.is_terminal(terminal_clone)
+    assert terminal_clone.clone().local_terminal_requires_exhausted_fixed_schedule
+    terminal_clone.fixed_ancestor_schedule = []
+    assert local_env.is_terminal(terminal_clone)
+
     ref_proposal = reference.local_state_to_proposal(
         ref_state,
         ref_prepared,
@@ -204,6 +249,35 @@ def test_reference_and_production_semantic_parity(prepared_contexts):
     )
 
 
+def test_source_anchored_topology_proposals_splice(prepared_contexts):
+    prepared = prepared_contexts["generated"]
+    base_env = _base_env(recombination_rate=2e-8)
+
+    copy_proposal = production.build_source_copy_proposal(prepared)
+    copy_splice = production.splice_local_proposal(prepared, copy_proposal)
+    assert copy_splice.is_valid
+    assert copy_splice.validation.counts["exterior_unchanged"]
+    assert copy_splice.validation.counts["target_genotypes_preserved"]
+
+    topology_proposal = production.build_vcf_distance_topology_proposal(
+        prepared,
+        base_env,
+        window_bp=1_000.0,
+        merge_power=2.0,
+        root_time_scale=1.0,
+    )
+    assert topology_proposal.nodes
+    assert topology_proposal.edges
+    assert topology_proposal.topology_digest != copy_proposal.topology_digest
+    topology_splice = production.splice_local_proposal(
+        prepared,
+        topology_proposal,
+    )
+    assert topology_splice.is_valid
+    assert topology_splice.validation.counts["exterior_unchanged"]
+    assert topology_splice.validation.counts["target_genotypes_preserved"]
+
+
 def test_boundary_gate_masks_mixed_contexts_and_policy_gradients(
     prepared_contexts,
 ):
@@ -217,6 +291,43 @@ def test_boundary_gate_masks_mixed_contexts_and_policy_gradients(
     )
     boundary_state = local_env.get_initial_state("boundary")
     generated_state = local_env.get_initial_state("generated")
+    coal_actions, _recomb_actions = local_env.enumerate_actions(generated_state)
+    coal_weights = [
+        production_local._local_coalescence_weight(
+            generated_state.active_lineages[action.active_lineage_i],
+            generated_state.active_lineages[action.active_lineage_j],
+            generated_state,
+        )
+        for action in coal_actions
+    ]
+    assert all(weight > 0.0 for weight in coal_weights)
+    if len(set(coal_weights)) > 1:
+        low_index = int(np.argmin(coal_weights))
+        high_index = int(np.argmax(coal_weights))
+        delta_time = local_env.time_quantile_to_delta(generated_state, 0.5)
+        low_action = replace(
+            coal_actions[low_index],
+            time_quantile=0.5,
+            delta_time=delta_time,
+        )
+        high_action = replace(
+            coal_actions[high_index],
+            time_quantile=0.5,
+            delta_time=delta_time,
+        )
+        low_log_prior = local_env.compute_cwr_event_log_prior(
+            generated_state,
+            local_env.enumerate_actions(generated_state),
+            low_action,
+        )
+        high_log_prior = local_env.compute_cwr_event_log_prior(
+            generated_state,
+            local_env.enumerate_actions(generated_state),
+            high_action,
+        )
+        assert high_log_prior - low_log_prior == pytest.approx(
+            math.log(coal_weights[high_index] / coal_weights[low_index])
+        )
     boundary_decision = local_env.prepare_state_rollout_inputs(
         [boundary_state]
     )["rollout"][0]
@@ -251,6 +362,9 @@ def test_boundary_gate_masks_mixed_contexts_and_policy_gradients(
             "transformer_depth": 1,
             "transformer_heads": 1,
             "breakpoint_hidden_dim": 16,
+            "time_context_mode": "full",
+            "local_prior_action_logit_bias": 1.0,
+            "local_prior_gate_logit_bias": 1.0,
         },
     )
     with torch.no_grad():
@@ -295,6 +409,14 @@ def test_boundary_gate_masks_mixed_contexts_and_policy_gradients(
     )
     assert torch.isfinite(outputs["log_paths_pf"]).all()
     assert torch.isfinite(outputs["log_paths_pb"]).all()
+    components = generator.last_forward_log_components
+    assert torch.allclose(
+        components["total"],
+        components["gate"]
+        + components["atomic_action"]
+        + components["breakpoint"]
+        + components["time"],
+    )
     assert {
         path[-1].local_context_id
         for path in outputs["trajectory_states"]
@@ -365,10 +487,26 @@ def test_explicit_request_validation_and_seeded_context_sampling():
                     "cut_event_index": 0,
                 },
             ],
+            "terminal_requires_exhausted_fixed_schedule": True,
         }
     )
     validate_train_config(config)
     assert config["refinement"]["requests"][0]["id"] == "region_000001"
+    assert config["refinement"]["terminal_requires_exhausted_fixed_schedule"]
+
+    config["refinement"]["terminal_requires_exhausted_fixed_schedule"] = "yes"
+    with pytest.raises(ValueError, match="terminal_requires_exhausted"):
+        validate_train_config(config)
+    config["refinement"]["terminal_requires_exhausted_fixed_schedule"] = True
+    config["model"]["local_prior_action_logit_bias"] = 1.0
+    config["model"]["local_prior_gate_logit_bias"] = 1.0
+    validate_train_config(config)
+
+    config["model"]["local_prior_action_logit_bias"] = "strong"
+    with pytest.raises(ValueError, match="local_prior_action_logit_bias"):
+        validate_train_config(config)
+    config["model"]["local_prior_action_logit_bias"] = 1.0
+
     first = SeededContextSampler(("a", "b", "c"), seed=19)
     second = SeededContextSampler(("a", "b", "c"), seed=19)
     assert first.sample(20) == second.sample(20)
@@ -454,12 +592,31 @@ def test_brief_training_reload_inference_likelihood_and_accuracy(tmp_path):
         breakpoint_hidden_dim=16,
         transformer_depth=1,
         transformer_heads=1,
+        time_context_mode="full",
+        time_policy_lr=0.01,
         verbose=False,
     )
     assert len(history) == 1
     assert math.isfinite(float(history[0]["loss"]))
     checkpoint = training_dir / "checkpoints/best.pt"
     assert checkpoint.exists()
+    last_checkpoint = training_dir / "checkpoints/last.pt"
+    assert last_checkpoint.exists()
+    checkpoint_data = torch.load(
+        checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert checkpoint_data["metadata"]["model"]["time_context_mode"] == "full"
+    assert checkpoint_data["metadata"]["checkpoint_kind"] == "best"
+    assert checkpoint_data["metadata"]["selection_metric"] == "loss"
+    assert checkpoint_data["checkpoint_format_version"] == 2
+    assert checkpoint_data["training_state"]["epoch_number"] == 1
+    assert checkpoint_data["metadata"]["time_policy_lr"] == pytest.approx(0.01)
+    optimizer_lrs = [
+        group["lr"] for group in checkpoint_data["opt_state_dict"]["param_groups"]
+    ]
+    assert optimizer_lrs == pytest.approx([1e-3, 0.01])
 
     inference_dir = tmp_path / "inference"
     manifest = run_inference(
@@ -473,6 +630,18 @@ def test_brief_training_reload_inference_likelihood_and_accuracy(tmp_path):
     assert manifest["num_outputs"] == 1
     trajectory = manifest["requests"][0]["trajectories"][0]
     assert trajectory["splice_validation"]["is_valid"]
+    generated_actions = [
+        action
+        for action in trajectory["actions"]
+        if action.get("time_quantile") is not None
+    ]
+    assert generated_actions
+    assert all(
+        math.isfinite(float(action["time_policy_entropy"]))
+        and math.isfinite(float(action["time_effective_components"]))
+        and action["time_context_diagnostics"]["time_context_mode"] == "full"
+        for action in generated_actions
+    )
     output_tree = Path(trajectory["output_file"])
     refined = tskit.load(str(output_tree))
 

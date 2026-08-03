@@ -177,6 +177,38 @@ class RolloutWorker:
             dtype=torch.float64,
             device=time_diagnostic_device,
         )
+        time_policy_entropies = torch.tensor(
+            [
+                float(action.get("time_policy_entropy", float("nan")))
+                for action in generated_actions
+            ],
+            dtype=torch.float64,
+            device=time_diagnostic_device,
+        )
+        time_effective_components = torch.tensor(
+            [
+                float(action.get("time_effective_components", float("nan")))
+                for action in generated_actions
+            ],
+            dtype=torch.float64,
+            device=time_diagnostic_device,
+        )
+        time_context_diagnostics = [
+            dict(action.get("time_context_diagnostics") or {})
+            for action in generated_actions
+        ]
+        time_event_times = torch.tensor(
+            [
+                float(context.get("current_time", 0.0))
+                + float(action["delta_time"])
+                for action, context in zip(
+                    generated_actions,
+                    time_context_diagnostics,
+                )
+            ],
+            dtype=torch.float64,
+            device=time_diagnostic_device,
+        )
 
 
         data = {
@@ -184,12 +216,19 @@ class RolloutWorker:
             "log_paths_pb": log_paths_pb,
             "log_rewards": log_rewards,
             "trajectory_states": trajectory_states,
+            "trajectory_actions": [
+                list(trajectory.actions) for trajectory in trajectories
+            ],
             "trajectory_lengths": trajectory_lengths,
             "terminal_mask": terminal_mask,
             "truncated_mask": truncated_mask,
             "time_quantiles": time_quantiles,
             "time_delta_times": time_delta_times,
             "time_log_densities": time_log_densities,
+            "time_policy_entropies": time_policy_entropies,
+            "time_effective_components": time_effective_components,
+            "time_event_times": time_event_times,
+            "time_context_diagnostics": time_context_diagnostics,
             "fixed_attachment_count": sum(
                 action.get("event_type") == "fixed_attachment"
                 for action in sampled_actions
