@@ -49,11 +49,23 @@ training:
   complete_trajectory_max_steps: 512
   min_terminal_trajectories_per_batch: 4
 
+  hybrid_replay:
+    enabled: true
+    capacity_per_context: 200
+    fractions:
+      fresh: 0.50
+      residual: 0.25
+      reward: 0.15
+      topology: 0.10
+    priority_top_fraction: 0.10
+    residual_priority: max_abs_subtb
+    priority_refresh: on_use
+
   eval_episodes: 32
   eval_every: 10
   fixed_eval_bank_path: validation/fixed_banks/local_1mb_flow_v1.pkl
   fixed_eval_bank_episodes: 32
-  fixed_eval_bank_seed: 7
+  fixed_eval_bank_seed: 100007
   fixed_eval_bank_source: similarity_0.25_initial
   fixed_eval_bank_create_if_missing: true
 

@@ -34,6 +34,10 @@ from arg.refinement import local_construction as production_local
 from arg.refinement import local_splice as production_splice
 from arg.new_rl import local_splice as reference_splice
 from arg.refinement.training import train_local_refinement
+from arg.refinement.replay import (
+    HybridReplayBuffer,
+    reconstruct_and_rescore_entries,
+)
 from arg.infer import run_inference
 from arg.validation.scripts.point_accuracy_common import (
     common_metric_values,
@@ -966,6 +970,71 @@ def test_fixed_attachment_is_deterministic_and_round_trips(
     diagnostic_clone = state.clone()
     diagnostic_clone.transition_records.append({"diagnostic": True})
     assert diagnostic_clone.structural_identity() == state.structural_identity()
+
+
+def test_replay_reconstructs_and_rescores_with_current_policy(
+    prepared_contexts,
+):
+    local_env = LocalARGEnvironment(
+        _base_env(recombination_rate=0.0),
+        {"ctx": prepared_contexts["boundary"]},
+    )
+    generator = TBGFlowNetGenerator(
+        local_env,
+        init_z_sample_count=0,
+        device="cpu",
+        verbose=False,
+        initialize_z_from_prior=False,
+        loss_mode="fl_subtb",
+        model_kwargs={
+            "embedding_size": 8,
+            "hidden_size": 16,
+            "transformer_depth": 1,
+            "transformer_heads": 1,
+            "breakpoint_hidden_dim": 8,
+            "time_hidden_size": 8,
+            "time_layers": 1,
+        },
+    )
+    fresh, _ = RolloutWorker(local_env).rollout(
+        generator,
+        episodes=1,
+        start_states=[local_env.get_initial_state("ctx")],
+        max_steps=512,
+    )
+    assert fresh["terminal_mask"].all()
+    stale_log_pf = fresh["log_paths_pf"].detach().clone()
+
+    buffer = HybridReplayBuffer(
+        ["ctx"], capacity_per_context=2, top_fraction=1.0, seed=1
+    )
+    entry, _ = buffer.add(
+        "ctx",
+        fresh["trajectory_actions"][0],
+        fresh["trajectory_states"][0][-1],
+        residual_priority=1.0,
+        step=0,
+    )
+    torch.manual_seed(99)
+    with torch.no_grad():
+        for parameter in generator.arg_model.parameters():
+            parameter.add_(0.05 * torch.randn_like(parameter))
+
+    replayed = reconstruct_and_rescore_entries(local_env, generator, [entry])
+    length = int(replayed["trajectory_lengths"][0].item())
+    assert replayed["terminal_mask"].all()
+    assert replayed["trajectory_states"][0][-1].structural_identity() == (
+        fresh["trajectory_states"][0][-1].structural_identity()
+    )
+    assert replayed["log_rewards"][0] == pytest.approx(fresh["log_rewards"][0])
+    assert torch.equal(replayed["log_paths_pb"], fresh["log_paths_pb"])
+    assert not torch.allclose(
+        replayed["log_paths_pf"][0, :length],
+        stale_log_pf[0, :length],
+    )
+
+    generator.accumulate_loss(replayed)
+    assert generator.policy_grad_norm() > 0.0
 
 
 def test_local_transition_rescoring_and_fixed_bank_are_deterministic(

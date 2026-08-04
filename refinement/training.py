@@ -64,6 +64,14 @@ except ImportError:  # Support the repository's script-style entry points.
 
 from .local_refinement import LocalRefinementRequest, prepare_local_refinement
 from .evaluation import compare_scores, replay_source_score, score_terminal_state
+from .replay import (
+    FractionalQuotaAllocator,
+    HybridReplayBuffer,
+    max_abs_subtb_residuals,
+    merge_rollout_outputs,
+    normalize_hybrid_replay_config,
+    reconstruct_and_rescore_entries,
+)
 
 
 LOCAL_MODEL_VERSION = "local-arg-gflownet-continuous-time-v2"
@@ -214,6 +222,7 @@ def train_local_refinement(
     partial_boundary_fraction=0.5,
     trajectory_training_mode="complete",
     complete_trajectory_max_steps=None,
+    hybrid_replay_config=None,
     reward_C=30000,
     embedding_size=32,
     hidden_size=64,
@@ -282,6 +291,7 @@ def train_local_refinement(
         complete_trajectory_max_steps = int(complete_trajectory_max_steps)
         if complete_trajectory_max_steps <= 0:
             raise ValueError("complete_trajectory_max_steps must be positive or null")
+    hybrid_replay_config = normalize_hybrid_replay_config(hybrid_replay_config)
     partial_boundary_fraction = float(partial_boundary_fraction)
     if not 0.0 <= partial_boundary_fraction <= 1.0:
         raise ValueError("partial_boundary_fraction must be between 0 and 1")
@@ -527,6 +537,7 @@ def train_local_refinement(
             ),
             "trajectory_training_mode": trajectory_training_mode,
             "complete_trajectory_max_steps": complete_trajectory_max_steps,
+            "hybrid_replay": dict(hybrid_replay_config),
             "flow_debug": bool(flow_debug),
             "probability_checks": bool(probability_checks),
             "lr_scheduler": generator.lr_scheduler_metadata(),
@@ -606,26 +617,122 @@ def train_local_refinement(
             source_score_diagnostics
         )
 
+    replay_buffer = None
+    replay_quota_allocator = None
+    replay_mix_rng = None
+    if hybrid_replay_config["enabled"]:
+        replay_buffer = HybridReplayBuffer(
+            local_env.context_ids,
+            capacity_per_context=hybrid_replay_config["capacity_per_context"],
+            top_fraction=hybrid_replay_config["priority_top_fraction"],
+            seed=int(seed) + 310001,
+        )
+        replay_quota_allocator = FractionalQuotaAllocator(
+            hybrid_replay_config["fractions"]
+        )
+        replay_mix_rng = random.Random(int(seed) + 310003)
+
     try:
         for epoch in range(int(epochs_num)):
             generator.set_training_epoch(epoch, total_epochs=int(epochs_num))
             sampled_context_ids = []
             rollout_metrics = []
             terminal_trajectory_count = 0
+            replay_requested_counts = {
+                source: 0 for source in ("fresh", "residual", "reward", "topology")
+            }
+            replay_actual_counts = dict(replay_requested_counts)
+            replay_fallback_fresh_count = 0
+            replay_selected_residual_sum = 0.0
+            replay_selected_reward_sum = 0.0
+            replay_selected_count = 0
+            replay_excluded_entry_ids = set()
             for _accumulation in range(grad_accum_steps):
                 rollout_mode = "terminal"
-                context_ids = sampler.sample(batch_size)
-                start_states = [
-                    initial_states[context_id]
-                    for context_id in context_ids
-                ]
-                sampled_context_ids.extend(context_ids)
-                outputs, _trajectories = worker.rollout(
-                    generator,
-                    episodes=batch_size,
-                    start_states=start_states,
-                    max_steps=complete_trajectory_max_steps,
-                )
+                if replay_buffer is None:
+                    context_ids = sampler.sample(batch_size)
+                    start_states = [
+                        initial_states[context_id]
+                        for context_id in context_ids
+                    ]
+                    sampled_context_ids.extend(context_ids)
+                    outputs, _trajectories = worker.rollout(
+                        generator,
+                        episodes=batch_size,
+                        start_states=start_states,
+                        max_steps=complete_trajectory_max_steps,
+                    )
+                    row_sources = ["fresh"] * batch_size
+                    row_replay_entries = [None] * batch_size
+                else:
+                    quota = replay_quota_allocator.allocate(batch_size)
+                    requested_sources = [
+                        source
+                        for source in ("fresh", "residual", "reward", "topology")
+                        for _ in range(quota[source])
+                    ]
+                    replay_mix_rng.shuffle(requested_sources)
+                    requested_context_ids = sampler.sample(batch_size)
+                    fresh_context_ids = []
+                    selected_replay_entries = []
+                    selected_replay_sources = []
+                    for source, context_id in zip(
+                        requested_sources,
+                        requested_context_ids,
+                    ):
+                        replay_requested_counts[source] += 1
+                        entry = None
+                        if source != "fresh":
+                            entry = replay_buffer.sample(
+                                source,
+                                context_id,
+                                excluded_ids=replay_excluded_entry_ids,
+                            )
+                        if entry is None:
+                            fresh_context_ids.append(context_id)
+                            replay_actual_counts["fresh"] += 1
+                            if source != "fresh":
+                                replay_fallback_fresh_count += 1
+                            continue
+                        selected_replay_entries.append(entry)
+                        selected_replay_sources.append(source)
+                        replay_actual_counts[source] += 1
+                        replay_excluded_entry_ids.add(entry.entry_id)
+
+                    fresh_outputs = None
+                    if fresh_context_ids:
+                        fresh_outputs, _trajectories = worker.rollout(
+                            generator,
+                            episodes=len(fresh_context_ids),
+                            start_states=[
+                                initial_states[context_id]
+                                for context_id in fresh_context_ids
+                            ],
+                            max_steps=complete_trajectory_max_steps,
+                        )
+                    replay_outputs = None
+                    if selected_replay_entries:
+                        replay_outputs = reconstruct_and_rescore_entries(
+                            local_env,
+                            generator,
+                            selected_replay_entries,
+                        )
+                    outputs = merge_rollout_outputs(
+                        fresh_outputs,
+                        replay_outputs,
+                    )
+                    row_sources = (
+                        ["fresh"] * len(fresh_context_ids)
+                        + list(selected_replay_sources)
+                    )
+                    row_replay_entries = (
+                        [None] * len(fresh_context_ids)
+                        + list(selected_replay_entries)
+                    )
+                    sampled_context_ids.extend(
+                        list(fresh_context_ids)
+                        + [entry.context_id for entry in selected_replay_entries]
+                    )
                 if not bool(outputs["terminal_mask"].all().detach().cpu().item()):
                     raise RuntimeError(
                         "complete trajectory hit complete_trajectory_max_steps "
@@ -638,6 +745,37 @@ def train_local_refinement(
                     outputs,
                     factor=grad_accum_steps,
                 )
+                if replay_buffer is not None:
+                    priorities = max_abs_subtb_residuals(
+                        generator._last_balance_details,
+                        len(row_sources),
+                    )
+                    for row_index, (source, entry) in enumerate(
+                        zip(row_sources, row_replay_entries)
+                    ):
+                        terminal_state = outputs["trajectory_states"][row_index][-1]
+                        if source == "fresh":
+                            added_entry, _status = replay_buffer.add(
+                                terminal_state.local_context_id,
+                                outputs["trajectory_actions"][row_index],
+                                terminal_state,
+                                priorities[row_index],
+                                epoch,
+                            )
+                            if added_entry is not None:
+                                replay_excluded_entry_ids.add(added_entry.entry_id)
+                        else:
+                            replay_selected_residual_sum += priorities[row_index]
+                            replay_selected_reward_sum += float(
+                                terminal_state.log_reward
+                            )
+                            replay_selected_count += 1
+                            replay_buffer.update_priority(
+                                entry,
+                                priorities[row_index],
+                                terminal_state.log_reward,
+                                epoch,
+                            )
                 rollout_metrics.append(_rollout_metrics(rollout_mode, outputs))
 
             if terminal_trajectory_count < min_terminal_trajectories_per_batch:
@@ -650,6 +788,30 @@ def train_local_refinement(
             info["epoch"] = int(epoch)
             info["sampled_context_ids"] = list(sampled_context_ids)
             info.update(_merge_rollout_metrics(rollout_metrics))
+            if replay_buffer is not None:
+                effective_count = max(batch_size * grad_accum_steps, 1)
+                for source in ("fresh", "residual", "reward", "topology"):
+                    requested = int(replay_requested_counts[source])
+                    actual = int(replay_actual_counts[source])
+                    info[f"replay/requested/{source}_count"] = requested
+                    info[f"replay/requested/{source}_fraction"] = (
+                        requested / effective_count
+                    )
+                    info[f"replay/actual/{source}_count"] = actual
+                    info[f"replay/actual/{source}_fraction"] = (
+                        actual / effective_count
+                    )
+                info["replay/fallback_fresh_count"] = int(
+                    replay_fallback_fresh_count
+                )
+                info["replay/selected_count"] = int(replay_selected_count)
+                info["replay/selected_residual_priority_mean"] = (
+                    replay_selected_residual_sum / max(replay_selected_count, 1)
+                )
+                info["replay/selected_log_reward_mean"] = (
+                    replay_selected_reward_sum / max(replay_selected_count, 1)
+                )
+                info.update(replay_buffer.metrics(epoch))
             if flow_debug and generator.last_transition_decomposition:
                 decomposition_path = os.path.join(
                     output_path,

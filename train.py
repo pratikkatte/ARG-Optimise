@@ -39,6 +39,10 @@ try:
         DEFAULT_LOCAL_CWR_EVENT_GATE_CONFIG,
         normalize_local_cwr_event_gate_config,
     )
+    from .hybrid_replay_config import (
+        DEFAULT_HYBRID_REPLAY_CONFIG,
+        normalize_hybrid_replay_config,
+    )
     from .utils import (
         VCF_PARSER_VERSION,
         is_vcf_path,
@@ -67,6 +71,10 @@ except ImportError:  # Support the repository's script-style entry points.
     from cwr_event_gate import (
         DEFAULT_LOCAL_CWR_EVENT_GATE_CONFIG,
         normalize_local_cwr_event_gate_config,
+    )
+    from hybrid_replay_config import (
+        DEFAULT_HYBRID_REPLAY_CONFIG,
+        normalize_hybrid_replay_config,
     )
     from utils import (
         VCF_PARSER_VERSION,
@@ -175,6 +183,7 @@ DEFAULT_CONFIG = {
         "selection_margin": 1e-6,
         "min_valid_splice_rate": 0.90,
         "min_unique_topology_rate": 0.25,
+        "hybrid_replay": copy.deepcopy(DEFAULT_HYBRID_REPLAY_CONFIG),
     },
     "environment": {
         "bp_per_blocks": 1,
@@ -691,6 +700,13 @@ def validate_train_config(config):
         training.get("complete_trajectory_max_steps"),
         "training.complete_trajectory_max_steps",
     )
+    training["hybrid_replay"] = normalize_hybrid_replay_config(
+        training.get("hybrid_replay")
+    )
+    if training["hybrid_replay"]["enabled"] and not refinement_enabled(config):
+        raise ValueError(
+            "training.hybrid_replay can be enabled only for local refinement"
+        )
     for field_name, default in (
         ("selection_margin", 1e-6),
         ("min_valid_splice_rate", 0.90),
@@ -903,6 +919,7 @@ def config_to_train_kwargs(config):
         "partial_boundary_fraction": training["partial_boundary_fraction"],
         "trajectory_training_mode": training["trajectory_training_mode"],
         "complete_trajectory_max_steps": training["complete_trajectory_max_steps"],
+        "hybrid_replay_config": copy.deepcopy(training["hybrid_replay"]),
         "selection_margin": training["selection_margin"],
         "min_valid_splice_rate": training["min_valid_splice_rate"],
         "min_unique_topology_rate": training["min_unique_topology_rate"],
@@ -1443,6 +1460,7 @@ def train(
     partial_boundary_fraction=DEFAULT_PARTIAL_BOUNDARY_FRACTION,
     trajectory_training_mode="complete",
     complete_trajectory_max_steps=None,
+    hybrid_replay_config=None,
     selection_margin=1e-6,
     min_valid_splice_rate=0.90,
     min_unique_topology_rate=0.25,
