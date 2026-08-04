@@ -44,6 +44,16 @@ from .vcf_likelihood import (
     compute_tree_sequence_vcf_log_likelihood,
     resolve_vcf_tree_sequence_alignment,
 )
+from .evaluation import (
+    DEFAULT_SELECTION_MARGIN,
+    LocalARGComparison,
+    LocalARGScore,
+    SourceScoreUnavailable,
+    compare_scores,
+    replay_source_score,
+    score_terminal_state,
+    select_best_candidate_record,
+)
 try:
     from ..env import (
         ARGLineage,
@@ -162,4 +172,12 @@ __all__ = [
     "undo_local_transition",
     "export_refined_tree_sequence",
     "validate_local_splice",
+    "DEFAULT_SELECTION_MARGIN",
+    "LocalARGComparison",
+    "LocalARGScore",
+    "SourceScoreUnavailable",
+    "compare_scores",
+    "replay_source_score",
+    "score_terminal_state",
+    "select_best_candidate_record",
 ]

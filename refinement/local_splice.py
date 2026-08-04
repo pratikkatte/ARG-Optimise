@@ -84,7 +84,6 @@ def splice_local_proposal(
     tables = source_synthetic.dump_tables()
     _replace_authorized_edges(tables, proposal)
     temporary_to_spliced = _append_local_proposal(tables, proposal)
-    tables.sort()
 
     original_num_nodes = int(
         prepared.synthetic_conversion.metadata["original_num_nodes"]
@@ -100,6 +99,10 @@ def splice_local_proposal(
     old_to_clean = _collapse_nodes(
         tables,
         source_synthetic_nodes,
+        source_node_times=np.asarray(
+            prepared.source_tree_sequence.tables.nodes.time,
+            dtype=np.float64,
+        ),
     )
     local_node_id_map = {
         int(temporary_node_id): int(old_to_clean[spliced_node_id])
@@ -284,14 +287,22 @@ def _append_local_proposal(
 def _collapse_nodes(
     tables: tskit.TableCollection,
     node_ids: Iterable[int],
+    *,
+    source_node_times: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Eliminate routing nodes by interval-aware path composition."""
+    """Eliminate routing nodes by interval-aware path composition.
+
+    Synthetic conversion can perturb original node times to make its internal
+    event schedule globally unique.  Local proposals, however, are bounded by
+    the original biological times that will be restored in the exported tree
+    sequence.  Keep the synthetic clock while composing routing paths, then
+    restore source times before ``TableCollection.subset`` performs its
+    implicit strict sort.
+    """
 
     remove = {int(value) for value in node_ids}
     num_nodes = int(tables.nodes.num_rows)
-    if not remove:
-        return np.arange(num_nodes, dtype=np.int32)
-    if min(remove) < 0 or max(remove) >= num_nodes:
+    if remove and (min(remove) < 0 or max(remove) >= num_nodes):
         raise ValueError("routing node removal set contains an invalid node ID")
     mutation_nodes = set(int(value) for value in tables.mutations.node)
     migration_nodes = set(int(value) for value in tables.migrations.node)
@@ -302,63 +313,71 @@ def _collapse_nodes(
             f"{sorted(referenced)[:10]}"
         )
 
-    edges = [
-        (
-            float(edge.left),
-            float(edge.right),
-            int(edge.parent),
-            int(edge.child),
-        )
-        for edge in tables.edges
-    ]
-    outgoing: dict[int, list[tuple[float, float, int]]] = {}
-    for left, right, parent, child in edges:
-        outgoing.setdefault(parent, []).append((left, right, child))
+    if remove:
+        edges = [
+            (
+                float(edge.left),
+                float(edge.right),
+                int(edge.parent),
+                int(edge.child),
+            )
+            for edge in tables.edges
+        ]
+        outgoing: dict[int, list[tuple[float, float, int]]] = {}
+        for left, right, parent, child in edges:
+            outgoing.setdefault(parent, []).append((left, right, child))
 
-    composed: list[tuple[float, float, int, int]] = []
+        composed: list[tuple[float, float, int, int]] = []
 
-    def descend(
-        fixed_parent: int,
-        left: float,
-        right: float,
-        child: int,
-        path: frozenset[int],
-    ) -> None:
-        if child not in remove:
-            if fixed_parent != child and left < right:
-                composed.append((left, right, fixed_parent, child))
-            return
-        if child in path:
-            raise ValueError("synthetic routing graph contains a cycle")
-        next_path = path | {child}
-        for edge_left, edge_right, grandchild in outgoing.get(child, ()):
-            overlap_left = max(left, edge_left)
-            overlap_right = min(right, edge_right)
-            if overlap_left < overlap_right:
-                descend(
-                    fixed_parent,
-                    overlap_left,
-                    overlap_right,
-                    grandchild,
-                    next_path,
-                )
+        def descend(
+            fixed_parent: int,
+            left: float,
+            right: float,
+            child: int,
+            path: frozenset[int],
+        ) -> None:
+            if child not in remove:
+                if fixed_parent != child and left < right:
+                    composed.append((left, right, fixed_parent, child))
+                return
+            if child in path:
+                raise ValueError("synthetic routing graph contains a cycle")
+            next_path = path | {child}
+            for edge_left, edge_right, grandchild in outgoing.get(child, ()):
+                overlap_left = max(left, edge_left)
+                overlap_right = min(right, edge_right)
+                if overlap_left < overlap_right:
+                    descend(
+                        fixed_parent,
+                        overlap_left,
+                        overlap_right,
+                        grandchild,
+                        next_path,
+                    )
 
-    for left, right, parent, child in edges:
-        if parent in remove:
-            continue
-        descend(parent, left, right, child, frozenset())
+        for left, right, parent, child in edges:
+            if parent in remove:
+                continue
+            descend(parent, left, right, child, frozenset())
 
-    merged = _merge_edge_intervals(composed)
-    tables.edges.clear()
-    empty_metadata = tables.edges.metadata_schema.empty_value
-    for left, right, parent, child in merged:
-        tables.edges.add_row(
-            left=left,
-            right=right,
-            parent=parent,
-            child=child,
-            metadata=empty_metadata,
-        )
+        merged = _merge_edge_intervals(composed)
+        tables.edges.clear()
+        empty_metadata = tables.edges.metadata_schema.empty_value
+        for left, right, parent, child in merged:
+            tables.edges.add_row(
+                left=left,
+                right=right,
+                parent=parent,
+                child=child,
+                metadata=empty_metadata,
+            )
+
+    if source_node_times is not None:
+        _restore_source_node_times(tables, source_node_times)
+        _validate_strict_edge_times(tables)
+
+    if not remove:
+        return np.arange(num_nodes, dtype=np.int32)
 
     keep_nodes = np.asarray(
         [node_id for node_id in range(num_nodes) if node_id not in remove],
@@ -397,6 +416,46 @@ def _collapse_nodes(
             metadata=metadata,
         )
     return old_to_new
+
+
+def _restore_source_node_times(
+    tables: tskit.TableCollection,
+    source_node_times: np.ndarray,
+) -> None:
+    source_node_times = np.asarray(source_node_times, dtype=np.float64)
+    if source_node_times.ndim != 1:
+        raise ValueError("source node times must be one-dimensional")
+    if source_node_times.size > int(tables.nodes.num_rows):
+        raise ValueError("source node times exceed the splice node table")
+    node_times = np.asarray(tables.nodes.time, dtype=np.float64).copy()
+    node_times[: source_node_times.size] = source_node_times
+    nodes = tables.nodes
+    nodes.set_columns(
+        flags=nodes.flags,
+        time=node_times,
+        population=nodes.population,
+        individual=nodes.individual,
+        metadata=nodes.metadata,
+        metadata_offset=nodes.metadata_offset,
+    )
+
+
+def _validate_strict_edge_times(tables: tskit.TableCollection) -> None:
+    node_times = np.asarray(tables.nodes.time, dtype=np.float64)
+    edge_parents = np.asarray(tables.edges.parent, dtype=np.int32)
+    edge_children = np.asarray(tables.edges.child, dtype=np.int32)
+    invalid = np.flatnonzero(
+        node_times[edge_parents] <= node_times[edge_children]
+    )
+    if invalid.size:
+        edge_id = int(invalid[0])
+        edge = tables.edges[edge_id]
+        raise ValueError(
+            "collapsed local splice violates parent.time > child.time: "
+            f"edge={edge_id} interval=[{edge.left}, {edge.right}) "
+            f"parent={edge.parent} time={node_times[int(edge.parent)]} "
+            f"child={edge.child} time={node_times[int(edge.child)]}"
+        )
 
 
 def _merge_edge_intervals(

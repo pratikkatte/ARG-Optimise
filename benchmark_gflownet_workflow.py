@@ -38,6 +38,7 @@ from refinement.training import (
     _rollout_metrics,
     evaluate_local_refinement,
 )
+from refinement import replay_source_score
 from infer import run_inference
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
@@ -329,6 +330,14 @@ def main() -> None:
     rollout_index = 0
     best_loss = float("inf")
     best_metric_name = None
+    best_selection_rank = None
+    best_selection_eligible = False
+    source_scores = {}
+    for context_id in local_env.context_ids:
+        try:
+            source_scores[context_id] = replay_source_score(local_env, context_id)
+        except Exception:
+            pass
     checkpoint_path = output_dir / "checkpoints" / "best.pt"
     last_checkpoint_path = output_dir / "checkpoints" / "last.pt"
     checkpoint_records: list[dict[str, Any]] = []
@@ -381,37 +390,55 @@ def main() -> None:
                         generator,
                         initial_states,
                         episodes=int(train_kwargs["eval_episodes"]),
-                        seed=seed + 100000 + epoch,
+                        seed=seed + 100000,
                         partial_segment_max_steps=int(
                             train_kwargs["partial_segment_max_steps"]
                         ),
+                        source_scores=source_scores,
+                        selection_margin=float(train_kwargs["selection_margin"]),
                     )
                 )
             history.append(info)
             if wandb_run is not None:
                 wandb.log(_json_safe(info), step=epoch + 1)
-            selection_metric_name = (
-                "eval_local_loss_mean"
-                if "eval_local_loss_mean" in info
-                else (
-                    "loss"
-                    if int(train_kwargs["eval_episodes"]) <= 0
-                    else None
+            eligible = bool(
+                info.get("eval_comparable_count", 0) > 0
+                and info.get("eval_valid_splice_rate", 0.0)
+                >= float(train_kwargs["min_valid_splice_rate"])
+                and info.get("eval_unique_topology_rate", 0.0)
+                >= float(train_kwargs["min_unique_topology_rate"])
+            )
+            if "eval_local_loss_mean" in info:
+                selection_rank = (
+                    (
+                        float(info.get("eval_posterior_improvement_rate", 0.0)),
+                        float(info.get("eval_posterior_delta_median", -math.inf)),
+                        float(info.get("eval_unique_topology_rate", 0.0)),
+                        -float(info["eval_local_loss_mean"]),
+                    )
+                    if eligible else
+                    (
+                        float(info.get("eval_valid_splice_rate", 0.0)),
+                        float(info.get("eval_unique_topology_rate", 0.0)),
+                        float(info.get("eval_posterior_improvement_rate", 0.0)),
+                        -float(info["eval_local_loss_mean"]),
+                    )
                 )
-            )
-            selection_value = (
-                None
-                if selection_metric_name is None
-                else float(info[selection_metric_name])
-            )
+                selection_metric_name = "balanced_local_evaluation"
+            else:
+                selection_rank = (-float(info["loss"]),)
+                selection_metric_name = "loss"
             is_best = (
-                selection_value is not None
-                and math.isfinite(selection_value)
-                and selection_value < best_loss
+                (eligible and not best_selection_eligible)
+                or (eligible == best_selection_eligible and (
+                    best_selection_rank is None or selection_rank > best_selection_rank
+                ))
             )
             if is_best:
-                best_loss = selection_value
+                best_loss = float(info.get("eval_local_loss_mean", info["loss"]))
                 best_metric_name = selection_metric_name
+                best_selection_rank = selection_rank
+                best_selection_eligible = eligible
                 _save_workflow_checkpoint(
                     generator,
                     checkpoint_path,

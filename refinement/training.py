@@ -43,6 +43,7 @@ except ImportError:  # Support the repository's script-style entry points.
     )
 
 from .local_refinement import LocalRefinementRequest, prepare_local_refinement
+from .evaluation import compare_scores, replay_source_score, score_terminal_state
 
 
 LOCAL_MODEL_VERSION = "local-arg-gflownet-continuous-time-v2"
@@ -187,6 +188,9 @@ def train_local_refinement(
     local_prior_gate_logit_bias=0.0,
     verbose=True,
     terminal_requires_exhausted_fixed_schedule=False,
+    selection_margin=1e-6,
+    min_valid_splice_rate=0.90,
+    min_unique_topology_rate=0.25,
 ):
     """Train one conditional local policy across explicit interval/time contexts."""
 
@@ -387,6 +391,15 @@ def train_local_refinement(
     history = []
     best_loss = float("inf")
     best_metric_name = None
+    best_selection_rank = None
+    best_selection_eligible = False
+    source_scores = {}
+    source_score_diagnostics = {}
+    for context_id in local_env.context_ids:
+        try:
+            source_scores[context_id] = replay_source_score(local_env, context_id)
+        except Exception as error:
+            source_score_diagnostics[context_id] = str(error)
     wandb_run = None
     if use_wandb:
         if wandb is None:
@@ -481,10 +494,12 @@ def train_local_refinement(
                         generator,
                         initial_states,
                         episodes=int(eval_episodes),
-                        seed=int(seed) + 100000 + epoch,
+                        seed=int(seed) + 100000,
                         partial_segment_max_steps=int(
                             partial_segment_max_steps
                         ),
+                        source_scores=source_scores,
+                        selection_margin=float(selection_margin),
                     )
                 )
 
@@ -492,24 +507,46 @@ def train_local_refinement(
             if wandb_run is not None:
                 wandb.log(_json_safe(info), step=epoch + 1)
             loss = float(info["loss"])
-            selection_metric_name = (
-                "eval_local_loss_mean"
-                if "eval_local_loss_mean" in info
-                else ("loss" if int(eval_episodes) <= 0 else None)
+            eligible = bool(
+                info.get("eval_comparable_count", 0) > 0
+                and info.get("eval_valid_splice_rate", 0.0)
+                >= float(min_valid_splice_rate)
+                and info.get("eval_unique_topology_rate", 0.0)
+                >= float(min_unique_topology_rate)
             )
-            selection_value = (
-                None
-                if selection_metric_name is None
-                else float(info[selection_metric_name])
-            )
-            is_best = (
-                selection_value is not None
-                and math.isfinite(selection_value)
-                and selection_value < best_loss
-            )
+            if "eval_local_loss_mean" in info:
+                if eligible:
+                    selection_rank = (
+                        float(info.get("eval_posterior_improvement_rate", 0.0)),
+                        float(info.get("eval_posterior_delta_median", -math.inf)),
+                        float(info.get("eval_unique_topology_rate", 0.0)),
+                        -float(info["eval_local_loss_mean"]),
+                    )
+                else:
+                    selection_rank = (
+                        float(info.get("eval_valid_splice_rate", 0.0)),
+                        float(info.get("eval_unique_topology_rate", 0.0)),
+                        float(info.get("eval_posterior_improvement_rate", 0.0)),
+                        -float(info["eval_local_loss_mean"]),
+                    )
+                is_best = (
+                    (eligible and not best_selection_eligible)
+                    or (eligible == best_selection_eligible and (
+                        best_selection_rank is None or selection_rank > best_selection_rank
+                    ))
+                )
+                selection_metric_name = "balanced_local_evaluation"
+                selection_value = selection_rank
+            else:
+                selection_rank = (-loss,)
+                is_best = best_selection_rank is None or selection_rank > best_selection_rank
+                selection_metric_name = "loss"
+                selection_value = selection_rank
             if is_best:
-                best_loss = selection_value
+                best_loss = float(info.get("eval_local_loss_mean", loss))
                 best_metric_name = selection_metric_name
+                best_selection_rank = selection_rank
+                best_selection_eligible = eligible
 
             checkpoint_metadata = {
                 **metadata_base,
@@ -520,8 +557,13 @@ def train_local_refinement(
                 ),
                 "selection_metric": best_metric_name,
                 "selection_value": (
-                    None if not math.isfinite(best_loss) else float(best_loss)
+                    None if best_selection_rank is None else list(best_selection_rank)
                 ),
+                "selection_eligible": bool(best_selection_eligible),
+                "selection_margin": float(selection_margin),
+                "min_valid_splice_rate": float(min_valid_splice_rate),
+                "min_unique_topology_rate": float(min_unique_topology_rate),
+                "source_score_diagnostics": dict(source_score_diagnostics),
                 "log_f_start_mean": float(info["log_f_start_mean"]),
             }
             training_state = {
@@ -575,6 +617,8 @@ def evaluate_local_refinement(
     episodes,
     seed,
     partial_segment_max_steps=16,
+    source_scores=None,
+    selection_margin=1e-6,
 ):
     if int(episodes) <= 0:
         return {}
@@ -592,6 +636,7 @@ def evaluate_local_refinement(
     was_training = generator.training
     sampler = random.Random(int(seed))
     rows = []
+    source_scores = {} if source_scores is None else dict(source_scores)
     try:
         generator.eval()
         _seed_everything(int(seed))
@@ -615,8 +660,7 @@ def evaluate_local_refinement(
                 loss = generator.compute_subtb_loss_from_rollout_outputs(
                     outputs
                 )
-                rows.append(
-                    {
+                row = {
                         "mode": mode,
                         "loss": float(loss.detach().cpu().item()),
                         "length": int(
@@ -644,7 +688,23 @@ def evaluate_local_refinement(
                             None,
                         ),
                     }
-                )
+                if mode == "terminal" and row["terminal"]:
+                    state = outputs["trajectory_states"][0][-1]
+                    try:
+                        candidate_score = score_terminal_state(worker.env, state)
+                        row["candidate_score"] = candidate_score
+                        row["splice_valid"] = bool(candidate_score.splice_valid)
+                        source_score = source_scores.get(context_id)
+                        if source_score is not None:
+                            row["comparison"] = compare_scores(
+                                source_score,
+                                candidate_score,
+                                margin=float(selection_margin),
+                            )
+                    except Exception as error:
+                        row["scoring_error"] = str(error)
+                        row["splice_valid"] = False
+                rows.append(row)
         result = {
             "eval_local_loss_mean": float(
                 np.mean([row["loss"] for row in rows])
@@ -656,6 +716,40 @@ def evaluate_local_refinement(
                 np.mean([row["terminal"] for row in rows])
             ),
         }
+        terminal_rows = [row for row in rows if row["mode"] == "terminal"]
+        valid_rows = [row for row in terminal_rows if row.get("splice_valid")]
+        comparable = [row["comparison"] for row in valid_rows if row.get("comparison")]
+        digests = {
+            row["candidate_score"].topology_digest
+            for row in valid_rows if row.get("candidate_score") is not None
+        }
+        deltas = [float(item.posterior_delta) for item in comparable]
+        result.update({
+            "eval_valid_splice_rate": (
+                float(len(valid_rows) / len(terminal_rows)) if terminal_rows else 0.0
+            ),
+            "eval_unique_topology_count": int(len(digests)),
+            "eval_unique_topology_rate": (
+                float(len(digests) / len(valid_rows)) if valid_rows else 0.0
+            ),
+            "eval_comparable_count": int(len(comparable)),
+            "eval_source_score_failure_count": int(
+                sum(1 for row in valid_rows if row.get("comparison") is None)
+            ),
+            "eval_posterior_improvement_rate": (
+                float(np.mean([item.improves for item in comparable]))
+                if comparable else 0.0
+            ),
+            "eval_posterior_delta_mean": float(np.mean(deltas)) if deltas else float("nan"),
+            "eval_posterior_delta_median": float(np.median(deltas)) if deltas else float("nan"),
+            "eval_posterior_delta_min": float(np.min(deltas)) if deltas else float("nan"),
+            "eval_posterior_delta_max": float(np.max(deltas)) if deltas else float("nan"),
+        })
+        for component in ("likelihood_delta", "prior_delta"):
+            values = [float(getattr(item, component)) for item in comparable]
+            result[f"eval_{component}_mean"] = (
+                float(np.mean(values)) if values else float("nan")
+            )
         for mode in ("partial", "terminal"):
             selected = [row for row in rows if row["mode"] == mode]
             if not selected:
