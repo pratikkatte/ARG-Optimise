@@ -33,3 +33,16 @@ training:
   eval_episodes: 64
   eval_every: 20
   partial_segment_max_steps: 16
+
+model:
+  local_cwr_event_gate:
+    enabled: false
+    max_abs_residual: 2.0
+
+  recombination_split_bias:
+    enabled: false
+    score_mode: partial_compatibility_v1
+    lineage_weight: 0.25
+    breakpoint_weight: 0.25
+    aggregation_temperature: 1.0
+    fragmentation_penalty: 0.10

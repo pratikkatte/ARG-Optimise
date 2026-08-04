@@ -1,12 +1,14 @@
 import math
 import os
 import tempfile
+import hashlib
 
 import numpy as np
 import torch
 
 try:
     from .models import ARGModel
+    from .lr_control import LearningRateController
     from .env import (
         CoalescenceChoice,
         FixedAttachmentChoice,
@@ -14,6 +16,7 @@ try:
     )
 except ImportError:  # Support the repository's script-style entry points.
     from models import ARGModel
+    from lr_control import LearningRateController
     from env import (
         CoalescenceChoice,
         FixedAttachmentChoice,
@@ -41,12 +44,28 @@ class TBGFlowNetGenerator(torch.nn.Module):
         grad_clip=10.0,
         model_kwargs=None,
         policy_lr=None,
+        breakpoint_policy_lr=None,
         time_policy_lr=None,
         log_z_lr=None,
         initialize_z_from_prior=True,
         loss_mode="tb",
         subtb_lambda=0.9,
         subtb_max_span=None,
+        terminal_loss_weight=1.0,
+        residual_scale=1.0,
+        subtb_lambda_initial=None,
+        subtb_lambda_final=None,
+        subtb_max_span_schedule=None,
+        breakpoint_gradient_clip_norm=None,
+        time_head_gradient_clip_norm=None,
+        time_head_warmup_epochs=0,
+        model_diagnostics=True,
+        model_diagnostics_update_norm_every=1,
+        flow_debug=False,
+        flow_debug_max_records=16,
+        probability_checks=False,
+        lr_scheduler_config=None,
+        total_training_steps=None,
     ):
         super().__init__()
         print(f"verbose: {verbose}")
@@ -85,11 +104,20 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if log_z_lr is not None:
             z_lr = log_z_lr
         self.arg_model_lr = float(arg_model_lr)
-        self.time_policy_lr = (
-            None if time_policy_lr is None else float(time_policy_lr)
+        self.breakpoint_policy_lr = (
+            self.arg_model_lr
+            if breakpoint_policy_lr is None
+            else float(breakpoint_policy_lr)
         )
-        if self.time_policy_lr is not None and self.time_policy_lr <= 0.0:
-            raise ValueError("time_policy_lr must be positive when provided")
+        if self.breakpoint_policy_lr <= 0.0:
+            raise ValueError("breakpoint_policy_lr must be positive")
+        self.time_policy_lr = (
+            self.arg_model_lr
+            if time_policy_lr is None
+            else float(time_policy_lr)
+        )
+        if self.time_policy_lr <= 0.0:
+            raise ValueError("time_policy_lr must be positive")
         self.z_lr = float(z_lr)
         self.loss_mode = str(loss_mode).lower()
         if self.loss_mode not in LOSS_MODES:
@@ -104,6 +132,78 @@ class TBGFlowNetGenerator(torch.nn.Module):
             raise ValueError(
                 f"subtb_max_span must be positive when provided, got {subtb_max_span!r}"
             )
+        self.terminal_loss_weight = float(terminal_loss_weight)
+        if not math.isfinite(self.terminal_loss_weight) or self.terminal_loss_weight < 0.0:
+            raise ValueError("terminal_loss_weight must be finite and nonnegative")
+        self.residual_scale = float(residual_scale)
+        if not math.isfinite(self.residual_scale) or self.residual_scale <= 0.0:
+            raise ValueError("residual_scale must be finite and positive")
+        self.subtb_lambda_initial = (
+            None if subtb_lambda_initial is None else float(subtb_lambda_initial)
+        )
+        self.subtb_lambda_final = (
+            None if subtb_lambda_final is None else float(subtb_lambda_final)
+        )
+        if (self.subtb_lambda_initial is None) != (self.subtb_lambda_final is None):
+            raise ValueError(
+                "subtb_lambda_initial and subtb_lambda_final must be provided together"
+            )
+        if self.subtb_lambda_initial is not None and (
+            self.subtb_lambda_initial <= 0.0 or self.subtb_lambda_final <= 0.0
+        ):
+            raise ValueError("SubTB curriculum lambdas must be positive")
+        self.subtb_max_span_schedule = self._normalize_span_schedule(
+            subtb_max_span_schedule
+        )
+        self.active_subtb_lambda = self.subtb_lambda
+        self.active_subtb_max_span = self.subtb_max_span
+        self.breakpoint_gradient_clip_norm = (
+            None
+            if breakpoint_gradient_clip_norm is None
+            else float(breakpoint_gradient_clip_norm)
+        )
+        if (
+            self.breakpoint_gradient_clip_norm is not None
+            and (
+                not math.isfinite(self.breakpoint_gradient_clip_norm)
+                or self.breakpoint_gradient_clip_norm <= 0.0
+            )
+        ):
+            raise ValueError(
+                "breakpoint_gradient_clip_norm must be finite and positive"
+            )
+        self.time_head_gradient_clip_norm = (
+            None
+            if time_head_gradient_clip_norm is None
+            else float(time_head_gradient_clip_norm)
+        )
+        if (
+            self.time_head_gradient_clip_norm is not None
+            and (
+                not math.isfinite(self.time_head_gradient_clip_norm)
+                or self.time_head_gradient_clip_norm <= 0.0
+            )
+        ):
+            raise ValueError(
+                "time_head_gradient_clip_norm must be finite and positive"
+            )
+        self.time_head_warmup_epochs = int(time_head_warmup_epochs)
+        if self.time_head_warmup_epochs < 0:
+            raise ValueError("time_head_warmup_epochs must be nonnegative")
+        self.model_diagnostics = bool(model_diagnostics)
+        self.model_diagnostics_update_norm_every = int(
+            model_diagnostics_update_norm_every
+        )
+        if self.model_diagnostics_update_norm_every <= 0:
+            raise ValueError(
+                "model_diagnostics_update_norm_every must be positive"
+            )
+        self.current_epoch = 0
+        self.flow_debug = bool(flow_debug)
+        self.flow_debug_max_records = int(flow_debug_max_records)
+        if self.flow_debug_max_records < 0:
+            raise ValueError("flow_debug_max_records must be nonnegative")
+        self.probability_checks = bool(probability_checks)
         self.model_kwargs = dict(model_kwargs or {})
         self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
         self.time_model = self.arg_model.time_scorer
@@ -125,26 +225,48 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.arg_model_params = list(self.arg_model.parameters())
         self.policy_params = self.arg_model_params
 
-        if self.time_policy_lr is None:
-            params = [{'params': self.arg_model_params, 'lr': self.arg_model_lr}]
-        else:
-            time_parameter_ids = {
-                id(parameter) for parameter in self.time_model.parameters()
-            }
-            non_time_parameters = [
-                parameter
-                for parameter in self.arg_model_params
-                if id(parameter) not in time_parameter_ids
-            ]
-            params = [
-                {'params': non_time_parameters, 'lr': self.arg_model_lr},
-                {
-                    'params': list(self.time_model.parameters()),
-                    'lr': self.time_policy_lr,
-                },
-            ]
+        self.time_params = list(self.time_model.parameters())
+        self.breakpoint_params = list(self.breakpoint_model.parameters())
+        time_parameter_ids = {id(parameter) for parameter in self.time_params}
+        breakpoint_parameter_ids = {
+            id(parameter) for parameter in self.breakpoint_params
+        }
+        self.structural_policy_params = [
+            parameter
+            for parameter in self.arg_model_params
+            if id(parameter) not in time_parameter_ids
+            and id(parameter) not in breakpoint_parameter_ids
+        ]
+        # Retain the compatibility attribute, but give it the corrected
+        # structural-only meaning now that breakpoint parameters are separate.
+        self.non_time_policy_params = self.structural_policy_params
+        self.model_parameter_groups = {
+            "structural": self.structural_policy_params,
+            "breakpoint": self.breakpoint_params,
+            "time": self.time_params,
+        }
+        params = [
+            {
+                'params': self.structural_policy_params,
+                'lr': self.arg_model_lr,
+            },
+            {
+                'params': self.breakpoint_params,
+                'lr': self.breakpoint_policy_lr,
+            },
+            {
+                'params': self.time_params,
+                'lr': self.time_policy_lr,
+            },
+        ]
+        optimizer_group_names = [
+            "structural_policy",
+            "breakpoint_policy",
+            "time_policy",
+        ]
         if self.loss_mode == "tb":
             params.append({'params': [self._Z], 'lr': self.z_lr})
+            optimizer_group_names.append("log_z")
 
         # gradient clipping exclude the Z part
         self.gradient_clipping_params = list(self.arg_model.parameters())
@@ -158,6 +280,18 @@ class TBGFlowNetGenerator(torch.nn.Module):
         )
 
         self.scheduler = None
+        self.optimizer_steps = 0
+        if lr_scheduler_config is not None:
+            if total_training_steps is None:
+                raise ValueError(
+                    "total_training_steps is required when lr_scheduler_config is provided"
+                )
+            self.scheduler = LearningRateController(
+                self.opt,
+                group_names=optimizer_group_names,
+                total_training_steps=int(total_training_steps),
+                config=lr_scheduler_config,
+            )
 
         self.loss_fn = LOSS_FN['MSE']
 
@@ -180,6 +314,71 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.log_z_target_count = 0
         self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
         self.last_time_subtb_diagnostics = {}
+        self.last_balance_diagnostics = {}
+        self.last_transition_decomposition = []
+        self.last_forward_log_components = {}
+        self.last_forward_policy_diagnostics = []
+        self._last_balance_details = None
+        self._accumulated_balance_records = []
+        self._accumulated_internal_loss = 0.0
+        self._accumulated_terminal_loss = 0.0
+        self.set_training_epoch(0)
+
+    @staticmethod
+    def _normalize_span_schedule(schedule):
+        if schedule in (None, ()):
+            return ()
+        normalized = []
+        saw_open_end = False
+        for index, row in enumerate(schedule):
+            if not isinstance(row, dict):
+                raise ValueError("each subtb_max_span_schedule row must be a mapping")
+            until = row.get("until_epoch")
+            if until is not None:
+                until = int(until)
+                if until <= 0:
+                    raise ValueError("schedule until_epoch values must be positive")
+                if saw_open_end:
+                    raise ValueError("open-ended SubTB schedule row must be last")
+            else:
+                saw_open_end = True
+            value = int(row["value"])
+            if value <= 0:
+                raise ValueError("scheduled SubTB spans must be positive")
+            if normalized and until is not None:
+                previous = normalized[-1]["until_epoch"]
+                if previous is None or until <= previous:
+                    raise ValueError("schedule until_epoch values must increase")
+            normalized.append({"until_epoch": until, "value": value})
+        return tuple(normalized)
+
+    def set_training_epoch(self, epoch, total_epochs=None):
+        """Activate the configured SubTB curriculum and time-head warm-up."""
+
+        self.current_epoch = int(epoch)
+        if self.subtb_lambda_initial is None:
+            self.active_subtb_lambda = self.subtb_lambda
+        else:
+            denominator = max(int(total_epochs or 1) - 1, 1)
+            progress = min(max(self.current_epoch / denominator, 0.0), 1.0)
+            self.active_subtb_lambda = (
+                self.subtb_lambda_initial
+                + progress * (self.subtb_lambda_final - self.subtb_lambda_initial)
+            )
+        self.active_subtb_max_span = self.subtb_max_span
+        for row in self.subtb_max_span_schedule:
+            until = row["until_epoch"]
+            if until is None or self.current_epoch < int(until):
+                self.active_subtb_max_span = int(row["value"])
+                break
+        time_trainable = self.current_epoch >= self.time_head_warmup_epochs
+        for parameter in self.time_params:
+            parameter.requires_grad_(time_trainable)
+        return {
+            "subtb_active_lambda": float(self.active_subtb_lambda),
+            "subtb_active_max_span": self.active_subtb_max_span,
+            "time_head_warmup_active": not time_trainable,
+        }
 
 
     def _encode_states(self, states):
@@ -279,6 +478,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
             and "scheduler_state_dict" in checkpoint
         ):
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            self.optimizer_steps = int(self.scheduler.optimizer_steps)
         if load_optimizer and "scaler_state_dict" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
         return checkpoint.get("metadata", {})
@@ -304,6 +504,199 @@ class TBGFlowNetGenerator(torch.nn.Module):
     @staticmethod
     def _param_norm(params):
         return math.sqrt(sum(p.detach().norm().item() ** 2 for p in params))
+
+    @staticmethod
+    def _structural_action_diagnostics(logits, candidates, selected_index):
+        """Summarize the categorical policy over valid structural actions."""
+
+        with torch.no_grad():
+            valid_logits = logits[:len(candidates)]
+            log_probabilities = torch.log_softmax(valid_logits, dim=0)
+            probabilities = torch.exp(log_probabilities)
+            entropy = -(probabilities * log_probabilities).sum()
+            support_size = int(len(candidates))
+            normalized_entropy = (
+                entropy / math.log(support_size)
+                if support_size > 1
+                else entropy.new_tensor(0.0)
+            ).clamp(0.0, 1.0)
+            coal_indices = [
+                index
+                for index, candidate in enumerate(candidates)
+                if isinstance(candidate, CoalescenceChoice)
+            ]
+            recomb_indices = [
+                index
+                for index, candidate in enumerate(candidates)
+                if isinstance(candidate, RecombinationChoice)
+            ]
+            return {
+                "valid_coalescence_actions": len(coal_indices),
+                "valid_recombination_actions": len(recomb_indices),
+                "coalescence_probability_mass": float(
+                    probabilities[coal_indices].sum().detach().cpu().item()
+                ) if coal_indices else 0.0,
+                "recombination_probability_mass": float(
+                    probabilities[recomb_indices].sum().detach().cpu().item()
+                ) if recomb_indices else 0.0,
+                "structural_action_support_size": support_size,
+                "structural_action_entropy": float(
+                    entropy.detach().cpu().item()
+                ),
+                "structural_action_normalized_entropy": float(
+                    normalized_entropy.detach().cpu().item()
+                ),
+                "selected_atomic_action_probability": float(
+                    probabilities[int(selected_index)].detach().cpu().item()
+                ),
+                "structural_action_max_probability": float(
+                    probabilities.max().detach().cpu().item()
+                ),
+            }
+
+    @staticmethod
+    def _selected_split_diagnostics(
+        row,
+        record,
+        selected_index,
+        selected_action=None,
+    ):
+        output = {
+            key: value
+            for key, value in dict(row or {}).items()
+            if key != "recombination_split_atomic_adjustments"
+        }
+        adjustments = None if row is None else row.get(
+            "recombination_split_atomic_adjustments"
+        )
+        if adjustments is not None:
+            output["recombination_split_selected_atomic_logit_adjustment"] = float(
+                adjustments[int(selected_index)].detach().cpu().item()
+            )
+        if record is not None:
+            output["recombination_split_selected_lineage_score"] = float(
+                record.lineage_score.detach().cpu().item()
+            )
+        if bool(output.get("local_cwr_event_gate_enabled", False)):
+            if isinstance(selected_action, RecombinationChoice):
+                selected_event = "recombination"
+                selected_probability = output[
+                    "local_cwr_policy_recombination_probability"
+                ]
+            elif isinstance(selected_action, CoalescenceChoice):
+                selected_event = "coalescence"
+                selected_probability = output[
+                    "local_cwr_policy_coalescence_probability"
+                ]
+            else:
+                raise ValueError(
+                    "local CwR event diagnostics require a generated action"
+                )
+            output["local_cwr_selected_event"] = selected_event
+            output["local_cwr_selected_event_probability"] = float(
+                selected_probability
+            )
+        return output
+
+    @staticmethod
+    def _selected_breakpoint_split_diagnostics(record, breakpoint):
+        if record is None:
+            return {}
+        return {
+            "recombination_split_selected_breakpoint_score": float(
+                record.selected_score(int(breakpoint)).detach().cpu().item()
+            )
+        }
+
+    @staticmethod
+    def _model_group_health(name, params, stage):
+        params = list(params)
+        gradients = [
+            parameter.grad.detach()
+            for parameter in params
+            if parameter.grad is not None
+        ]
+        parameter_count = sum(parameter.numel() for parameter in params)
+        trainable_count = sum(
+            parameter.numel() for parameter in params if parameter.requires_grad
+        )
+        gradient_count = sum(gradient.numel() for gradient in gradients)
+        parameter_finite_count = sum(
+            int(torch.isfinite(parameter.detach()).sum().cpu().item())
+            for parameter in params
+        )
+        finite_count = sum(
+            int(torch.isfinite(gradient).sum().detach().cpu().item())
+            for gradient in gradients
+        )
+        zero_count = sum(
+            int((gradient == 0).sum().detach().cpu().item())
+            for gradient in gradients
+        )
+        parameter_norm = TBGFlowNetGenerator._param_norm(params)
+        gradient_norm = TBGFlowNetGenerator._grad_norm(params)
+        finite_rate = finite_count / max(gradient_count, 1)
+        zero_rate = zero_count / max(gradient_count, 1)
+        parameter_finite_rate = parameter_finite_count / max(parameter_count, 1)
+        prefix = f"models/{name}"
+        result = {
+            f"{prefix}/parameter_count": int(parameter_count),
+            f"{prefix}/trainable_parameter_count": int(trainable_count),
+            f"{prefix}/gradient_element_count": int(gradient_count),
+            f"{prefix}/gradient_present": bool(gradient_count),
+            f"{prefix}/gradient_finite_rate": float(finite_rate),
+            f"{prefix}/gradient_nonfinite_detected": bool(
+                gradient_count and finite_count != gradient_count
+            ),
+            f"{prefix}/gradient_zero_rate": float(zero_rate),
+            f"{prefix}/parameter_finite_rate": float(parameter_finite_rate),
+            f"{prefix}/parameter_nonfinite_detected": bool(
+                parameter_finite_count != parameter_count
+            ),
+            f"{prefix}/param_norm": float(parameter_norm),
+            f"{prefix}/grad_norm_{stage}": float(gradient_norm),
+        }
+        if stage == "before_clip":
+            result[f"{prefix}/grad_to_param_ratio"] = float(
+                gradient_norm / max(parameter_norm, 1e-12)
+            )
+        return result
+
+    def _snapshot_model_parameters(self):
+        return {
+            name: [parameter.detach().clone() for parameter in parameters]
+            for name, parameters in self.model_parameter_groups.items()
+        }
+
+    def _model_update_metrics(self, snapshots, parameter_norms):
+        result = {}
+        for name, parameters in self.model_parameter_groups.items():
+            before = snapshots[name]
+            squared_update = sum(
+                float(
+                    (parameter.detach() - old_value)
+                    .float()
+                    .square()
+                    .sum()
+                    .cpu()
+                    .item()
+                )
+                for parameter, old_value in zip(parameters, before)
+            )
+            update_norm = math.sqrt(squared_update)
+            parameter_norm = float(parameter_norms[name])
+            prefix = f"models/{name}"
+            result[f"{prefix}/update_norm"] = float(update_norm)
+            result[f"{prefix}/relative_update_norm"] = float(
+                update_norm / max(parameter_norm, 1e-12)
+            )
+            result[f"{prefix}/update_finite"] = bool(
+                math.isfinite(update_norm)
+            )
+            result[f"{prefix}/update_applied"] = bool(
+                math.isfinite(update_norm) and update_norm > 0.0
+            )
+        return result
 
     def grad_norm(self):
         return self._grad_norm(self.gradient_clipping_params)
@@ -477,9 +870,43 @@ class TBGFlowNetGenerator(torch.nn.Module):
         # input_dict = self._move_input_to_device(input_dict)
         ret = self.arg_model(all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec)
 
-        log_action_pf, selected_action_indices, choosen_actions, choosen_action_features = ret
+        (
+            log_action_pf,
+            selected_action_indices,
+            choosen_actions,
+            choosen_action_features,
+            chosen_split_records,
+        ) = ret
+        if self.probability_checks:
+            self._assert_masked_categorical_probabilities(
+                self.arg_model.last_action_probability_logits,
+                self.arg_model.last_action_valid_mask,
+                "global atomic action",
+            )
 
         log_p_breakpoints = []
+        policy_diagnostics = []
+        action_probability_logits = self.arg_model.last_action_probability_logits
+        for idx, candidates in enumerate(all_actions):
+            diagnostics = {
+                "selected_gate": "generated",
+                "selected_gate_probability": float(event_probs[idx]),
+            }
+            diagnostics.update(
+                self._structural_action_diagnostics(
+                    action_probability_logits[idx],
+                    candidates,
+                    selected_action_indices[idx],
+                )
+            )
+            diagnostics.update(
+                self._selected_split_diagnostics(
+                    self.arg_model.last_action_split_diagnostics[idx],
+                    chosen_split_records[idx],
+                    selected_action_indices[idx],
+                )
+            )
+            policy_diagnostics.append(diagnostics)
         for idx, chosen_action in enumerate(choosen_actions):
             if isinstance(chosen_action, RecombinationChoice):
                 lineage_idx = int(chosen_action.active_lineage_i)
@@ -494,9 +921,33 @@ class TBGFlowNetGenerator(torch.nn.Module):
                     int(self.env.num_blocks),
                     action_context=choosen_action_features[idx],
                     random_spec=random_spec,
+                    logit_bias=(
+                        None
+                        if chosen_split_records[idx] is None
+                        else chosen_split_records[idx].breakpoint_bias(
+                            self.arg_model.recombination_split_bias_config[
+                                "breakpoint_weight"
+                            ]
+                        )
+                    ),
                 )
                 choosen_actions[idx] = replace(chosen_action, breakpoint=breakpoint)
                 log_p_breakpoints.append(log_p_breakpoint)
+                policy_diagnostics[idx].update(
+                    dict(
+                        getattr(
+                            self.breakpoint_model,
+                            "last_sample_diagnostics",
+                            {},
+                        )
+                    )
+                )
+                policy_diagnostics[idx].update(
+                    self._selected_breakpoint_split_diagnostics(
+                        chosen_split_records[idx],
+                        breakpoint,
+                    )
+                )
             else:
                 log_p_breakpoints.append(torch.tensor(0.0, device=self.device))
 
@@ -559,23 +1010,25 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         total_log_pf = log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
 
+        self.last_forward_log_components = {
+            "gate": log_event_pf.detach(),
+            "atomic_action": log_action_pf.detach(),
+            "breakpoint": log_breakpoint_pf.detach(),
+            "time": log_time_pf.detach(),
+            "total": total_log_pf.detach(),
+        }
+        self.last_forward_policy_diagnostics = policy_diagnostics
+
         log_probs = torch.exp(total_log_pf)
         
         return total_log_pf, log_probs, choosen_actions
 
-    def _forward_local(self, input_dict):
-        states = input_dict["states"]
-        random_spec = input_dict.get("random_spec")
-        rollout = input_dict["rollout"]
-        all_actions = input_dict["input_actions"]
-
-        (
-            lineage_reps,
-            summary_reps,
-            lineage_seq_features,
-            batch_active_lineage_counts,
-        ) = self._encode_states(states)
-
+    def _local_gate_log_probabilities(
+        self,
+        summary_reps,
+        rollout,
+        random_spec=None,
+    ):
         gate_logits = self.arg_model.compute_local_gate_logits(summary_reps)
         prior_gate_weight = float(
             getattr(self.arg_model, "local_prior_gate_logit_bias", 0.0)
@@ -616,22 +1069,34 @@ class TBGFlowNetGenerator(torch.nn.Module):
             dtype=torch.bool,
             device=self.device,
         )
-        masked_gate_logits = gate_logits.masked_fill(
-            ~gate_mask,
-            float("-inf"),
-        )
-        sample_gate_logits = masked_gate_logits
+        if not bool(gate_mask.any(dim=1).all().detach().cpu().item()):
+            raise RuntimeError("local transition gate contains an all-invalid row")
+        probability_logits = gate_logits.masked_fill(~gate_mask, float("-inf"))
         if random_spec is not None and "T" in random_spec:
-            sample_gate_logits = (
-                sample_gate_logits / float(random_spec["T"])
-            )
-        gate_actions = torch.distributions.Categorical(
-            logits=sample_gate_logits
-        ).sample()
-        gate_log_probabilities = torch.log_softmax(
-            masked_gate_logits,
-            dim=1,
+            probability_logits = probability_logits / float(random_spec["T"])
+        return torch.log_softmax(probability_logits, dim=1), gate_mask
+
+    def _forward_local(self, input_dict):
+        states = input_dict["states"]
+        random_spec = input_dict.get("random_spec")
+        rollout = input_dict["rollout"]
+        all_actions = input_dict["input_actions"]
+
+        (
+            lineage_reps,
+            summary_reps,
+            lineage_seq_features,
+            batch_active_lineage_counts,
+        ) = self._encode_states(states)
+
+        gate_log_probabilities, gate_mask = self._local_gate_log_probabilities(
+            summary_reps,
+            rollout,
+            random_spec=random_spec,
         )
+        gate_actions = torch.distributions.Categorical(
+            logits=gate_log_probabilities
+        ).sample()
         batch_indices = torch.arange(
             len(states),
             dtype=torch.long,
@@ -647,6 +1112,33 @@ class TBGFlowNetGenerator(torch.nn.Module):
         component_action = torch.zeros_like(selected_gate_log_pf)
         component_breakpoint = torch.zeros_like(selected_gate_log_pf)
         component_time = torch.zeros_like(selected_gate_log_pf)
+        policy_diagnostics = [
+            {
+                "gate_generated_probability": float(
+                    torch.exp(gate_log_probabilities[index, 0]).detach().cpu().item()
+                )
+                if bool(gate_mask[index, 0])
+                else 0.0,
+                "gate_fixed_probability": float(
+                    torch.exp(gate_log_probabilities[index, 1]).detach().cpu().item()
+                )
+                if bool(gate_mask[index, 1])
+                else 0.0,
+                "selected_gate_probability": float(
+                    torch.exp(selected_gate_log_pf[index]).detach().cpu().item()
+                ),
+                "selected_gate": (
+                    "generated" if int(gate_actions[index].detach().cpu().item()) == 0
+                    else "fixed_attachment"
+                ),
+                "valid_coalescence_actions": 0,
+                "valid_recombination_actions": 0,
+                "coalescence_probability_mass": 0.0,
+                "recombination_probability_mass": 0.0,
+                "selected_atomic_action_probability": 1.0,
+            }
+            for index in range(len(states))
+        ]
         generated_indices = [
             index
             for index, gate_action in enumerate(
@@ -716,6 +1208,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 _selected_action_indices,
                 generated_chosen_actions,
                 generated_action_features,
+                generated_split_records,
             ) = self.arg_model(
                 generated_actions,
                 generated_lineage_reps,
@@ -723,7 +1216,38 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 generated_lineage_features,
                 generated_counts,
                 random_spec,
+                event_rates=[
+                    {
+                        "lambda_coal": rollout[index]["lambda_coal"],
+                        "lambda_recomb": rollout[index]["lambda_recomb"],
+                    }
+                    for index in generated_indices
+                ],
             )
+            probability_logits = self.arg_model.last_action_probability_logits
+            if self.probability_checks:
+                self._assert_masked_categorical_probabilities(
+                    probability_logits,
+                    self.arg_model.last_action_valid_mask,
+                    "local atomic action",
+                )
+            for local_index, candidates in enumerate(generated_actions):
+                state_index = generated_indices[local_index]
+                policy_diagnostics[state_index].update(
+                    self._structural_action_diagnostics(
+                        probability_logits[local_index],
+                        candidates,
+                        _selected_action_indices[local_index],
+                    )
+                )
+                policy_diagnostics[state_index].update(
+                    self._selected_split_diagnostics(
+                        self.arg_model.last_action_split_diagnostics[local_index],
+                        generated_split_records[local_index],
+                        _selected_action_indices[local_index],
+                        generated_chosen_actions[local_index],
+                    )
+                )
 
             log_breakpoint_pf = []
             for local_index, action in enumerate(
@@ -748,10 +1272,29 @@ class TBGFlowNetGenerator(torch.nn.Module):
                         ],
                         random_spec=random_spec,
                         state=state,
+                        logit_bias=self.arg_model.recombination_breakpoint_logit_bias(
+                            generated_split_records[local_index],
+                            valid_breakpoints,
+                        ),
                     )
                     action = replace(action, breakpoint=breakpoint)
                     generated_chosen_actions[local_index] = action
                     log_breakpoint_pf.append(log_probability)
+                    policy_diagnostics[state_index].update(
+                        dict(
+                            getattr(
+                                self.breakpoint_model,
+                                "last_sample_diagnostics",
+                                {},
+                            )
+                        )
+                    )
+                    policy_diagnostics[state_index].update(
+                        self._selected_breakpoint_split_diagnostics(
+                            generated_split_records[local_index],
+                            breakpoint,
+                        )
+                    )
                 else:
                     log_breakpoint_pf.append(
                         log_action_pf.new_tensor(0.0)
@@ -862,28 +1405,538 @@ class TBGFlowNetGenerator(torch.nn.Module):
             "time": component_time.detach(),
             "total": total_log_pf.detach(),
         }
+        self.last_forward_policy_diagnostics = policy_diagnostics
+        if self.probability_checks:
+            self._assert_forward_probability_components(
+                gate_mask,
+                gate_log_probabilities,
+                total_log_pf,
+            )
         return total_log_pf, torch.exp(total_log_pf), chosen_actions
+
+    @staticmethod
+    def _assert_masked_categorical_probabilities(logits, valid_mask, label):
+        if logits.shape != valid_mask.shape:
+            raise RuntimeError(f"{label} logits and mask shapes do not match")
+        if not bool(valid_mask.any(dim=1).all().detach().cpu().item()):
+            raise RuntimeError(f"{label} contains an all-invalid row")
+        valid_logits = logits.masked_select(valid_mask)
+        if not bool(torch.isfinite(valid_logits).all().detach().cpu().item()):
+            raise RuntimeError(f"{label} has a non-finite valid logit")
+        probabilities = torch.softmax(logits, dim=1)
+        if not torch.allclose(
+            probabilities.sum(dim=1),
+            torch.ones_like(probabilities[:, 0]),
+            rtol=1e-5,
+            atol=1e-6,
+        ):
+            raise RuntimeError(f"{label} probabilities do not sum to one")
+        if bool(
+            (probabilities.masked_select(~valid_mask) != 0)
+            .any()
+            .detach()
+            .cpu()
+            .item()
+        ):
+            raise RuntimeError(f"invalid {label} has nonzero probability")
+
+    @staticmethod
+    def _assert_forward_probability_components(
+        gate_mask,
+        gate_log_probabilities,
+        total_log_pf,
+    ):
+        probabilities = torch.exp(gate_log_probabilities)
+        if not torch.allclose(
+            probabilities.sum(dim=1),
+            torch.ones_like(probabilities[:, 0]),
+            rtol=1e-5,
+            atol=1e-6,
+        ):
+            raise RuntimeError("valid local gate probabilities do not sum to one")
+        if bool((probabilities.masked_select(~gate_mask) != 0).any().detach().cpu().item()):
+            raise RuntimeError("invalid local gate action has nonzero probability")
+        if not bool(torch.isfinite(total_log_pf).all().detach().cpu().item()):
+            raise RuntimeError("sampled forward transition has non-finite log probability")
+
+    @staticmethod
+    def _matching_action_index(candidates, action):
+        coal = CoalescenceChoice.from_action(action)
+        if coal is not None:
+            requested = {
+                int(coal.active_lineage_i),
+                int(coal.active_lineage_j),
+            }
+            for index, candidate in enumerate(candidates):
+                if isinstance(candidate, CoalescenceChoice) and {
+                    int(candidate.active_lineage_i),
+                    int(candidate.active_lineage_j),
+                } == requested:
+                    return index, coal
+            raise ValueError("recorded coalescence is outside the current action support")
+        recomb = RecombinationChoice.from_action(action)
+        if recomb is not None:
+            for index, candidate in enumerate(candidates):
+                if (
+                    isinstance(candidate, RecombinationChoice)
+                    and int(candidate.active_lineage_i)
+                    == int(recomb.active_lineage_i)
+                ):
+                    return index, recomb
+            raise ValueError("recorded recombination is outside the current action support")
+        raise ValueError(f"unsupported recorded generated action: {action!r}")
+
+    def score_local_transitions(self, states, actions, random_spec=None):
+        """Score fixed local transitions without resampling any component.
+
+        This is the canonical evaluation/replay path.  It uses the same gate,
+        candidate-action, breakpoint, and transformed continuous-time densities
+        as sampling, so every returned total has a reconstructible decomposition.
+        """
+
+        if not bool(getattr(self.env, "is_local", False)):
+            raise ValueError("score_local_transitions currently requires a local environment")
+        if len(states) != len(actions) or not states:
+            raise ValueError("states and actions must have equal nonzero lengths")
+        inputs = self.env.prepare_state_rollout_inputs(
+            states,
+            random_spec=random_spec,
+        )
+        candidates_by_state = inputs["input_actions"]
+        rollout = inputs["rollout"]
+        (
+            lineage_reps,
+            summary_reps,
+            lineage_seq_features,
+            _active_counts,
+        ) = self._encode_states(states)
+        gate_log_probs, gate_mask = self._local_gate_log_probabilities(
+            summary_reps,
+            rollout,
+            random_spec=random_spec,
+        )
+        gate = gate_log_probs.new_zeros(len(states))
+        atomic = gate.new_zeros(len(states))
+        breakpoint = gate.new_zeros(len(states))
+        time = gate.new_zeros(len(states))
+        generated_rows = []
+        diagnostics = []
+        for row, action in enumerate(actions):
+            event_type = (
+                action.get("event_type")
+                if isinstance(action, dict)
+                else "fixed_attachment"
+                if isinstance(action, FixedAttachmentChoice)
+                else "coal"
+                if isinstance(action, CoalescenceChoice)
+                else "recomb"
+                if isinstance(action, RecombinationChoice)
+                else None
+            )
+            gate_index = 1 if event_type == "fixed_attachment" else 0
+            if not bool(gate_mask[row, gate_index].detach().cpu().item()):
+                raise ValueError(
+                    f"recorded {event_type!r} transition is outside gate support"
+                )
+            gate[row] = gate_log_probs[row, gate_index]
+            diagnostics.append(
+                {
+                    "selected_gate": (
+                        "fixed_attachment" if gate_index == 1 else "generated"
+                    ),
+                    "gate_generated_probability": float(
+                        torch.exp(gate_log_probs[row, 0]).detach().cpu().item()
+                    ) if bool(gate_mask[row, 0]) else 0.0,
+                    "gate_fixed_probability": float(
+                        torch.exp(gate_log_probs[row, 1]).detach().cpu().item()
+                    ) if bool(gate_mask[row, 1]) else 0.0,
+                    "valid_coalescence_actions": 0,
+                    "valid_recombination_actions": 0,
+                    "coalescence_probability_mass": 0.0,
+                    "recombination_probability_mass": 0.0,
+                    "selected_atomic_action_probability": 1.0,
+                }
+            )
+            if gate_index == 0:
+                generated_rows.append(row)
+
+        if generated_rows:
+            selected_candidates = [candidates_by_state[row] for row in generated_rows]
+            index_tensor = torch.as_tensor(
+                generated_rows,
+                dtype=torch.long,
+                device=self.device,
+            )
+            generated_lineages = lineage_reps.index_select(0, index_tensor)
+            generated_summaries = summary_reps.index_select(0, index_tensor)
+            generated_contexts = [states[row] for row in generated_rows]
+            candidate_scoring = self.arg_model.score_action_candidates(
+                selected_candidates,
+                generated_lineages,
+                generated_summaries,
+                state_contexts=generated_contexts,
+                event_rates=[
+                    {
+                        "lambda_coal": rollout[row]["lambda_coal"],
+                        "lambda_recomb": rollout[row]["lambda_recomb"],
+                    }
+                    for row in generated_rows
+                ],
+                random_spec=random_spec,
+            )
+            probability_logits = candidate_scoring.probability_logits
+            action_features = candidate_scoring.action_features
+            split_records_by_row = candidate_scoring.split_records
+            split_diagnostics_by_row = candidate_scoring.diagnostics
+            action_log_probs = torch.log_softmax(probability_logits, dim=1)
+            for local_row, state_row in enumerate(generated_rows):
+                candidates = selected_candidates[local_row]
+                selected_index, parsed_action = self._matching_action_index(
+                    candidates,
+                    actions[state_row],
+                )
+                atomic[state_row] = action_log_probs[local_row, selected_index]
+                diagnostics[state_row].update(
+                    self._structural_action_diagnostics(
+                        probability_logits[local_row],
+                        candidates,
+                        selected_index,
+                    )
+                )
+                split_record = split_records_by_row[local_row][selected_index]
+                diagnostics[state_row].update(
+                    self._selected_split_diagnostics(
+                        split_diagnostics_by_row[local_row],
+                        split_record,
+                        selected_index,
+                        parsed_action,
+                    )
+                )
+                feature = action_features[local_row, selected_index]
+                state = states[state_row]
+                if isinstance(parsed_action, RecombinationChoice):
+                    if parsed_action.breakpoint is None:
+                        raise ValueError("recorded recombination has no breakpoint")
+                    valid_breakpoints = self.env.valid_breakpoints(
+                        state,
+                        parsed_action,
+                    )
+                    bp_logits = self.breakpoint_model.valid_breakpoint_logits(
+                        valid_breakpoints,
+                        state.active_lineages[int(parsed_action.active_lineage_i)],
+                        int(self.env.sequence_length),
+                        max(len(state.block_boundaries or ()) - 1, 1),
+                        feature,
+                        state=state,
+                        logit_bias=self.arg_model.recombination_breakpoint_logit_bias(
+                            split_record,
+                            valid_breakpoints,
+                        ),
+                    )
+                    if random_spec is not None and "T" in random_spec:
+                        bp_logits = bp_logits / float(random_spec["T"])
+                    valid_breakpoints = [int(value) for value in valid_breakpoints]
+                    try:
+                        bp_index = valid_breakpoints.index(int(parsed_action.breakpoint))
+                    except ValueError as error:
+                        raise ValueError(
+                            "recorded breakpoint is outside the current support"
+                        ) from error
+                    bp_log_probabilities = torch.log_softmax(bp_logits, dim=0)
+                    breakpoint[state_row] = bp_log_probabilities[bp_index]
+                    with torch.no_grad():
+                        bp_probabilities = torch.exp(bp_log_probabilities)
+                        bp_entropy = -(
+                            bp_probabilities * bp_log_probabilities
+                        ).sum()
+                        support_size = int(bp_logits.numel())
+                        normalized_entropy = (
+                            bp_entropy / math.log(support_size)
+                            if support_size > 1
+                            else bp_entropy.new_tensor(0.0)
+                        ).clamp(0.0, 1.0)
+                        diagnostics[state_row].update(
+                            {
+                                "breakpoint_support_size": support_size,
+                                "breakpoint_entropy": float(
+                                    bp_entropy.detach().cpu().item()
+                                ),
+                                "breakpoint_normalized_entropy": float(
+                                    normalized_entropy.detach().cpu().item()
+                                ),
+                                "breakpoint_selected_probability": float(
+                                    bp_probabilities[bp_index]
+                                    .detach().cpu().item()
+                                ),
+                                "breakpoint_max_probability": float(
+                                    bp_probabilities.max().detach().cpu().item()
+                                ),
+                            }
+                        )
+                    diagnostics[state_row].update(
+                        self._selected_breakpoint_split_diagnostics(
+                            split_record,
+                            parsed_action.breakpoint,
+                        )
+                    )
+
+                rate = float(rollout[state_row]["total_rate"])
+                max_delta = rollout[state_row]["max_delta"]
+                delta = parsed_action.delta_time
+                quantile = parsed_action.time_quantile
+                if delta is None and quantile is None:
+                    raise ValueError("recorded generated action is missing its event time")
+                if delta is None:
+                    delta = self.env.time_env.quantile_to_delta(
+                        float(quantile),
+                        rate,
+                        max_delta=max_delta,
+                    )
+                if quantile is None:
+                    quantile = self.env.time_env.delta_to_quantile(
+                        float(delta),
+                        rate,
+                        max_delta=max_delta,
+                    )
+                context_features = self.time_model.context_features(
+                    [rate],
+                    [max_delta],
+                    device=self.device,
+                    dtype=feature.dtype,
+                )
+                biological_context, _ = self.arg_model.build_time_context(
+                    [state],
+                    [parsed_action],
+                    [max_delta],
+                    dtype=feature.dtype,
+                )
+                mixture_logits = self.time_model(
+                    torch.cat(
+                        [feature[None, :], context_features, biological_context],
+                        dim=1,
+                    )
+                )
+                generated_mass = self.env.time_env.generated_probability(
+                    rate,
+                    max_delta=max_delta,
+                )
+                time[state_row] = self.time_model.log_time_density(
+                    mixture_logits,
+                    [float(quantile)],
+                    [float(delta)],
+                    [rate],
+                    [generated_mass],
+                    random_spec=random_spec,
+                )[0].to(time)
+
+        total = gate + atomic + breakpoint + time
+        if not bool(torch.isfinite(total).all().detach().cpu().item()):
+            raise RuntimeError("rescored local transition has non-finite log P_F")
+        return {
+            "gate": gate,
+            "atomic_action": atomic,
+            "breakpoint": breakpoint,
+            "time": time,
+            "total": total,
+            "policy_diagnostics": diagnostics,
+        }
 
 
     def update_model(self):
-        time_gradient_squared = sum(
-            parameter.grad.norm().item() ** 2
-            for parameter in self.time_model.parameters()
-            if parameter.grad is not None
+        used_learning_rates = [
+            float(group["lr"]) for group in self.opt.param_groups
+        ]
+        record_update_norm = bool(
+            self.model_diagnostics
+            and self.optimizer_steps % self.model_diagnostics_update_norm_every == 0
         )
-        info = {'grad_norm': self.grad_norm(self),
-                'time_head_grad_norm': math.sqrt(time_gradient_squared),
+        model_snapshots = (
+            self._snapshot_model_parameters() if record_update_norm else None
+        )
+        model_health_before = {}
+        model_parameter_norms = {}
+        if self.model_diagnostics:
+            for name, parameters in self.model_parameter_groups.items():
+                group_health = self._model_group_health(
+                    name,
+                    parameters,
+                    "before_clip",
+                )
+                model_health_before.update(group_health)
+                model_parameter_norms[name] = group_health[
+                    f"models/{name}/param_norm"
+                ]
+        gradient_norm_before = self._grad_norm(self.gradient_clipping_params)
+        time_gradient_norm_before = self._grad_norm(self.time_params)
+        breakpoint_gradient_norm_before = self._grad_norm(self.breakpoint_params)
+        structural_gradient_norm_before = self._grad_norm(
+            self.structural_policy_params
+        )
+        info = {'grad_norm': gradient_norm_before,
+                'gradient_norm_before_clip': gradient_norm_before,
+                'time_head_grad_norm': time_gradient_norm_before,
+                'time_head_gradient_norm_before_clip': time_gradient_norm_before,
+                'breakpoint_grad_norm': breakpoint_gradient_norm_before,
+                'breakpoint_gradient_norm_before_clip': breakpoint_gradient_norm_before,
+                'structural_gradient_norm_before_clip': structural_gradient_norm_before,
                 # 'z_grad_norm': self._Z.grad.norm().item(),
-                'param_norm': self.param_norm(self),
+                'param_norm': self._param_norm(self.gradient_clipping_params),
                 'loss': self.loss.detach().cpu().numpy().tolist()}
+        info.update(model_health_before)
         info.update(self.last_time_subtb_diagnostics)
-        
-        torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
+        if self._accumulated_balance_records:
+            accumulated_details = {
+                "loss": self.loss,
+                "internal_loss": self.loss.new_tensor(
+                    self._accumulated_internal_loss
+                ),
+                "terminal_loss": self.loss.new_tensor(
+                    self._accumulated_terminal_loss
+                ),
+                "terminal_loss_weight": self.terminal_loss_weight,
+                "residual_scale": self.residual_scale,
+                "records": self._accumulated_balance_records,
+            }
+            info.update(self._balance_metrics(accumulated_details))
+        else:
+            info.update(self.last_balance_diagnostics)
+        info.update(
+            {
+                "subtb_active_lambda": float(self.active_subtb_lambda),
+                "subtb_active_max_span": (
+                    0
+                    if self.active_subtb_max_span is None
+                    else int(self.active_subtb_max_span)
+                ),
+                "time_head_warmup_active": (
+                    self.current_epoch < self.time_head_warmup_epochs
+                ),
+            }
+        )
+
+        torch.nn.utils.clip_grad_norm_(
+            self.structural_policy_params,
+            self.grad_clip,
+        )
+        breakpoint_clip = (
+            self.grad_clip
+            if self.breakpoint_gradient_clip_norm is None
+            else self.breakpoint_gradient_clip_norm
+        )
+        torch.nn.utils.clip_grad_norm_(self.breakpoint_params, breakpoint_clip)
+        time_clip = (
+            self.grad_clip
+            if self.time_head_gradient_clip_norm is None
+            else self.time_head_gradient_clip_norm
+        )
+        torch.nn.utils.clip_grad_norm_(self.time_params, time_clip)
+        info["gradient_norm_after_clip"] = self._grad_norm(
+            self.gradient_clipping_params
+        )
+        info["time_head_gradient_norm_after_clip"] = self._grad_norm(
+            self.time_params
+        )
+        info["breakpoint_gradient_norm_after_clip"] = self._grad_norm(
+            self.breakpoint_params
+        )
+        info["structural_gradient_norm_after_clip"] = self._grad_norm(
+            self.structural_policy_params
+        )
+        if self.model_diagnostics:
+            clip_norms = {
+                "structural": float(self.grad_clip),
+                "breakpoint": float(breakpoint_clip),
+                "time": float(time_clip),
+            }
+            for name, parameters in self.model_parameter_groups.items():
+                info.update(
+                    self._model_group_health(name, parameters, "after_clip")
+                )
+                before_norm = float(
+                    info[f"models/{name}/grad_norm_before_clip"]
+                )
+                after_norm = float(
+                    info[f"models/{name}/grad_norm_after_clip"]
+                )
+                info[f"models/{name}/clip_norm"] = clip_norms[name]
+                info[f"models/{name}/gradient_clipped"] = bool(
+                    math.isfinite(before_norm)
+                    and before_norm > clip_norms[name]
+                )
+                info[f"models/{name}/clip_scale"] = float(
+                    1.0
+                    if before_norm <= 1e-12
+                    else after_norm / before_norm
+                )
         self.opt.step()
+        if model_snapshots is not None:
+            info.update(
+                self._model_update_metrics(
+                    model_snapshots,
+                    model_parameter_norms,
+                )
+            )
+        self.optimizer_steps += 1
+        if self.scheduler is not None:
+            self.scheduler.step_update()
         self.opt.zero_grad()
         self.loss = 0
+        self._accumulated_balance_records = []
+        self._accumulated_internal_loss = 0.0
+        self._accumulated_terminal_loss = 0.0
+
+        info.update(self.learning_rate_metrics())
+        learning_rate_group_names = (
+            self.scheduler.group_names
+            if self.scheduler is not None
+            else tuple(
+                f"group_{index}" for index in range(len(self.opt.param_groups))
+            )
+        )
+        info.update(
+            {
+                f"lr/used/{name}": value
+                for name, value in zip(
+                    learning_rate_group_names,
+                    used_learning_rates,
+                )
+            }
+        )
+        for index, name in enumerate(("structural", "breakpoint", "time")):
+            info[f"models/{name}/lr_used"] = float(
+                used_learning_rates[index]
+            )
+            info[f"models/{name}/lr_next"] = float(
+                self.opt.param_groups[index]["lr"]
+            )
+        info["models/diagnostics_enabled"] = bool(self.model_diagnostics)
+        info["models/update_norm_recorded"] = bool(
+            model_snapshots is not None
+        )
 
         return info
+
+    def learning_rate_metrics(self):
+        if self.scheduler is not None:
+            return self.scheduler.metrics()
+        return {
+            "lr/scheduler_type": "constant",
+            "lr/optimizer_step": int(self.optimizer_steps),
+            **{
+                f"lr/group_{index}": float(group["lr"])
+                for index, group in enumerate(self.opt.param_groups)
+            },
+        }
+
+    def step_lr_scheduler(self, metrics):
+        if self.scheduler is None:
+            return self.learning_rate_metrics()
+        return self.scheduler.step_metric(metrics)
+
+    def lr_scheduler_metadata(self):
+        if self.scheduler is None:
+            return {"type": "constant", "configured": False}
+        return {**self.scheduler.metadata(), "configured": True}
 
     def _record_log_z_targets(self, targets):
         finite_targets = targets[torch.isfinite(targets)]
@@ -1190,24 +2243,293 @@ class TBGFlowNetGenerator(torch.nn.Module):
             log_flows_by_traj.append(flat_log_flows[cursor:next_cursor])
             cursor = next_cursor
 
-        loss = self._subtb_loss_from_log_flows(
+        loss, details = self._subtb_loss_from_log_flows(
             log_flows_by_traj,
             rollout_outputs["log_paths_pf"],
             rollout_outputs["log_paths_pb"],
             rollout_outputs["trajectory_lengths"],
-            self.subtb_lambda,
-            self.subtb_max_span,
+            self.active_subtb_lambda,
+            self.active_subtb_max_span,
+            terminal_mask=rollout_outputs.get("terminal_mask"),
+            terminal_loss_weight=self.terminal_loss_weight,
+            residual_scale=self.residual_scale,
+            trajectory_actions=rollout_outputs.get("trajectory_actions"),
+            return_details=True,
         )
+        self.last_balance_diagnostics = self._balance_metrics(details)
+        self._last_balance_details = details
+        self.last_balance_diagnostics.update(
+            {
+                "flow/subtb_active_lambda": float(self.active_subtb_lambda),
+                "flow/subtb_active_max_span": (
+                    0
+                    if self.active_subtb_max_span is None
+                    else int(self.active_subtb_max_span)
+                ),
+                "flow/terminal_loss_weight": float(self.terminal_loss_weight),
+                "flow/residual_scale": float(self.residual_scale),
+            }
+        )
+        self.last_transition_decomposition = self._transition_decomposition(
+            rollout_outputs,
+            log_flows_by_traj,
+            details,
+        )
+        if self.flow_debug and self.flow_debug_max_records:
+            for record in self.last_transition_decomposition[
+                : self.flow_debug_max_records
+            ]:
+                print("FLOW_DEBUG", record)
         self.last_time_subtb_diagnostics = self._time_subtb_diagnostics(
             log_flows_by_traj,
             rollout_outputs["log_paths_pf"],
             rollout_outputs["log_paths_pb"],
             rollout_outputs["trajectory_lengths"],
             rollout_outputs.get("trajectory_actions", ()),
-            self.subtb_lambda,
-            self.subtb_max_span,
+            self.active_subtb_lambda,
+            self.active_subtb_max_span,
         )
         return loss
+
+    @staticmethod
+    def _float_metric(value):
+        if torch.is_tensor(value):
+            return float(value.detach().cpu().item())
+        return float(value)
+
+    @classmethod
+    def _balance_metrics(cls, details):
+        records = details["records"]
+        residual_scale = float(details.get("residual_scale", 1.0))
+
+        def values(predicate=lambda _record: True):
+            selected = [
+                record["residual"].detach().to(torch.float64)
+                for record in records
+                if predicate(record)
+            ]
+            if not selected:
+                return None
+            return torch.stack(selected)
+
+        def mse(predicate):
+            tensor = values(predicate)
+            return 0.0 if tensor is None else float(tensor.square().mean().cpu().item())
+
+        all_values = values()
+        metrics = {
+            "flow/loss_total_weighted": cls._float_metric(details["loss"]),
+            "flow/loss_internal_scaled": cls._float_metric(details["internal_loss"]),
+            "flow/loss_terminal_scaled_unweighted": cls._float_metric(
+                details["terminal_loss"]
+            ),
+            "flow/loss_terminal_scaled_weighted": cls._float_metric(
+                details["terminal_loss"] * details["terminal_loss_weight"]
+            ),
+            "flow/internal_one_step_residual_mse": mse(
+                lambda row: not row["terminal"] and row["span"] == 1
+            ),
+            "flow/internal_multi_step_subtb_residual_mse": mse(
+                lambda row: not row["terminal"] and row["span"] > 1
+            ),
+            "flow/terminal_one_step_residual_mse": mse(
+                lambda row: row["terminal"] and row["span"] == 1
+            ),
+            "flow/terminal_multi_step_residual_mse": mse(
+                lambda row: row["terminal"] and row["span"] > 1
+            ),
+            "flow/unweighted_total_residual_mse": (
+                0.0
+                if all_values is None
+                else float(all_values.square().mean().cpu().item())
+            ),
+            "flow/residual_count": len(records),
+            "flow/terminal_residual_count": sum(row["terminal"] for row in records),
+            "flow/internal_residual_count": sum(not row["terminal"] for row in records),
+            "flow/residual_scale": residual_scale,
+        }
+        if all_values is None:
+            for key in (
+                "mean", "abs_mean", "rmse", "p50", "p90", "p95", "p99",
+                "length_normalized_rmse",
+            ):
+                metrics[f"flow/residual_{key}"] = 0.0
+        else:
+            metrics.update(
+                {
+                    "flow/residual_mean": float(all_values.mean().cpu().item()),
+                    "flow/residual_abs_mean": float(all_values.abs().mean().cpu().item()),
+                    "flow/residual_rmse": float(
+                        all_values.square().mean().sqrt().cpu().item()
+                    ),
+                    "flow/residual_p50": float(all_values.abs().quantile(0.50).cpu().item()),
+                    "flow/residual_p90": float(all_values.abs().quantile(0.90).cpu().item()),
+                    "flow/residual_p95": float(all_values.abs().quantile(0.95).cpu().item()),
+                    "flow/residual_p99": float(all_values.abs().quantile(0.99).cpu().item()),
+                    "flow/scaled_residual_rmse": float(
+                        all_values.square().mean().sqrt().div(residual_scale).cpu().item()
+                    ),
+                    "flow/scaled_residual_abs_mean": float(
+                        all_values.abs().mean().div(residual_scale).cpu().item()
+                    ),
+                }
+            )
+            all_weights = torch.stack(
+                [row["weight"].detach().to(torch.float64) for row in records]
+            )
+            denominator = all_weights.sum().clamp_min(
+                torch.finfo(all_weights.dtype).tiny
+            )
+            internal_mask = torch.as_tensor(
+                [not row["terminal"] for row in records],
+                dtype=torch.bool,
+                device=all_values.device,
+            )
+            terminal_mask = ~internal_mask
+            metrics["flow/loss_internal_raw_unscaled"] = float(
+                (
+                    (all_weights[internal_mask] * all_values[internal_mask].square()).sum()
+                    / denominator
+                ).cpu().item()
+            )
+            metrics["flow/loss_terminal_raw_unscaled"] = float(
+                (
+                    (all_weights[terminal_mask] * all_values[terminal_mask].square()).sum()
+                    / denominator
+                ).cpu().item()
+            )
+            normalized = torch.stack(
+                [
+                    row["residual"].detach().to(torch.float64)
+                    / max(int(row["trajectory_length"]), 1)
+                    for row in records
+                ]
+            )
+            metrics["flow/residual_length_normalized_rmse"] = float(
+                normalized.square().mean().sqrt().cpu().item()
+            )
+        for action_type in ("coal", "recomb", "fixed_attachment", "terminal"):
+            action_values = values(
+                lambda row, requested=action_type: row["action_type"] == requested
+            )
+            prefix = f"flow/action/{action_type}"
+            metrics[f"{prefix}_count"] = (
+                0 if action_values is None else int(action_values.numel())
+            )
+            metrics[f"{prefix}_residual_mse"] = (
+                0.0
+                if action_values is None
+                else float(action_values.square().mean().cpu().item())
+            )
+            metrics[f"{prefix}_residual_abs_mean"] = (
+                0.0
+                if action_values is None
+                else float(action_values.abs().mean().cpu().item())
+            )
+        spans = sorted({int(row["span"]) for row in records})
+        for span in spans:
+            span_values = values(lambda row, requested=span: row["span"] == requested)
+            metrics[f"flow/span/{span}_count"] = int(span_values.numel())
+            metrics[f"flow/span/{span}_residual_mse"] = float(
+                span_values.square().mean().cpu().item()
+            )
+        return metrics
+
+    @staticmethod
+    def _state_debug_id(state):
+        identity = (
+            state.structural_identity()
+            if hasattr(state, "structural_identity")
+            else repr(state)
+        )
+        return hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()[:16]
+
+    def _transition_decomposition(
+        self,
+        rollout_outputs,
+        log_flows_by_traj,
+        details,
+    ):
+        one_step = {
+            (row["trajectory_index"], row["start"]): row
+            for row in details["records"]
+            if row["span"] == 1
+        }
+        recorded_components = rollout_outputs.get("trajectory_log_components", ())
+        decompositions = []
+        for traj_idx, path in enumerate(rollout_outputs["trajectory_states"]):
+            actions = rollout_outputs.get("trajectory_actions", ())[traj_idx]
+            length = int(rollout_outputs["trajectory_lengths"][traj_idx].item())
+            for step in range(length):
+                residual_row = one_step[(traj_idx, step)]
+                components = (
+                    recorded_components[traj_idx][step]
+                    if traj_idx < len(recorded_components)
+                    and step < len(recorded_components[traj_idx])
+                    else {}
+                )
+                action_type = actions[step].get("event_type", "unknown")
+                destination = path[step + 1]
+                terminal = bool(destination.is_done)
+                source_flow = log_flows_by_traj[traj_idx][step]
+                destination_flow = log_flows_by_traj[traj_idx][step + 1]
+                row = {
+                    "state_id": self._state_debug_id(path[step]),
+                    "destination_state_id": self._state_debug_id(destination),
+                    "trajectory_index": traj_idx,
+                    "step": step,
+                    "action_type": action_type,
+                    "log_flow_source": self._float_metric(source_flow),
+                    "log_flow_source_partial_reward": float(
+                        getattr(path[step], "partial_log_reward", 0.0)
+                    ),
+                    "log_pf_gate": float(components.get("gate", 0.0)),
+                    "log_pf_action": float(components.get("atomic_action", 0.0)),
+                    "log_pf_time": float(components.get("time", 0.0)),
+                    "log_pf_breakpoint": float(components.get("breakpoint", 0.0)),
+                    "log_pb_parent": float(
+                        rollout_outputs["log_paths_pb"][traj_idx, step]
+                        .detach().cpu().item()
+                    ),
+                    "log_pb_action": 0.0,
+                    "log_pb_time": 0.0,
+                    "log_flow_destination_or_reward": self._float_metric(destination_flow),
+                    "log_flow_destination_partial_reward": float(
+                        getattr(destination, "partial_log_reward", 0.0)
+                    ),
+                    "destination_is_terminal": terminal,
+                    "residual": self._float_metric(residual_row["residual"]),
+                }
+                reconstructed_pf = (
+                    row["log_pf_gate"]
+                    + row["log_pf_action"]
+                    + row["log_pf_time"]
+                    + row["log_pf_breakpoint"]
+                )
+                row["log_pf_total"] = float(
+                    rollout_outputs["log_paths_pf"][traj_idx, step]
+                    .detach().cpu().item()
+                )
+                row["log_flow_source_learned_potential"] = (
+                    row["log_flow_source"]
+                    - row["log_flow_source_partial_reward"]
+                )
+                row["log_flow_destination_learned_potential"] = (
+                    None
+                    if terminal
+                    else row["log_flow_destination_or_reward"]
+                    - row["log_flow_destination_partial_reward"]
+                )
+                row["log_pf_reconstruction_error"] = reconstructed_pf - row["log_pf_total"]
+                row["log_pb_total"] = row["log_pb_parent"]
+                row["log_pb_reconstruction_error"] = (
+                    row["log_pb_parent"]
+                    + row["log_pb_action"]
+                    + row["log_pb_time"]
+                    - row["log_pb_total"]
+                )
+                decompositions.append(row)
+        return decompositions
 
     @staticmethod
     def _time_subtb_diagnostics(
@@ -1339,6 +2661,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
         trajectory_lengths,
         subtb_lambda,
         subtb_max_span=None,
+        terminal_mask=None,
+        terminal_loss_weight=1.0,
+        residual_scale=1.0,
+        trajectory_actions=None,
+        return_details=False,
     ):
         if subtb_max_span is not None:
             subtb_max_span = int(subtb_max_span)
@@ -1349,8 +2676,25 @@ class TBGFlowNetGenerator(torch.nn.Module):
         else:
             lengths = list(trajectory_lengths)
 
-        weighted_sum = log_paths_pf.new_tensor(0.0)
+        terminal_loss_weight = float(terminal_loss_weight)
+        residual_scale = float(residual_scale)
+        if not math.isfinite(terminal_loss_weight) or terminal_loss_weight < 0.0:
+            raise ValueError("terminal_loss_weight must be finite and nonnegative")
+        if not math.isfinite(residual_scale) or residual_scale <= 0.0:
+            raise ValueError("residual_scale must be finite and positive")
+        if terminal_mask is None:
+            terminal_flags = [False] * len(lengths)
+        elif torch.is_tensor(terminal_mask):
+            terminal_flags = [bool(value) for value in terminal_mask.detach().cpu().tolist()]
+        else:
+            terminal_flags = [bool(value) for value in terminal_mask]
+        if len(terminal_flags) != len(lengths):
+            raise ValueError("terminal_mask length must match trajectory_lengths")
+
+        internal_weighted_sum = log_paths_pf.new_tensor(0.0)
+        terminal_weighted_sum = log_paths_pf.new_tensor(0.0)
         weight_sum = log_paths_pf.new_tensor(0.0)
+        records = []
         for traj_idx, length in enumerate(lengths):
             length = int(length)
             if length <= 0:
@@ -1382,16 +2726,82 @@ class TBGFlowNetGenerator(torch.nn.Module):
                     log_pb = pb_prefix[end] - pb_prefix[start]
                     residual = log_flows[start] + log_pf - log_flows[end] - log_pb
                     weight = log_paths_pf.new_tensor(float(subtb_lambda) ** span)
-                    weighted_sum = weighted_sum + weight * residual.pow(2)
+                    is_terminal = bool(terminal_flags[traj_idx] and end == length)
+                    scaled_square = (residual / residual_scale).pow(2)
+                    if is_terminal:
+                        terminal_weighted_sum = (
+                            terminal_weighted_sum + weight * scaled_square
+                        )
+                    else:
+                        internal_weighted_sum = (
+                            internal_weighted_sum + weight * scaled_square
+                        )
                     weight_sum = weight_sum + weight
+                    action_type = "multi_step"
+                    if span == 1 and trajectory_actions is not None:
+                        action_type = str(
+                            trajectory_actions[traj_idx][start].get(
+                                "event_type", "unknown"
+                            )
+                        )
+                    if is_terminal:
+                        action_type = "terminal"
+                    records.append(
+                        {
+                            "trajectory_index": traj_idx,
+                            "trajectory_length": length,
+                            "start": start,
+                            "end": end,
+                            "span": span,
+                            "terminal": is_terminal,
+                            "action_type": action_type,
+                            "residual": residual,
+                            "weight": weight,
+                        }
+                    )
 
         if float(weight_sum.detach().cpu().item()) == 0.0:
-            return weighted_sum
-        return weighted_sum / weight_sum
+            loss = internal_weighted_sum + terminal_weighted_sum
+            internal_loss = internal_weighted_sum
+            terminal_loss = terminal_weighted_sum
+        else:
+            # Both components use the historical all-subtrajectory denominator.
+            # Therefore lambda_T=1 and residual_scale=1 reproduce the previous
+            # objective exactly, while lambda_T>1 increases only terminal
+            # supervision and never double-counts a terminal term.
+            internal_loss = internal_weighted_sum / weight_sum
+            terminal_loss = terminal_weighted_sum / weight_sum
+            loss = internal_loss + terminal_loss_weight * terminal_loss
+        if not return_details:
+            return loss
+        return loss, {
+            "loss": loss,
+            "internal_loss": internal_loss,
+            "terminal_loss": terminal_loss,
+            "terminal_loss_weight": terminal_loss_weight,
+            "residual_scale": residual_scale,
+            "weight_sum": weight_sum,
+            "records": records,
+        }
         
     
     def accumulate_loss(self, rollout_outputs, factor=1.0):
         loss = self.get_loss_from_rollout_outputs(rollout_outputs)
+        if self._last_balance_details is not None:
+            self._accumulated_balance_records.extend(
+                {
+                    **record,
+                    "residual": record["residual"].detach(),
+                    "weight": record["weight"].detach(),
+                }
+                for record in self._last_balance_details["records"]
+            )
+            self._accumulated_internal_loss += self._float_metric(
+                self._last_balance_details["internal_loss"]
+            ) / float(factor)
+            self._accumulated_terminal_loss += self._float_metric(
+                self._last_balance_details["terminal_loss"]
+            ) / float(factor)
         loss = (loss / factor)
         loss.backward()
         self.loss = self.loss + loss.detach()

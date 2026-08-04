@@ -6,3 +6,6 @@ wandb/
 checkpoints/
 validation/output/
 pg.ipynb
+logs/
+validation/
+.ipynb_checkpoints/

@@ -1,8 +1,10 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
 from collections.abc import Mapping
 
 import torch
@@ -92,11 +94,14 @@ def run_inference(
     bad_region_bp=None,
     refine_strategy=None,
     experiment=None,
+    selection_margin=1e-6,
 ):
     if num_args < 1:
         raise ValueError("num_args must be at least 1")
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
+    if not math.isfinite(float(selection_margin)) or float(selection_margin) < 0.0:
+        raise ValueError("selection_margin must be finite and nonnegative")
     output_dir = resolve_inference_output_dir(
         output_dir=output_dir, experiment=experiment
     )
@@ -191,6 +196,7 @@ def run_inference(
             batch_size=batch_size,
             experiment=experiment,
             verbose=verbose,
+            selection_margin=selection_margin,
         )
     if refine_arg is not None:
         raise ValueError(
@@ -538,17 +544,26 @@ def run_local_refinement_inference(
     batch_size,
     experiment=None,
     verbose=False,
+    selection_margin=1e-6,
 ):
     """Sample, splice, validate, and export every checkpoint request."""
 
     try:
         from .refinement import (
+            compare_scores,
             export_refined_tree_sequence,
+            replay_source_score,
+            score_terminal_state,
+            select_best_candidate_record,
             splice_local_proposal,
         )
     except ImportError:
         from refinement import (
+            compare_scores,
             export_refined_tree_sequence,
+            replay_source_score,
+            score_terminal_state,
+            select_best_candidate_record,
             splice_local_proposal,
         )
 
@@ -573,6 +588,15 @@ def run_local_refinement_inference(
             start_state=initial_state,
         )
         prepared = env.prepared_contexts[context_id]
+        source_score = None
+        source_score_diagnostic = None
+        try:
+            source_score = replay_source_score(env, context_id)
+        except Exception as error:
+            source_score_diagnostic = {
+                "code": "source_score_unavailable",
+                "message": str(error),
+            }
         trajectory_records = []
         for index, (state, trajectory) in enumerate(
             zip(rollout_outputs["states"], trajectories),
@@ -617,6 +641,8 @@ def run_local_refinement_inference(
                 "topology_digest": None,
                 "splice_validation": None,
                 "failure_diagnostics": [],
+                "score": None,
+                "comparison": None,
             }
             try:
                 if not state.is_done:
@@ -661,6 +687,14 @@ def run_local_refinement_inference(
                         overwrite=False,
                     )
                     record["output_file"] = os.path.abspath(output_path)
+                    candidate_score = score_terminal_state(env, state)
+                    record["score"] = candidate_score.to_dict()
+                    if source_score is not None:
+                        record["comparison"] = compare_scores(
+                            source_score,
+                            candidate_score,
+                            margin=float(selection_margin),
+                        ).to_dict()
                     total_valid_outputs += 1
             except Exception as error:
                 record["failure_diagnostics"].append(
@@ -671,6 +705,15 @@ def run_local_refinement_inference(
                 )
             trajectory_records.append(record)
 
+        selected_path = os.path.join(request_dir, "selected_arg.trees")
+        selected = select_best_candidate_record(trajectory_records)
+        selected_candidate_index = None
+        if selected is not None:
+            selected_candidate_index = int(selected["index"])
+            shutil.copy2(selected["output_file"], selected_path)
+        else:
+            prepared.source_tree_sequence.dump(selected_path)
+
         request_manifest = {
             "id": context_id,
             "request": request_records[context_id],
@@ -680,6 +723,15 @@ def run_local_refinement_inference(
                 row["output_file"] is not None
                 for row in trajectory_records
             ),
+            "source_score": (
+                None if source_score is None else source_score.to_dict()
+            ),
+            "source_score_diagnostic": source_score_diagnostic,
+            "selection_margin": float(selection_margin),
+            "selected_candidate_index": selected_candidate_index,
+            "selected_source": selected_candidate_index is None,
+            "selected_output_file": os.path.abspath(selected_path),
+            "evaluation": _local_evaluation_summary(trajectory_records),
             "trajectories": trajectory_records,
         }
         with open(
@@ -714,6 +766,31 @@ def run_local_refinement_inference(
     ) as handle:
         json.dump(manifest, handle, indent=2)
     return manifest
+
+
+def _local_evaluation_summary(records):
+    valid = [row for row in records if row.get("output_file")]
+    comparable = [row["comparison"] for row in valid if row.get("comparison")]
+    digests = {row.get("topology_digest") for row in valid if row.get("topology_digest")}
+    deltas = [float(row["posterior_delta"]) for row in comparable]
+    return {
+        "candidate_count": int(len(records)),
+        "valid_splice_count": int(len(valid)),
+        "valid_splice_rate": float(len(valid) / len(records)) if records else 0.0,
+        "comparable_count": int(len(comparable)),
+        "source_score_failure_count": int(len(valid) - len(comparable)),
+        "unique_topology_count": int(len(digests)),
+        "unique_topology_rate": float(len(digests) / len(valid)) if valid else 0.0,
+        "posterior_improvement_rate": (
+            float(sum(bool(row["improves"]) for row in comparable) / len(comparable))
+            if comparable else 0.0
+        ),
+        "posterior_delta_mean": (
+            float(sum(deltas) / len(deltas)) if deltas else None
+        ),
+        "posterior_delta_min": min(deltas) if deltas else None,
+        "posterior_delta_max": max(deltas) if deltas else None,
+    }
 
 
 def _run_refinement_inference_legacy(
@@ -971,6 +1048,12 @@ def build_parser():
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--temperature", type=float)
+    parser.add_argument(
+        "--selection-margin",
+        type=float,
+        default=1e-6,
+        help="Minimum strict local posterior improvement required to replace the source ARG.",
+    )
     parser.add_argument("--dataset-path", help="Override the dataset path stored in checkpoint metadata.")
     parser.add_argument(
         "--refine-arg",
@@ -1022,6 +1105,7 @@ def main():
         bad_region_bp=args.bad_region_bp,
         refine_strategy=args.refine_strategy,
         experiment=args.experiment,
+        selection_margin=args.selection_margin,
     )
     print(
         f"Wrote {manifest.get('num_outputs', manifest.get('num_args', 0))} "

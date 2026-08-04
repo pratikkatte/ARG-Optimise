@@ -2354,6 +2354,31 @@ class LocalARGEnvironment:
             )
         )
 
+    def breakpoint_prior_weights(self, state, action):
+        """Return positive prior weights aligned with ``valid_breakpoints``."""
+
+        try:
+            from .refinement import local_construction as local
+        except ImportError:
+            from refinement import local_construction as local
+
+        if not isinstance(action, RecombinationChoice):
+            return ()
+        lineage = state.active_lineages[int(action.active_lineage_i)]
+        if self.is_vcf_mode:
+            weighted = local._vcf_breakpoints(
+                lineage.material_segments,
+                state,
+                self.base_env,
+            )
+            valid = self.valid_breakpoints(state, action)
+            weights_by_breakpoint = {
+                int(breakpoint): float(weight)
+                for breakpoint, weight in weighted
+            }
+            return tuple(weights_by_breakpoint[int(value)] for value in valid)
+        return tuple(1.0 for _ in self.valid_breakpoints(state, action))
+
     def _rollout_time_data(self, state, rates):
         total_rate = float(
             rates["lambda_coal"] + rates["lambda_recomb"]
@@ -2389,6 +2414,8 @@ class LocalARGEnvironment:
         )
         return {
             "total_rate": total_rate,
+            "lambda_coal": float(rates["lambda_coal"]),
+            "lambda_recomb": float(rates["lambda_recomb"]),
             "next_fixed_time": next_fixed,
             "max_delta": max_delta,
             "generated_prior_mass": float(generated_prior_mass),
@@ -2507,15 +2534,6 @@ class LocalARGEnvironment:
         if isinstance(action, CoalescenceChoice):
             if not action.is_valid_for(state.active_lineages):
                 raise ValueError(f"invalid local coalescence action: {action}")
-            coal_weights = [
-                local._local_coalescence_weight(
-                    state.active_lineages[int(choice.active_lineage_i)],
-                    state.active_lineages[int(choice.active_lineage_j)],
-                    state,
-                )
-                for choice in coal_actions
-            ]
-            total_coal_weight = float(sum(coal_weights))
             matching = [
                 index
                 for index, choice in enumerate(coal_actions)
@@ -2528,12 +2546,11 @@ class LocalARGEnvironment:
                     int(action.active_lineage_j),
                 }
             ]
-            if not matching or total_coal_weight <= 0.0:
+            if not matching or not coal_actions:
                 raise ValueError(f"invalid local coalescence action: {action}")
-            pair_weight = float(coal_weights[matching[0]])
             action_log_prior = (
                 math.log(float(rates["lambda_coal"]) / total_rate)
-                + math.log(pair_weight / total_coal_weight)
+                - math.log(len(coal_actions))
             )
         elif isinstance(action, RecombinationChoice):
             lineage = state.active_lineages[int(action.active_lineage_i)]

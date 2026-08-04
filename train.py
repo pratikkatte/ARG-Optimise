@@ -21,8 +21,24 @@ try:
     from .env import SimpleARGEnvironment, action_as_dict
     from .rollout_worker_arg import RolloutWorker
     from .tb_gfn import TBGFlowNetGenerator
+    from .lr_control import (
+        DEFAULT_LR_SCHEDULER_CONFIG,
+        LR_PLATEAU_MODES,
+        LR_PLATEAU_THRESHOLD_MODES,
+        LR_SCHEDULER_TYPES,
+        normalize_lr_scheduler_config,
+        resolve_warmup_steps,
+    )
     from .time_env import DEFAULT_TIME_BASIS_COMPONENTS
     from .time_context import TIME_CONTEXT_MODES
+    from .recombination_split_bias import (
+        DEFAULT_RECOMBINATION_SPLIT_BIAS_CONFIG,
+        normalize_recombination_split_bias_config,
+    )
+    from .cwr_event_gate import (
+        DEFAULT_LOCAL_CWR_EVENT_GATE_CONFIG,
+        normalize_local_cwr_event_gate_config,
+    )
     from .utils import (
         VCF_PARSER_VERSION,
         is_vcf_path,
@@ -34,8 +50,24 @@ except ImportError:  # Support the repository's script-style entry points.
     from env import SimpleARGEnvironment, action_as_dict
     from rollout_worker_arg import RolloutWorker
     from tb_gfn import TBGFlowNetGenerator
+    from lr_control import (
+        DEFAULT_LR_SCHEDULER_CONFIG,
+        LR_PLATEAU_MODES,
+        LR_PLATEAU_THRESHOLD_MODES,
+        LR_SCHEDULER_TYPES,
+        normalize_lr_scheduler_config,
+        resolve_warmup_steps,
+    )
     from time_env import DEFAULT_TIME_BASIS_COMPONENTS
     from time_context import TIME_CONTEXT_MODES
+    from recombination_split_bias import (
+        DEFAULT_RECOMBINATION_SPLIT_BIAS_CONFIG,
+        normalize_recombination_split_bias_config,
+    )
+    from cwr_event_gate import (
+        DEFAULT_LOCAL_CWR_EVENT_GATE_CONFIG,
+        normalize_local_cwr_event_gate_config,
+    )
     from utils import (
         VCF_PARSER_VERSION,
         is_vcf_path,
@@ -105,18 +137,44 @@ DEFAULT_CONFIG = {
         "verbose": False,
         "wandb": True,
         "policy_lr": DEFAULT_POLICY_LR,
+        "breakpoint_policy_lr": None,
         "time_policy_lr": None,
         "log_z_lr": DEFAULT_LOG_Z_LR,
+        "lr_scheduler": copy.deepcopy(DEFAULT_LR_SCHEDULER_CONFIG),
         "loss": DEFAULT_LOSS,
         "subtb_lambda": DEFAULT_SUBTB_LAMBDA,
         "subtb_max_span": DEFAULT_SUBTB_MAX_SPAN,
+        "subtb_lambda_initial": None,
+        "subtb_lambda_final": None,
+        "subtb_max_span_schedule": [],
+        "terminal_loss_weight": 1.0,
+        "residual_scale": 1.0,
         "grad_clip": DEFAULT_GRAD_CLIP,
+        "breakpoint_gradient_clip_norm": None,
+        "time_head_gradient_clip_norm": None,
+        "time_head_warmup_epochs": 0,
+        "model_diagnostics": True,
+        "model_diagnostics_update_norm_every": 1,
         "grad_accum_steps": DEFAULT_GRAD_ACCUM_STEPS,
+        "min_terminal_trajectories_per_batch": 0,
+        "flow_debug": False,
+        "flow_debug_max_records": 16,
+        "probability_checks": False,
+        "fixed_eval_bank_path": None,
+        "fixed_eval_bank_episodes": 0,
+        "fixed_eval_bank_seed": 100007,
+        "fixed_eval_bank_source": "baseline",
+        "fixed_eval_bank_create_if_missing": False,
         "eval_episodes": DEFAULT_EVAL_EPISODES,
         "eval_every": DEFAULT_EVAL_EVERY,
         "partial_segment_max_steps": DEFAULT_PARTIAL_SEGMENT_MAX_STEPS,
         "partial_start_mode": DEFAULT_PARTIAL_START_MODE,
         "partial_boundary_fraction": DEFAULT_PARTIAL_BOUNDARY_FRACTION,
+        "trajectory_training_mode": "complete",
+        "complete_trajectory_max_steps": None,
+        "selection_margin": 1e-6,
+        "min_valid_splice_rate": 0.90,
+        "min_unique_topology_rate": 0.25,
     },
     "environment": {
         "bp_per_blocks": 1,
@@ -142,6 +200,12 @@ DEFAULT_CONFIG = {
         "local_coalescence_similarity_bias": DEFAULT_LOCAL_COALESCENCE_SIMILARITY_BIAS,
         "local_prior_action_logit_bias": DEFAULT_LOCAL_PRIOR_ACTION_LOGIT_BIAS,
         "local_prior_gate_logit_bias": DEFAULT_LOCAL_PRIOR_GATE_LOGIT_BIAS,
+        "recombination_split_bias": copy.deepcopy(
+            DEFAULT_RECOMBINATION_SPLIT_BIAS_CONFIG
+        ),
+        "local_cwr_event_gate": copy.deepcopy(
+            DEFAULT_LOCAL_CWR_EVENT_GATE_CONFIG
+        ),
     },
 }
 
@@ -164,18 +228,64 @@ CLI_CONFIG_PATHS = {
     "verbose": ("training", "verbose"),
     "wandb": ("training", "wandb"),
     "policy_lr": ("training", "policy_lr"),
+    "breakpoint_policy_lr": ("training", "breakpoint_policy_lr"),
     "time_policy_lr": ("training", "time_policy_lr"),
     "log_z_lr": ("training", "log_z_lr"),
+    "lr_scheduler_type": ("training", "lr_scheduler", "type"),
+    "lr_warmup_steps": ("training", "lr_scheduler", "warmup_steps"),
+    "lr_warmup_fraction": ("training", "lr_scheduler", "warmup_fraction"),
+    "lr_warmup_start_ratio": (
+        "training", "lr_scheduler", "warmup_start_ratio"
+    ),
+    "lr_min_ratio": ("training", "lr_scheduler", "min_lr_ratio"),
+    "lr_step_size": ("training", "lr_scheduler", "step_size"),
+    "lr_step_gamma": ("training", "lr_scheduler", "step_gamma"),
+    "lr_plateau_metric": ("training", "lr_scheduler", "plateau_metric"),
+    "lr_plateau_mode": ("training", "lr_scheduler", "plateau_mode"),
+    "lr_plateau_factor": ("training", "lr_scheduler", "plateau_factor"),
+    "lr_plateau_patience": (
+        "training", "lr_scheduler", "plateau_patience"
+    ),
+    "lr_plateau_threshold": (
+        "training", "lr_scheduler", "plateau_threshold"
+    ),
+    "lr_plateau_threshold_mode": (
+        "training", "lr_scheduler", "plateau_threshold_mode"
+    ),
+    "lr_plateau_cooldown": (
+        "training", "lr_scheduler", "plateau_cooldown"
+    ),
     "loss": ("training", "loss"),
     "subtb_lambda": ("training", "subtb_lambda"),
     "subtb_max_span": ("training", "subtb_max_span"),
+    "terminal_loss_weight": ("training", "terminal_loss_weight"),
+    "residual_scale": ("training", "residual_scale"),
     "grad_clip": ("training", "grad_clip"),
+    "breakpoint_gradient_clip_norm": (
+        "training", "breakpoint_gradient_clip_norm"
+    ),
+    "time_head_gradient_clip_norm": ("training", "time_head_gradient_clip_norm"),
+    "time_head_warmup_epochs": ("training", "time_head_warmup_epochs"),
+    "model_diagnostics": ("training", "model_diagnostics"),
+    "model_diagnostics_update_norm_every": (
+        "training", "model_diagnostics_update_norm_every"
+    ),
+    "min_terminal_trajectories_per_batch": (
+        "training", "min_terminal_trajectories_per_batch"
+    ),
     "grad_accum_steps": ("training", "grad_accum_steps"),
     "eval_episodes": ("training", "eval_episodes"),
     "eval_every": ("training", "eval_every"),
     "partial_segment_max_steps": ("training", "partial_segment_max_steps"),
     "partial_start_mode": ("training", "partial_start_mode"),
     "partial_boundary_fraction": ("training", "partial_boundary_fraction"),
+    "trajectory_training_mode": ("training", "trajectory_training_mode"),
+    "complete_trajectory_max_steps": (
+        "training", "complete_trajectory_max_steps"
+    ),
+    "selection_margin": ("training", "selection_margin"),
+    "min_valid_splice_rate": ("training", "min_valid_splice_rate"),
+    "min_unique_topology_rate": ("training", "min_unique_topology_rate"),
     "bp_per_blocks": ("environment", "bp_per_blocks"),
     "effective_population_size": ("environment", "effective_population_size"),
     "mutation_rate": ("environment", "mutation_rate"),
@@ -314,6 +424,39 @@ def validate_train_config(config):
         )
     training = config.get("training", {})
     environment = config.get("environment", {})
+    try:
+        epochs = int(training["epochs"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("training.epochs must be a positive integer") from exc
+    if epochs <= 0:
+        raise ValueError("training.epochs must be a positive integer")
+    training["epochs"] = epochs
+    for field_name in ("policy_lr", "log_z_lr"):
+        try:
+            value = float(training[field_name])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"training.{field_name} must be positive") from exc
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"training.{field_name} must be finite and positive")
+        training[field_name] = value
+    for field_name in ("breakpoint_policy_lr", "time_policy_lr"):
+        value = training.get(field_name)
+        if value is not None:
+            try:
+                value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"training.{field_name} must be positive or null"
+                ) from exc
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"training.{field_name} must be finite and positive or null"
+                )
+        training[field_name] = value
+    training["lr_scheduler"] = normalize_lr_scheduler_config(
+        training.get("lr_scheduler")
+    )
+    resolve_warmup_steps(training["lr_scheduler"], epochs)
     legacy_time_fields = sorted(
         key
         for key in ("time_bins", "time_delta_bin_width", "time_bin_scheme")
@@ -358,6 +501,44 @@ def validate_train_config(config):
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(f"model.{field_name} must be a number") from exc
+    model["recombination_split_bias"] = (
+        normalize_recombination_split_bias_config(
+            model.get("recombination_split_bias")
+        )
+    )
+    model["local_cwr_event_gate"] = normalize_local_cwr_event_gate_config(
+        model.get("local_cwr_event_gate")
+    )
+    if model["recombination_split_bias"]["enabled"]:
+        refinement_config = config.get("refinement", {})
+        if not bool(
+            refinement_config.get("enabled")
+            or refinement_config.get("arg_path")
+            or refinement_config.get("requests")
+        ):
+            raise ValueError(
+                "model.recombination_split_bias can be enabled only for local "
+                "VCF ARG refinement"
+            )
+        if not is_vcf_path(config.get("dataset_path")):
+            raise ValueError(
+                "model.recombination_split_bias requires a VCF dataset"
+            )
+    if model["local_cwr_event_gate"]["enabled"]:
+        refinement_config = config.get("refinement", {})
+        if not bool(
+            refinement_config.get("enabled")
+            or refinement_config.get("arg_path")
+            or refinement_config.get("requests")
+        ):
+            raise ValueError(
+                "model.local_cwr_event_gate can be enabled only for local VCF "
+                "ARG refinement"
+            )
+        if not is_vcf_path(config.get("dataset_path")):
+            raise ValueError(
+                "model.local_cwr_event_gate requires a VCF dataset"
+            )
     loss = str(training.get("loss", DEFAULT_LOSS)).lower()
     if loss not in {"tb", "subtb", "fl_subtb"}:
         raise ValueError("training.loss must be one of 'tb', 'subtb', or 'fl_subtb'")
@@ -384,6 +565,88 @@ def validate_train_config(config):
         training.get("subtb_max_span", DEFAULT_SUBTB_MAX_SPAN),
         "training.subtb_max_span",
     )
+    for field_name, strictly_positive in (
+        ("terminal_loss_weight", False),
+        ("residual_scale", True),
+    ):
+        try:
+            value = float(training.get(field_name, DEFAULT_CONFIG["training"][field_name]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"training.{field_name} must be a number") from exc
+        if not math.isfinite(value) or (value <= 0.0 if strictly_positive else value < 0.0):
+            qualifier = "positive" if strictly_positive else "nonnegative"
+            raise ValueError(f"training.{field_name} must be finite and {qualifier}")
+        training[field_name] = value
+    for field_name in ("subtb_lambda_initial", "subtb_lambda_final"):
+        value = training.get(field_name)
+        if value is not None:
+            value = float(value)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"training.{field_name} must be positive or null")
+        training[field_name] = value
+    if (training["subtb_lambda_initial"] is None) != (
+        training["subtb_lambda_final"] is None
+    ):
+        raise ValueError(
+            "training.subtb_lambda_initial and subtb_lambda_final must be set together"
+        )
+    schedule = training.get("subtb_max_span_schedule") or []
+    if not isinstance(schedule, list):
+        raise ValueError("training.subtb_max_span_schedule must be a list")
+    # The generator performs the full ordering/open-ended validation.
+    training["subtb_max_span_schedule"] = [dict(row) for row in schedule]
+    for field_name in (
+        "breakpoint_gradient_clip_norm",
+        "time_head_gradient_clip_norm",
+    ):
+        training[field_name] = (
+            None
+            if training.get(field_name) is None
+            else float(training[field_name])
+        )
+        if training[field_name] is not None and (
+            not math.isfinite(training[field_name])
+            or training[field_name] <= 0.0
+        ):
+            raise ValueError(
+                f"training.{field_name} must be finite and positive or null"
+            )
+    for field_name in (
+        "time_head_warmup_epochs",
+        "min_terminal_trajectories_per_batch",
+        "flow_debug_max_records",
+    ):
+        value = int(training.get(field_name, DEFAULT_CONFIG["training"][field_name]))
+        if value < 0:
+            raise ValueError(f"training.{field_name} must be nonnegative")
+        training[field_name] = value
+    update_norm_every = int(
+        training.get("model_diagnostics_update_norm_every", 1)
+    )
+    if update_norm_every <= 0:
+        raise ValueError(
+            "training.model_diagnostics_update_norm_every must be positive"
+        )
+    training["model_diagnostics_update_norm_every"] = update_norm_every
+    for field_name in (
+        "flow_debug",
+        "probability_checks",
+        "model_diagnostics",
+    ):
+        if not isinstance(training.get(field_name), bool):
+            raise ValueError(f"training.{field_name} must be true or false")
+    for field_name in ("fixed_eval_bank_episodes", "fixed_eval_bank_seed"):
+        value = int(training.get(field_name, DEFAULT_CONFIG["training"][field_name]))
+        if field_name == "fixed_eval_bank_episodes" and value < 0:
+            raise ValueError("training.fixed_eval_bank_episodes must be nonnegative")
+        training[field_name] = value
+    if not isinstance(training.get("fixed_eval_bank_create_if_missing"), bool):
+        raise ValueError(
+            "training.fixed_eval_bank_create_if_missing must be true or false"
+        )
+    training["fixed_eval_bank_source"] = str(
+        training.get("fixed_eval_bank_source", "baseline")
+    )
     partial_segment_max_steps = int(
         training.get("partial_segment_max_steps", DEFAULT_PARTIAL_SEGMENT_MAX_STEPS)
     )
@@ -399,14 +662,6 @@ def validate_train_config(config):
             + ", ".join(repr(value) for value in PARTIAL_START_MODES)
         )
     training["partial_start_mode"] = partial_start_mode
-    if (
-        partial_start_mode == "terminal_prefix_mixture"
-        and training["grad_accum_steps"] % 2
-    ):
-        raise ValueError(
-            "training.partial_start_mode='terminal_prefix_mixture' requires "
-            "an even training.grad_accum_steps"
-        )
     try:
         partial_boundary_fraction = float(
             training.get(
@@ -423,6 +678,34 @@ def validate_train_config(config):
             "training.partial_boundary_fraction must be between 0 and 1"
         )
     training["partial_boundary_fraction"] = partial_boundary_fraction
+    trajectory_training_mode = str(
+        training.get("trajectory_training_mode", "complete")
+    ).lower()
+    if trajectory_training_mode != "complete":
+        raise ValueError(
+            "partial trajectory training is temporarily disabled; "
+            "training.trajectory_training_mode must be 'complete'"
+        )
+    training["trajectory_training_mode"] = trajectory_training_mode
+    training["complete_trajectory_max_steps"] = parse_optional_positive_int(
+        training.get("complete_trajectory_max_steps"),
+        "training.complete_trajectory_max_steps",
+    )
+    for field_name, default in (
+        ("selection_margin", 1e-6),
+        ("min_valid_splice_rate", 0.90),
+        ("min_unique_topology_rate", 0.25),
+    ):
+        try:
+            value = float(training.get(field_name, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"training.{field_name} must be a number") from exc
+        if field_name == "selection_margin":
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError("training.selection_margin must be finite and nonnegative")
+        elif not 0.0 <= value <= 1.0:
+            raise ValueError(f"training.{field_name} must be between 0 and 1")
+        training[field_name] = value
     refinement = config.get("refinement", {})
     legacy_fields = {
         "bad_region_top_k",
@@ -577,18 +860,52 @@ def config_to_train_kwargs(config):
         "mutation_rate": environment["mutation_rate"],
         "recombination_rate": environment["recombination_rate"],
         "policy_lr": training["policy_lr"],
+        "breakpoint_policy_lr": training.get("breakpoint_policy_lr"),
         "time_policy_lr": training.get("time_policy_lr"),
         "log_z_lr": training["log_z_lr"],
+        "lr_scheduler_config": copy.deepcopy(training["lr_scheduler"]),
         "loss_mode": str(training["loss"]).lower(),
         "subtb_lambda": training["subtb_lambda"],
         "subtb_max_span": training["subtb_max_span"],
+        "subtb_lambda_initial": training["subtb_lambda_initial"],
+        "subtb_lambda_final": training["subtb_lambda_final"],
+        "subtb_max_span_schedule": training["subtb_max_span_schedule"],
+        "terminal_loss_weight": training["terminal_loss_weight"],
+        "residual_scale": training["residual_scale"],
         "grad_clip": training["grad_clip"],
+        "breakpoint_gradient_clip_norm": training[
+            "breakpoint_gradient_clip_norm"
+        ],
+        "time_head_gradient_clip_norm": training["time_head_gradient_clip_norm"],
+        "time_head_warmup_epochs": training["time_head_warmup_epochs"],
+        "model_diagnostics": training["model_diagnostics"],
+        "model_diagnostics_update_norm_every": training[
+            "model_diagnostics_update_norm_every"
+        ],
         "grad_accum_steps": training["grad_accum_steps"],
+        "min_terminal_trajectories_per_batch": training[
+            "min_terminal_trajectories_per_batch"
+        ],
+        "flow_debug": training["flow_debug"],
+        "flow_debug_max_records": training["flow_debug_max_records"],
+        "probability_checks": training["probability_checks"],
+        "fixed_eval_bank_path": training["fixed_eval_bank_path"],
+        "fixed_eval_bank_episodes": training["fixed_eval_bank_episodes"],
+        "fixed_eval_bank_seed": training["fixed_eval_bank_seed"],
+        "fixed_eval_bank_source": training["fixed_eval_bank_source"],
+        "fixed_eval_bank_create_if_missing": training[
+            "fixed_eval_bank_create_if_missing"
+        ],
         "eval_episodes": training["eval_episodes"],
         "eval_every": training["eval_every"],
         "partial_segment_max_steps": training["partial_segment_max_steps"],
         "partial_start_mode": training["partial_start_mode"],
         "partial_boundary_fraction": training["partial_boundary_fraction"],
+        "trajectory_training_mode": training["trajectory_training_mode"],
+        "complete_trajectory_max_steps": training["complete_trajectory_max_steps"],
+        "selection_margin": training["selection_margin"],
+        "min_valid_splice_rate": training["min_valid_splice_rate"],
+        "min_unique_topology_rate": training["min_unique_topology_rate"],
         "reward_C": reward["constant"],
         "embedding_size": model["embedding_size"],
         "hidden_size": model["hidden_size"],
@@ -615,6 +932,18 @@ def config_to_train_kwargs(config):
         "local_prior_gate_logit_bias": model.get(
             "local_prior_gate_logit_bias",
             DEFAULT_LOCAL_PRIOR_GATE_LOGIT_BIAS,
+        ),
+        "recombination_split_bias": copy.deepcopy(
+            model.get(
+                "recombination_split_bias",
+                DEFAULT_RECOMBINATION_SPLIT_BIAS_CONFIG,
+            )
+        ),
+        "local_cwr_event_gate": copy.deepcopy(
+            model.get(
+                "local_cwr_event_gate",
+                DEFAULT_LOCAL_CWR_EVENT_GATE_CONFIG,
+            )
         ),
         "verbose": training["verbose"],
     }
@@ -729,7 +1058,27 @@ def _record_rollout_metrics(metrics, rollout_mode, rollout_outputs):
             "time_delta_sum": 0.0,
             "time_near_boundary_sum": 0.0,
             "time_finite_density_sum": 0.0,
+            "time_entropy_sum": 0.0,
+            "time_entropy_count": 0,
+            "time_effective_components_sum": 0.0,
+            "time_effective_components_count": 0,
             "fixed_attachment_sum": 0,
+            "coalescence_sum": 0,
+            "recombination_sum": 0,
+            "structural_decision_count": 0,
+            "structural_action_support_size_sum": 0,
+            "structural_action_entropy_sum": 0.0,
+            "structural_action_normalized_entropy_sum": 0.0,
+            "structural_selected_probability_sum": 0.0,
+            "structural_max_probability_sum": 0.0,
+            "coalescence_probability_mass_sum": 0.0,
+            "recombination_probability_mass_sum": 0.0,
+            "breakpoint_decision_count": 0,
+            "breakpoint_support_size_sum": 0,
+            "breakpoint_entropy_sum": 0.0,
+            "breakpoint_normalized_entropy_sum": 0.0,
+            "breakpoint_selected_probability_sum": 0.0,
+            "breakpoint_max_probability_sum": 0.0,
         },
     )
     lengths = rollout_outputs["trajectory_lengths"].detach().float().cpu()
@@ -754,9 +1103,81 @@ def _record_rollout_metrics(metrics, rollout_mode, rollout_outputs):
     entry["time_finite_density_sum"] += float(
         torch.isfinite(densities).sum().item()
     )
+    entropies = rollout_outputs["time_policy_entropies"].detach().cpu()
+    finite_entropies = entropies[torch.isfinite(entropies)]
+    entry["time_entropy_sum"] += float(finite_entropies.sum().item())
+    entry["time_entropy_count"] += int(finite_entropies.numel())
+    effective_components = rollout_outputs[
+        "time_effective_components"
+    ].detach().cpu()
+    entry["time_effective_components_sum"] += float(
+        effective_components[torch.isfinite(effective_components)].sum().item()
+    )
+    entry["time_effective_components_count"] += int(
+        torch.isfinite(effective_components).sum().item()
+    )
     entry["fixed_attachment_sum"] += int(
         rollout_outputs["fixed_attachment_count"]
     )
+    entry["coalescence_sum"] += int(
+        rollout_outputs["coalescence_counts"].sum().item()
+    )
+    entry["recombination_sum"] += int(
+        rollout_outputs["recombination_counts"].sum().item()
+    )
+    policy_rows = [
+        row
+        for trajectory in rollout_outputs.get("trajectory_policy_diagnostics", ())
+        for row in trajectory
+    ]
+    structural_rows = [
+        row for row in policy_rows if row.get("selected_gate") == "generated"
+    ]
+    entry["structural_decision_count"] += len(structural_rows)
+    for row in structural_rows:
+        entry["structural_action_support_size_sum"] += int(
+            row.get("structural_action_support_size", 0)
+        )
+        entry["structural_action_entropy_sum"] += float(
+            row.get("structural_action_entropy", 0.0)
+        )
+        entry["structural_action_normalized_entropy_sum"] += float(
+            row.get("structural_action_normalized_entropy", 0.0)
+        )
+        entry["structural_selected_probability_sum"] += float(
+            row.get("selected_atomic_action_probability", 0.0)
+        )
+        entry["structural_max_probability_sum"] += float(
+            row.get("structural_action_max_probability", 0.0)
+        )
+        entry["coalescence_probability_mass_sum"] += float(
+            row.get("coalescence_probability_mass", 0.0)
+        )
+        entry["recombination_probability_mass_sum"] += float(
+            row.get("recombination_probability_mass", 0.0)
+        )
+    breakpoint_rows = [
+        row
+        for row in policy_rows
+        if int(row.get("breakpoint_support_size", 0)) > 0
+    ]
+    entry["breakpoint_decision_count"] += len(breakpoint_rows)
+    for row in breakpoint_rows:
+        entry["breakpoint_support_size_sum"] += int(
+            row.get("breakpoint_support_size", 0)
+        )
+        entry["breakpoint_entropy_sum"] += float(
+            row.get("breakpoint_entropy", 0.0)
+        )
+        entry["breakpoint_normalized_entropy_sum"] += float(
+            row.get("breakpoint_normalized_entropy", 0.0)
+        )
+        entry["breakpoint_selected_probability_sum"] += float(
+            row.get("breakpoint_selected_probability", 0.0)
+        )
+        entry["breakpoint_max_probability_sum"] += float(
+            row.get("breakpoint_max_probability", 0.0)
+        )
 
 
 def _summarize_rollout_metrics(metrics):
@@ -786,6 +1207,66 @@ def _summarize_rollout_metrics(metrics):
         summary[f"{prefix}_fixed_attachment_mean"] = float(
             entry["fixed_attachment_sum"] / trajectories
         )
+        time_prefix = f"models/time/behavior/{mode}"
+        summary[f"{time_prefix}/sample_count"] = int(entry["time_count"])
+        summary[f"{time_prefix}/quantile_mean"] = summary[
+            f"{prefix}_time_quantile_mean"
+        ]
+        summary[f"{time_prefix}/near_boundary_rate"] = summary[
+            f"{prefix}_time_near_boundary_rate"
+        ]
+        summary[f"{time_prefix}/finite_density_rate"] = summary[
+            f"{prefix}_time_finite_density_rate"
+        ]
+        entropy_count = max(int(entry["time_entropy_count"]), 1)
+        summary[f"{time_prefix}/entropy_mean"] = float(
+            entry["time_entropy_sum"] / entropy_count
+        )
+        effective_component_count = max(
+            int(entry["time_effective_components_count"]),
+            1,
+        )
+        summary[f"{time_prefix}/effective_components_mean"] = float(
+            entry["time_effective_components_sum"] / effective_component_count
+        )
+
+        structural_prefix = f"models/structural/behavior/{mode}"
+        structural_count = int(entry["structural_decision_count"])
+        summary[f"{structural_prefix}/decision_count"] = structural_count
+        if structural_count:
+            for metric_name, sum_name in (
+                ("support_size_mean", "structural_action_support_size_sum"),
+                ("entropy_mean", "structural_action_entropy_sum"),
+                (
+                    "normalized_entropy_mean",
+                    "structural_action_normalized_entropy_sum",
+                ),
+                ("selected_probability_mean", "structural_selected_probability_sum"),
+                ("max_probability_mean", "structural_max_probability_sum"),
+                ("coalescence_probability_mass_mean", "coalescence_probability_mass_sum"),
+                ("recombination_probability_mass_mean", "recombination_probability_mass_sum"),
+            ):
+                summary[f"{structural_prefix}/{metric_name}"] = float(
+                    entry[sum_name] / structural_count
+                )
+        summary[f"{structural_prefix}/recombination_coalescence_ratio"] = float(
+            entry["recombination_sum"] / max(entry["coalescence_sum"], 1)
+        )
+
+        breakpoint_prefix = f"models/breakpoint/behavior/{mode}"
+        breakpoint_count = int(entry["breakpoint_decision_count"])
+        summary[f"{breakpoint_prefix}/decision_count"] = breakpoint_count
+        if breakpoint_count:
+            for metric_name, sum_name in (
+                ("support_size_mean", "breakpoint_support_size_sum"),
+                ("entropy_mean", "breakpoint_entropy_sum"),
+                ("normalized_entropy_mean", "breakpoint_normalized_entropy_sum"),
+                ("selected_probability_mean", "breakpoint_selected_probability_sum"),
+                ("max_probability_mean", "breakpoint_max_probability_sum"),
+            ):
+                summary[f"{breakpoint_prefix}/{metric_name}"] = float(
+                    entry[sum_name] / breakpoint_count
+                )
     return summary
 
 
@@ -927,16 +1408,44 @@ def train(
     mutation_rate=DEFAULT_MU_PER_BP,
     recombination_rate=DEFAULT_R_PER_BP,
     policy_lr=DEFAULT_POLICY_LR,
+    breakpoint_policy_lr=None,
     time_policy_lr=None,
     log_z_lr=DEFAULT_LOG_Z_LR,
+    lr_scheduler_config=None,
     loss_mode=DEFAULT_LOSS,
     subtb_lambda=DEFAULT_SUBTB_LAMBDA,
     subtb_max_span=DEFAULT_SUBTB_MAX_SPAN,
+    subtb_lambda_initial=None,
+    subtb_lambda_final=None,
+    subtb_max_span_schedule=None,
+    terminal_loss_weight=1.0,
+    residual_scale=1.0,
     grad_clip=DEFAULT_GRAD_CLIP,
+    breakpoint_gradient_clip_norm=None,
+    time_head_gradient_clip_norm=None,
+    time_head_warmup_epochs=0,
+    model_diagnostics=True,
+    model_diagnostics_update_norm_every=1,
     grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
+    min_terminal_trajectories_per_batch=0,
+    flow_debug=False,
+    flow_debug_max_records=16,
+    probability_checks=False,
+    fixed_eval_bank_path=None,
+    fixed_eval_bank_episodes=0,
+    fixed_eval_bank_seed=100007,
+    fixed_eval_bank_source="baseline",
+    fixed_eval_bank_create_if_missing=False,
     eval_episodes=DEFAULT_EVAL_EPISODES,
     eval_every=DEFAULT_EVAL_EVERY,
     partial_segment_max_steps=DEFAULT_PARTIAL_SEGMENT_MAX_STEPS,
+    partial_start_mode=DEFAULT_PARTIAL_START_MODE,
+    partial_boundary_fraction=DEFAULT_PARTIAL_BOUNDARY_FRACTION,
+    trajectory_training_mode="complete",
+    complete_trajectory_max_steps=None,
+    selection_margin=1e-6,
+    min_valid_splice_rate=0.90,
+    min_unique_topology_rate=0.25,
     reward_C=30000,
     embedding_size=DEFAULT_EMBEDDING_SIZE,
     hidden_size=DEFAULT_HIDDEN_SIZE,
@@ -951,6 +1460,8 @@ def train(
     local_coalescence_similarity_bias=DEFAULT_LOCAL_COALESCENCE_SIMILARITY_BIAS,
     local_prior_action_logit_bias=DEFAULT_LOCAL_PRIOR_ACTION_LOGIT_BIAS,
     local_prior_gate_logit_bias=DEFAULT_LOCAL_PRIOR_GATE_LOGIT_BIAS,
+    recombination_split_bias=None,
+    local_cwr_event_gate=None,
     verbose=True,
     
 ):
@@ -989,6 +1500,12 @@ def train(
         mutation_rate=mutation_rate,
         reward_C=reward_C,
     )
+    requested_recombination_split_bias = (
+        normalize_recombination_split_bias_config(recombination_split_bias)
+    )
+    requested_local_cwr_event_gate = normalize_local_cwr_event_gate_config(
+        local_cwr_event_gate
+    )
     model_kwargs = {
         "embedding_size": int(embedding_size),
         "hidden_size": int(hidden_size),
@@ -1002,6 +1519,8 @@ def train(
         "local_coalescence_similarity_bias": float(local_coalescence_similarity_bias),
         "local_prior_action_logit_bias": float(local_prior_action_logit_bias),
         "local_prior_gate_logit_bias": float(local_prior_gate_logit_bias),
+        "recombination_split_bias": requested_recombination_split_bias,
+        "local_cwr_event_gate": requested_local_cwr_event_gate,
         "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
         "time_layers": int(DEFAULT_TIME_LAYERS),
         "time_dropout": float(DEFAULT_TIME_DROPOUT),
@@ -1018,6 +1537,7 @@ def train(
         device=device,
         verbose=verbose,
         policy_lr=policy_lr,
+        breakpoint_policy_lr=breakpoint_policy_lr,
         time_policy_lr=time_policy_lr,
         log_z_lr=log_z_lr,
         grad_clip=grad_clip,
@@ -1025,6 +1545,23 @@ def train(
         loss_mode=loss_mode,
         subtb_lambda=subtb_lambda,
         subtb_max_span=subtb_max_span,
+        subtb_lambda_initial=subtb_lambda_initial,
+        subtb_lambda_final=subtb_lambda_final,
+        subtb_max_span_schedule=subtb_max_span_schedule,
+        terminal_loss_weight=terminal_loss_weight,
+        residual_scale=residual_scale,
+        breakpoint_gradient_clip_norm=breakpoint_gradient_clip_norm,
+        time_head_gradient_clip_norm=time_head_gradient_clip_norm,
+        time_head_warmup_epochs=time_head_warmup_epochs,
+        model_diagnostics=model_diagnostics,
+        model_diagnostics_update_norm_every=(
+            model_diagnostics_update_norm_every
+        ),
+        flow_debug=flow_debug,
+        flow_debug_max_records=flow_debug_max_records,
+        probability_checks=probability_checks,
+        lr_scheduler_config=lr_scheduler_config,
+        total_training_steps=int(epochs_num),
     )
     print(f"Generator device: {generator.device}")
 
@@ -1045,6 +1582,15 @@ def train(
     print(f"use_wandb: {use_wandb}")
     if use_wandb:
         wandb_run = wandb.init()
+        wandb_run.define_metric("lr/optimizer_step")
+        wandb_run.define_metric(
+            "models/*",
+            step_metric="lr/optimizer_step",
+        )
+        wandb_run.define_metric(
+            "lr/*",
+            step_metric="lr/optimizer_step",
+        )
         wandb.config.update({
             "device": str(generator.device),
             "input_mode": input_mode,
@@ -1053,14 +1599,33 @@ def train(
             "mutation_rate": float(mutation_rate),
             "recombination_rate": float(recombination_rate),
             "policy_lr": float(policy_lr),
-            "time_policy_lr": (
-                None if time_policy_lr is None else float(time_policy_lr)
+            "breakpoint_policy_lr": (
+                float(policy_lr)
+                if breakpoint_policy_lr is None
+                else float(breakpoint_policy_lr)
             ),
+            "time_policy_lr": float(generator.time_policy_lr),
             "log_z_lr": float(log_z_lr),
+            "lr_scheduler": generator.lr_scheduler_metadata(),
             "loss": loss_mode,
             "subtb_lambda": float(subtb_lambda),
             "subtb_max_span": subtb_max_span,
+            "subtb_lambda_initial": subtb_lambda_initial,
+            "subtb_lambda_final": subtb_lambda_final,
+            "subtb_max_span_schedule": list(subtb_max_span_schedule or ()),
+            "terminal_loss_weight": float(terminal_loss_weight),
+            "residual_scale": float(residual_scale),
             "grad_clip": float(grad_clip),
+            "breakpoint_gradient_clip_norm": breakpoint_gradient_clip_norm,
+            "time_head_gradient_clip_norm": time_head_gradient_clip_norm,
+            "time_head_warmup_epochs": int(time_head_warmup_epochs),
+            "model_diagnostics": bool(model_diagnostics),
+            "model_diagnostics_update_norm_every": int(
+                model_diagnostics_update_norm_every
+            ),
+            "min_terminal_trajectories_per_batch": int(
+                min_terminal_trajectories_per_batch
+            ),
             "grad_accum_steps": int(grad_accum_steps),
             "eval_episodes": int(eval_episodes),
             "eval_every": int(eval_every),
@@ -1071,6 +1636,7 @@ def train(
 
     try:
         for epoch in range(epochs_num):
+            generator.set_training_epoch(epoch, total_epochs=epochs_num)
             info = train_epoch(
                 epoch,
                 rollout_worker,
@@ -1107,6 +1673,7 @@ def train(
                         seed + 100000 + epoch,
                     )
                 )
+            info.update(generator.step_lr_scheduler(info))
             history.append(info)
             loss = float(info["loss"])
 
@@ -1170,6 +1737,41 @@ def train(
             )
             metadata.update(
                 {
+                    "lr_scheduler": generator.lr_scheduler_metadata(),
+                    "model_analysis": {
+                        "breakpoint_policy_lr": float(
+                            generator.breakpoint_policy_lr
+                        ),
+                        "breakpoint_gradient_clip_norm": (
+                            generator.breakpoint_gradient_clip_norm
+                        ),
+                        "model_diagnostics": bool(model_diagnostics),
+                        "model_diagnostics_update_norm_every": int(
+                            model_diagnostics_update_norm_every
+                        ),
+                        "parameter_groups": {
+                            "structural": {
+                                "base_lr": float(generator.arg_model_lr),
+                                "gradient_clip_norm": float(generator.grad_clip),
+                            },
+                            "breakpoint": {
+                                "base_lr": float(generator.breakpoint_policy_lr),
+                                "gradient_clip_norm": float(
+                                    generator.grad_clip
+                                    if generator.breakpoint_gradient_clip_norm is None
+                                    else generator.breakpoint_gradient_clip_norm
+                                ),
+                            },
+                            "time": {
+                                "base_lr": float(generator.time_policy_lr),
+                                "gradient_clip_norm": float(
+                                    generator.grad_clip
+                                    if generator.time_head_gradient_clip_norm is None
+                                    else generator.time_head_gradient_clip_norm
+                                ),
+                            },
+                        },
+                    },
                     "selection_metric": best_metric_name,
                     "selection_value": (
                         None if not math.isfinite(best_loss) else float(best_loss)
@@ -1183,6 +1785,7 @@ def train(
                 "best_metric_value": (
                     None if not math.isfinite(best_loss) else float(best_loss)
                 ),
+                "optimizer_step": int(info["lr/optimizer_step"]),
             }
             if is_best:
                 generator.save(
@@ -1264,6 +1867,8 @@ def _train_local_refinement_legacy(
     local_coalescence_similarity_bias=DEFAULT_LOCAL_COALESCENCE_SIMILARITY_BIAS,
     local_prior_action_logit_bias=DEFAULT_LOCAL_PRIOR_ACTION_LOGIT_BIAS,
     local_prior_gate_logit_bias=DEFAULT_LOCAL_PRIOR_GATE_LOGIT_BIAS,
+    recombination_split_bias=None,
+    local_cwr_event_gate=None,
     verbose=True,
 ):
     from refinement import (
@@ -1311,6 +1916,12 @@ def _train_local_refinement_legacy(
         mutation_rate=mutation_rate,
         reward_C=reward_C,
     )
+    requested_recombination_split_bias = (
+        normalize_recombination_split_bias_config(recombination_split_bias)
+    )
+    requested_local_cwr_event_gate = normalize_local_cwr_event_gate_config(
+        local_cwr_event_gate
+    )
     model_kwargs = {
         "embedding_size": int(embedding_size),
         "hidden_size": int(hidden_size),
@@ -1324,6 +1935,8 @@ def _train_local_refinement_legacy(
         "local_coalescence_similarity_bias": float(local_coalescence_similarity_bias),
         "local_prior_action_logit_bias": float(local_prior_action_logit_bias),
         "local_prior_gate_logit_bias": float(local_prior_gate_logit_bias),
+        "recombination_split_bias": requested_recombination_split_bias,
+        "local_cwr_event_gate": requested_local_cwr_event_gate,
         "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
         "time_layers": int(DEFAULT_TIME_LAYERS),
         "time_dropout": float(DEFAULT_TIME_DROPOUT),
@@ -1342,6 +1955,10 @@ def _train_local_refinement_legacy(
         validate_checkpoint_metadata_for_env(checkpoint_metadata, env)
         if checkpoint_metadata.get("model"):
             model_kwargs = dict(checkpoint_metadata["model"])
+            model_kwargs["recombination_split_bias"] = (
+                requested_recombination_split_bias
+            )
+            model_kwargs["local_cwr_event_gate"] = requested_local_cwr_event_gate
 
     source = build_refinement_source(
         source_env,
@@ -2035,11 +2652,55 @@ def main():
     parser.add_argument("--mutation-rate", type=float)
     parser.add_argument("--recombination-rate", type=float)
     parser.add_argument("--policy-lr", type=float)
+    parser.add_argument("--breakpoint-policy-lr", type=float)
+    parser.add_argument("--time-policy-lr", type=float)
     parser.add_argument("--log-z-lr", type=float)
+    parser.add_argument(
+        "--lr-scheduler",
+        dest="lr_scheduler_type",
+        choices=sorted(LR_SCHEDULER_TYPES),
+    )
+    parser.add_argument("--lr-warmup-steps", type=int)
+    parser.add_argument("--lr-warmup-fraction", type=float)
+    parser.add_argument("--lr-warmup-start-ratio", type=float)
+    parser.add_argument("--lr-min-ratio", type=float)
+    parser.add_argument("--lr-step-size", type=int)
+    parser.add_argument("--lr-step-gamma", type=float)
+    parser.add_argument("--lr-plateau-metric")
+    parser.add_argument(
+        "--lr-plateau-mode",
+        choices=sorted(LR_PLATEAU_MODES),
+    )
+    parser.add_argument("--lr-plateau-factor", type=float)
+    parser.add_argument("--lr-plateau-patience", type=int)
+    parser.add_argument("--lr-plateau-threshold", type=float)
+    parser.add_argument(
+        "--lr-plateau-threshold-mode",
+        choices=sorted(LR_PLATEAU_THRESHOLD_MODES),
+    )
+    parser.add_argument("--lr-plateau-cooldown", type=int)
     parser.add_argument("--loss", choices=["tb", "subtb", "fl_subtb"])
     parser.add_argument("--subtb-lambda", type=float)
     parser.add_argument("--subtb-max-span", type=int)
+    parser.add_argument("--terminal-loss-weight", type=float)
+    parser.add_argument("--residual-scale", type=float)
     parser.add_argument("--grad-clip", type=float)
+    parser.add_argument("--breakpoint-gradient-clip-norm", type=float)
+    parser.add_argument("--time-head-gradient-clip-norm", type=float)
+    parser.add_argument("--time-head-warmup-epochs", type=int)
+    parser.add_argument(
+        "--model-diagnostics",
+        dest="model_diagnostics",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-model-diagnostics",
+        dest="model_diagnostics",
+        action="store_false",
+    )
+    parser.add_argument("--model-diagnostics-update-norm-every", type=int)
+    parser.add_argument("--min-terminal-trajectories-per-batch", type=int)
     parser.add_argument(
         "--grad-accum-steps",
         type=int,
@@ -2053,6 +2714,14 @@ def main():
         choices=list(PARTIAL_START_MODES),
     )
     parser.add_argument("--partial-boundary-fraction", type=float)
+    parser.add_argument(
+        "--trajectory-training-mode",
+        choices=["complete"],
+    )
+    parser.add_argument("--complete-trajectory-max-steps", type=int)
+    parser.add_argument("--selection-margin", type=float)
+    parser.add_argument("--min-valid-splice-rate", type=float)
+    parser.add_argument("--min-unique-topology-rate", type=float)
     parser.add_argument("--time-basis-components", type=int)
     parser.add_argument("--reward-constant", type=float)
     parser.add_argument("--embedding-size", type=int)

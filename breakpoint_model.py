@@ -1,7 +1,53 @@
+import math
+
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
+
+
+def _add_candidate_logit_bias(logits, logit_bias):
+    if logit_bias is None:
+        return logits
+    bias = torch.as_tensor(
+        logit_bias,
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    if bias.ndim != 1 or tuple(bias.shape) != tuple(logits.shape):
+        raise ValueError(
+            "breakpoint logit_bias must be one-dimensional and aligned with "
+            f"valid breakpoints; expected {tuple(logits.shape)}, got {tuple(bias.shape)}"
+        )
+    if not bool(torch.isfinite(bias).all().detach().cpu().item()):
+        raise ValueError("breakpoint logit_bias must contain only finite values")
+    return logits + bias
 import torch.nn.functional as F
+
+
+def _categorical_diagnostics(logits, selected_index):
+    with torch.no_grad():
+        log_probabilities = F.log_softmax(logits, dim=0)
+        probabilities = torch.exp(log_probabilities)
+        entropy = -(probabilities * log_probabilities).sum()
+        support_size = int(logits.numel())
+        normalized_entropy = (
+            entropy / math.log(support_size)
+            if support_size > 1
+            else entropy.new_tensor(0.0)
+        ).clamp(0.0, 1.0)
+        return {
+            "breakpoint_support_size": support_size,
+            "breakpoint_entropy": float(entropy.detach().cpu().item()),
+            "breakpoint_normalized_entropy": float(
+                normalized_entropy.detach().cpu().item()
+            ),
+            "breakpoint_selected_probability": float(
+                probabilities[selected_index].detach().cpu().item()
+            ),
+            "breakpoint_max_probability": float(
+                probabilities.max().detach().cpu().item()
+            ),
+        }
 
 class ResidualDilatedConvBlock(nn.Module):
     def __init__(self, hidden_dim, kernel_size=5, dilation=1, dropout=0.1):
@@ -169,6 +215,7 @@ class BreakpointSplitPositionCNN(nn.Module):
         sequence_length,
         num_blocks,
         action_context,
+        logit_bias=None,
     ):
         valid_breakpoints = self._valid_breakpoints_list(valid_breakpoints)
         if not valid_breakpoints:
@@ -206,7 +253,10 @@ class BreakpointSplitPositionCNN(nn.Module):
                 )
             )
         scorer_input = torch.cat(scorer_inputs, dim=1)
-        return self.gap_scorer(scorer_input).squeeze(-1)
+        return _add_candidate_logit_bias(
+            self.gap_scorer(scorer_input).squeeze(-1),
+            logit_bias,
+        )
 
     def forward(
         self,
@@ -216,6 +266,7 @@ class BreakpointSplitPositionCNN(nn.Module):
         num_blocks,
         action_context,
         random_spec=None,
+        logit_bias=None,
     ):
         valid_breakpoints = self._valid_breakpoints_list(valid_breakpoints)
         valid_logits = self.valid_breakpoint_logits(
@@ -224,6 +275,7 @@ class BreakpointSplitPositionCNN(nn.Module):
             sequence_length,
             num_blocks,
             action_context,
+            logit_bias=logit_bias,
         )
         if random_spec is not None and "T" in random_spec:
             sample_logits = valid_logits / random_spec["T"]
@@ -232,7 +284,12 @@ class BreakpointSplitPositionCNN(nn.Module):
 
         local_idx = Categorical(logits=sample_logits).sample()
         breakpoint = int(valid_breakpoints[int(local_idx.detach().cpu().item())])
-        log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
+        # Match the recorded probability to the sampling distribution.
+        log_p = F.log_softmax(sample_logits, dim=0)[local_idx]
+        self.last_sample_diagnostics = _categorical_diagnostics(
+            sample_logits,
+            local_idx,
+        )
         return breakpoint, log_p
 
 
@@ -515,16 +572,20 @@ class VCFBreakpointScorer(nn.Module):
         num_blocks,
         action_context,
         state=None,
+        logit_bias=None,
     ):
         device = next(self.parameters()).device
         breakpoints = self._valid_breakpoints_tensor(valid_breakpoints, device)
-        return self._valid_breakpoint_logits_from_tensor(
-            breakpoints,
-            lineage,
-            sequence_length,
-            num_blocks,
-            action_context,
-            state=state,
+        return _add_candidate_logit_bias(
+            self._valid_breakpoint_logits_from_tensor(
+                breakpoints,
+                lineage,
+                sequence_length,
+                num_blocks,
+                action_context,
+                state=state,
+            ),
+            logit_bias,
         )
 
     def forward(
@@ -536,16 +597,20 @@ class VCFBreakpointScorer(nn.Module):
         action_context,
         random_spec=None,
         state=None,
+        logit_bias=None,
     ):
         device = next(self.parameters()).device
         breakpoints = self._valid_breakpoints_tensor(valid_breakpoints, device)
-        valid_logits = self._valid_breakpoint_logits_from_tensor(
-            breakpoints,
-            lineage,
-            sequence_length,
-            num_blocks,
-            action_context,
-            state=state,
+        valid_logits = _add_candidate_logit_bias(
+            self._valid_breakpoint_logits_from_tensor(
+                breakpoints,
+                lineage,
+                sequence_length,
+                num_blocks,
+                action_context,
+                state=state,
+            ),
+            logit_bias,
         )
         if random_spec is not None and "T" in random_spec:
             sample_logits = valid_logits / random_spec["T"]
@@ -554,5 +619,10 @@ class VCFBreakpointScorer(nn.Module):
 
         local_idx = Categorical(logits=sample_logits).sample()
         breakpoint = int(breakpoints[local_idx].detach().cpu().item())
-        log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
+        # Match the recorded probability to the sampling distribution.
+        log_p = F.log_softmax(sample_logits, dim=0)[local_idx]
+        self.last_sample_diagnostics = _categorical_diagnostics(
+            sample_logits,
+            local_idx,
+        )
         return breakpoint, log_p

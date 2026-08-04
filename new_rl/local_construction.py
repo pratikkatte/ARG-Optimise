@@ -466,24 +466,15 @@ def enumerate_local_prior_actions(
     _require_local_state(state)
     coal_actions, recomb_actions = env.enumerate_actions(state)
 
-    legal_coal = []
-    for action in coal_actions:
-        left = state.active_lineages[action.active_lineage_i]
-        right = state.active_lineages[action.active_lineage_j]
-        if (
-            left.event_type == "fixed_source"
-            and right.event_type == "fixed_source"
-        ):
-            continue
-        if not left.material_segments.overlaps(right.material_segments):
-            continue
-        legal_coal.append(action)
+    # Overlap-CwR gives each permitted overlapping pair rate one; disjoint
+    # common-ancestor events are outside this local target.
+    # The base environment enumerates exactly the overlapping pairs.  Revealed
+    # fixed-source target material follows the same local event law.
+    legal_coal = list(coal_actions)
 
     legal_recomb = []
     for action in recomb_actions:
         lineage = state.active_lineages[action.active_lineage_i]
-        if lineage.event_type == "fixed_source":
-            continue
         if not _has_valid_breakpoint(lineage.material_segments, state, env):
             continue
         legal_recomb.append(action)

@@ -1,0 +1,78 @@
+# Complete-trajectory baseline for matched fixed-bank flow evaluation.
+
+dataset_path: validation/vcf/sim_l1mb_0.vcf
+output_path: runs/local_refinement_1mb_flow_consistency_baseline
+device: cuda
+
+refinement:
+  enabled: true
+  arg_path: validation/output/tsinfer/l1mb_dated.trees
+  checkpoint: null
+  terminal_requires_exhausted_fixed_schedule: true
+  requests:
+    - id: region_100kb_200kb
+      genomic_range: [400000, 500000]
+      cut_time: 25000
+
+training:
+  epochs: 1000
+  batch_size: 4
+  grad_accum_steps: 4
+  seed: 7
+  init_z_sample_count: 0
+  verbose: true
+  wandb: true
+
+  policy_lr: 0.0001
+  time_policy_lr: 0.001
+  log_z_lr: 0.001
+  loss: fl_subtb
+  subtb_lambda: 0.9
+  subtb_max_span: 16
+  terminal_loss_weight: 1.0
+  residual_scale: 1.0
+  grad_clip: 10.0
+  time_head_gradient_clip_norm: null
+  time_head_warmup_epochs: 0
+
+  trajectory_training_mode: complete
+  complete_trajectory_max_steps: 512
+  min_terminal_trajectories_per_batch: 4
+
+  eval_episodes: 32
+  eval_every: 10
+  fixed_eval_bank_path: validation/fixed_banks/local_1mb_flow_v1.pkl
+  fixed_eval_bank_episodes: 32
+  fixed_eval_bank_seed: 100007
+  fixed_eval_bank_source: similarity_0.25_initial
+  fixed_eval_bank_create_if_missing: false
+
+  flow_debug: false
+  flow_debug_max_records: 16
+  probability_checks: true
+
+environment:
+  bp_per_blocks: 1
+  effective_population_size: 10000
+  mutation_rate: 2.0e-8
+  recombination_rate: 2.0e-8
+
+reward:
+  constant: 0
+
+model:
+  embedding_size: 64
+  hidden_size: 128
+  dropout: 0.05
+  breakpoint_hidden_dim: 128
+  breakpoint_dropout: 0.05
+  transformer_depth: 4
+  transformer_heads: 4
+  transformer_mlp_ratio: 2.0
+  attention_dropout: 0.05
+  time_basis_components: 16
+  time_context_mode: full
+
+  local_coalescence_similarity_bias: 0.0
+  local_prior_action_logit_bias: 0.0
+  local_prior_gate_logit_bias: 1.0

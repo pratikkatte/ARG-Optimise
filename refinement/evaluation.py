@@ -181,9 +181,17 @@ def _replay_source_score(local_env, context_id: str) -> LocalARGScore:
             live_children = [source_to_live.get(value, value) for value in child_ids]
             live_children = [value for value in live_children if value in active_by_id]
             if len(live_children) != 2:
+                live_material = tuple(
+                    (
+                        int(node_id),
+                        tuple(state.all_nodes[int(node_id)].material_segments.segments),
+                    )
+                    for node_id in live_children
+                )
                 raise SourceScoreUnavailable(
                     "source coalescence is outside the continuous binary CWR "
-                    f"support: active_children={len(live_children)}"
+                    f"support: event_index={selected_event.event_index} "
+                    f"source_children={child_ids} live_children={live_material}"
                 )
             action = CoalescenceChoice(
                 active_lineage_i=active_by_id[live_children[0]],
@@ -225,6 +233,22 @@ def _replay_source_score(local_env, context_id: str) -> LocalARGScore:
                 for _left, right in intervals
                 if boundaries[0] < right < boundaries[-1]
             ]
+            if not source_boundaries and _canonicalize_exterior_recombination(
+                selected_event=selected_event,
+                trace=trace,
+                state=state,
+                source_child_id=child_ids[0],
+                live_child_id=live_child,
+                parent_ids=parent_ids,
+                source_to_live=source_to_live,
+            ):
+                # This is a whole-ARG recombination whose split lies outside
+                # the requested interval.  Exactly one parent carries all of
+                # the mutable local material, so the event is an identity
+                # transition in the conditional local ARG.  Its exterior
+                # contribution is fixed context and is not part of the local
+                # action path or local CWR prior.
+                continue
             breakpoint = (
                 min(
                     candidates,
@@ -237,7 +261,12 @@ def _replay_source_score(local_env, context_id: str) -> LocalARGScore:
                 else None
             )
             if breakpoint is None:
-                raise SourceScoreUnavailable("source breakpoint is outside policy support")
+                raise SourceScoreUnavailable(
+                    "source breakpoint is outside policy support: "
+                    f"event_index={selected_event.event_index} "
+                    f"source_boundaries={tuple(source_boundaries)} "
+                    f"candidate_breakpoints={tuple(candidates)}"
+                )
             action = replace(
                 base_choice,
                 breakpoint=int(breakpoint),
@@ -294,6 +323,103 @@ def _replay_source_score(local_env, context_id: str) -> LocalARGScore:
     ):
         raise SourceScoreUnavailable("source replay topology differs from the input ARG")
     return score
+
+
+def _canonicalize_exterior_recombination(
+    *,
+    selected_event,
+    trace,
+    state,
+    source_child_id: int,
+    live_child_id: int,
+    parent_ids: tuple[int, ...],
+    source_to_live: dict[int, int],
+) -> bool:
+    """Collapse an outside-window source split to its local continuation.
+
+    A mixed-boundary recombination can be selected because one source edge
+    overlaps the requested interval even when the actual split coordinate is
+    outside it.  Such an event is not a legal local recombination.  When one
+    and only one source parent carries the complete live local material, map
+    that parent to the unchanged live lineage and omit the exterior event from
+    the conditional local path.
+
+    The coverage check is deliberately strict.  Ambiguous or partial local
+    routing continues to fail closed rather than inventing a source prior.
+    """
+
+    if getattr(selected_event, "mode", None) != "mixed_boundary":
+        return False
+
+    authorized_edge_ids = tuple(
+        int(value) for value in selected_event.authorized_edge_ids
+    )
+    authorized_child_edges = tuple(
+        edge_id
+        for edge_id in authorized_edge_ids
+        if int(trace.edge_child[edge_id]) == int(source_child_id)
+    )
+    local_parent_ids = {
+        int(trace.edge_parent[edge_id])
+        for edge_id in authorized_child_edges
+    }
+    if len(local_parent_ids) != 1:
+        return False
+
+    local_parent_id = int(next(iter(local_parent_ids)))
+    if local_parent_id not in parent_ids:
+        raise SourceScoreUnavailable(
+            "mixed-boundary source recombination routes local material to an "
+            "unexpected parent"
+        )
+
+    boundaries = tuple(float(value) for value in state.block_boundaries)
+    live_lineage = next(
+        (
+            lineage
+            for lineage in state.active_lineages
+            if int(lineage.node_id) == int(live_child_id)
+        ),
+        None,
+    )
+    if live_lineage is None:
+        raise SourceScoreUnavailable(
+            "mixed-boundary source recombination child is not live"
+        )
+    live_intervals = _merge_intervals(
+        tuple(
+            (boundaries[int(left)], boundaries[int(right)])
+            for left, right in live_lineage.material_segments.segments
+        )
+    )
+    authorized_intervals = _merge_intervals(
+        tuple(
+            (
+                max(boundaries[0], float(trace.edge_left[edge_id])),
+                min(boundaries[-1], float(trace.edge_right[edge_id])),
+            )
+            for edge_id in authorized_child_edges
+        )
+    )
+    if authorized_intervals != live_intervals:
+        return False
+
+    source_to_live[local_parent_id] = int(live_child_id)
+    return True
+
+
+def _merge_intervals(intervals):
+    merged = []
+    for left, right in sorted(
+        (float(left), float(right))
+        for left, right in intervals
+        if float(left) < float(right)
+    ):
+        if merged and left <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+        else:
+            merged.append((left, right))
+    return tuple(merged)
 
 
 def _marginal_topology_signature(tree_sequence, interval):

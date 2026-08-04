@@ -471,24 +471,17 @@ def enumerate_local_prior_actions(
     _require_local_state(state)
     coal_actions, recomb_actions = env.enumerate_actions(state)
 
-    legal_coal = []
-    for action in coal_actions:
-        left = state.active_lineages[action.active_lineage_i]
-        right = state.active_lineages[action.active_lineage_j]
-        if (
-            left.event_type == "fixed_source"
-            and right.event_type == "fixed_source"
-        ):
-            continue
-        if not left.material_segments.overlaps(right.material_segments):
-            continue
-        legal_coal.append(action)
+    # Overlap-CwR support: each permitted overlapping pair has rate one.  This
+    # deliberately excludes likelihood-neutral common-ancestor events between
+    # disjoint material, and is therefore not the complete Hudson process.
+    # ``env.enumerate_actions`` already returns exactly the overlapping pairs.
+    # Once revealed, fixed-source target material participates normally; its
+    # immutable exterior material is not represented in this local state.
+    legal_coal = list(coal_actions)
 
     legal_recomb = []
     for action in recomb_actions:
         lineage = state.active_lineages[action.active_lineage_i]
-        if lineage.event_type == "fixed_source":
-            continue
         if not _has_valid_breakpoint(lineage.material_segments, state, env):
             continue
         legal_recomb.append(action)
@@ -609,24 +602,7 @@ def sample_local_prior_action(
     if event_type == 0:
         if not options.coal_actions:
             raise RuntimeError("coalescence rate is positive without legal pairs")
-        weights = np.asarray(
-            [
-                _local_coalescence_weight(
-                    state.active_lineages[choice.active_lineage_i],
-                    state.active_lineages[choice.active_lineage_j],
-                    state,
-                )
-                for choice in options.coal_actions
-            ],
-            dtype=np.float64,
-        )
-        total_weight = float(weights.sum())
-        if not total_weight > 0.0:
-            weights = np.ones(len(options.coal_actions), dtype=np.float64)
-            total_weight = float(weights.sum())
-        action_index = int(
-            rng.choice(len(options.coal_actions), p=weights / total_weight)
-        )
+        action_index = int(rng.integers(len(options.coal_actions)))
         action = replace(
             options.coal_actions[action_index],
             time_quantile=time_quantile,
@@ -634,7 +610,7 @@ def sample_local_prior_action(
         )
         choice_log_probability = (
             math.log(lambda_coal / total_rate)
-            + math.log(float(weights[action_index]) / total_weight)
+            - math.log(len(options.coal_actions))
         )
     else:
         if not options.recomb_choices:
@@ -2266,12 +2242,16 @@ def _local_coalescence_weight(
     right: ARGLineage,
     state: ARGState,
 ) -> float:
+    """Return the unit rate for a permitted overlap-CwR pair.
+
+    Overlap determines support only; physical overlap length never changes a
+    permitted pair's rate.
+    """
+
     overlap = left.material_segments.intersection(right.material_segments)
     if state.target_material is not None:
         overlap = overlap.intersection(state.target_material)
-    if overlap.count <= 0:
-        return 0.0
-    return max(_material_physical_length(state, overlap), 1.0)
+    return 1.0 if overlap.count > 0 else 0.0
 
 
 def _subtract_material(

@@ -104,6 +104,24 @@ def test_rollout_metric_merge_reports_per_trajectory_counts():
         "start_step_sum": 40.0,
         "start_count": 4,
         "boundary_targeted_sum": 2,
+        "policy_row_count": 4,
+        "generated_policy_row_count": 4,
+        "coalescence_probability_mass_sum": 3.0,
+        "recombination_probability_mass_sum": 1.0,
+        "valid_coalescence_actions_sum": 12,
+        "valid_recombination_actions_sum": 4,
+        "selected_gate_probability_sum": 3.2,
+        "selected_atomic_action_probability_sum": 2.0,
+        "structural_action_support_size_sum": 16,
+        "structural_action_entropy_sum": 4.0,
+        "structural_action_normalized_entropy_sum": 3.0,
+        "structural_action_max_probability_sum": 2.4,
+        "breakpoint_decision_count": 2,
+        "breakpoint_support_size_sum": 10,
+        "breakpoint_entropy_sum": 2.0,
+        "breakpoint_normalized_entropy_sum": 1.4,
+        "breakpoint_selected_probability_sum": 0.6,
+        "breakpoint_max_probability_sum": 0.8,
     }
     merged = _merge_rollout_metrics([row])
     assert merged["train_partial_fixed_attachment_mean"] == pytest.approx(3.0)
@@ -111,9 +129,21 @@ def test_rollout_metric_merge_reports_per_trajectory_counts():
     assert merged["train_partial_recombination_mean"] == pytest.approx(2.0)
     assert merged["train_partial_start_step_mean"] == pytest.approx(10.0)
     assert merged["train_partial_boundary_targeted_rate"] == pytest.approx(0.5)
+    assert merged[
+        "models/structural/behavior/partial/normalized_entropy_mean"
+    ] == pytest.approx(0.75)
+    assert merged[
+        "models/breakpoint/behavior/partial/decision_count"
+    ] == 2
+    assert merged[
+        "models/breakpoint/behavior/partial/selected_probability_mean"
+    ] == pytest.approx(0.3)
+    assert merged[
+        "models/time/behavior/partial/effective_components_mean"
+    ] == pytest.approx(2.0)
 
 
-def test_prefix_mode_training_uses_terminal_states(tmp_path):
+def test_production_training_uses_only_complete_terminal_trajectories(tmp_path):
     root = Path(__file__).resolve().parents[1]
     history = train_local_refinement(
         dataset_path=str(root / "validation/vcf/sim_l25kb_0.vcf"),
@@ -150,5 +180,5 @@ def test_prefix_mode_training_uses_terminal_states(tmp_path):
 
     assert len(history) == 1
     assert history[0]["train_terminal_trajectory_length_mean"] > 0
-    assert history[0]["train_partial_boundary_targeted_rate"] == pytest.approx(0.0)
-    assert "train_partial_start_step_mean" in history[0]
+    assert history[0]["train_terminal_terminal_rate"] == pytest.approx(1.0)
+    assert not any(key.startswith("train_partial_") for key in history[0])

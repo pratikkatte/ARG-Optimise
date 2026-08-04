@@ -42,6 +42,12 @@ from refinement import replay_source_score
 from infer import run_inference
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
+from flow_evaluation import (
+    evaluate_fixed_bank,
+    generate_fixed_evaluation_bank,
+    load_fixed_evaluation_bank,
+    save_fixed_evaluation_bank,
+)
 from train import (
     config_to_refinement_kwargs,
     config_to_train_kwargs,
@@ -77,6 +83,13 @@ def main() -> None:
         default=None,
         help="Override the config device.",
     )
+    parser.add_argument("--terminal-loss-weight", type=float)
+    parser.add_argument("--residual-scale", type=float)
+    parser.add_argument("--subtb-lambda", type=float)
+    parser.add_argument("--subtb-max-span", type=int)
+    parser.add_argument("--time-policy-lr", type=float)
+    parser.add_argument("--time-head-gradient-clip-norm", type=float)
+    parser.add_argument("--similarity-bias", type=float)
     parser.add_argument(
         "--report-name",
         default="benchmark_report.json",
@@ -167,6 +180,21 @@ def main() -> None:
         config["training"]["wandb"] = bool(args.wandb)
     if args.device is not None:
         config["device"] = args.device
+    training_overrides = {
+        "terminal_loss_weight": args.terminal_loss_weight,
+        "residual_scale": args.residual_scale,
+        "subtb_lambda": args.subtb_lambda,
+        "subtb_max_span": args.subtb_max_span,
+        "time_policy_lr": args.time_policy_lr,
+        "time_head_gradient_clip_norm": args.time_head_gradient_clip_norm,
+    }
+    for name, value in training_overrides.items():
+        if value is not None:
+            config["training"][name] = value
+    if args.similarity_bias is not None:
+        config["model"]["local_coalescence_similarity_bias"] = (
+            args.similarity_bias
+        )
     if args.output_dir is not None:
         config["output_path"] = args.output_dir
     elif config.get("output_path"):
@@ -272,6 +300,7 @@ def main() -> None:
             device=device,
             verbose=bool(train_kwargs["verbose"]),
             policy_lr=float(train_kwargs["policy_lr"]),
+            breakpoint_policy_lr=train_kwargs.get("breakpoint_policy_lr"),
             time_policy_lr=(
                 None
                 if train_kwargs.get("time_policy_lr") is None
@@ -284,6 +313,27 @@ def main() -> None:
             loss_mode="fl_subtb",
             subtb_lambda=float(train_kwargs["subtb_lambda"]),
             subtb_max_span=train_kwargs["subtb_max_span"],
+            subtb_lambda_initial=train_kwargs.get("subtb_lambda_initial"),
+            subtb_lambda_final=train_kwargs.get("subtb_lambda_final"),
+            subtb_max_span_schedule=train_kwargs.get("subtb_max_span_schedule"),
+            terminal_loss_weight=float(train_kwargs["terminal_loss_weight"]),
+            residual_scale=float(train_kwargs["residual_scale"]),
+            breakpoint_gradient_clip_norm=train_kwargs.get(
+                "breakpoint_gradient_clip_norm"
+            ),
+            time_head_gradient_clip_norm=train_kwargs.get(
+                "time_head_gradient_clip_norm"
+            ),
+            time_head_warmup_epochs=int(train_kwargs["time_head_warmup_epochs"]),
+            model_diagnostics=bool(train_kwargs["model_diagnostics"]),
+            model_diagnostics_update_norm_every=int(
+                train_kwargs["model_diagnostics_update_norm_every"]
+            ),
+            flow_debug=bool(train_kwargs["flow_debug"]),
+            flow_debug_max_records=int(train_kwargs["flow_debug_max_records"]),
+            probability_checks=bool(train_kwargs["probability_checks"]),
+            lr_scheduler_config=train_kwargs.get("lr_scheduler_config"),
+            total_training_steps=int(train_kwargs["epochs_num"]),
         )
     metadata_base = _build_metadata(
         local_env=local_env,
@@ -302,7 +352,7 @@ def main() -> None:
         mutation_rate=train_kwargs["mutation_rate"],
         recombination_rate=train_kwargs["recombination_rate"],
         policy_lr=train_kwargs["policy_lr"],
-        time_policy_lr=train_kwargs.get("time_policy_lr"),
+        time_policy_lr=generator.time_policy_lr,
         log_z_lr=train_kwargs["log_z_lr"],
         subtb_lambda=train_kwargs["subtb_lambda"],
         subtb_max_span=train_kwargs["subtb_max_span"],
@@ -317,6 +367,64 @@ def main() -> None:
             False,
         ),
     )
+    metadata_base["flow_training"] = _json_safe(
+        {
+            "terminal_loss_weight": train_kwargs["terminal_loss_weight"],
+            "residual_scale": train_kwargs["residual_scale"],
+            "subtb_lambda_initial": train_kwargs.get("subtb_lambda_initial"),
+            "subtb_lambda_final": train_kwargs.get("subtb_lambda_final"),
+            "subtb_max_span_schedule": train_kwargs.get(
+                "subtb_max_span_schedule"
+            ),
+            "time_head_gradient_clip_norm": train_kwargs.get(
+                "time_head_gradient_clip_norm"
+            ),
+            "breakpoint_gradient_clip_norm": train_kwargs.get(
+                "breakpoint_gradient_clip_norm"
+            ),
+            "breakpoint_policy_lr": float(generator.breakpoint_policy_lr),
+            "time_policy_lr": float(generator.time_policy_lr),
+            "parameter_groups": {
+                "structural": {
+                    "base_lr": float(generator.arg_model_lr),
+                    "gradient_clip_norm": float(generator.grad_clip),
+                },
+                "breakpoint": {
+                    "base_lr": float(generator.breakpoint_policy_lr),
+                    "gradient_clip_norm": float(
+                        generator.grad_clip
+                        if generator.breakpoint_gradient_clip_norm is None
+                        else generator.breakpoint_gradient_clip_norm
+                    ),
+                },
+                "time": {
+                    "base_lr": float(generator.time_policy_lr),
+                    "gradient_clip_norm": float(
+                        generator.grad_clip
+                        if generator.time_head_gradient_clip_norm is None
+                        else generator.time_head_gradient_clip_norm
+                    ),
+                },
+            },
+            "time_head_warmup_epochs": train_kwargs["time_head_warmup_epochs"],
+            "model_diagnostics": train_kwargs["model_diagnostics"],
+            "model_diagnostics_update_norm_every": train_kwargs[
+                "model_diagnostics_update_norm_every"
+            ],
+            "min_terminal_trajectories_per_batch": train_kwargs[
+                "min_terminal_trajectories_per_batch"
+            ],
+            "trajectory_training_mode": train_kwargs[
+                "trajectory_training_mode"
+            ],
+            "complete_trajectory_max_steps": train_kwargs.get(
+                "complete_trajectory_max_steps"
+            ),
+            "flow_debug": train_kwargs["flow_debug"],
+            "probability_checks": train_kwargs["probability_checks"],
+            "lr_scheduler": generator.lr_scheduler_metadata(),
+        }
+    )
     with open(
         output_dir / "refinement_context_manifest.json",
         "w",
@@ -325,6 +433,26 @@ def main() -> None:
         json.dump(_json_safe(metadata_base), handle, indent=2, sort_keys=True)
 
     worker = RolloutWorker(local_env, verbose=bool(train_kwargs["verbose"]))
+    fixed_eval_bank = None
+    fixed_eval_bank_path = train_kwargs.get("fixed_eval_bank_path")
+    if fixed_eval_bank_path:
+        if os.path.exists(fixed_eval_bank_path):
+            fixed_eval_bank = load_fixed_evaluation_bank(fixed_eval_bank_path)
+        elif bool(train_kwargs.get("fixed_eval_bank_create_if_missing")):
+            fixed_eval_bank = generate_fixed_evaluation_bank(
+                worker,
+                generator,
+                initial_states,
+                episodes=int(train_kwargs["fixed_eval_bank_episodes"]),
+                seed=int(train_kwargs["fixed_eval_bank_seed"]),
+                source=str(train_kwargs["fixed_eval_bank_source"]),
+                max_steps=train_kwargs.get("complete_trajectory_max_steps"),
+            )
+            save_fixed_evaluation_bank(fixed_eval_bank, fixed_eval_bank_path)
+        else:
+            raise FileNotFoundError(
+                f"fixed evaluation bank does not exist: {fixed_eval_bank_path}"
+            )
     sampler = SeededContextSampler(local_env.context_ids, seed)
     history = []
     rollout_index = 0
@@ -333,21 +461,51 @@ def main() -> None:
     best_selection_rank = None
     best_selection_eligible = False
     source_scores = {}
+    source_score_diagnostics = {}
     for context_id in local_env.context_ids:
         try:
             source_scores[context_id] = replay_source_score(local_env, context_id)
-        except Exception:
-            pass
+        except Exception as error:
+            diagnostic = f"{type(error).__name__}: {error}"
+            source_score_diagnostics[context_id] = diagnostic
+            print(
+                "source_score_unavailable\t"
+                f"context={context_id}\terror={diagnostic}",
+                file=sys.stderr,
+                flush=True,
+            )
+    source_score_status = {
+        "available_context_ids": sorted(source_scores),
+        "diagnostics": dict(source_score_diagnostics),
+    }
+    report["source_scores"] = source_score_status
+    metadata_base["source_scores"] = source_score_status
+    if wandb_run is not None:
+        wandb_run.config.update(
+            {"source_scores": _json_safe(source_score_status)},
+            allow_val_change=True,
+        )
+        wandb_run.summary["source_score_available_context_count"] = len(
+            source_scores
+        )
+        wandb_run.summary["source_score_unavailable_context_count"] = len(
+            source_score_diagnostics
+        )
     checkpoint_path = output_dir / "checkpoints" / "best.pt"
     last_checkpoint_path = output_dir / "checkpoints" / "last.pt"
     checkpoint_records: list[dict[str, Any]] = []
 
     with profiler.phase("training", report):
         for epoch in range(int(train_kwargs["epochs_num"])):
+            generator.set_training_epoch(
+                epoch,
+                total_epochs=int(train_kwargs["epochs_num"]),
+            )
             sampled_context_ids = []
             rollout_metrics = []
+            terminal_trajectory_count = 0
             for _ in range(int(train_kwargs["grad_accum_steps"])):
-                rollout_mode = "partial" if rollout_index % 2 == 0 else "terminal"
+                rollout_mode = "terminal"
                 rollout_index += 1
                 context_ids = sampler.sample(int(train_kwargs["batch_size"]))
                 sampled_context_ids.extend(context_ids)
@@ -358,17 +516,28 @@ def main() -> None:
                         initial_states[context_id]
                         for context_id in context_ids
                     ],
-                    max_steps=(
-                        int(train_kwargs["partial_segment_max_steps"])
-                        if rollout_mode == "partial"
-                        else None
-                    ),
+                    max_steps=train_kwargs.get("complete_trajectory_max_steps"),
+                )
+                if not bool(outputs["terminal_mask"].all().detach().cpu().item()):
+                    raise RuntimeError(
+                        "benchmark trajectory hit complete_trajectory_max_steps "
+                        "before termination; partial training is disabled"
+                    )
+                terminal_trajectory_count += int(
+                    outputs["terminal_mask"].detach().sum().cpu().item()
                 )
                 generator.accumulate_loss(
                     outputs,
                     factor=int(train_kwargs["grad_accum_steps"]),
                 )
                 rollout_metrics.append(_rollout_metrics(rollout_mode, outputs))
+            if terminal_trajectory_count < int(
+                train_kwargs["min_terminal_trajectories_per_batch"]
+            ):
+                raise RuntimeError(
+                    "benchmark optimizer step did not contain the configured "
+                    "minimum number of terminal trajectories"
+                )
             info = dict(generator.update_model())
             info["epoch"] = int(epoch)
             info["sampled_context_ids"] = sampled_context_ids
@@ -391,13 +560,16 @@ def main() -> None:
                         initial_states,
                         episodes=int(train_kwargs["eval_episodes"]),
                         seed=seed + 100000,
-                        partial_segment_max_steps=int(
-                            train_kwargs["partial_segment_max_steps"]
+                        complete_trajectory_max_steps=train_kwargs.get(
+                            "complete_trajectory_max_steps"
                         ),
                         source_scores=source_scores,
                         selection_margin=float(train_kwargs["selection_margin"]),
                     )
                 )
+                if fixed_eval_bank is not None:
+                    info.update(evaluate_fixed_bank(generator, fixed_eval_bank))
+            info.update(generator.step_lr_scheduler(info))
             history.append(info)
             if wandb_run is not None:
                 wandb.log(_json_safe(info), step=epoch + 1)
@@ -621,6 +793,9 @@ def _initialize_wandb(
         config=_json_safe(config),
         dir=str(output_dir),
     )
+    wandb.define_metric("lr/optimizer_step")
+    wandb.define_metric("models/*", step_metric="lr/optimizer_step")
+    wandb.define_metric("lr/*", step_metric="lr/optimizer_step")
     wandb.define_metric("checkpoint_inference/*", step_metric="checkpoint_epoch")
     report["wandb"] = {
         "enabled": True,
@@ -1010,6 +1185,12 @@ def _model_kwargs(train_kwargs: dict[str, Any]) -> dict[str, Any]:
         ),
         "local_prior_gate_logit_bias": float(
             train_kwargs.get("local_prior_gate_logit_bias", 0.0)
+        ),
+        "recombination_split_bias": dict(
+            train_kwargs.get("recombination_split_bias") or {}
+        ),
+        "local_cwr_event_gate": dict(
+            train_kwargs.get("local_cwr_event_gate") or {}
         ),
         "time_hidden_size": 256,
         "time_layers": 3,

@@ -1,6 +1,11 @@
 try:
     from .env import CoalescenceChoice, MaterialSegments, RecombinationChoice
     from .breakpoint_model import BreakpointSplitPositionCNN, VCFBreakpointScorer
+    from .recombination_split_bias import (
+        RecombinationSplitBiasScorer,
+        normalize_recombination_split_bias_config,
+    )
+    from .cwr_event_gate import normalize_local_cwr_event_gate_config
     from .time_model import TimeModel
     from .time_env import DEFAULT_TIME_BASIS_COMPONENTS
     from .time_context import (
@@ -12,6 +17,11 @@ try:
 except ImportError:  # Support the repository's script-style entry points.
     from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
     from breakpoint_model import BreakpointSplitPositionCNN, VCFBreakpointScorer
+    from recombination_split_bias import (
+        RecombinationSplitBiasScorer,
+        normalize_recombination_split_bias_config,
+    )
+    from cwr_event_gate import normalize_local_cwr_event_gate_config
     from time_model import TimeModel
     from time_env import DEFAULT_TIME_BASIS_COMPONENTS
     from time_context import (
@@ -24,8 +34,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import math
+
+
+@dataclass(frozen=True)
+class CandidateScoringResult:
+    """Shared candidate-aligned policy data for sampling and replay."""
+
+    base_logits: torch.Tensor
+    probability_logits: torch.Tensor
+    action_features: torch.Tensor
+    valid_mask: torch.Tensor
+    split_records: tuple[tuple[object | None, ...], ...]
+    diagnostics: tuple[dict, ...]
 
 
 class TransformerMLP(nn.Module):
@@ -254,6 +276,8 @@ class ARGModel(nn.Module):
         local_coalescence_similarity_bias=0.0,
         local_prior_action_logit_bias=0.0,
         local_prior_gate_logit_bias=0.0,
+        recombination_split_bias=None,
+        local_cwr_event_gate=None,
     ):
         super().__init__()
         self.env = env
@@ -266,6 +290,25 @@ class ARGModel(nn.Module):
         )
         self.local_prior_action_logit_bias = float(local_prior_action_logit_bias)
         self.local_prior_gate_logit_bias = float(local_prior_gate_logit_bias)
+        self.recombination_split_bias_config = (
+            normalize_recombination_split_bias_config(
+                recombination_split_bias
+            )
+        )
+        self.recombination_split_bias = RecombinationSplitBiasScorer(
+            env,
+            self.recombination_split_bias_config,
+        )
+        self.local_cwr_event_gate_config = normalize_local_cwr_event_gate_config(
+            local_cwr_event_gate
+        )
+        if self.local_cwr_event_gate_config["enabled"] and not (
+            self.local_mode and self.input_mode == "vcf"
+        ):
+            raise ValueError(
+                "model.local_cwr_event_gate is supported only for local VCF "
+                "ARG refinement"
+            )
         self.time_context_mode = str(time_context_mode).lower()
         self.time_context_dim = time_context_dim(self.time_context_mode)
         self.time_context_version = TIME_CONTEXT_VERSION
@@ -316,11 +359,26 @@ class ARGModel(nn.Module):
             self.local_role_embedding = nn.Embedding(4, embedding_size)
             self.local_lineage_time_encoder = nn.Linear(2, embedding_size)
             self.local_transition_gate = nn.Linear(embedding_size, 2)
+            if self.local_cwr_event_gate_config["enabled"]:
+                # Keep every pre-existing parameter initialization identical in
+                # matched enabled/disabled runs.  Constructing an nn.Linear
+                # normally advances the global RNG even though this head is
+                # immediately zero-initialized.
+                with torch.random.fork_rng(devices=[]):
+                    self.local_cwr_event_residual_head = nn.Linear(
+                        embedding_size,
+                        1,
+                    )
+                nn.init.zeros_(self.local_cwr_event_residual_head.weight)
+                nn.init.zeros_(self.local_cwr_event_residual_head.bias)
+            else:
+                self.local_cwr_event_residual_head = None
         else:
             self.local_context_encoder = None
             self.local_role_embedding = None
             self.local_lineage_time_encoder = None
             self.local_transition_gate = None
+            self.local_cwr_event_residual_head = None
         if self.input_mode == "vcf":
             self.breakpoint_scorer = VCFBreakpointScorer(
                 env,
@@ -406,6 +464,17 @@ class ARGModel(nn.Module):
         if self.local_transition_gate is None:
             raise ValueError("local transition gate is unavailable in global mode")
         return self.local_transition_gate(summary_reps)
+
+    def compute_local_cwr_event_residual(self, summary_reps):
+        """Return the bounded posterior correction to the CwR log odds."""
+
+        if self.local_cwr_event_residual_head is None:
+            raise ValueError("local CwR event gate is disabled")
+        raw = self.local_cwr_event_residual_head(summary_reps).squeeze(-1)
+        bound = float(
+            self.local_cwr_event_gate_config["max_abs_residual"]
+        )
+        return bound * torch.tanh(raw / bound), raw
 
     def _local_context_features(self, states):
         rows = []
@@ -1054,7 +1123,10 @@ class ARGModel(nn.Module):
                 summary_reps
             )
             features[batch_idx, :n] = state_action_features
-        logits = self.action_scorer(features.reshape(-1, feat_dim)).reshape(batch_size, max_candidates).squeeze(-1)
+        logits = self.action_scorer(features.reshape(-1, feat_dim)).reshape(
+            batch_size,
+            max_candidates,
+        )
         if (
             self.local_mode
             and self.local_prior_action_logit_bias != 0.0
@@ -1083,8 +1155,352 @@ class ARGModel(nn.Module):
 
         counts = torch.tensor(candidate_counts, device=self.device)
         valid = torch.arange(max_candidates, device=self.device).unsqueeze(0) < counts.unsqueeze(1)
-        masked_logits = logits.masked_fill(~valid, -1e9)
+        # Invalid actions must have exactly zero probability.  A large finite
+        # sentinel can leak mass in low-precision arithmetic and makes support
+        # diagnostics ambiguous.
+        masked_logits = logits.masked_fill(~valid, float("-inf"))
         return masked_logits, features
+
+    def prepare_action_probability_logits(
+        self,
+        logits,
+        candidate_actions,
+        state_contexts,
+        random_spec=None,
+    ):
+        """Apply rollout temperature and the mass-preserving split bias."""
+
+        temperature = (
+            1.0
+            if random_spec is None or "T" not in random_spec
+            else float(random_spec["T"])
+        )
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("rollout temperature must be finite and positive")
+        has_temperature = random_spec is not None and "T" in random_spec
+        probability_logits = logits / temperature if has_temperature else logits
+        empty_records = tuple(
+            tuple(None for _ in actions) for actions in candidate_actions
+        )
+        empty_diagnostics = tuple(
+            {"recombination_split_bias_enabled": False}
+            for _ in candidate_actions
+        )
+        if not self.recombination_split_bias.enabled:
+            return probability_logits, empty_records, empty_diagnostics
+        if state_contexts is None or len(state_contexts) != len(candidate_actions):
+            raise ValueError(
+                "enabled recombination split bias requires one state per action row"
+            )
+
+        adjusted = probability_logits.clone()
+        records_by_row = []
+        diagnostics_by_row = []
+        lineage_weight = float(
+            self.recombination_split_bias_config["lineage_weight"]
+        )
+        for row, (actions, state) in enumerate(
+            zip(candidate_actions, state_contexts)
+        ):
+            records = self.recombination_split_bias.score_candidates(
+                state,
+                actions,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            records_by_row.append(records)
+            recombination_indices = [
+                index
+                for index, action in enumerate(actions)
+                if isinstance(action, RecombinationChoice)
+            ]
+            valid_before = torch.softmax(
+                probability_logits[row, : len(actions)],
+                dim=0,
+            )
+            mass_before = (
+                valid_before[recombination_indices].sum()
+                if recombination_indices
+                else valid_before.new_tensor(0.0)
+            )
+            atomic_adjustments = logits.new_zeros(len(actions))
+            all_breakpoint_scores = []
+            if recombination_indices and lineage_weight != 0.0:
+                recombination_index_tensor = torch.as_tensor(
+                    recombination_indices,
+                    dtype=torch.long,
+                    device=logits.device,
+                )
+                lineage_scores = torch.stack(
+                    [records[index].lineage_score for index in recombination_indices]
+                ).to(device=logits.device, dtype=logits.dtype)
+                proposed = probability_logits[
+                    row, recombination_index_tensor
+                ] + lineage_weight * lineage_scores / temperature
+                correction = torch.logsumexp(proposed, dim=0) - torch.logsumexp(
+                    probability_logits[row, recombination_index_tensor],
+                    dim=0,
+                )
+                final_recombination = proposed - correction
+                adjusted[row, recombination_index_tensor] = final_recombination
+                atomic_adjustments[recombination_index_tensor] = (
+                    final_recombination
+                    - probability_logits[row, recombination_index_tensor]
+                )
+            for record in records:
+                if record is not None:
+                    all_breakpoint_scores.append(record.breakpoint_scores)
+
+            valid_after = torch.softmax(adjusted[row, : len(actions)], dim=0)
+            mass_after = (
+                valid_after[recombination_indices].sum()
+                if recombination_indices
+                else valid_after.new_tensor(0.0)
+            )
+            if all_breakpoint_scores:
+                flattened = torch.cat(all_breakpoint_scores)
+                score_min = float(flattened.min().detach().cpu().item())
+                score_mean = float(flattened.mean().detach().cpu().item())
+                score_max = float(flattened.max().detach().cpu().item())
+            else:
+                score_min = score_mean = score_max = 0.0
+            diagnostics_by_row.append(
+                {
+                    "recombination_split_bias_enabled": True,
+                    "recombination_mass_before_split_bias": float(
+                        mass_before.detach().cpu().item()
+                    ),
+                    "recombination_mass_after_split_bias": float(
+                        mass_after.detach().cpu().item()
+                    ),
+                    "recombination_split_mass_absolute_error": float(
+                        torch.abs(mass_after - mass_before)
+                        .detach().cpu().item()
+                    ),
+                    "recombination_split_score_min": score_min,
+                    "recombination_split_score_mean": score_mean,
+                    "recombination_split_score_max": score_max,
+                    "recombination_split_atomic_adjustments": atomic_adjustments,
+                }
+            )
+        return (
+            adjusted,
+            tuple(records_by_row),
+            tuple(diagnostics_by_row),
+        )
+
+    def apply_local_cwr_event_gate(
+        self,
+        probability_logits,
+        candidate_actions,
+        summary_reps,
+        event_rates,
+        *,
+        random_spec=None,
+    ):
+        """Compose CwR event probabilities with conditional action policies."""
+
+        if not self.local_cwr_event_gate_config["enabled"]:
+            return probability_logits, tuple({} for _ in candidate_actions)
+        if event_rates is None or len(event_rates) != len(candidate_actions):
+            raise ValueError(
+                "enabled local CwR event gate requires one rate record per row"
+            )
+        if int(summary_reps.shape[0]) != len(candidate_actions):
+            raise ValueError(
+                "local CwR event gate summary rows must align with candidates"
+            )
+        temperature = (
+            1.0
+            if random_spec is None or "T" not in random_spec
+            else float(random_spec["T"])
+        )
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("rollout temperature must be finite and positive")
+
+        residuals, raw_residuals = self.compute_local_cwr_event_residual(
+            summary_reps
+        )
+        final_logits = torch.full_like(probability_logits, float("-inf"))
+        diagnostics = []
+        for row, (actions, rates) in enumerate(
+            zip(candidate_actions, event_rates)
+        ):
+            coal_indices = [
+                index
+                for index, action in enumerate(actions)
+                if isinstance(action, CoalescenceChoice)
+            ]
+            recombination_indices = [
+                index
+                for index, action in enumerate(actions)
+                if isinstance(action, RecombinationChoice)
+            ]
+            try:
+                lambda_coal = float(rates["lambda_coal"])
+                lambda_recomb = float(rates["lambda_recomb"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "local CwR event rates require lambda_coal and lambda_recomb"
+                ) from exc
+            if any(
+                not math.isfinite(value) or value < 0.0
+                for value in (lambda_coal, lambda_recomb)
+            ):
+                raise ValueError("local CwR event rates must be finite and nonnegative")
+            if bool(coal_indices) != bool(lambda_coal > 0.0):
+                raise ValueError(
+                    "local coalescence candidates do not match their CwR rate"
+                )
+            if bool(recombination_indices) != bool(lambda_recomb > 0.0):
+                raise ValueError(
+                    "local recombination candidates do not match their CwR rate"
+                )
+            total_rate = lambda_coal + lambda_recomb
+            if total_rate <= 0.0:
+                raise ValueError("local generated events require a positive CwR rate")
+
+            event_logits = probability_logits.new_full((2,), float("-inf"))
+            if coal_indices:
+                event_logits[0] = math.log(lambda_coal)
+            if recombination_indices:
+                event_logits[1] = (
+                    math.log(lambda_recomb) + residuals[row]
+                )
+            event_log_probabilities = torch.log_softmax(
+                event_logits / temperature,
+                dim=0,
+            )
+            for event_index, indices in enumerate(
+                (coal_indices, recombination_indices)
+            ):
+                if not indices:
+                    continue
+                index_tensor = torch.as_tensor(
+                    indices,
+                    dtype=torch.long,
+                    device=probability_logits.device,
+                )
+                conditional_log_probabilities = torch.log_softmax(
+                    probability_logits[row, index_tensor],
+                    dim=0,
+                )
+                final_logits[row, index_tensor] = (
+                    event_log_probabilities[event_index]
+                    + conditional_log_probabilities
+                )
+
+            diagnostics.append(
+                {
+                    "local_cwr_event_gate_enabled": True,
+                    "local_cwr_lambda_coal": lambda_coal,
+                    "local_cwr_lambda_recomb": lambda_recomb,
+                    "local_cwr_prior_coalescence_probability": (
+                        lambda_coal / total_rate
+                    ),
+                    "local_cwr_prior_recombination_probability": (
+                        lambda_recomb / total_rate
+                    ),
+                    "local_cwr_event_residual": float(
+                        residuals[row].detach().cpu().item()
+                    ),
+                    "local_cwr_event_raw_residual": float(
+                        raw_residuals[row].detach().cpu().item()
+                    ),
+                    "local_cwr_policy_coalescence_probability": float(
+                        torch.exp(event_log_probabilities[0])
+                        .detach().cpu().item()
+                    ) if coal_indices else 0.0,
+                    "local_cwr_policy_recombination_probability": float(
+                        torch.exp(event_log_probabilities[1])
+                        .detach().cpu().item()
+                    ) if recombination_indices else 0.0,
+                }
+            )
+        return final_logits, tuple(diagnostics)
+
+    def score_action_candidates(
+        self,
+        candidate_actions,
+        lineage_reps,
+        summary_reps,
+        *,
+        state_contexts=None,
+        event_rates=None,
+        random_spec=None,
+    ) -> CandidateScoringResult:
+        """Return every candidate-aligned value used by the policy."""
+
+        base_logits, action_features = self._score_candidates(
+            candidate_actions,
+            lineage_reps,
+            summary_reps,
+            state_contexts=state_contexts,
+        )
+        candidate_counts = torch.as_tensor(
+            [len(actions) for actions in candidate_actions],
+            dtype=torch.long,
+            device=base_logits.device,
+        )
+        valid_mask = (
+            torch.arange(base_logits.shape[1], device=base_logits.device)
+            .unsqueeze(0)
+            < candidate_counts.unsqueeze(1)
+        )
+        probability_logits, split_records, diagnostics = (
+            self.prepare_action_probability_logits(
+                base_logits,
+                candidate_actions,
+                state_contexts,
+                random_spec=random_spec,
+            )
+        )
+        if self.local_cwr_event_gate_config["enabled"]:
+            probability_logits, cwr_diagnostics = self.apply_local_cwr_event_gate(
+                probability_logits,
+                candidate_actions,
+                summary_reps,
+                event_rates,
+                random_spec=random_spec,
+            )
+            diagnostics = tuple(
+                {**split_row, **cwr_row}
+                for split_row, cwr_row in zip(diagnostics, cwr_diagnostics)
+            )
+        return CandidateScoringResult(
+            base_logits=base_logits,
+            probability_logits=probability_logits,
+            action_features=action_features,
+            valid_mask=valid_mask,
+            split_records=split_records,
+            diagnostics=diagnostics,
+        )
+
+    def recombination_breakpoint_logit_bias(
+        self,
+        split_record,
+        valid_breakpoints,
+    ):
+        """Validate and align the handcrafted bias with breakpoint support."""
+
+        if split_record is None:
+            return None
+        support = tuple(int(value) for value in valid_breakpoints)
+        if split_record.breakpoints != support:
+            raise ValueError(
+                "recombination split-score breakpoint order does not match "
+                "the current breakpoint support"
+            )
+        bias = split_record.breakpoint_bias(
+            self.recombination_split_bias_config["breakpoint_weight"]
+        )
+        if bias.ndim != 1 or int(bias.numel()) != len(support):
+            raise ValueError(
+                "recombination split-score bias must align with breakpoint support"
+            )
+        if not bool(torch.isfinite(bias).all().detach().cpu().item()):
+            raise ValueError("recombination split-score bias must be finite")
+        return bias
 
     def _local_similarity_bias(
         self,
@@ -1327,7 +1743,16 @@ class ARGModel(nn.Module):
 
 
 
-    def forward(self, all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec):
+    def forward(
+        self,
+        all_actions,
+        lineage_reps,
+        summary_reps,
+        lineage_seq_features,
+        batch_active_lineage_counts,
+        random_spec,
+        event_rates=None,
+    ):
         
         all_candidate_actions = all_actions
 
@@ -1335,34 +1760,24 @@ class ARGModel(nn.Module):
         if any(len(actions) == 0 for actions in all_candidate_actions):
             raise ValueError("ARGModel.forward received a batch item with no candidate actions.")
 
-        logits, action_features = self._score_candidates(
+        state_contexts = (
+            lineage_seq_features
+            if self.local_mode and isinstance(lineage_seq_features, list)
+            else None
+        )
+        scoring = self.score_action_candidates(
             all_candidate_actions,
             lineage_reps,
             summary_reps,
-            state_contexts=(
-                lineage_seq_features
-                if self.local_mode and isinstance(lineage_seq_features, list)
-                else None
-            ),
+            state_contexts=state_contexts,
+            event_rates=event_rates,
+            random_spec=random_spec,
         )
-        
-        # Vectorize processing instead of multiple for-loops.
+        probability_logits = scoring.probability_logits
 
-        # Compute lengths of actions per batch and build index tensor
-        action_lengths = [len(actions) for actions in all_candidate_actions]
-        max_len = max(action_lengths)
-
-        # Create mask for valid actions in logits
-        mask = torch.zeros_like(logits, dtype=torch.bool)
-        for i, n in enumerate(action_lengths):
-            mask[i, :n] = True
-
-        # Build valid logits tensor (invalid entries set to very low value)
-        logits_masked = logits.masked_fill(~mask, float('-inf'))
-
-        # Sample actions in a vectorized way
-        # In case there are -inf rows in invalid entries, Categorical supports this
-        sampled_action_indices = self.sample(logits_masked, random_spec)
+        # Sample actions in a vectorized way.  ``probability_logits`` already
+        # contains the active rollout temperature and every fixed logit bias.
+        sampled_action_indices = Categorical(logits=probability_logits).sample()
         # sampled_action_indices shape: (batch,)
 
         # Convert to standard Python ints and collect for indexing
@@ -1371,11 +1786,32 @@ class ARGModel(nn.Module):
         # Now, retrieve chosen actions and features in a single loop
         choosen_actions = []
         choosen_action_features = []
+        chosen_split_records = []
         for batch_idx, action_idx in enumerate(selected_action_indices):
             choosen_actions.append(all_candidate_actions[batch_idx][action_idx])
-            choosen_action_features.append(action_features[batch_idx, action_idx])
+            choosen_action_features.append(
+                scoring.action_features[batch_idx, action_idx]
+            )
+            chosen_split_records.append(
+                scoring.split_records[batch_idx][action_idx]
+            )
 
-        # Compute log pf for action scorer (policy) selection
-        log_action_pf = self.compute_log_path_pf(logits, selected_action_indices)
+        # Record the probability of the distribution that actually sampled the
+        # action.  Previously temperature-controlled rollouts sampled from
+        # logits / T but recorded log-softmax(logits), which is not a valid
+        # trajectory probability when T != 1.
+        self.last_action_probability_logits = probability_logits
+        self.last_action_valid_mask = scoring.valid_mask
+        self.last_action_split_diagnostics = scoring.diagnostics
+        log_action_pf = self.compute_log_path_pf(
+            probability_logits,
+            selected_action_indices,
+        )
 
-        return log_action_pf, selected_action_indices, choosen_actions, choosen_action_features
+        return (
+            log_action_pf,
+            selected_action_indices,
+            choosen_actions,
+            choosen_action_features,
+            chosen_split_records,
+        )

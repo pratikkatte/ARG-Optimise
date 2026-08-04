@@ -1,13 +1,9 @@
-# Long-run 1 Mb overlap-CwR local-refinement training.
-#
-# The filename is retained for job compatibility, but production prefix/partial
-# training is currently disabled. Every optimization batch below contains only
-# complete terminal trajectories, as required by the current FL-SubTB audit.
-# Coalescence uses the new target: overlapping pairs only, unit rate per pair,
-# and uniform selection among those pairs (no overlap-length weighting).
+# Matched A/B partner of config_1mb_local_refinement_flow_consistency.yaml.
+# The output path and paper-inspired recombination split bias are the only
+# intentional differences.
 
 dataset_path: validation/vcf/sim_l1mb_0.vcf
-output_path: runs/local_refinement_1mb_overlap_cwr_uniform_1000
+output_path: runs/local_refinement_1mb_flow_consistency_split_bias
 device: cuda
 
 refinement:
@@ -16,14 +12,12 @@ refinement:
   checkpoint: null
   terminal_requires_exhausted_fixed_schedule: true
   requests:
-    - id: region_400kb_500kb
+    - id: region_100kb_200kb
       genomic_range: [400000, 500000]
       cut_time: 25000
 
 training:
   epochs: 1000
-
-  # Effective batch size: 4 trajectories x 4 accumulation steps = 16.
   batch_size: 4
   grad_accum_steps: 4
   seed: 7
@@ -31,7 +25,6 @@ training:
   verbose: true
   wandb: true
 
-  # Separately controlled structural, breakpoint, and continuous-time heads.
   policy_lr: 0.0001
   breakpoint_policy_lr: 0.0001
   time_policy_lr: 0.0003
@@ -41,13 +34,11 @@ training:
     warmup_fraction: 0.05
     warmup_start_ratio: 0.1
     min_lr_ratio: 0.1
-
   loss: fl_subtb
   subtb_lambda: 0.6
   subtb_max_span: 4
   terminal_loss_weight: 10.0
   residual_scale: 50.0
-
   grad_clip: 10.0
   breakpoint_gradient_clip_norm: 10.0
   time_head_gradient_clip_norm: 1.0
@@ -55,20 +46,16 @@ training:
   model_diagnostics: true
   model_diagnostics_update_norm_every: 1
 
-  # A max-step hit is a hard error; a truncated trajectory is never trained.
   trajectory_training_mode: complete
   complete_trajectory_max_steps: 512
   min_terminal_trajectories_per_batch: 4
 
-  eval_episodes: 8
-  eval_every: 20
-
-  # Do not reuse local_1mb_flow_v1.pkl: its states contain rewards from the old
-  # overlap-length-weighted coalescence prior. Generate a target-specific bank.
-  fixed_eval_bank_path: validation/fixed_banks/local_1mb_overlap_cwr_uniform_v1.pkl
+  eval_episodes: 32
+  eval_every: 10
+  fixed_eval_bank_path: validation/fixed_banks/local_1mb_flow_v1.pkl
   fixed_eval_bank_episodes: 32
   fixed_eval_bank_seed: 100007
-  fixed_eval_bank_source: overlap_cwr_uniform_similarity_0.25_initial
+  fixed_eval_bank_source: similarity_0.25_initial
   fixed_eval_bank_create_if_missing: true
 
   flow_debug: false
@@ -97,9 +84,18 @@ model:
   time_basis_components: 16
   time_context_mode: full
 
-  # Similarity is proposal guidance only; it does not change the uniform-pair
-  # overlap-CwR target. A modest 0.25 avoids the large trajectory inflation
-  # observed with bias 1.0.
   local_coalescence_similarity_bias: 0.25
   local_prior_action_logit_bias: 0.0
   local_prior_gate_logit_bias: 1.0
+
+  local_cwr_event_gate:
+    enabled: false
+    max_abs_residual: 2.0
+
+  recombination_split_bias:
+    enabled: true
+    score_mode: partial_compatibility_v1
+    lineage_weight: 0.25
+    breakpoint_weight: 0.25
+    aggregation_temperature: 1.0
+    fragmentation_penalty: 0.10

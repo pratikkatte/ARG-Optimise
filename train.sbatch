@@ -9,7 +9,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=200G
 #SBATCH --time=48:00:00
-#SBATCH --array=0
+#SBATCH --array=0-1
 #SBATCH --gres=gpu:A100:1
 
 
@@ -31,7 +31,8 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 CONFIGS=(
     # config/config.yaml
-    config/config_1mb_local_refinement_1000.yaml
+    config/config_1mb_local_refinement_flow_consistency_cwr_gate.yaml
+    config/config_1mb_local_refinement_flow_consistency_cwr_gate_split_bias.yaml
 )
 
 CONFIG=${CONFIGS[$SLURM_ARRAY_TASK_ID]}
@@ -48,7 +49,7 @@ nvidia-smi || true
 
 python benchmark_gflownet_workflow.py \
     --config "${CONFIG}" \
-    --output-dir runs/config_1mb_local_refinement_1000_terminal_requires_exhausted_fixed_schedule_true \
+    --output-dir runs/$(basename "${CONFIG}" .yaml) \
     --epochs 1000 \
     --device cuda
 

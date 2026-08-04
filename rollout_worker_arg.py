@@ -36,6 +36,8 @@ class RolloutWorker:
         
         log_paths_pf_by_traj = [[] for _ in range(episodes)]
         backward_num_parents_by_traj = [[] for _ in range(episodes)]
+        trajectory_log_components = [[] for _ in range(episodes)]
+        trajectory_policy_diagnostics = [[] for _ in range(episodes)]
         
         if self.verbose:
             print(
@@ -55,6 +57,12 @@ class RolloutWorker:
             )
 
             total_log_pf, log_probs, choosen_actions = generator(input_dict)
+            forward_components = dict(
+                getattr(generator, "last_forward_log_components", {})
+            )
+            policy_diagnostics = list(
+                getattr(generator, "last_forward_policy_diagnostics", ())
+            )
 
             for batch_idx, traj_idx in enumerate(unfinished):
                 state = states[traj_idx]
@@ -70,6 +78,34 @@ class RolloutWorker:
                             "sampled action does not touch the local refinement region"
                         )
                 log_paths_pf_by_traj[traj_idx].append(total_log_pf[batch_idx])
+                component_row = {}
+                for name in ("gate", "atomic_action", "breakpoint", "time", "total"):
+                    values = forward_components.get(name)
+                    if values is not None and batch_idx < int(values.numel()):
+                        component_row[name] = float(
+                            values[batch_idx].detach().cpu().item()
+                        )
+                trajectory_log_components[traj_idx].append(component_row)
+                if bool(getattr(generator, "probability_checks", False)):
+                    reconstructed = sum(
+                        component_row.get(name, 0.0)
+                        for name in ("gate", "atomic_action", "breakpoint", "time")
+                    )
+                    recorded = float(total_log_pf[batch_idx].detach().cpu().item())
+                    if not np.isfinite(recorded) or not np.isclose(
+                        reconstructed,
+                        recorded,
+                        rtol=1e-5,
+                        atol=1e-5,
+                    ):
+                        raise RuntimeError(
+                            "forward probability components do not reconstruct log P_F"
+                        )
+                trajectory_policy_diagnostics[traj_idx].append(
+                    dict(policy_diagnostics[batch_idx])
+                    if batch_idx < len(policy_diagnostics)
+                    else {}
+                )
                 if isinstance(action, FixedAttachmentChoice):
                     log_prior = self.env.fixed_attachment_log_prior(state)
                 else:
@@ -92,9 +128,20 @@ class RolloutWorker:
                     log_reward=next_state.log_reward,
                 )
 
-                backward_num_parents_by_traj[traj_idx].append(
-                    generator.count_backward_parents(next_state)
+                parent_count = generator.count_backward_parents(next_state)
+                if parent_count <= 0:
+                    raise RuntimeError(
+                        "sampled forward transition has no backward representation"
                     )
+                if (
+                    bool(getattr(generator, "probability_checks", False))
+                    and isinstance(action, FixedAttachmentChoice)
+                    and parent_count != 1
+                ):
+                    raise RuntimeError(
+                        "fixed attachment must have exactly one backward parent"
+                    )
+                backward_num_parents_by_traj[traj_idx].append(parent_count)
             unfinished = self._unfinished_indices(states, trajectory_states, max_steps)
 
         log_paths_pf = self._pad_log_path_lists(log_paths_pf_by_traj, torch.float32, self.device)
@@ -232,6 +279,11 @@ class RolloutWorker:
             "trajectory_states": trajectory_states,
             "trajectory_actions": [
                 list(trajectory.actions) for trajectory in trajectories
+            ],
+            "trajectory_log_components": trajectory_log_components,
+            "trajectory_policy_diagnostics": trajectory_policy_diagnostics,
+            "backward_parent_counts": [
+                list(values) for values in backward_num_parents_by_traj
             ],
             "trajectory_lengths": trajectory_lengths,
             "terminal_mask": terminal_mask,
