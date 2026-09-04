@@ -146,8 +146,8 @@ class TransformerEncoder(nn.Module):
 class ARGModel(nn.Module):
     """One-step ARG action policy.
 
-    The model scores candidate coalescent and recombination actions. When the
-    caller provides current ARG states, candidates are read from the environment
+    The model chooses an event type with a learned/CwR mixture and then scores
+    candidate actions within that event. Candidates come from the environment,
     so material-mask constraints are respected.
     """
 
@@ -157,6 +157,9 @@ class ARGModel(nn.Module):
         embedding_size=32,
         hidden_size=64,
         dropout=0.0,
+        event_hidden_size=64,
+        event_dropout=0.0,
+        event_prior_weight=0.1,
         breakpoint_hidden_dim=128,
         breakpoint_dropout=0.1,
         transformer_depth=6,
@@ -181,6 +184,13 @@ class ARGModel(nn.Module):
             )
         input_size = int(env.num_blocks) * 4
 
+        self.event_prior_weight = float(event_prior_weight)
+        if not 0.0 <= self.event_prior_weight <= 1.0:
+            raise ValueError(
+                "event_prior_weight must be between 0 and 1 inclusive, "
+                f"got {event_prior_weight}"
+            )
+
         self.seq_embedding = nn.Linear(input_size, embedding_size)
         self.summary_token = nn.Parameter(torch.zeros(1, 1, embedding_size))
         nn.init.trunc_normal_(self.summary_token, std=0.1)
@@ -197,6 +207,12 @@ class ARGModel(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
+        )
+        self.event_scorer = nn.Sequential(
+            nn.Linear(embedding_size, event_hidden_size),
+            nn.ReLU(),
+            nn.Dropout(event_dropout),
+            nn.Linear(event_hidden_size, len(env.event_types)),
         )
         self.breakpoint_scorer = BreakpointSplitPositionCNN(
             hidden_dim=breakpoint_hidden_dim,
@@ -353,6 +369,44 @@ class ARGModel(nn.Module):
 
         temperature = random_spec["T"]
         return Categorical(logits=logits / temperature).sample()
+
+    def compute_event_probabilities(
+        self,
+        summary_reps,
+        event_valid_mask,
+        prior_event_probs,
+        random_spec=None,
+    ):
+        """Return learned and CwR-mixed event distributions for each state."""
+        event_valid_mask = event_valid_mask.to(device=summary_reps.device, dtype=torch.bool)
+        prior_event_probs = prior_event_probs.to(
+            device=summary_reps.device,
+            dtype=summary_reps.dtype,
+        )
+        if event_valid_mask.shape != prior_event_probs.shape:
+            raise ValueError("event mask and prior probabilities must have matching shapes")
+        if event_valid_mask.shape != (summary_reps.shape[0], len(self.env.event_types)):
+            raise ValueError("event inputs must have shape (batch, number of event types)")
+        if not bool(event_valid_mask.any(dim=1).all()):
+            raise ValueError("every state must have at least one valid event type")
+
+        event_logits = self.event_scorer(summary_reps)
+        if random_spec is not None:
+            event_logits = event_logits / float(random_spec["T"])
+        event_logits = event_logits.masked_fill(~event_valid_mask, float("-inf"))
+        learned_event_probs = torch.softmax(event_logits, dim=1)
+
+        prior_event_probs = prior_event_probs.masked_fill(~event_valid_mask, 0.0)
+        prior_normalizer = prior_event_probs.sum(dim=1, keepdim=True)
+        if not bool((prior_normalizer > 0).all()):
+            raise ValueError("CwR event probabilities must have positive mass")
+        prior_event_probs = prior_event_probs / prior_normalizer
+
+        mixed_event_probs = (
+            (1.0 - self.event_prior_weight) * learned_event_probs
+            + self.event_prior_weight * prior_event_probs
+        )
+        return learned_event_probs, mixed_event_probs
 
 
     def compute_log_path_pf(self, logits, action_indices):

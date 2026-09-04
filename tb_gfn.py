@@ -112,6 +112,59 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def _encode_states(self, states):
         return self.arg_model._encode_states(states)
 
+    def _candidate_action_groups(self, states, candidate_actions=None):
+        if candidate_actions is None:
+            candidate_actions = [self.env.enumerate_actions(state) for state in states]
+        if len(candidate_actions) != len(states):
+            raise ValueError("candidate actions must contain one entry per state")
+        return candidate_actions
+
+    def _event_policy_distributions(
+        self,
+        states,
+        candidate_actions,
+        summary_reps,
+        random_spec=None,
+    ):
+        valid_mask = []
+        cwr_probs = []
+        for state, (coal_actions, recomb_actions) in zip(states, candidate_actions):
+            probabilities = self.env.compute_event_probabilities(
+                state,
+                (coal_actions, recomb_actions),
+            )
+            valid_mask.append([
+                bool(coal_actions) and probabilities["coal"] > 0.0,
+                bool(recomb_actions) and probabilities["recomb"] > 0.0,
+            ])
+            cwr_probs.append([probabilities[event_type] for event_type in self.env.event_types])
+
+        valid_mask = torch.tensor(valid_mask, dtype=torch.bool, device=self.device)
+        cwr_probs = torch.tensor(cwr_probs, dtype=summary_reps.dtype, device=self.device)
+        learned_probs, mixed_probs = self.arg_model.compute_event_probabilities(
+            summary_reps,
+            valid_mask,
+            cwr_probs,
+            random_spec=random_spec,
+        )
+        return learned_probs, cwr_probs, mixed_probs
+
+    def compute_event_probabilities(self, states, random_spec=None):
+        """Expose learned, CwR, and mixed event probabilities for diagnostics."""
+        candidate_actions = self._candidate_action_groups(states)
+        _, summary_reps, _, _ = self._encode_states(states)
+        learned_probs, cwr_probs, mixed_probs = self._event_policy_distributions(
+            states,
+            candidate_actions,
+            summary_reps,
+            random_spec=random_spec,
+        )
+        return {
+            "learned": learned_probs,
+            "cwr": cwr_probs,
+            "mixed": mixed_probs,
+        }
+
 
     def save(self, path, metadata=None):
         directory = os.path.dirname(os.path.abspath(path))
@@ -192,23 +245,31 @@ class TBGFlowNetGenerator(torch.nn.Module):
     def forward(self, input_dict):
 
         states = input_dict.get("states")
-
+        if not states:
+            raise ValueError("generator forward requires at least one state")
         random_spec = input_dict.get("random_spec")
-        
-
-        event = input_dict.get("event")
-        event_probs = [
-            float(event[idx]["probability"])
-            for idx in range(len(states))
-        ]
-        log_event_pf = torch.log(
-            torch.tensor(event_probs, dtype=torch.float32, device=self.device)
+        candidate_actions = self._candidate_action_groups(
+            states,
+            input_dict.get("candidate_actions"),
         )
-
-        all_actions = input_dict.get("input_actions")
-
         lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states(states)
-        # input_dict = self._move_input_to_device(input_dict)
+        _, _, mixed_event_probs = self._event_policy_distributions(
+            states,
+            candidate_actions,
+            summary_reps,
+            random_spec=random_spec,
+        )
+        selected_event_indices = torch.distributions.Categorical(
+            probs=mixed_event_probs
+        ).sample()
+        batch_indices = torch.arange(len(states), device=self.device)
+        log_event_pf = torch.log(mixed_event_probs[batch_indices, selected_event_indices])
+        selected_event_indices_list = selected_event_indices.detach().cpu().tolist()
+        all_actions = [
+            candidate_actions[batch_idx][event_idx]
+            for batch_idx, event_idx in enumerate(selected_event_indices_list)
+        ]
+
         ret = self.arg_model(all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec)
 
         log_action_pf, selected_action_indices, choosen_actions, choosen_action_features = ret

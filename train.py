@@ -31,6 +31,9 @@ DEFAULT_EVAL_EVERY = 10
 DEFAULT_EMBEDDING_SIZE = 32
 DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_DROPOUT = 0.0
+DEFAULT_EVENT_HIDDEN_SIZE = 64
+DEFAULT_EVENT_DROPOUT = 0.0
+DEFAULT_EVENT_PRIOR_WEIGHT = 0.10
 DEFAULT_BREAKPOINT_HIDDEN_DIM = 128
 DEFAULT_BREAKPOINT_DROPOUT = 0.1
 DEFAULT_TRANSFORMER_DEPTH = 6
@@ -44,7 +47,7 @@ DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE = 256
 DEFAULT_BREAKPOINT_GAP_LAYERS = 3
 DEFAULT_BREAKPOINT_GAP_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_USE_POSITION_FEATURES = True
-MODEL_VERSION = "cwr-event-transformer-material-aware-time-v5"
+MODEL_VERSION = "learned-cwr-mixed-event-transformer-material-aware-time-v6"
 
 def seed_everything(seed):
     random.seed(seed)
@@ -105,7 +108,7 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
                 log_rewards + log_pb
             )
             initial_state = env.get_initial_state()
-            initial_event_probs = env.compute_event_probabilities(initial_state)
+            initial_event_probs = generator.compute_event_probabilities([initial_state])
 
         lengths = torch.tensor([len(traj) for traj in trajectories], dtype=torch.float32)
         coal_counts = torch.tensor(
@@ -142,8 +145,12 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             "eval_trajectory_length_mean": float(lengths.mean().item()),
             "eval_coalescence_count_mean": float(coal_counts.mean().item()),
             "eval_recombination_count_mean": float(recomb_counts.mean().item()),
-            "eval_initial_coalescence_prob": float(initial_event_probs.get("coal", 0.0)),
-            "eval_initial_recombination_prob": float(initial_event_probs.get("recomb", 0.0)),
+            "eval_initial_learned_coalescence_prob": float(initial_event_probs["learned"][0, 0].item()),
+            "eval_initial_learned_recombination_prob": float(initial_event_probs["learned"][0, 1].item()),
+            "eval_initial_cwr_coalescence_prob": float(initial_event_probs["cwr"][0, 0].item()),
+            "eval_initial_cwr_recombination_prob": float(initial_event_probs["cwr"][0, 1].item()),
+            "eval_initial_mixed_coalescence_prob": float(initial_event_probs["mixed"][0, 0].item()),
+            "eval_initial_mixed_recombination_prob": float(initial_event_probs["mixed"][0, 1].item()),
         }
     finally:
         random.setstate(python_state)
@@ -178,6 +185,9 @@ def train(
     embedding_size=DEFAULT_EMBEDDING_SIZE,
     hidden_size=DEFAULT_HIDDEN_SIZE,
     dropout=DEFAULT_DROPOUT,
+    event_hidden_size=DEFAULT_EVENT_HIDDEN_SIZE,
+    event_dropout=DEFAULT_EVENT_DROPOUT,
+    event_prior_weight=DEFAULT_EVENT_PRIOR_WEIGHT,
     breakpoint_hidden_dim=DEFAULT_BREAKPOINT_HIDDEN_DIM,
     breakpoint_dropout=DEFAULT_BREAKPOINT_DROPOUT,
     transformer_depth=DEFAULT_TRANSFORMER_DEPTH,
@@ -209,6 +219,9 @@ def train(
         "embedding_size": int(embedding_size),
         "hidden_size": int(hidden_size),
         "dropout": float(dropout),
+        "event_hidden_size": int(event_hidden_size),
+        "event_dropout": float(event_dropout),
+        "event_prior_weight": float(event_prior_weight),
         "breakpoint_hidden_dim": int(breakpoint_hidden_dim),
         "breakpoint_dropout": float(breakpoint_dropout),
         "transformer_depth": int(transformer_depth),
@@ -435,6 +448,14 @@ def main():
     parser.add_argument("--embedding-size", type=int, default=DEFAULT_EMBEDDING_SIZE)
     parser.add_argument("--hidden-size", type=int, default=DEFAULT_HIDDEN_SIZE)
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
+    parser.add_argument("--event-hidden-size", type=int, default=DEFAULT_EVENT_HIDDEN_SIZE)
+    parser.add_argument("--event-dropout", type=float, default=DEFAULT_EVENT_DROPOUT)
+    parser.add_argument(
+        "--event-prior-weight",
+        type=float,
+        default=DEFAULT_EVENT_PRIOR_WEIGHT,
+        help="CwR probability mixture weight for event-type selection (default: 0.10)",
+    )
     parser.add_argument("--breakpoint-hidden-dim", type=int, default=DEFAULT_BREAKPOINT_HIDDEN_DIM)
     parser.add_argument("--breakpoint-dropout", type=float, default=DEFAULT_BREAKPOINT_DROPOUT)
     parser.add_argument("--transformer-depth", type=int, default=DEFAULT_TRANSFORMER_DEPTH)
@@ -473,6 +494,9 @@ def main():
         embedding_size=args.embedding_size,
         hidden_size=args.hidden_size,
         dropout=args.dropout,
+        event_hidden_size=args.event_hidden_size,
+        event_dropout=args.event_dropout,
+        event_prior_weight=args.event_prior_weight,
         breakpoint_hidden_dim=args.breakpoint_hidden_dim,
         breakpoint_dropout=args.breakpoint_dropout,
         transformer_depth=args.transformer_depth,

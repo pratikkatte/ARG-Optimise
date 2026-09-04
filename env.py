@@ -1324,34 +1324,14 @@ class SimpleARGEnvironment:
         states,
         random_spec=None,
     ):
-        batch_size = len(states)
-        if batch_size == 0:
+        if len(states) == 0:
             raise ValueError("states must contain at least one ARGState")
 
-        event = {}
-        input_actions = []
-        for idx, state in enumerate(states):
-            coal_actions, recomb_actions = self.enumerate_actions(state)
-            event_prob = list(self.compute_event_probabilities(state, (coal_actions, recomb_actions)).values())
-            event_idx = np.random.choice(2, p=event_prob)
-            choosen_event_type = self.event_types[event_idx]
-            if choosen_event_type == "coal":
-                input_actions.append(coal_actions)
-            else:
-                input_actions.append(recomb_actions)
-
-            event[idx] = {}
-            event[idx]["event_type"] = choosen_event_type
-            event[idx]["probability"] = event_prob[event_idx]
-
-        input_dict = {
+        return {
             "states": states,
-            "event": event,
-            "input_actions": input_actions,
+            "candidate_actions": [self.enumerate_actions(state) for state in states],
             "random_spec": random_spec,
         }
-
-        return input_dict
 
     def _sample_recombination_prior_action(self, recomb_weights):
         total_weight = sum(self._recomb_weight(item) for item in recomb_weights)
