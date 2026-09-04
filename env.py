@@ -328,11 +328,15 @@ class ARGLineage:
         breakpoint: Optional[int] = None,
         recombination_side: Optional[str] = None,
         time: float = 0.0,
+        preview_pair_features: Optional[torch.Tensor] = None,
     ):
         self.node_id = int(node_id)
         self.children = list(children or [])
         self.parents = list(parents or [])
         self.partials = partials
+        # Encoding-only channels: nucleotide disagreement (4) and overlap (1).
+        # Committed lineages contain likelihood partials and leave this unset.
+        self.preview_pair_features = preview_pair_features
         self.sequences_indices = list(sequences_indices or [])
         self.event_type = event_type
         self.breakpoint = breakpoint
@@ -405,6 +409,11 @@ class ARGLineage:
             breakpoint=self.breakpoint,
             recombination_side=self.recombination_side,
             time=float(self.time),
+            preview_pair_features=(
+                self.preview_pair_features.clone()
+                if copy_partials and self.preview_pair_features is not None
+                else self.preview_pair_features
+            ),
         )
         if copy_mask and self._material_mask is not None:
             clone._material_mask = self._material_mask.copy()
@@ -700,6 +709,11 @@ class SimpleARGEnvironment:
         partials = self._require_lineage_partials(lineage)
         return self.evolution_model.transition_partials(partials, edge_time)
 
+    def _parent_partials(self, lineage, parent_time):
+        if parent_time is None:
+            return self._require_lineage_partials(lineage)
+        return self._transition_lineage_partials(lineage, parent_time)
+
     def _coalesced_parent_partials(self, child_i, child_j, parent_segments, parent_time):
         reference = self._require_lineage_partials(child_i)
         combined = torch.ones_like(reference)
@@ -711,7 +725,7 @@ class SimpleARGEnvironment:
         )
 
         for child in (child_i, child_j):
-            transitioned = self._transition_lineage_partials(child, parent_time)
+            transitioned = self._parent_partials(child, parent_time)
             transitioned = self.evolution_model.normalize_partials(transitioned)
             weights = self.evolution_model.material_site_weights(
                 child.material_segments,
@@ -728,9 +742,33 @@ class SimpleARGEnvironment:
         return self.evolution_model.normalize_partials(combined)
 
     def _recombined_parent_partials(self, child, parent_segments, parent_time):
-        transitioned = self._transition_lineage_partials(child, parent_time)
+        transitioned = self._parent_partials(child, parent_time)
         masked = self.evolution_model.mask_partials(transitioned, parent_segments)
         return self.evolution_model.normalize_partials(masked)
+
+    def _coalescence_preview_features(self, child_i, child_j):
+        """Pool evidence without assuming a branch time or multiplying partials.
+
+        Shared blocks contain the mean child evidence, with separate absolute
+        differences and an overlap indicator. Single-child blocks retain that
+        child's evidence; blocks carried by neither child remain zero. These are
+        policy features, not parent likelihood partials.
+        """
+        evidence = []
+        masks = []
+        for child in (child_i, child_j):
+            partials = self.evolution_model.normalize_partials(
+                self._require_lineage_partials(child)
+            )
+            mask = self.evolution_model.material_site_weights(
+                child.material_segments, device=partials.device, dtype=partials.dtype,
+            )[:, None]
+            evidence.append(partials * mask)
+            masks.append(mask)
+        overlap = masks[0] * masks[1]
+        mean_evidence = (evidence[0] + evidence[1]) / (masks[0] + masks[1]).clamp_min(1.0)
+        disagreement = (evidence[0] - evidence[1]).abs() * overlap
+        return mean_evidence, torch.cat([disagreement, overlap], dim=-1)
 
     def get_active_counts(self, state):
         if not state.active_lineages:
@@ -1064,6 +1102,102 @@ class SimpleARGEnvironment:
         next_state.active_lineages.extend([left_parent, right_parent])
         next_state.max_node_idx = right_parent.node_id
         return self._finalize_transition_state(next_state, log_prior)
+
+    def preview_action_for_time_model(self, state, action):
+        """Apply only an action's topology for time-policy conditioning.
+
+        The event time cannot be used while constructing this preview because it
+        is the value that the time policy is about to choose.  Consequently, the
+        preview pools coalescing children's evidence and retains disagreement
+        and overlap channels, or splits a recombining lineage's evidence. It is
+        an encoding-only state and must not be committed to a rollout.
+        """
+        next_state = state.clone(copy_partials=False)
+
+        if isinstance(action, CoalescenceChoice):
+            if not action.is_valid_for(next_state.active_lineages):
+                raise ValueError(f"Invalid coalescence action: {action}")
+
+            i = int(action.active_lineage_i)
+            j = int(action.active_lineage_j)
+            child_i = next_state.active_lineages[i]
+            child_j = next_state.active_lineages[j]
+            parent_segments = child_i.material_segments.union(
+                child_j.material_segments
+            )
+            evidence, pair_features = self._coalescence_preview_features(child_i, child_j)
+            parent = ARGLineage(
+                node_id=next_state.max_node_idx + 1,
+                material_segments=parent_segments,
+                num_blocks=self.num_blocks,
+                partials=evidence,
+                preview_pair_features=pair_features,
+                sequences_indices=sorted(
+                    set(child_i.sequences_indices + child_j.sequences_indices)
+                ),
+                event_type="coal",
+                time=state.current_time,
+            )
+            next_state.active_lineages = [
+                lineage
+                for idx, lineage in enumerate(next_state.active_lineages)
+                if idx not in (i, j)
+            ]
+            next_state.active_lineages.append(parent)
+            return next_state
+
+        if isinstance(action, RecombinationChoice):
+            if not action.is_valid_for(next_state.active_lineages):
+                raise ValueError(f"Invalid recombination action: {action}")
+            if action.breakpoint is None:
+                raise ValueError(
+                    "A recombination breakpoint must be chosen before the time-model preview"
+                )
+
+            lineage_idx = int(action.active_lineage_i)
+            child = next_state.active_lineages[lineage_idx]
+            left_segments, right_segments = child.material_segments.split(
+                action.breakpoint
+            )
+            left_parent = ARGLineage(
+                node_id=next_state.max_node_idx + 1,
+                material_segments=left_segments,
+                num_blocks=self.num_blocks,
+                partials=self._recombined_parent_partials(
+                    child,
+                    left_segments,
+                    parent_time=None,
+                ),
+                sequences_indices=list(child.sequences_indices),
+                event_type="recomb",
+                breakpoint=int(action.breakpoint),
+                recombination_side="left",
+                time=state.current_time,
+            )
+            right_parent = ARGLineage(
+                node_id=next_state.max_node_idx + 2,
+                material_segments=right_segments,
+                num_blocks=self.num_blocks,
+                partials=self._recombined_parent_partials(
+                    child,
+                    right_segments,
+                    parent_time=None,
+                ),
+                sequences_indices=list(child.sequences_indices),
+                event_type="recomb",
+                breakpoint=int(action.breakpoint),
+                recombination_side="right",
+                time=state.current_time,
+            )
+            next_state.active_lineages = [
+                lineage
+                for idx, lineage in enumerate(next_state.active_lineages)
+                if idx != lineage_idx
+            ]
+            next_state.active_lineages.extend([left_parent, right_parent])
+            return next_state
+
+        raise ValueError(f"Unknown action event_type: {action}")
 
     def apply_action(self, state, action, log_prior=None):
         

@@ -44,7 +44,7 @@ DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE = 256
 DEFAULT_BREAKPOINT_GAP_LAYERS = 3
 DEFAULT_BREAKPOINT_GAP_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_USE_POSITION_FEATURES = True
-MODEL_VERSION = "cwr-event-transformer-block-partials-v3"
+MODEL_VERSION = "cwr-event-transformer-material-aware-time-v5"
 
 def seed_everything(seed):
     random.seed(seed)

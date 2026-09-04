@@ -133,7 +133,7 @@ def validate_metadata(metadata):
         )
     if metadata["model_version"] != MODEL_VERSION:
         raise ValueError(
-            "Checkpoint model_version is incompatible with block-resolution partials: "
+            "Checkpoint model_version is incompatible with the current model architecture: "
             f"expected {MODEL_VERSION!r}, got {metadata['model_version']!r}."
         )
 

@@ -209,13 +209,16 @@ class ARGModel(nn.Module):
         ).to(self.device)
 
         self.time_scorer = TimeModel(
-            embedding_size * 4,
+            embedding_size,
             time_hidden_size,
             time_dropout,
             env.time_env.bins,
             layers=time_layers,
         )
         self.logsoftmax = nn.LogSoftmax(dim=1)
+        # Preview-only absolute nucleotide differences and ancestral overlap.
+        # No bias: missing pair features contribute exactly zero.
+        self.preview_pair_embedding = nn.Linear(int(env.num_blocks) * 5, embedding_size, bias=False)
 
     def _build_source_sequence_features(self):
         return self.env.block_seq_arrays.detach().to(dtype=torch.float32).clone()
@@ -223,7 +226,8 @@ class ARGModel(nn.Module):
     def model_params(self):
         return list(self.parameters())
 
-    def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
+    def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts,
+                                preview_pair_features=None):
         batch_size, active_lineages, seq_len, channels = lineage_seq_features.shape
         if seq_len != int(self.env.num_blocks) or channels != 4:
             raise ValueError(
@@ -247,6 +251,14 @@ class ARGModel(nn.Module):
             < batch_active_lineage_counts[:, None]
         )
         lineage_reps = self.seq_embedding(batch_input)
+        if preview_pair_features is not None:
+            expected_shape = (batch_size, active_lineages, seq_len, 5)
+            if tuple(preview_pair_features.shape) != expected_shape:
+                raise ValueError(f"preview pair features must have shape {expected_shape}")
+            pair_input = preview_pair_features.to(device=self.device, dtype=torch.float32)
+            lineage_reps = lineage_reps + self.preview_pair_embedding(
+                pair_input.reshape(batch_size, active_lineages, -1)
+            )
         summary_token = self.summary_token.expand(batch_size, -1, -1)
         transformer_input = torch.cat([summary_token, lineage_reps], dim=1)
 
@@ -276,6 +288,7 @@ class ARGModel(nn.Module):
             num_blocks,
             4,
         )
+        preview_pair_features = None
 
         for batch_idx, state in enumerate(states):
             for lineage_idx, lineage in enumerate(state.active_lineages):
@@ -289,8 +302,19 @@ class ARGModel(nn.Module):
                 lineage_seq_features[batch_idx, lineage_idx] = (
                     self.env.evolution_model.normalize_partials(masked_feature)
                 )
+                if lineage.preview_pair_features is not None:
+                    if preview_pair_features is None:
+                        preview_pair_features = lineage_seq_features.new_zeros(
+                            batch_size, max_active_lineages, num_blocks, 5,
+                        )
+                    pair_features = lineage.preview_pair_features.to(lineage_seq_features)
+                    if tuple(pair_features.shape) != (num_blocks, 5):
+                        raise ValueError(f"Lineage preview pair features must have shape {(num_blocks, 5)}")
+                    preview_pair_features[batch_idx, lineage_idx] = pair_features * weights[:, None]
 
-        return self._encode_lineage_features(lineage_seq_features, batch_active_lineage_counts)
+        return self._encode_lineage_features(
+            lineage_seq_features, batch_active_lineage_counts, preview_pair_features,
+        )
 
     def _lineage_partials_tensor(self, lineage):
         if lineage.partials is None:

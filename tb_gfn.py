@@ -233,8 +233,12 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         log_breakpoint_pf = torch.stack(log_p_breakpoints)
 
-        selected_action_features = torch.stack(choosen_action_features, dim=0)  # shape: [B, F]
-        time_logits = self.time_model(selected_action_features)
+        post_action_states = [
+            self.env.preview_action_for_time_model(state, action)
+            for state, action in zip(states, choosen_actions)
+        ]
+        _, post_action_summary_reps, _, _ = self._encode_states(post_action_states)
+        time_logits = self.time_model(post_action_summary_reps)
         time_actions = self.time_model.sample(time_logits, random_spec)
 
         for batch_idx, action in enumerate(choosen_actions):

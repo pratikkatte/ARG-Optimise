@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 class ResidualDilatedConvBlock(nn.Module):
     def __init__(self, hidden_dim, kernel_size=5, dilation=1, dropout=0.1):
@@ -218,13 +219,23 @@ class BreakpointSplitPositionCNN(nn.Module):
         random_spec=None,
     ):
         valid_breakpoints = self._valid_breakpoints_list(valid_breakpoints)
-        valid_logits = self.valid_breakpoint_logits(
+        score_args = (
             valid_breakpoints,
             lineage_seq_feature,
             sequence_length,
             num_blocks,
             action_context,
         )
+        if torch.is_grad_enabled():
+            # Full-resolution sequences otherwise retain every CNN activation
+            # for every recombination step until the trajectory loss is built.
+            valid_logits = checkpoint(
+                self.valid_breakpoint_logits,
+                *score_args,
+                use_reentrant=False,
+            )
+        else:
+            valid_logits = self.valid_breakpoint_logits(*score_args)
         if random_spec is not None and "T" in random_spec:
             sample_logits = valid_logits / random_spec["T"]
         else:
