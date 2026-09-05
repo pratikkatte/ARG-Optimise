@@ -114,7 +114,7 @@ class ActionPolicyMixin:
         masked_logits = logits.masked_fill(~valid, -1e9)
         return masked_logits, features
 
-    def forward(self, all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec):
+    def forward(self, all_actions, lineage_reps, summary_reps, random_spec=None):
         
         if any(len(actions) == 0 for actions in all_actions):
             raise ValueError("ARGModel.forward received a batch item with no candidate actions.")
@@ -130,5 +130,4 @@ class ActionPolicyMixin:
         chosen_actions = [actions[i] for actions, i in zip(all_actions, selected_action_indices)]
         chosen_features = [action_features[b, i] for b, i in enumerate(selected_action_indices)]
         log_action_pf = self.compute_log_path_pf(logits, selected_action_indices)
-        return log_action_pf, selected_action_indices, chosen_actions, chosen_features
-
+        return log_action_pf, chosen_actions, chosen_features

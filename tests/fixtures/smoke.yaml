@@ -1,0 +1,27 @@
+data:
+  dataset_path: tests/fixtures/smoke.fa
+  output_path: /tmp/arg_gfn_refactor_smoke
+  bp_per_blocks: 1
+runtime:
+  device: cpu
+  seed: 7
+  verbose: false
+training:
+  epochs: 1
+  batch_size: 1
+  init_z_sample_count: 1
+  grad_accum_steps: 1
+  eval_episodes: 0
+  eval_every: 1
+model:
+  embedding_size: 8
+  hidden_size: 8
+  transformer_depth: 1
+  transformer_heads: 2
+  time_hidden_size: 8
+  time_layers: 1
+  breakpoint_hidden_dim: 8
+  breakpoint_gap_hidden_size: 8
+  breakpoint_gap_layers: 1
+logging:
+  wandb: false

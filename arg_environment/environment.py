@@ -51,78 +51,70 @@ class SimpleARGEnvironment(ExportMixin, TransitionMixin, PriorMixin):
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
         self.event_types = ["coal", "recomb"]
         self.device = torch.device(device)
-
-        if self.sequences is not None:
-            num_sequences = len(self.sequences)
-            sequence_length = len(self.sequences[0])
-            if any(len(sequence) != sequence_length for sequence in self.sequences):
-                raise ValueError("all sequences must have length sequence_length")
-
-
-        self.num_sequences = int(num_sequences)
-        self.sequence_length = int(sequence_length)
-        if num_blocks is None:
-            self.num_blocks = int(sequence_length // bp_per_blocks)
-        else:
-            self.num_blocks = int(num_blocks)
-        if self.num_blocks <= 0:
-            raise ValueError("num_blocks must be positive")
-
-        ## Important parameters
+        self._set_dimensions(
+            num_sequences, sequence_length, num_blocks, bp_per_blocks,
+        )
         self.recombination_rate = float(recombination_rate)
         if effective_population_size is not None:
             population_size = effective_population_size
         self.population_size = float(population_size)
-        self.mutation_rate = float(mutation_rate) ## where are we using this?
-
+        self.mutation_rate = float(mutation_rate)
         self.rho = (
             float(rho)
             if rho is not None
             else 4 * self.population_size * self.recombination_rate * self.sequence_length
         )
-
-        ## Time environment
-        time_env_kwargs = {}
-        if time_bins is not None:
-            time_env_kwargs["bins"] = int(time_bins)
-        if time_delta_bin_width is not None:
-            time_env_kwargs["delta_bin_width"] = float(time_delta_bin_width)
-        self.time_env = TimeEnvFixedDelta(**time_env_kwargs)
-
+        self.time_env = self._build_time_environment(time_bins, time_delta_bin_width)
         self.rng = random.Random(seed)
-
-        ## Sequence arrays
         self.block_indices = np.arange(self.num_blocks)
+        seq_arrays, block_seq_arrays = self._encode_sequences()
+        self.seq_arrays = torch.nn.Parameter(
+            torch.as_tensor(seq_arrays, device=self.device), requires_grad=False,
+        )
+        self.block_seq_arrays = torch.nn.Parameter(
+            torch.as_tensor(block_seq_arrays, device=self.device), requires_grad=False,
+        )
+        self.evolution_model = EvolutionModelTorch(self)
+        self.reward_fn = ARGReward()
 
-        seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences], dtype=np.float32)
+    def _set_dimensions(self, num_sequences, sequence_length, num_blocks, bp_per_blocks):
+        if self.sequences is not None:
+            num_sequences = len(self.sequences)
+            sequence_length = len(self.sequences[0])
+            if any(len(sequence) != sequence_length for sequence in self.sequences):
+                raise ValueError("all sequences must have length sequence_length")
+        self.num_sequences = int(num_sequences)
+        self.sequence_length = int(sequence_length)
+        self.num_blocks = int(
+            sequence_length // bp_per_blocks if num_blocks is None else num_blocks
+        )
+        if self.num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
 
-        block_seq_arrays = np.empty(
-            (self.num_sequences, self.num_blocks, seq_arrays.shape[-1]),
+    @staticmethod
+    def _build_time_environment(time_bins, time_delta_bin_width):
+        options = {}
+        if time_bins is not None:
+            options["bins"] = int(time_bins)
+        if time_delta_bin_width is not None:
+            options["delta_bin_width"] = float(time_delta_bin_width)
+        return TimeEnvFixedDelta(**options)
+
+    def _encode_sequences(self):
+        seq_arrays = np.asarray(
+            [self.seq2array(sequence) for sequence in self.sequences],
             dtype=np.float32,
         )
+        blocks = []
         for block_idx in range(self.num_blocks):
-            site_start = int(round(block_idx * self.sequence_length / self.num_blocks))
-            site_end = int(round((block_idx + 1) * self.sequence_length / self.num_blocks))
-            if site_end <= site_start:
+            start = round(block_idx * self.sequence_length / self.num_blocks)
+            end = round((block_idx + 1) * self.sequence_length / self.num_blocks)
+            if end <= start:
                 raise ValueError(
                     "num_blocks must not create empty block intervals for sequence_length"
                 )
-            block_seq_arrays[:, block_idx, :] = seq_arrays[:, site_start:site_end, :].mean(axis=1)
-
-        self.seq_arrays = torch.nn.Parameter(
-            torch.tensor(seq_arrays, dtype=torch.float32, device=self.device),
-            requires_grad=False,
-        )
-        self.block_seq_arrays = torch.nn.Parameter(
-            torch.tensor(block_seq_arrays, dtype=torch.float32, device=self.device),
-            requires_grad=False,
-        )
-        
-        ## Evolution model
-        self.evolution_model = EvolutionModelTorch(self)
-
-        ## Reward function 
-        self.reward_fn = ARGReward()
+            blocks.append(seq_arrays[:, start:end].mean(axis=1))
+        return seq_arrays, np.stack(blocks, axis=1)
 
     @property
     def time_metadata(self):

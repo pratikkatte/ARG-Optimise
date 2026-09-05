@@ -1,4 +1,3 @@
-import numbers
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -14,40 +13,6 @@ class RecombinationChoice:
     @property
     def breakpoint_count(self):
         return int(self.span_end - self.span_start)
-
-    def as_weight_tuple(self):
-        return (
-            self.active_lineage_i,
-            self.material_count,
-            list(range(self.span_start + 1, self.span_end + 1)),
-        )
-
-    @classmethod
-    def from_action(cls, action):
-        if isinstance(action, cls):
-            return action
-        if not isinstance(action, dict) or action.get("event_type") != "recomb":
-            return None
-        active_lineage_i = action.get("active_lineage_i")
-        material_count = action.get("material_count")
-        span_start = action.get("span_start")
-        span_end = action.get("span_end")
-        if not isinstance(active_lineage_i, numbers.Integral) or not isinstance(material_count, numbers.Integral) or not isinstance(span_start, numbers.Integral) or not isinstance(span_end, numbers.Integral):
-            return None
-        time_action = action.get("time_action")
-        if time_action is not None and not isinstance(time_action, numbers.Integral):
-            return None
-        breakpoint = action.get("breakpoint")
-        if breakpoint is not None and not isinstance(breakpoint, numbers.Integral):
-            return None
-        return cls(
-            active_lineage_i=int(active_lineage_i),
-            material_count=int(material_count),
-            span_start=int(span_start),
-            span_end=int(span_end),
-            time_action=int(time_action) if time_action is not None else None,
-            breakpoint=int(breakpoint) if breakpoint is not None else None,
-        )
 
     def is_valid_for(self, active_lineages):
         return self.active_lineage_i < len(active_lineages) and self.span_start < self.span_end
@@ -100,25 +65,6 @@ class CoalescenceChoice:
         )
 
     @classmethod
-    def from_action(cls, action):
-        if isinstance(action, cls):
-            return action
-        if not isinstance(action, dict) or action.get("event_type") != "coal":
-            return None
-        i = action.get("active_lineage_i")
-        j = action.get("active_lineage_j")
-        if not isinstance(i, numbers.Integral) or not isinstance(j, numbers.Integral):
-            return None
-        time_action = action.get("time_action")
-        if time_action is not None and not isinstance(time_action, numbers.Integral):
-            return None
-        return cls(
-            active_lineage_i=int(i),
-            active_lineage_j=int(j),
-            time_action=int(time_action) if time_action is not None else None,
-        )
-
-    @classmethod
     def enumerate_from_active_lineages(cls, active_lineages):
         events = []
         for active_idx, lineage in enumerate(active_lineages):
@@ -151,8 +97,3 @@ class PriorActionOptions:
     coal_actions: Tuple[CoalescenceChoice, ...]
     recomb_choices: Tuple[RecombinationChoice, ...]
     rates: Dict[str, float]
-
-    @property
-    def total_recomb_weight(self):
-        return sum(choice.material_count for choice in self.recomb_choices)
-

@@ -140,108 +140,86 @@ class TransitionMixin:
         and overlap channels, or splits a recombining lineage's evidence. It is
         an encoding-only state and must not be committed to a rollout.
         """
-        next_state = state.clone(copy_partials=False)
-
         if isinstance(action, CoalescenceChoice):
-            if not action.is_valid_for(next_state.active_lineages):
-                raise ValueError(f"Invalid coalescence action: {action}")
-
-            i = int(action.active_lineage_i)
-            j = int(action.active_lineage_j)
-            child_i = next_state.active_lineages[i]
-            child_j = next_state.active_lineages[j]
-            parent_segments = child_i.material_segments.union(
-                child_j.material_segments
-            )
-            evidence, pair_features = self._coalescence_preview_features(child_i, child_j)
-            parent = ARGLineage(
-                node_id=next_state.max_node_idx + 1,
-                material_segments=parent_segments,
-                num_blocks=self.num_blocks,
-                partials=evidence,
-                preview_pair_features=pair_features,
-                sequences_indices=sorted(
-                    set(child_i.sequences_indices + child_j.sequences_indices)
-                ),
-                event_type="coal",
-                time=state.current_time,
-            )
-            next_state.active_lineages = [
-                lineage
-                for idx, lineage in enumerate(next_state.active_lineages)
-                if idx not in (i, j)
-            ]
-            next_state.active_lineages.append(parent)
-            return next_state
-
+            return self._preview_coalescence(state, action)
         if isinstance(action, RecombinationChoice):
-            if not action.is_valid_for(next_state.active_lineages):
-                raise ValueError(f"Invalid recombination action: {action}")
-            if action.breakpoint is None:
-                raise ValueError(
-                    "A recombination breakpoint must be chosen before the time-model preview"
-                )
-
-            lineage_idx = int(action.active_lineage_i)
-            child = next_state.active_lineages[lineage_idx]
-            left_segments, right_segments = child.material_segments.split(
-                action.breakpoint
-            )
-            left_parent = ARGLineage(
-                node_id=next_state.max_node_idx + 1,
-                material_segments=left_segments,
-                num_blocks=self.num_blocks,
-                partials=self._recombined_parent_partials(
-                    child,
-                    left_segments,
-                    parent_time=None,
-                ),
-                sequences_indices=list(child.sequences_indices),
-                event_type="recomb",
-                breakpoint=int(action.breakpoint),
-                recombination_side="left",
-                time=state.current_time,
-            )
-            right_parent = ARGLineage(
-                node_id=next_state.max_node_idx + 2,
-                material_segments=right_segments,
-                num_blocks=self.num_blocks,
-                partials=self._recombined_parent_partials(
-                    child,
-                    right_segments,
-                    parent_time=None,
-                ),
-                sequences_indices=list(child.sequences_indices),
-                event_type="recomb",
-                breakpoint=int(action.breakpoint),
-                recombination_side="right",
-                time=state.current_time,
-            )
-            next_state.active_lineages = [
-                lineage
-                for idx, lineage in enumerate(next_state.active_lineages)
-                if idx != lineage_idx
-            ]
-            next_state.active_lineages.extend([left_parent, right_parent])
-            return next_state
-
+            return self._preview_recombination(state, action)
         raise ValueError(f"Unknown action event_type: {action}")
 
+    def _preview_coalescence(self, state, action):
+        next_state = state.clone(copy_partials=False)
+        if not action.is_valid_for(next_state.active_lineages):
+            raise ValueError(f"Invalid coalescence action: {action}")
+
+        i, j = int(action.active_lineage_i), int(action.active_lineage_j)
+        child_i = next_state.active_lineages[i]
+        child_j = next_state.active_lineages[j]
+        evidence, pair_features = self._coalescence_preview_features(child_i, child_j)
+        parent = ARGLineage(
+            node_id=next_state.max_node_idx + 1,
+            material_segments=child_i.material_segments.union(child_j.material_segments),
+            num_blocks=self.num_blocks,
+            partials=evidence,
+            preview_pair_features=pair_features,
+            sequences_indices=sorted(
+                set(child_i.sequences_indices + child_j.sequences_indices)
+            ),
+            event_type="coal",
+            time=state.current_time,
+        )
+        next_state.active_lineages = [
+            lineage for idx, lineage in enumerate(next_state.active_lineages)
+            if idx not in (i, j)
+        ] + [parent]
+        return next_state
+
+    def _preview_recombination(self, state, action):
+        next_state = state.clone(copy_partials=False)
+        if not action.is_valid_for(next_state.active_lineages):
+            raise ValueError(f"Invalid recombination action: {action}")
+        if action.breakpoint is None:
+            raise ValueError(
+                "A recombination breakpoint must be chosen before the time-model preview"
+            )
+
+        lineage_idx = int(action.active_lineage_i)
+        child = next_state.active_lineages[lineage_idx]
+        segments = child.material_segments.split(action.breakpoint)
+        parents = [
+            self._preview_recombination_parent(
+                child, material, next_state.max_node_idx + offset,
+                side, action.breakpoint, state.current_time,
+            )
+            for offset, (side, material) in enumerate(
+                zip(("left", "right"), segments), start=1,
+            )
+        ]
+        next_state.active_lineages = [
+            lineage for idx, lineage in enumerate(next_state.active_lineages)
+            if idx != lineage_idx
+        ] + parents
+        return next_state
+
+    def _preview_recombination_parent(
+        self, child, material_segments, node_id, side, breakpoint, current_time,
+    ):
+        return ARGLineage(
+            node_id=node_id,
+            material_segments=material_segments,
+            num_blocks=self.num_blocks,
+            partials=self._recombined_parent_partials(
+                child, material_segments, parent_time=None,
+            ),
+            sequences_indices=list(child.sequences_indices),
+            event_type="recomb",
+            breakpoint=int(breakpoint),
+            recombination_side=side,
+            time=current_time,
+        )
+
     def apply_action(self, state, action, log_prior=None):
-        
         if isinstance(action, RecombinationChoice):
-            return self.apply_recombination(
-                state,
-                action,
-                log_prior
-            )
-        elif isinstance(action, CoalescenceChoice):
-            return self.apply_coalescence(
-                state,
-                action,
-                log_prior
-            )
-        else:
-            raise ValueError(f"Unknown action event_type: {action}")
-
-
+            return self.apply_recombination(state, action, log_prior)
+        if isinstance(action, CoalescenceChoice):
+            return self.apply_coalescence(state, action, log_prior)
+        raise ValueError(f"Unknown action event_type: {action}")

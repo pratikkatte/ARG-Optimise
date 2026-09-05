@@ -21,26 +21,15 @@ class BackwardPolicyMixin:
         return True
 
     def _enumerate_inverse_arg_actions(self, state):
-        inverse_actions = []
+        return self._inverse_coalescences(state) + self._inverse_recombinations(state)
 
-        # Use one loop to collect both coal and recomb candidates efficiently
-        # Prepare coal candidates in a single pass with a list comprehension
-        coal_candidates = [
-            (active_idx, lineage)
-            for active_idx, lineage in enumerate(state.active_lineages)
-            if (
-                lineage.event_type == "coal"
-                and len(lineage.children) == 2
-                and self._is_latest_time_event(state, lineage.node_id)
-                and lineage.children[0] in state.all_nodes
-                and lineage.children[1] in state.all_nodes
-                and lineage.node_id in state.all_nodes[lineage.children[0]].parents
-                and lineage.node_id in state.all_nodes[lineage.children[1]].parents
-            )
-        ]
-        for active_idx, lineage in coal_candidates:
+    def _inverse_coalescences(self, state):
+        actions = []
+        for active_idx, lineage in enumerate(state.active_lineages):
+            if not self._is_reversible_coalescence(state, lineage):
+                continue
             child_i, child_j = lineage.children
-            inverse_actions.append(
+            actions.append(
                 {
                     "event_type": "coal",
                     "active_idx": active_idx,
@@ -48,9 +37,22 @@ class BackwardPolicyMixin:
                     "child_ids": (child_i, child_j),
                 }
             )
+        return actions
 
-        # Prepare recomb_by_event using a single pass with a dictionary
-        recomb_by_event = {}
+    def _is_reversible_coalescence(self, state, lineage):
+        if lineage.event_type != "coal" or len(lineage.children) != 2:
+            return False
+        child_i, child_j = lineage.children
+        return (
+            self._is_latest_time_event(state, lineage.node_id)
+            and child_i in state.all_nodes
+            and child_j in state.all_nodes
+            and lineage.node_id in state.all_nodes[child_i].parents
+            and lineage.node_id in state.all_nodes[child_j].parents
+        )
+
+    def _recombination_sides(self, state):
+        events = {}
         for active_idx, lineage in enumerate(state.active_lineages):
             if (
                 lineage.event_type == "recomb"
@@ -59,11 +61,19 @@ class BackwardPolicyMixin:
                 and lineage.recombination_side in ("left", "right")
             ):
                 key = (lineage.children[0], lineage.breakpoint)
-                recomb_by_event.setdefault(key, {})[lineage.recombination_side] = (active_idx, lineage.node_id)
+                events.setdefault(key, {})[lineage.recombination_side] = (
+                    active_idx, lineage.node_id,
+                )
+        return events
 
-        # We can iterate efficiently over recomb_by_event rather than collecting in a list
-        for (child_id, breakpoint), sides in recomb_by_event.items():
-            if "left" not in sides or "right" not in sides or child_id not in state.all_nodes:
+    def _inverse_recombinations(self, state):
+        actions = []
+        for (child_id, breakpoint), sides in self._recombination_sides(state).items():
+            if (
+                "left" not in sides
+                or "right" not in sides
+                or child_id not in state.all_nodes
+            ):
                 continue
             left_idx, left_id = sides["left"]
             right_idx, right_id = sides["right"]
@@ -71,16 +81,19 @@ class BackwardPolicyMixin:
             left_parent = state.all_nodes[left_id]
             right_parent = state.all_nodes[right_id]
 
-            # Fast short-circuit checks, in a single conditional
             if (
                 not self._is_latest_time_event(state, left_id, right_id)
                 or set(child.parents) != {left_id, right_id}
-                or left_parent.material_segments.intersection_count(right_parent.material_segments) > 0
-                or left_parent.material_segments.union(right_parent.material_segments) != child.material_segments
+                or left_parent.material_segments.intersection_count(
+                    right_parent.material_segments
+                ) > 0
+                or left_parent.material_segments.union(
+                    right_parent.material_segments
+                ) != child.material_segments
             ):
                 continue
 
-            inverse_actions.append(
+            actions.append(
                 {
                     "event_type": "recomb",
                     "active_indices": (left_idx, right_idx),
@@ -89,8 +102,7 @@ class BackwardPolicyMixin:
                     "breakpoint": breakpoint,
                 }
             )
-
-        return inverse_actions
+        return actions
 
     def _is_latest_time_event(self, state, *node_ids):
         current_time = float(state.current_time)
@@ -122,7 +134,8 @@ class BackwardPolicyMixin:
         child_ids = inverse_action["child_ids"]
 
         remaining_lineages = [
-            lineage for lineage in parent_state.active_lineages if lineage.node_id != parent_id
+            lineage for lineage in parent_state.active_lineages
+            if lineage.node_id != parent_id
         ]
         parent_state.all_nodes.pop(parent_id)
         parent_state.active_lineages = []
@@ -152,7 +165,8 @@ class BackwardPolicyMixin:
         child_id = inverse_action["child_id"]
 
         remaining_lineages = [
-            lineage for lineage in parent_state.active_lineages if lineage.node_id not in (left_id, right_id)
+            lineage for lineage in parent_state.active_lineages
+            if lineage.node_id not in (left_id, right_id)
         ]
         parent_state.all_nodes.pop(left_id)
         parent_state.all_nodes.pop(right_id)
@@ -192,5 +206,3 @@ class BackwardPolicyMixin:
 
     def _active_index_by_node_id(self, state):
         return {lineage.node_id: idx for idx, lineage in enumerate(state.active_lineages)}
-
-

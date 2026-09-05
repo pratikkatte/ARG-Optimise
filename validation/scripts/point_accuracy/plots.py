@@ -8,6 +8,8 @@ from matplotlib.ticker import LogFormatterMathtext
 
 from .inputs import DEFAULT_XLIM, DEFAULT_YLIM
 from .tables import heatmap_tables_from_df, mse_by_rounded_bins, mse_by_segments
+
+
 def raster_heatmap(
     toplot: pd.DataFrame,
     out_path: Path,
@@ -21,19 +23,8 @@ def raster_heatmap(
 ) -> None:
     if toplot.empty:
         return
-    width = 0.1
-    nxb = int(round((xlim[1] - xlim[0]) / width)) + 1
-    nyb = int(round((ylim[1] - ylim[0]) / width)) + 1
+    x_edges, y_edges, z_display, width = fill_grid(toplot, xlim, ylim)
     x0, y0 = xlim[0], ylim[0]
-    x_edges = x0 + width * np.arange(nxb)
-    y_edges = y0 + width * np.arange(nyb)
-    z = np.zeros((len(y_edges) - 1, len(x_edges) - 1), dtype=float)
-    for _, row in toplot.iterrows():
-        i = int(round((float(row["Simulated"]) - x0) / width))
-        j = int(round((float(row["PosteriorMean"]) - y0) / width))
-        if 0 <= i < z.shape[1] and 0 <= j < z.shape[0]:
-            z[j, i] += float(row["x"])
-    z_display = np.where(z > 0, z, np.nan)
     fig, ax = plt.subplots(
         figsize=(2 if not with_colorbar else 3, 2.5 if with_colorbar else 2.0)
     )
@@ -81,13 +72,33 @@ def fill_grid(
     x_edges = x0 + width * np.arange(nxb)
     y_edges = y0 + width * np.arange(nyb)
     z = np.zeros((len(y_edges) - 1, len(x_edges) - 1), dtype=float)
-    for _, row in toplot.iterrows():
-        i = int(round((float(row["Simulated"]) - x0) / width))
-        j = int(round((float(row["PosteriorMean"]) - y0) / width))
-        if 0 <= i < z.shape[1] and 0 <= j < z.shape[0]:
-            z[j, i] += float(row["x"])
+    i = np.rint((toplot["Simulated"].to_numpy(dtype=float) - x0) / width).astype(int)
+    j = np.rint((toplot["PosteriorMean"].to_numpy(dtype=float) - y0) / width).astype(int)
+    valid = (i >= 0) & (i < z.shape[1]) & (j >= 0) & (j < z.shape[0])
+    np.add.at(z, (j[valid], i[valid]), toplot["x"].to_numpy(dtype=float)[valid])
     z_display = np.where(z > 0, z, np.nan)
     return x_edges, y_edges, z_display, width
+
+
+def write_heatmap_pair(
+    table,
+    clean_path,
+    labelled_path,
+    *,
+    xlim,
+    ylim,
+    xlabel,
+    ylabel,
+    vmax,
+):
+    common = dict(xlim=xlim, ylim=ylim, vmax=vmax)
+    raster_heatmap(
+        table, clean_path, xlabel="", ylabel="", with_colorbar=False, **common,
+    )
+    raster_heatmap(
+        table, labelled_path, xlabel=xlabel, ylabel=ylabel,
+        with_colorbar=True, **common,
+    )
 
 
 def overlay_mean(
@@ -164,6 +175,74 @@ def plot_mean_mse(mean_table: pd.DataFrame, out_path: Path, *, ylabel: str) -> N
     plt.close(fig)
 
 
+def write_mse_outputs(
+    mean_table,
+    out_prefix,
+    *,
+    error_column,
+    plot_name,
+    ylabel,
+    table_name=None,
+):
+    if table_name is not None:
+        mean_table.loc[:, ["SimRound", "len", "Mean", "MSE"]].to_csv(
+            out_prefix.parent / f"{out_prefix.name}{table_name}",
+            sep="\t",
+            index=False,
+            float_format="%.10g",
+        )
+    mse = (
+        float(mean_table[error_column].sum() / mean_table["len"].sum())
+        if not mean_table.empty
+        else float("nan")
+    )
+    (out_prefix.parent / f"{out_prefix.name}MSEall.txt").write_text(
+        f"{mse}\n", encoding="utf-8"
+    )
+    plot_mean_mse(
+        mean_table, out_prefix.parent / f"{out_prefix.name}{plot_name}",
+        ylabel=ylabel,
+    )
+    return mse
+
+
+def overlay_tsinferdate_means(
+    linear_table,
+    log_table,
+    linear_means,
+    log_means,
+    out_prefix,
+    *,
+    xlim,
+    ylim,
+    xlim_log,
+    ylim_log,
+    label,
+    tag,
+    vmax,
+):
+    overlay_mean(
+        linear_table,
+        linear_means,
+        out_prefix.parent / f"{out_prefix.name}_{tag}_meanest_mean_lin.png",
+        xlim=xlim,
+        ylim=ylim,
+        xlabel="Simulated coalTime\n(2Ne generations)",
+        ylabel=f"{label} coalTime\n(2Ne generations)",
+        vmax=vmax,
+    )
+    overlay_mean(
+        log_table,
+        log_means,
+        out_prefix.parent / f"{out_prefix.name}meanest_mean_log.png",
+        xlim=xlim_log,
+        ylim=ylim_log,
+        xlabel="Simulated Tcoal\n(log10 2Ne generations)",
+        ylabel=f"{label} Tcoal\n(log10 2Ne gen.)",
+        vmax=vmax,
+    )
+
+
 def run_tsinferdate_plots(
     df: pd.DataFrame,
     out_prefix: Path,
@@ -177,88 +256,39 @@ def run_tsinferdate_plots(
     vmax: float = 1e11,
 ) -> float:
     toplotall, toplotall_log = heatmap_tables_from_df(df)
-
-    raster_heatmap(
+    write_heatmap_pair(
         toplotall,
         out_prefix.parent / f"{out_prefix.name}_{tag}_pointest_lin_clean.png",
-        xlim=xlim,
-        ylim=ylim,
-        xlabel="",
-        ylabel="",
-        with_colorbar=False,
-        vmax=vmax,
-    )
-    raster_heatmap(
-        toplotall_log,
-        out_prefix.parent / f"{out_prefix.name}_{tag}_pointest_log_clean.png",
-        xlim=xlim_log,
-        ylim=ylim_log,
-        xlabel="",
-        ylabel="",
-        with_colorbar=False,
-        vmax=vmax,
-    )
-    raster_heatmap(
-        toplotall,
         out_prefix.parent / f"{out_prefix.name}_{tag}_pointest_lin.png",
         xlim=xlim,
         ylim=ylim,
         xlabel="Simulated coalTime\n(2Ne generations)",
         ylabel=f"{label} coalTime\n(2Ne generations)",
-        with_colorbar=True,
         vmax=vmax,
     )
-    raster_heatmap(
+    write_heatmap_pair(
         toplotall_log,
+        out_prefix.parent / f"{out_prefix.name}_{tag}_pointest_log_clean.png",
         out_prefix.parent / f"{out_prefix.name}_{tag}_pointest_log.png",
         xlim=xlim_log,
         ylim=ylim_log,
         xlabel="Simulated coalTime\n(log10 2Ne generations)",
         ylabel=f"{label} coalTime\n(log10 2Ne generations)",
-        with_colorbar=True,
         vmax=vmax,
     )
-
     mean_table = mse_by_rounded_bins(toplotall)
     mean_table_log = mse_by_rounded_bins(toplotall_log)
-    mean_table.loc[:, ["SimRound", "len", "Mean", "MSE"]].to_csv(
-        out_prefix.parent / f"{out_prefix.name}meanPerSim.txt",
-        sep="\t",
-        index=False,
-        float_format="%.10g",
-    )
-    mseall = (
-        float(mean_table["SqErr"].sum() / mean_table["len"].sum())
-        if not mean_table.empty
-        else float("nan")
-    )
-    (out_prefix.parent / f"{out_prefix.name}MSEall.txt").write_text(
-        f"{mseall}\n", encoding="utf-8"
-    )
-    plot_mean_mse(
-        mean_table,
-        out_prefix.parent / f"{out_prefix.name}meanMSE_lin.png",
+    mseall = write_mse_outputs(
+        mean_table, out_prefix,
+        error_column="SqErr",
+        table_name="meanPerSim.txt",
+        plot_name="meanMSE_lin.png",
         ylabel=f"{label} Tcoal\n(2Ne generations)",
     )
-    overlay_mean(
-        toplotall,
-        mean_table,
-        out_prefix.parent / f"{out_prefix.name}_{tag}_meanest_mean_lin.png",
-        xlim=xlim,
-        ylim=ylim,
-        xlabel="Simulated coalTime\n(2Ne generations)",
-        ylabel=f"{label} coalTime\n(2Ne generations)",
-        vmax=vmax,
-    )
-    overlay_mean(
-        toplotall_log,
-        mean_table_log,
-        out_prefix.parent / f"{out_prefix.name}meanest_mean_log.png",
-        xlim=xlim_log,
-        ylim=ylim_log,
-        xlabel="Simulated Tcoal\n(log10 2Ne generations)",
-        ylabel=f"{label} Tcoal\n(log10 2Ne gen.)",
-        vmax=vmax,
+    overlay_tsinferdate_means(
+        toplotall, toplotall_log, mean_table, mean_table_log, out_prefix,
+        xlim=xlim, ylim=ylim, xlim_log=xlim_log, ylim_log=ylim_log,
+        label=label, tag=tag, vmax=vmax,
     )
     print(f"Wrote {label} plots with prefix {out_prefix}", flush=True)
     return mseall
@@ -278,60 +308,31 @@ def run_singer_plots(
     toplotall, toplotall_log = heatmap_tables_from_df(df)
     ylabel = f"{label} Tcoal\n(2Ne generations)"
     ylabel_log = f"{label} Tcoal\n(log10 2Ne gen.)"
-
-    raster_heatmap(
+    write_heatmap_pair(
         toplotall,
         out_prefix.parent / f"{out_prefix.name}meanest_lin_clean.png",
-        xlim=xlim,
-        ylim=ylim,
-        xlabel="",
-        ylabel="",
-        with_colorbar=False,
-        vmax=vmax,
-    )
-    raster_heatmap(
-        toplotall_log,
-        out_prefix.parent / f"{out_prefix.name}meanest_log_clean.png",
-        xlim=xlim_log,
-        ylim=ylim_log,
-        xlabel="",
-        ylabel="",
-        with_colorbar=False,
-        vmax=vmax,
-    )
-    raster_heatmap(
-        toplotall,
         out_prefix.parent / f"{out_prefix.name}meanest_lin.png",
         xlim=xlim,
         ylim=ylim,
         xlabel="Simulated Tcoal\n(2Ne generations)",
         ylabel=ylabel,
-        with_colorbar=True,
         vmax=vmax,
     )
-    raster_heatmap(
+    write_heatmap_pair(
         toplotall_log,
+        out_prefix.parent / f"{out_prefix.name}meanest_log_clean.png",
         out_prefix.parent / f"{out_prefix.name}meanest_log.png",
         xlim=xlim_log,
         ylim=ylim_log,
         xlabel="Simulated Tcoal\n(log10 2Ne generations)",
         ylabel=ylabel_log,
-        with_colorbar=True,
         vmax=vmax,
     )
-
     mean_table = mse_by_segments(df)
-    mseall = (
-        float(mean_table["WtdSqErr"].sum() / mean_table["len"].sum())
-        if not mean_table.empty
-        else float("nan")
-    )
-    (out_prefix.parent / f"{out_prefix.name}MSEall.txt").write_text(
-        f"{mseall}\n", encoding="utf-8"
-    )
-    plot_mean_mse(
-        mean_table,
-        out_prefix.parent / f"{out_prefix.name}MeanMSE_lin.png",
+    mseall = write_mse_outputs(
+        mean_table, out_prefix,
+        error_column="WtdSqErr",
+        plot_name="MeanMSE_lin.png",
         ylabel=ylabel,
     )
     overlay_mean(
@@ -346,4 +347,3 @@ def run_singer_plots(
     )
     print(f"Wrote {label} plots with prefix {out_prefix}", flush=True)
     return mseall
-

@@ -3,6 +3,11 @@ import os
 import torch
 
 
+def load_checkpoint(path, map_location=None):
+    """Load a checkpoint using the supported PyTorch checkpoint format."""
+    return torch.load(path, map_location=map_location, weights_only=False)
+
+
 class CheckpointMixin:
     def save(self, path, metadata=None):
         directory = os.path.dirname(os.path.abspath(path))
@@ -23,12 +28,11 @@ class CheckpointMixin:
         checkpoint = (
             path
             if isinstance(path, dict)
-            else self._torch_load(path, map_location=map_location)
+            else load_checkpoint(path, map_location=map_location)
         )
         state_dict = checkpoint.get("generator_state_dict", checkpoint)
         self.load_state_dict(state_dict)
         self.to(self.device)
-        self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
 
         if load_optimizer and "opt_state_dict" in checkpoint:
             self.opt.load_state_dict(checkpoint["opt_state_dict"])
@@ -40,10 +44,4 @@ class CheckpointMixin:
             for key, value in state.items():
                 if torch.is_tensor(value):
                     state[key] = value.to(self.device)
-
-    def _torch_load(self, path, map_location=None):
-        try:
-            return torch.load(path, map_location=map_location, weights_only=False)
-        except TypeError:
-            return torch.load(path, map_location=map_location)
 

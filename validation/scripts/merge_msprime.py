@@ -154,22 +154,7 @@ def write_haplotype_fasta(ts, fasta_path, site_mask=None):
     for variant in ts.variants():
         if site_mask is not None and site_mask[variant.site.id]:
             continue
-        site_pos = int(variant.site.position)
-        if not (0 <= site_pos < sequence_length):
-            continue
-        alleles = variant.alleles
-        if not alleles:
-            for seq in seqs:
-                seq[site_pos] = ord('N')
-            continue
-        reference_base = reference[site_pos].upper()
-        allele_bases = [_allele_to_base(allele, reference_base) for allele in alleles]
-        for sample_idx, allele_idx in enumerate(variant.genotypes):
-            if allele_idx < 0 or allele_idx >= len(alleles):
-                base = 'N'
-            else:
-                base = allele_bases[int(allele_idx)]
-            seqs[sample_idx][site_pos] = ord(base if base in _ACGT else 'N')
+        _apply_variant(seqs, reference, variant)
 
     with open(fasta_path, 'w', encoding='utf-8') as handle:
         for sample_idx, seq in enumerate(seqs):
@@ -177,6 +162,33 @@ def write_haplotype_fasta(ts, fasta_path, site_mask=None):
             text = seq.decode('ascii')
             for start in range(0, len(text), 80):
                 handle.write(text[start : start + 80] + '\n')
+
+
+def _apply_variant(sequences, reference, variant):
+    position = int(variant.site.position)
+    if not 0 <= position < len(reference):
+        return
+    alleles = variant.alleles
+    if not alleles:
+        for sequence in sequences:
+            sequence[position] = ord('N')
+        return
+    bases = [_allele_to_base(allele, reference[position].upper()) for allele in alleles]
+    for sample, allele_index in enumerate(variant.genotypes):
+        base = bases[int(allele_index)] if 0 <= allele_index < len(bases) else 'N'
+        sequences[sample][position] = ord(base if base in _ACGT else 'N')
+
+
+def _write_pair_times(ts, sample_ids, output_dir, output_name, sample_count):
+    os.makedirs(output_dir, exist_ok=True)
+    for first in range(sample_count - 1):
+        for second in range(first + 1, sample_count):
+            path = output_dir + output_name + f'_spls{first}-{second}.tc'
+            with open(path, 'w', encoding='utf-8') as handle:
+                for tree in ts.trees():
+                    left, right = tree.interval
+                    time = tree.tmrca(sample_ids[first], sample_ids[second])
+                    print(left, right, time, sep='\t', file=handle)
 
 
 def simulate(
@@ -198,55 +210,49 @@ def simulate(
     os.makedirs(tsdir, exist_ok=True)
     os.makedirs(fastadir, exist_ok=True)
     for i in range(nrep):
-        print('rep', i)
-        ancestry_seed = seed + i * 100_000
-        ancestry_ts = msprime.sim_ancestry(
-            samples=n // 2,
-            ploidy=2,
-            population_size=Ne,
-            sequence_length=length,
-            recombination_rate=rec,
-            discrete_genome=True,
-            random_seed=ancestry_seed,
+        _simulate_replicate(
+            i, pref, n, mu, rec, Ne, length, seed,
+            contig_id, vcfdir, tcdir, tsdir, fastadir,
         )
-        ts = msprime.sim_mutations(
-            ancestry_ts,
-            rate=mu,
-            model=msprime.JC69(),
-            discrete_genome=True,
-            keep=False,
-            random_seed=ancestry_seed + 1,
-        )
-        site_mask = vcf_site_mask(ts)
-        sample_ids = list(ts.samples())
-        outname = 'sim_' + pref + str(i)
-        vcfpath = vcfdir + outname + '.vcf'
-        vcf_kwargs = {
-            'contig_id': contig_id,
-            'individual_names': ['spl' + str(s) for s in range(n // 2)],
-            'site_mask': np.asarray(site_mask, dtype=bool),
-        }
-        if ts.num_individuals == 0:
-            vcf_kwargs['ploidy'] = 2
-        with open(vcfpath, 'w', encoding='utf-8') as vcffh:
-            ts.write_vcf(vcffh, **vcf_kwargs)
-        print('writing vcf to', vcfpath)
-        tsfile = tsdir + outname + '.trees'
-        ts.dump(tsfile)
-        print('writing trees to', tsfile)
-        fastafile = fastadir + outname + '.fa'
-        write_haplotype_fasta(ts, fastafile, site_mask=site_mask)
-        print('writing fasta to', fastafile)
-        rep_dir = tcdir + 'rep' + str(i) + '/'
-        os.makedirs(rep_dir, exist_ok=True)
-        for s1 in range(0, n - 1):
-            for s2 in range(s1 + 1, n):
-                tcpath = rep_dir + outname + '_spls' + str(s1) + '-' + str(s2) + '.tc'
-                with open(tcpath, 'w', encoding='utf-8') as coaltimefh:
-                    for tree in ts.trees():
-                        left, right = tree.interval
-                        coalescence_time = tree.tmrca(sample_ids[s1], sample_ids[s2])
-                        print(left, right, coalescence_time, sep='\t', file=coaltimefh)
+
+
+def _simulate_replicate(
+    index, pref, n, mu, rec, population_size, length, base_seed,
+    contig, vcf_dir, time_dir, tree_dir, fasta_dir,
+):
+    print('rep', index)
+    ancestry_seed = base_seed + index * 100_000
+    ancestry = msprime.sim_ancestry(
+        samples=n // 2, ploidy=2, population_size=population_size,
+        sequence_length=length, recombination_rate=rec, discrete_genome=True,
+        random_seed=ancestry_seed,
+    )
+    ts = msprime.sim_mutations(
+        ancestry, rate=mu, model=msprime.JC69(), discrete_genome=True,
+        keep=False, random_seed=ancestry_seed + 1,
+    )
+    mask = vcf_site_mask(ts)
+    output_name = f'sim_{pref}{index}'
+    vcf_path = vcf_dir + output_name + '.vcf'
+    vcf_options = {
+        'contig_id': contig,
+        'individual_names': [f'spl{sample}' for sample in range(n // 2)],
+        'site_mask': np.asarray(mask, dtype=bool),
+    }
+    if ts.num_individuals == 0:
+        vcf_options['ploidy'] = 2
+    with open(vcf_path, 'w', encoding='utf-8') as handle:
+        ts.write_vcf(handle, **vcf_options)
+    tree_path = tree_dir + output_name + '.trees'
+    fasta_path = fasta_dir + output_name + '.fa'
+    ts.dump(tree_path)
+    write_haplotype_fasta(ts, fasta_path, site_mask=mask)
+    print('writing vcf to', vcf_path)
+    print('writing trees to', tree_path)
+    print('writing fasta to', fasta_path)
+    _write_pair_times(
+        ts, list(ts.samples()), time_dir + f'rep{index}/', output_name, n,
+    )
 
 
 ## standard simulation — 1 Mb
@@ -257,8 +263,7 @@ def simulate(
 # mutation 2e-8 (JC69)
 # length 1mb
 # replicates 1
-print('1mb sequence length')
-simulate(nrep=1, pref='l1mb_', n=8, rec=2e-8, Ne=10000, length=10**6)
+# Run from ``main`` below.
 
 ## change number of samples
 # coalescent model
@@ -323,5 +328,12 @@ simulate(nrep=1, pref='l1mb_', n=8, rec=2e-8, Ne=10000, length=10**6)
 # simulate(nrep=1, pref='l5mb_', n=8, rec=2e-8, Ne=10000, length=5*10**6)
 # print('250kb sequence length')
 # simulate(nrep=1, pref='l250kb_', n=8, rec=2e-8, Ne=10000, length=250*10**3)
-print('25kb sequence length')
-simulate(nrep=1, pref='l25kb_', n=8, rec=2e-8, Ne=10000, length=25_000)
+def main():
+    print('1mb sequence length')
+    simulate(nrep=1, pref='l1mb_', n=8, rec=2e-8, Ne=10000, length=10**6)
+    print('25kb sequence length')
+    simulate(nrep=1, pref='l25kb_', n=8, rec=2e-8, Ne=10000, length=25_000)
+
+
+if __name__ == '__main__':
+    main()

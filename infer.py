@@ -7,6 +7,7 @@ import torch
 from arg_environment import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from gflownet import TBGFlowNetGenerator
+from gflownet.checkpoint import load_checkpoint
 from arg_environment.time import DEFAULT_TIME_BIN_SCHEME
 from training.config import (
     DEFAULT_LOG_Z_LR,
@@ -15,6 +16,7 @@ from training.config import (
     DEFAULT_NE,
 )
 from training.loop import seed_everything
+from utils import resolve_device
 
 
 REQUIRED_METADATA_KEYS = {
@@ -53,32 +55,15 @@ def run_inference(
     inference_seed = int(metadata["seed"] if seed is None else seed)
     seed_everything(inference_seed)
 
-    resolved_device = resolve_device(device)
-    env = environment_from_metadata(
-        metadata,
-        seed=inference_seed,
-        device=resolved_device,
+    env, generator = build_inference_components(
+        metadata, inference_seed, resolve_device(device), verbose,
     )
-    generator = TBGFlowNetGenerator(
-        env,
-        init_z_sample_count=metadata["init_z_sample_count"],
-        cfg={
-            "breakpoint_policy": metadata.get("breakpoint_policy", "continuous-bin"),
-            "breakpoint_mixtures": int(metadata.get("breakpoint_mixtures", 4)),
-        },
-        device=resolved_device,
-        verbose=verbose,
-        log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
-        model_kwargs=dict(metadata.get("model", {})),
-        initialize_z_from_prior=False,
-    )
-    generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
+    generator.load(checkpoint_data, load_optimizer=False)
     generator.eval()
 
     random_spec = build_random_spec(temperature=temperature)
-    rollout_worker = RolloutWorker(env, verbose=verbose)
     rollout_outputs, trajectories = run_batched_rollouts(
-        rollout_worker,
+        RolloutWorker(env, verbose=verbose),
         generator,
         num_args=num_args,
         batch_size=batch_size,
@@ -88,14 +73,8 @@ def run_inference(
 
     os.makedirs(output_dir, exist_ok=True)
     manifest = build_manifest(
-        checkpoint=checkpoint,
-        metadata=metadata,
-        seed=inference_seed,
-        random_spec=random_spec,
-        output_dir=output_dir,
-        env=env,
-        rollout_outputs=rollout_outputs,
-        trajectories=trajectories,
+        checkpoint, metadata, inference_seed, random_spec, output_dir,
+        env, rollout_outputs, trajectories,
     )
     manifest_path = os.path.join(output_dir, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as handle:
@@ -103,20 +82,22 @@ def run_inference(
     return manifest
 
 
-def load_checkpoint(path, map_location=None):
-    try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
-
-
-def resolve_device(device):
-    if device is None or device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    resolved = torch.device(device)
-    if resolved.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA was requested for inference but is not available.")
-    return resolved
+def build_inference_components(metadata, seed, device, verbose=False):
+    env = environment_from_metadata(
+        metadata,
+        seed=seed,
+        device=device,
+    )
+    generator = TBGFlowNetGenerator(
+        env,
+        init_z_sample_count=metadata["init_z_sample_count"],
+        device=device,
+        verbose=verbose,
+        log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
+        model_kwargs=dict(metadata.get("model", {})),
+        initialize_z_from_prior=False,
+    )
+    return env, generator
 
 
 def validate_metadata(metadata):
@@ -215,13 +196,7 @@ def run_batched_rollouts(
 def _pad_log_path_rows(rows):
     if not rows:
         return torch.empty(0, 0)
-    max_length = max(row.numel() for row in rows)
-    dtype = rows[0].dtype
-    padded = torch.zeros(len(rows), max_length, dtype=dtype)
-    for row_idx, row in enumerate(rows):
-        if row.numel() > 0:
-            padded[row_idx, : row.numel()] = row
-    return padded
+    return torch.nn.utils.rnn.pad_sequence(rows, batch_first=True)
 
 
 def build_random_spec(temperature=None):

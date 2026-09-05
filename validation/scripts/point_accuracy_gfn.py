@@ -7,28 +7,24 @@ import argparse
 from pathlib import Path
 
 try:
-    from .point_accuracy_common import (
+    from .point_accuracy import (
         add_common_args,
         dataframe_from_tree_sequences,
         load_posterior_tree_samples,
         load_tree_sequence,
-        parse_limits,
         plot_limits_from_args,
-        prepare_output_prefix,
+        run_analysis,
         run_tsinferdate_plots,
-        write_standard_outputs,
     )
 except ImportError:
-    from point_accuracy_common import (
+    from point_accuracy import (
         add_common_args,
         dataframe_from_tree_sequences,
         load_posterior_tree_samples,
         load_tree_sequence,
-        parse_limits,
         plot_limits_from_args,
-        prepare_output_prefix,
+        run_analysis,
         run_tsinferdate_plots,
-        write_standard_outputs,
     )
 
 
@@ -67,10 +63,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    parse_limits(args.xlim)
-    parse_limits(args.ylim)
-    parse_limits(args.xlim_log)
-    parse_limits(args.ylim_log)
+    plot_limits_from_args(args)
     has_single = args.inferred_trees is not None
     has_samples = args.input_dir is not None or args.sample_prefix is not None
     if has_single and has_samples:
@@ -101,33 +94,14 @@ def dataframe_from_args(args: argparse.Namespace):
 
 
 def run_from_args(args: argparse.Namespace) -> float:
-    out_prefix = prepare_output_prefix(args.output_prefix)
-    xlim, ylim, xlim_log, ylim_log = plot_limits_from_args(args)
-    df = dataframe_from_args(args)
-    print(f"segments: {len(df)} rows", flush=True)
-    legacy_mse = run_tsinferdate_plots(
-        df,
-        out_prefix,
-        xlim=xlim,
-        ylim=ylim,
-        xlim_log=xlim_log,
-        ylim_log=ylim_log,
-        label=METHOD_LABEL,
+    return run_analysis(
+        args,
+        dataframe_from_args,
+        run_tsinferdate_plots,
+        method_label=METHOD_LABEL,
         tag="gfn",
         vmax=1e11,
     )
-    write_standard_outputs(
-        df,
-        out_prefix,
-        method_label=METHOD_LABEL,
-        legacy_mse=legacy_mse,
-        xlim=xlim,
-        ylim=ylim,
-        xlim_log=xlim_log,
-        ylim_log=ylim_log,
-    )
-    print(f"MSEall = {legacy_mse}", flush=True)
-    return legacy_mse
 
 
 def main() -> None:

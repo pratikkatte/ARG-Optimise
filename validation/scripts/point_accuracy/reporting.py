@@ -124,6 +124,24 @@ def write_time_summary(
     ylim_log: tuple[float, float],
     method_label: str,
 ) -> None:
+    rows = _time_summary_rows(
+        df, xlim, ylim, xlim_log, ylim_log, method_label,
+    )
+    pd.DataFrame(rows).to_csv(
+        out_prefix.parent / f"{out_prefix.name}timeSummary.tsv",
+        sep="\t",
+        index=False,
+    )
+    for column in ("Simulated", "PosteriorMean"):
+        stats = _summary_stats(df[column])
+        print(
+            f"{column}: n={stats['n']} min={stats['min']:.10g} "
+            f"median={stats['median']:.10g} max={stats['max']:.10g}",
+            flush=True,
+        )
+
+
+def _time_summary_rows(df, xlim, ylim, xlim_log, ylim_log, method_label):
     rows: list[dict[str, str | float | int]] = [
         {"series": "metadata", "metric": "method", "value": method_label},
         {"series": "metadata", "metric": "units", "value": "t/(2Ne)"},
@@ -137,8 +155,7 @@ def write_time_summary(
             {"series": series, "metric": metric, "value": value}
             for metric, value in stats.items()
         )
-    rows.extend(
-        [
+    rows.extend([
             {
                 "series": "plot_limits",
                 "metric": "linear_x",
@@ -172,18 +189,7 @@ def write_time_summary(
             {"series": "clipping", "metric": "total_rows", "value": len(df)},
         ]
     )
-    pd.DataFrame(rows).to_csv(
-        out_prefix.parent / f"{out_prefix.name}timeSummary.tsv",
-        sep="\t",
-        index=False,
-    )
-    for column in ("Simulated", "PosteriorMean"):
-        stats = _summary_stats(df[column])
-        print(
-            f"{column}: n={stats['n']} min={stats['min']:.10g} "
-            f"median={stats['median']:.10g} max={stats['max']:.10g}",
-            flush=True,
-        )
+    return rows
 
 
 def write_standard_outputs(

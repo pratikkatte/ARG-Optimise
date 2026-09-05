@@ -3,10 +3,10 @@
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-import torch
 import yaml
 
 from arg_environment.time import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
+from utils.device import resolve_device
 
 
 @dataclass
@@ -175,11 +175,7 @@ class TrainConfig:
 
     @property
     def device(self):
-        name = "cuda" if self.runtime.device == "auto" and torch.cuda.is_available() else self.runtime.device
-        name = "cpu" if name == "auto" else name
-        if name == "cuda" and not torch.cuda.is_available():
-            raise ValueError("runtime.device requests CUDA, but CUDA is unavailable")
-        return torch.device(name)
+        return resolve_device(self.runtime.device)
 
     def as_dict(self):
         return asdict(self)
@@ -190,4 +186,3 @@ DEFAULT_NE = EnvironmentConfig.effective_population_size
 DEFAULT_MU_PER_BP = EnvironmentConfig.mutation_rate
 DEFAULT_LOG_Z_LR = OptimizerConfig.log_z_lr
 MODEL_VERSION = "pytorch-transformer-yaml-v7"
-

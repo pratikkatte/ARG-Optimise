@@ -85,12 +85,10 @@ class BreakpointSplitPositionCNN(nn.Module):
         # Keep features for valid split gaps only. Gap row i corresponds to breakpoint k=i+1.
         return x.transpose(1, 2)[:, :-1].contiguous()
 
-    def _breakpoint_logit_indices(self, sequence_length, num_blocks, breakpoints, device):
-        indices = []
-        for breakpoint in breakpoints:
-            index = min(max(int(breakpoint), 1), int(num_blocks) - 1) - 1
-            indices.append(index)
-        return torch.tensor(indices, dtype=torch.long, device=device)
+    def _breakpoint_logit_indices(self, num_blocks, breakpoints, device):
+        return torch.as_tensor(breakpoints, dtype=torch.long, device=device).clamp(
+            1, int(num_blocks) - 1,
+        ) - 1
 
     def _valid_breakpoints_list(self, valid_breakpoints):
         return list(range(
@@ -135,7 +133,6 @@ class BreakpointSplitPositionCNN(nn.Module):
         self,
         valid_breakpoints,
         lineage_seq_feature,
-        sequence_length,
         num_blocks,
         action_context,
     ):
@@ -153,7 +150,6 @@ class BreakpointSplitPositionCNN(nn.Module):
 
         gap_features = self.gap_features(lineage_seq_feature)[0]
         logit_indices = self._breakpoint_logit_indices(
-            sequence_length,
             num_blocks,
             valid_breakpoints,
             gap_features.device,
@@ -181,7 +177,6 @@ class BreakpointSplitPositionCNN(nn.Module):
         self,
         valid_breakpoints,
         lineage_seq_feature,
-        sequence_length,
         num_blocks,
         action_context,
         random_spec=None,
@@ -190,7 +185,6 @@ class BreakpointSplitPositionCNN(nn.Module):
         score_args = (
             valid_breakpoints,
             lineage_seq_feature,
-            sequence_length,
             num_blocks,
             action_context,
         )
@@ -213,4 +207,3 @@ class BreakpointSplitPositionCNN(nn.Module):
         breakpoint = int(valid_breakpoints[int(local_idx.detach().cpu().item())])
         log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
         return breakpoint, log_p
-
