@@ -90,3 +90,4 @@ class TimeEnvFixedDelta:
             return lower_t
         tail_factor = math.exp(-rate * width)
         return lower_t + (1.0 / rate) - (width * tail_factor / interval_mass_from_zero)
+

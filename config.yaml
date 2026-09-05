@@ -1,0 +1,56 @@
+data:
+  dataset_path: validation/fasta/sim_l25kb_0.fa
+  output_path: outputs/example
+  bp_per_blocks: 1
+
+runtime:
+  device: auto
+  seed: 7
+  verbose: true
+
+training:
+  epochs: 10
+  batch_size: 10
+  init_z_sample_count: 16
+  grad_accum_steps: 1
+  eval_episodes: 8
+  eval_every: 10
+
+optimizer:
+  policy_lr: 0.001
+  log_z_lr: 0.001
+  grad_clip: 10.0
+
+environment:
+  effective_population_size: 10000
+  mutation_rate: 2.0e-8
+  recombination_rate: 2.0e-8
+  time_bins: 32
+  time_delta_bin_width: 0.001
+
+model:
+  embedding_size: 32
+  hidden_size: 64
+  dropout: 0.0
+  event_hidden_size: 64
+  event_dropout: 0.0
+  event_prior_weight: 0.1
+  breakpoint_hidden_dim: 128
+  breakpoint_dropout: 0.1
+  transformer_depth: 6
+  transformer_heads: 4
+  transformer_mlp_ratio: 2.0
+  attention_dropout: 0.0
+  time_hidden_size: 256
+  time_layers: 3
+  time_dropout: 0.0
+  breakpoint_gap_hidden_size: 256
+  breakpoint_gap_layers: 3
+  breakpoint_gap_dropout: 0.0
+  breakpoint_use_position_features: true
+
+logging:
+  wandb: false
+  project: null
+  entity: null
+  run_name: null

@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.distributions import Categorical
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from .layers import mlp
 
 class ResidualDilatedConvBlock(nn.Module):
     def __init__(self, hidden_dim, kernel_size=5, dilation=1, dropout=0.1):
@@ -63,40 +64,10 @@ class BreakpointSplitPositionCNN(nn.Module):
             for dilation in dilations
         )
 
-        self.gap_scorer = self._build_gap_scorer(
-            input_dim=self.hidden_dim + self.action_context_dim + self.position_feature_dim,
-            hidden_dim=int(gap_hidden_dim),
-            layers=int(gap_layers),
-            dropout=float(gap_dropout),
+        self.gap_scorer = mlp(
+            self.hidden_dim + self.action_context_dim + self.position_feature_dim,
+            int(gap_hidden_dim), 1, layers=int(gap_layers), dropout=float(gap_dropout),
         )
-
-    def _build_gap_scorer(self, input_dim, hidden_dim, layers, dropout):
-        if layers < 0:
-            raise ValueError(f"gap_layers must be non-negative, got {layers}")
-        if layers == 0:
-            scorer = nn.Sequential(nn.Linear(input_dim, 1))
-        else:
-            modules = [
-                nn.Linear(input_dim, hidden_dim),
-                nn.Dropout(dropout),
-                nn.ReLU(),
-            ]
-            for _ in range(layers - 1):
-                modules.extend([
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.Dropout(dropout),
-                    nn.ReLU(),
-                ])
-            modules.append(nn.Linear(hidden_dim, 1))
-            scorer = nn.Sequential(*modules)
-        scorer.apply(self._init_mlp_weights)
-        return scorer
-
-    def _init_mlp_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
 
     def gap_features(self, x):
         # x: [B, L, 4]
@@ -113,9 +84,6 @@ class BreakpointSplitPositionCNN(nn.Module):
 
         # Keep features for valid split gaps only. Gap row i corresponds to breakpoint k=i+1.
         return x.transpose(1, 2)[:, :-1].contiguous()
-
-    def breakpoint_scorer(self, x):
-        return self.gap_features(x)
 
     def _breakpoint_logit_indices(self, sequence_length, num_blocks, breakpoints, device):
         indices = []
@@ -245,3 +213,4 @@ class BreakpointSplitPositionCNN(nn.Module):
         breakpoint = int(valid_breakpoints[int(local_idx.detach().cpu().item())])
         log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
         return breakpoint, log_p
+

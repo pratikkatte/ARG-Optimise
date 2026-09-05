@@ -1,6 +1,5 @@
 import torch
-import numpy as np
-from env import SimpleTrajectory, action_as_dict
+from arg_environment import SimpleTrajectory, action_as_dict
 
 
 class RolloutWorker:

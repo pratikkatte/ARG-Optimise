@@ -4,17 +4,17 @@ import os
 
 import torch
 
-from env import SimpleARGEnvironment
+from arg_environment import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
-from tb_gfn import TBGFlowNetGenerator
-from time_env import DEFAULT_TIME_BIN_SCHEME
-from train import (
+from gflownet import TBGFlowNetGenerator
+from arg_environment.time import DEFAULT_TIME_BIN_SCHEME
+from training.config import (
     DEFAULT_LOG_Z_LR,
     MODEL_VERSION,
     DEFAULT_MU_PER_BP,
     DEFAULT_NE,
-    seed_everything,
 )
+from training.loop import seed_everything
 
 
 REQUIRED_METADATA_KEYS = {

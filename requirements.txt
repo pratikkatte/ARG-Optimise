@@ -13,11 +13,12 @@
 numpy
 torch
 wandb
+PyYAML
 
 # --- Environment & export (env.py: .trees export via tskit) ---
 tskit
 
-# --- Visualization (viz.py, pg.ipynb) ---
+# --- Visualization (utils/visualization.py, notebook/*.ipynb) ---
 matplotlib
 
 # --- Validation pipeline (validation/scripts/) ---
@@ -27,6 +28,6 @@ pandas
 tsdate
 tsinfer
 
-# --- Notebook (pg.ipynb) ---
+# --- Notebooks (notebook/) ---
 ipython
 jupyter

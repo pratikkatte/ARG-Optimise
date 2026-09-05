@@ -308,3 +308,4 @@ class EvolutionModelTorch(torch.nn.Module):
             interval_start=block_start,
             interval_end=block_end,
         ) > 0
+
