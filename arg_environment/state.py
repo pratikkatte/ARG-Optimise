@@ -190,12 +190,12 @@ class ARGReward:
     Terminal reward helpers for constructed ARG states.
     """
 
-    def __init__(self, C=30000):
-        self.C = C
+    def __init__(self, offset=0.0, C=None):
+        # ``C`` remains an input alias for callers using the legacy name.
+        self.offset = float(offset if C is None else C)
 
     def __call__(self, log_likelihood, accumulated_log_prior):
         return self.compute_terminal_posterior_log_reward(log_likelihood, accumulated_log_prior)
 
     def compute_terminal_posterior_log_reward(self, log_likelihood, accumulated_log_prior):
-        return float(self.C + log_likelihood + accumulated_log_prior)
-
+        return float(self.offset + log_likelihood + accumulated_log_prior)

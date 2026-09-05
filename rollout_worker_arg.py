@@ -18,12 +18,13 @@ class RolloutWorker:
         episodes=1,
         random_spec=None,
         return_states=False,
+        progress_label=None,
     ):
         if generator is None:
             raise ValueError("Generator is required for rollout")
         return self._rollout_batch(
             generator, episodes, random_spec=random_spec,
-            return_states=return_states,
+            return_states=return_states, progress_label=progress_label,
         )
 
     def _rollout_batch(
@@ -32,28 +33,51 @@ class RolloutWorker:
         episodes,
         random_spec=None,
         return_states=False,
+        progress_label=None,
     ):
         states = [self.env.get_initial_state() for _ in range(episodes)]
         trajectories = [SimpleTrajectory() for _ in states]
         forward_logs = [[] for _ in states]
         backward_counts = [[] for _ in states]
 
-        if self.verbose:
-            print(f"Rolling out {episodes} trajectory/trajectories in batch...")
-
         unfinished = self._unfinished_indices(states)
-        while unfinished:
-            inputs = self.env.prepare_state_rollout_inputs(
-                [states[index] for index in unfinished],
-                random_spec=random_spec,
+        step = 0
+        progress_width = 0
+
+        def report_progress():
+            nonlocal progress_width
+            prefix = f"{progress_label} | " if progress_label else ""
+            message = (
+                f"{prefix}rollout step {step} | "
+                f"active trajectories {len(unfinished)}/{episodes}"
             )
-            log_pf, actions = generator(inputs)
-            self._advance(
-                generator, states, trajectories, unfinished,
-                inputs["candidate_actions"], actions, log_pf,
-                forward_logs, backward_counts,
-            )
-            unfinished = self._unfinished_indices(states)
+            progress_width = max(progress_width, len(message))
+            print(f"\r{message:<{progress_width}}", end="", flush=True)
+
+        try:
+            while unfinished:
+                step += 1
+                if self.verbose:
+                    # Report before the model call so an exception identifies the
+                    # exact number of trajectories that were being processed.
+                    report_progress()
+                inputs = self.env.prepare_state_rollout_inputs(
+                    [states[index] for index in unfinished],
+                    random_spec=random_spec,
+                )
+                log_pf, actions = generator(inputs)
+                self._advance(
+                    generator, states, trajectories, unfinished,
+                    inputs["candidate_actions"], actions, log_pf,
+                    forward_logs, backward_counts,
+                )
+                unfinished = self._unfinished_indices(states)
+            if self.verbose:
+                report_progress()
+        finally:
+            if self.verbose:
+                # Keep subsequent epoch output or a traceback off the progress line.
+                print()
 
         data = self._rollout_data(states, forward_logs, backward_counts)
         if return_states:

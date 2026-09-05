@@ -42,10 +42,11 @@ class TBGFlowNetGenerator(CheckpointMixin, BackwardPolicyMixin, torch.nn.Module)
             init_z_sample_count, initialize_z_from_prior,
         )
         self._Z = torch.nn.Parameter(
-            torch.full((256,), initial_log_z / 256, device=self.device)
+            torch.tensor(float(initial_log_z), device=self.device)
         )
 
         self.gradient_clipping_params = list(self.arg_model.parameters())
+        self.gradient_groups = self._build_gradient_groups()
         self.grad_clip = float(grad_clip)
         self.opt = torch.optim.Adam(
             [
@@ -64,6 +65,26 @@ class TBGFlowNetGenerator(CheckpointMixin, BackwardPolicyMixin, torch.nn.Module)
             return 0.0
         rewards = self.env.sample_log_rewards(sample_count, verbose=self.verbose)
         return float(np.max(rewards))
+
+    def _build_gradient_groups(self):
+        groups = {
+            "encoder": [
+                self.arg_model.summary_token,
+                *self.arg_model.seq_embedding.parameters(),
+                *self.arg_model.encoder.parameters(),
+                *self.arg_model.preview_pair_embedding.parameters(),
+            ],
+            "event": list(self.arg_model.event_scorer.parameters()),
+            "action": list(self.arg_model.action_scorer.parameters()),
+            "breakpoint": list(self.arg_model.breakpoint_scorer.parameters()),
+            "time": list(self.arg_model.time_scorer.parameters()),
+        }
+        assigned = {id(parameter) for values in groups.values() for parameter in values}
+        groups["other"] = [
+            parameter for parameter in self.gradient_clipping_params
+            if id(parameter) not in assigned
+        ]
+        return groups
 
     def _encode_states(self, states):
         return self.arg_model._encode_states(states)
@@ -199,12 +220,20 @@ class TBGFlowNetGenerator(CheckpointMixin, BackwardPolicyMixin, torch.nn.Module)
             actions[batch_idx] = replace(action, time_action=time)
         return actions, self.time_model.compute_log_time_pf(time_logits, time_actions)
     def update_model(self):
+        grad_norm_pre = self.grad_norm()
         info = {
-            "grad_norm": self.grad_norm(),
+            "grad_norm": grad_norm_pre,
+            "grad_norm_pre": grad_norm_pre,
+            "log_z_grad_norm": self._grad_norm([self._Z]),
             "param_norm": self.param_norm(),
             "loss": self.loss.detach().cpu().item(),
         }
+        info.update({
+            f"grad_norm_{name}": self._grad_norm(parameters)
+            for name, parameters in self.gradient_groups.items()
+        })
         torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
+        info["grad_norm_post"] = self.grad_norm()
         self.opt.step()
         self.opt.zero_grad()
         self.loss = torch.tensor(0.0, device=self.device)
@@ -248,4 +277,4 @@ class TBGFlowNetGenerator(CheckpointMixin, BackwardPolicyMixin, torch.nn.Module)
         return self._param_norm(self.gradient_clipping_params)
 
     def compute_log_Z(self):
-        return self._Z.sum()
+        return self._Z

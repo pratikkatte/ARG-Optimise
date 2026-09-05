@@ -1,6 +1,6 @@
 data:
   dataset_path: validation/fasta/sim_poc_easy_0.fa
-  output_path: outputs/example
+  output_path: outputs/example2_tb_stable
   bp_per_blocks: 50
 
 runtime:
@@ -9,16 +9,23 @@ runtime:
   verbose: true
 
 training:
-  epochs: 10
-  batch_size: 8
+  epochs: 1000
+  batch_size: 16
   init_z_sample_count: 64
-  grad_accum_steps: 8
+  grad_accum_steps: 4
   eval_episodes: 32
   eval_every: 5
+  convergence_eval_episodes: 256
+  convergence_eval_every: 25
+  convergence_min_ess_fraction: 0.25
+  convergence_max_abs_residual_mean: 1.0
+  convergence_max_residual_rmse: 2.0
+  convergence_required_passes: 3
+  stop_on_convergence: true
 
 optimizer:
-  policy_lr: 0.001
-  log_z_lr: 0.001
+  policy_lr: 0.0001
+  log_z_lr: 0.05
   grad_clip: 10.0
 
 environment:
@@ -27,6 +34,7 @@ environment:
   recombination_rate: 1.0e-8
   time_bins: 64
   time_delta_bin_width: 0.001
+  reward_offset: 0.0
 
 model:
   embedding_size: 64

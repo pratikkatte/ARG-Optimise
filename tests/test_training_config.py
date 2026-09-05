@@ -25,6 +25,9 @@ data:
         self.assertEqual(config.model.embedding_size, 32)
         self.assertEqual(config.runtime.device, "auto")
         self.assertFalse(config.logging.wandb)
+        self.assertEqual(config.training.convergence_eval_episodes, 0)
+        self.assertEqual(config.training.convergence_min_ess_fraction, 0.25)
+        self.assertEqual(config.environment.reward_offset, 0.0)
 
     def test_unknown_setting_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unknown model settings: mystery"):
@@ -52,6 +55,20 @@ model: {breakpoint_dropout: 1.0}
             self.load_text("""
 data: {dataset_path: input.fa, output_path: output}
 environment: {recombination_rate: -0.1}
+""")
+
+    def test_invalid_convergence_threshold_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "ess_fraction"):
+            self.load_text("""
+data: {dataset_path: input.fa, output_path: output}
+training: {convergence_min_ess_fraction: 1.1}
+""")
+
+    def test_certification_panel_cannot_be_too_small(self):
+        with self.assertRaisesRegex(ValueError, "0 or at least 256"):
+            self.load_text("""
+data: {dataset_path: input.fa, output_path: output}
+training: {convergence_eval_episodes: 64}
 """)
 
     def test_cpu_device_resolves(self):

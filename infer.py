@@ -14,8 +14,14 @@ from training.config import (
     MODEL_VERSION,
     DEFAULT_MU_PER_BP,
     DEFAULT_NE,
+    MAX_CONVERGENCE_ABS_RESIDUAL_MEAN,
+    MAX_CONVERGENCE_RESIDUAL_RMSE,
+    MIN_CONVERGENCE_ESS_FRACTION,
+    MIN_CONVERGENCE_EVAL_EPISODES,
+    MIN_CONVERGENCE_REQUIRED_PASSES,
 )
 from training.loop import seed_everything
+from training.evaluation import compute_importance_diagnostics
 from utils import resolve_device
 
 
@@ -43,6 +49,7 @@ def run_inference(
     device="auto",
     temperature=None,
     verbose=False,
+    allow_unconverged=False,
 ):
     if num_args < 1:
         raise ValueError("num_args must be at least 1")
@@ -50,7 +57,7 @@ def run_inference(
         raise ValueError("batch_size must be at least 1")
     checkpoint_data = load_checkpoint(checkpoint, map_location="cpu")
     metadata = checkpoint_data.get("metadata", {})
-    validate_metadata(metadata)
+    validate_metadata(metadata, allow_unconverged=allow_unconverged)
 
     inference_seed = int(metadata["seed"] if seed is None else seed)
     seed_everything(inference_seed)
@@ -70,11 +77,19 @@ def run_inference(
         random_spec=random_spec,
         verbose=verbose,
     )
+    inference_diagnostics = compute_importance_diagnostics(
+        [state.log_reward for state in rollout_outputs["states"]],
+        rollout_outputs["log_paths_pf"].sum(-1),
+        rollout_outputs["log_paths_pb"].sum(-1),
+        log_z=generator.compute_log_Z().detach(),
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     manifest = build_manifest(
         checkpoint, metadata, inference_seed, random_spec, output_dir,
         env, rollout_outputs, trajectories,
+        allow_unconverged=allow_unconverged,
+        inference_diagnostics=inference_diagnostics,
     )
     manifest_path = os.path.join(output_dir, "manifest.json")
     with open(manifest_path, "w", encoding="utf-8") as handle:
@@ -100,7 +115,7 @@ def build_inference_components(metadata, seed, device, verbose=False):
     return env, generator
 
 
-def validate_metadata(metadata):
+def validate_metadata(metadata, *, allow_unconverged=False):
     missing = sorted(REQUIRED_METADATA_KEYS - set(metadata))
     if missing:
         raise ValueError(
@@ -112,11 +127,47 @@ def validate_metadata(metadata):
             "This inference path requires fixed-delta time-bin checkpoints "
             f"({DEFAULT_TIME_BIN_SCHEME}), got {metadata['time_bin_scheme']!r}."
         )
-    if metadata["model_version"] != MODEL_VERSION:
+    model_version = metadata["model_version"]
+    is_legacy_v7 = model_version == "pytorch-transformer-yaml-v7"
+    if model_version != MODEL_VERSION and not (allow_unconverged and is_legacy_v7):
         raise ValueError(
             "Checkpoint model_version is incompatible with the current model architecture: "
-            f"expected {MODEL_VERSION!r}, got {metadata['model_version']!r}."
+            f"expected {MODEL_VERSION!r}, got {model_version!r}."
         )
+    if not _has_certified_convergence(metadata.get("convergence")):
+        if not allow_unconverged:
+            raise ValueError(
+                "Checkpoint has not passed the convergence/ESS gate. Use "
+                "--allow-unconverged only for diagnostic proposal sampling."
+            )
+
+
+def _has_certified_convergence(convergence):
+    if not isinstance(convergence, dict):
+        return False
+    metrics = convergence.get("metrics")
+    if not isinstance(metrics, dict):
+        return False
+    required = ("importance_ess_fraction", "residual_mean", "residual_rmse")
+    if any(name not in metrics for name in required):
+        return False
+    try:
+        return (
+            convergence.get("version") == 1
+            and convergence.get("evaluated") is True
+            and convergence.get("passed") is True
+            and int(convergence.get("eval_episodes", 0)) >= MIN_CONVERGENCE_EVAL_EPISODES
+            and int(convergence.get("consecutive_passes", 0))
+            >= MIN_CONVERGENCE_REQUIRED_PASSES
+            and float(metrics["importance_ess_fraction"])
+            >= MIN_CONVERGENCE_ESS_FRACTION
+            and abs(float(metrics["residual_mean"]))
+            <= MAX_CONVERGENCE_ABS_RESIDUAL_MEAN
+            and float(metrics["residual_rmse"])
+            <= MAX_CONVERGENCE_RESIDUAL_RMSE
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def environment_from_metadata(metadata, seed, device=None):
@@ -131,6 +182,12 @@ def environment_from_metadata(metadata, seed, device=None):
             metadata.get("effective_population_size", DEFAULT_NE)
         ),
         "mutation_rate": float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
+        "reward_offset": float(metadata.get(
+            "reward_offset",
+            30_000.0
+            if metadata.get("model_version") == "pytorch-transformer-yaml-v7"
+            else 0.0,
+        )),
         "sequences": list(metadata["sequences"]),
         "seed": seed,
     }
@@ -216,6 +273,9 @@ def build_manifest(
     env,
     rollout_outputs,
     trajectories,
+    *,
+    allow_unconverged=False,
+    inference_diagnostics=None,
 ):
     states = rollout_outputs["states"]
     log_paths_pf = rollout_outputs["log_paths_pf"].detach().cpu()
@@ -249,6 +309,13 @@ def build_manifest(
         "checkpoint_best_loss": (
             float(metadata["best_loss"]) if "best_loss" in metadata else None
         ),
+        "checkpoint_kind": metadata.get("checkpoint_kind"),
+        "checkpoint_selection_metric": metadata.get("checkpoint_selection_metric"),
+        "checkpoint_selection_value": metadata.get("checkpoint_selection_value"),
+        "checkpoint_model_version": metadata.get("model_version"),
+        "checkpoint_convergence": metadata.get("convergence"),
+        "allow_unconverged": bool(allow_unconverged),
+        "inference_diagnostics": dict(inference_diagnostics or {}),
         "seed": int(seed),
         "num_args": len(records),
         "random_spec": random_spec,
@@ -278,6 +345,11 @@ def main():
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--allow-unconverged",
+        action="store_true",
+        help="Allow diagnostic sampling from a failed, unevaluated, or legacy v7 checkpoint.",
+    )
     args = parser.parse_args()
 
     manifest = run_inference(
@@ -289,6 +361,7 @@ def main():
         device=args.device,
         temperature=args.temperature,
         verbose=args.verbose,
+        allow_unconverged=args.allow_unconverged,
     )
     print(f"Wrote {manifest['num_args']} ARG tree sequence(s) to {args.output_dir}")
 

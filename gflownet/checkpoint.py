@@ -30,7 +30,13 @@ class CheckpointMixin:
             if isinstance(path, dict)
             else load_checkpoint(path, map_location=map_location)
         )
-        state_dict = checkpoint.get("generator_state_dict", checkpoint)
+        state_dict = dict(checkpoint.get("generator_state_dict", checkpoint))
+        if (
+            "_Z" in state_dict
+            and state_dict["_Z"].numel() > 1
+            and self._Z.numel() == 1
+        ):
+            state_dict["_Z"] = state_dict["_Z"].sum().reshape_as(self._Z)
         self.load_state_dict(state_dict)
         self.to(self.device)
 
@@ -44,4 +50,3 @@ class CheckpointMixin:
             for key, value in state.items():
                 if torch.is_tensor(value):
                     state[key] = value.to(self.device)
-

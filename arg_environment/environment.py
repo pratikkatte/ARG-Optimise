@@ -46,6 +46,7 @@ class SimpleARGEnvironment(ExportMixin, TransitionMixin, PriorMixin):
         device: Optional[torch.device] = 'cpu',
         time_bins: Optional[int] = None,
         time_delta_bin_width: Optional[float] = None,
+        reward_offset: float = 0.0,
     ):
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
@@ -75,7 +76,8 @@ class SimpleARGEnvironment(ExportMixin, TransitionMixin, PriorMixin):
             torch.as_tensor(block_seq_arrays, device=self.device), requires_grad=False,
         )
         self.evolution_model = EvolutionModelTorch(self)
-        self.reward_fn = ARGReward()
+        self.reward_offset = float(reward_offset)
+        self.reward_fn = ARGReward(offset=self.reward_offset)
 
     def _set_dimensions(self, num_sequences, sequence_length, num_blocks, bp_per_blocks):
         if self.sequences is not None:

@@ -1,4 +1,6 @@
 from dataclasses import replace
+from contextlib import redirect_stdout
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -63,6 +65,21 @@ class RolloutTests(unittest.TestCase):
         padded = worker._pad([torch.tensor([1.0, 2.0]), torch.empty(0)])
         torch.testing.assert_close(padded, torch.tensor([[1.0, 2.0], [0.0, 0.0]]))
 
+    def test_verbose_rollout_reports_active_trajectories_in_place(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            RolloutWorker(self.env, verbose=True).rollout(
+                make_generator(self.env), episodes=2, progress_label="Epoch 1/3 | batch 1/2",
+            )
+
+        progress = output.getvalue()
+        self.assertIn(
+            "Epoch 1/3 | batch 1/2 | rollout step 1 | active trajectories 2/2",
+            progress,
+        )
+        self.assertIn("active trajectories 0/2", progress)
+        self.assertTrue(progress.endswith("\n"))
+
 
 class BackwardActionTests(unittest.TestCase):
     def setUp(self):
@@ -90,6 +107,20 @@ class BackwardActionTests(unittest.TestCase):
 
 
 class CheckpointTests(unittest.TestCase):
+    def test_legacy_vector_log_z_loads_as_scalar_sum(self):
+        generator = make_generator(
+            SimpleARGEnvironment(sequences=["AAAA", "ACAA", "AAGA"])
+        )
+        state_dict = dict(generator.state_dict())
+        state_dict["_Z"] = torch.arange(256, dtype=generator._Z.dtype)
+
+        generator.load({"generator_state_dict": state_dict}, load_optimizer=False)
+
+        self.assertEqual(generator._Z.ndim, 0)
+        self.assertEqual(
+            float(generator.compute_log_Z().detach()), float(torch.arange(256).sum())
+        )
+
     def test_path_and_mapping_load_restore_parameters_and_metadata(self):
         env = SimpleARGEnvironment(sequences=["AAAA", "ACAA", "AAGA"])
         generator = make_generator(env)
@@ -147,13 +178,24 @@ model:
             )
 
             history = train(config)
-            checkpoint = output / "checkpoints" / "best.pt"
+            checkpoint = output / "checkpoints" / "last.pt"
+            self.assertFalse((output / "checkpoints" / "best.pt").exists())
+            self.assertFalse((output / "checkpoints" / "best_candidate.pt").exists())
+            rejected_output = root / "rejected_inference"
+            with self.assertRaisesRegex(ValueError, "has not passed"):
+                run_inference(
+                    checkpoint, rejected_output, num_args=1, device="cpu",
+                )
+            self.assertFalse(rejected_output.exists())
             manifest = run_inference(
                 checkpoint, root / "inference", num_args=1, device="cpu",
+                allow_unconverged=True,
             )
 
         self.assertEqual(len(history), 1)
         self.assertEqual(manifest["num_args"], 1)
+        self.assertFalse(manifest["checkpoint_convergence"]["passed"])
+        self.assertTrue(manifest["allow_unconverged"])
         self.assertEqual(len(manifest["outputs"]), 1)
 
 

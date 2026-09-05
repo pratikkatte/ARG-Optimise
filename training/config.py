@@ -8,6 +8,12 @@ import yaml
 from arg_environment.time import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
 from utils.device import resolve_device
 
+MIN_CONVERGENCE_EVAL_EPISODES = 256
+MIN_CONVERGENCE_ESS_FRACTION = 0.25
+MAX_CONVERGENCE_ABS_RESIDUAL_MEAN = 1.0
+MAX_CONVERGENCE_RESIDUAL_RMSE = 2.0
+MIN_CONVERGENCE_REQUIRED_PASSES = 3
+
 
 @dataclass
 class DataConfig:
@@ -31,6 +37,13 @@ class TrainingOptions:
     grad_accum_steps: int = 1
     eval_episodes: int = 8
     eval_every: int = 10
+    convergence_eval_episodes: int = 0
+    convergence_eval_every: int = 25
+    convergence_min_ess_fraction: float = MIN_CONVERGENCE_ESS_FRACTION
+    convergence_max_abs_residual_mean: float = MAX_CONVERGENCE_ABS_RESIDUAL_MEAN
+    convergence_max_residual_rmse: float = MAX_CONVERGENCE_RESIDUAL_RMSE
+    convergence_required_passes: int = MIN_CONVERGENCE_REQUIRED_PASSES
+    stop_on_convergence: bool = True
 
 
 @dataclass
@@ -47,6 +60,7 @@ class EnvironmentConfig:
     recombination_rate: float = 2e-8
     time_bins: int = DEFAULT_TIME_BINS
     time_delta_bin_width: float = DEFAULT_TIME_DELTA_BIN_WIDTH
+    reward_offset: float = 0.0
 
 
 @dataclass
@@ -135,6 +149,8 @@ class TrainConfig:
             "training.batch_size": self.training.batch_size,
             "training.init_z_sample_count": self.training.init_z_sample_count,
             "training.grad_accum_steps": self.training.grad_accum_steps,
+            "training.convergence_eval_every": self.training.convergence_eval_every,
+            "training.convergence_required_passes": self.training.convergence_required_passes,
             "environment.effective_population_size": self.environment.effective_population_size,
             "environment.time_bins": self.environment.time_bins,
             "environment.time_delta_bin_width": self.environment.time_delta_bin_width,
@@ -153,8 +169,50 @@ class TrainConfig:
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
             raise ValueError(f"settings must be positive: {', '.join(invalid)}")
-        if self.training.eval_episodes < 0 or self.training.eval_every < 0:
+        if (
+            self.training.eval_episodes < 0
+            or self.training.eval_every < 0
+            or self.training.convergence_eval_episodes < 0
+        ):
             raise ValueError("evaluation settings cannot be negative")
+        if not 0 < self.training.convergence_min_ess_fraction <= 1:
+            raise ValueError("training.convergence_min_ess_fraction must be in (0, 1]")
+        if (
+            self.training.convergence_max_abs_residual_mean < 0
+            or self.training.convergence_max_residual_rmse < 0
+        ):
+            raise ValueError("convergence residual thresholds cannot be negative")
+        if (
+            self.training.convergence_eval_episodes != 0
+            and self.training.convergence_eval_episodes < MIN_CONVERGENCE_EVAL_EPISODES
+        ):
+            raise ValueError(
+                "training.convergence_eval_episodes must be 0 or at least "
+                f"{MIN_CONVERGENCE_EVAL_EPISODES}"
+            )
+        if self.training.convergence_min_ess_fraction < MIN_CONVERGENCE_ESS_FRACTION:
+            raise ValueError(
+                "training.convergence_min_ess_fraction cannot be below "
+                f"{MIN_CONVERGENCE_ESS_FRACTION}"
+            )
+        if (
+            self.training.convergence_max_abs_residual_mean
+            > MAX_CONVERGENCE_ABS_RESIDUAL_MEAN
+        ):
+            raise ValueError(
+                "training.convergence_max_abs_residual_mean cannot exceed "
+                f"{MAX_CONVERGENCE_ABS_RESIDUAL_MEAN}"
+            )
+        if self.training.convergence_max_residual_rmse > MAX_CONVERGENCE_RESIDUAL_RMSE:
+            raise ValueError(
+                "training.convergence_max_residual_rmse cannot exceed "
+                f"{MAX_CONVERGENCE_RESIDUAL_RMSE}"
+            )
+        if self.training.convergence_required_passes < MIN_CONVERGENCE_REQUIRED_PASSES:
+            raise ValueError(
+                "training.convergence_required_passes cannot be below "
+                f"{MIN_CONVERGENCE_REQUIRED_PASSES}"
+            )
         if self.environment.mutation_rate < 0 or self.environment.recombination_rate < 0:
             raise ValueError("environment rates cannot be negative")
         if self.model.time_layers < 0 or self.model.breakpoint_gap_layers < 0:
@@ -185,4 +243,4 @@ class TrainConfig:
 DEFAULT_NE = EnvironmentConfig.effective_population_size
 DEFAULT_MU_PER_BP = EnvironmentConfig.mutation_rate
 DEFAULT_LOG_Z_LR = OptimizerConfig.log_z_lr
-MODEL_VERSION = "pytorch-transformer-yaml-v7"
+MODEL_VERSION = "pytorch-transformer-yaml-v8"
