@@ -1,0 +1,37 @@
+# Run from the repository root: python train.py --config config.yaml
+# CLI options override these settings. Paths are relative to the working directory.
+# First experiment from the wxv8mptu analysis: faster log-Z adaptation.
+dataset_path: validation/fasta/sim_2k_super_easy_0.fa
+output_path: runs/sim_2k_super_easy_epoch1000
+epochs: 1000
+batch_size: 64
+seed: 7
+verbose: true
+wandb: true
+
+policy_lr: 0.0001
+log_z_lr: 0.003            # wxv8mptu used 0.001
+grad_clip: 10.0
+grad_accum_steps: 1
+init_z_sample_count: 16
+eval_episodes: 128        # wxv8mptu used 8
+eval_every: 10
+
+# Preserve the data-generating assumptions and time discretization.
+bp_per_blocks: 1
+effective_population_size: 10000
+mutation_rate: 1.0e-7
+recombination_rate: 1.0e-8
+time_bins: 32
+time_delta_bin_width: 0.001
+
+# Preserve the policy architecture.
+embedding_size: 32
+hidden_size: 64
+dropout: 0.0
+breakpoint_hidden_dim: 128
+breakpoint_dropout: 0.1
+transformer_depth: 6
+transformer_heads: 4
+transformer_mlp_ratio: 2.0
+attention_dropout: 0.0

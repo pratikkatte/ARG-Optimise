@@ -1,7 +1,9 @@
 import argparse
+import math
 import os
 import pickle
 import random
+import sys
 
 import numpy as np
 import torch
@@ -26,7 +28,7 @@ DEFAULT_POLICY_LR = 1e-3
 DEFAULT_LOG_Z_LR = 1e-3
 DEFAULT_GRAD_CLIP = 10.0
 DEFAULT_GRAD_ACCUM_STEPS = 1
-DEFAULT_EVAL_EPISODES = 8
+DEFAULT_EVAL_EPISODES = 128
 DEFAULT_EVAL_EVERY = 10
 DEFAULT_EMBEDDING_SIZE = 32
 DEFAULT_HIDDEN_SIZE = 64
@@ -86,8 +88,10 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
     torch_state = torch.random.get_rng_state()
     cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     env_rng_state = env.rng.getstate() if hasattr(env.rng, "getstate") else None
+    module_modes = [(module, module.training) for module in generator.modules()]
 
     try:
+        generator.eval()
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -146,6 +150,8 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             "eval_initial_recombination_prob": float(initial_event_probs.get("recomb", 0.0)),
         }
     finally:
+        for module, training in module_modes:
+            module.training = training
         random.setstate(python_state)
         np.random.set_state(numpy_state)
         torch.random.set_rng_state(torch_state)
@@ -153,6 +159,41 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             torch.cuda.set_rng_state_all(cuda_states)
         if env_rng_state is not None:
             env.rng.setstate(env_rng_state)
+
+
+def save_best_checkpoints(generator, info, metadata, checkpoints_path, best_scores):
+    """Keep independent minima; residual mean is best when closest to zero."""
+    criteria = (
+        ("loss", "best.pt", "best_loss"),
+        ("eval_tb_mse", "best_eval_loss.pt", "best_eval_loss"),
+        ("eval_residual_mean", "best_residual_mean.pt", "best_abs_residual_mean"),
+        ("eval_residual_std", "best_residual_std.pt", "best_residual_std"),
+    )
+    logged = {}
+    for metric, filename, best_key in criteria:
+        if metric not in info:
+            continue
+        value = float(info[metric])
+        score = abs(value) if metric == "eval_residual_mean" else value
+        if not math.isfinite(score):
+            continue
+        if score < best_scores.get(metric, float("inf")):
+            path = os.path.join(checkpoints_path, filename)
+            checkpoint_metadata = {
+                **metadata,
+                **{key: float(value) for key, value in info.items()
+                   if key == "loss" or key.startswith("eval_")},
+                "checkpoint_metric": metric,
+                "checkpoint_metric_value": value,
+                "checkpoint_score": score,
+            }
+            generator.save(path, metadata=checkpoint_metadata)
+            best_scores[metric] = score
+            path_key = "best_checkpoint_path" if metric == "loss" else f"{best_key}_checkpoint_path"
+            logged[path_key] = path
+        logged[best_key] = best_scores[metric]
+    return logged
+
 
 def train(
     dataset_path,
@@ -242,10 +283,9 @@ def train(
     os.makedirs(output_path, exist_ok=True)
     checkpoints_path = os.path.join(output_path, "checkpoints")
     os.makedirs(checkpoints_path, exist_ok=True)
-    best_checkpoint_path = os.path.join(checkpoints_path, "best.pt")
 
     history = []
-    best_loss = float("inf")
+    best_scores = {}
     wandb_run = None
     
     print(f"use_wandb: {use_wandb}")
@@ -259,6 +299,9 @@ def train(
             "recombination_rate": float(recombination_rate),
             "policy_lr": float(policy_lr),
             "log_z_lr": float(log_z_lr),
+            "log_z_initialization": "policy_tb_mean",
+            "init_z_sample_count": int(init_z_sample_count),
+            "initial_log_z": float(generator.compute_log_Z().detach().cpu().item()),
             "grad_clip": float(grad_clip),
             "grad_accum_steps": int(grad_accum_steps),
             "eval_episodes": int(eval_episodes),
@@ -290,7 +333,6 @@ def train(
                 or (epoch + 1) % int(eval_every) == 0
             )
 
-            ## TODO: Check this implementation of evaluation
             if should_eval:
                 info.update(
                     evaluate_generator(
@@ -300,45 +342,45 @@ def train(
                         seed + 100000 + epoch,
                     )
                 )
-            history.append(info)
             loss = float(info["loss"])
+
+            metadata = build_checkpoint_metadata(
+                epoch=epoch,
+                best_loss=min(best_scores.get("loss", float("inf")), loss),
+                log_z=log_z,
+                sequences=sequences,
+                sequence_length=sequence_length,
+                bp_per_blocks=bp_per_blocks,
+                time_metadata=env.time_metadata,
+                rho=env.rho,
+                effective_population_size=effective_population_size,
+                mutation_rate=mutation_rate,
+                recombination_rate=recombination_rate,
+                policy_lr=policy_lr,
+                log_z_lr=log_z_lr,
+                grad_clip=grad_clip,
+                grad_accum_steps=grad_accum_steps,
+                eval_episodes=eval_episodes,
+                eval_every=eval_every,
+                model_kwargs=model_kwargs,
+                seed=seed,
+                init_z_sample_count=init_z_sample_count,
+                model_version=MODEL_VERSION,
+            )
+            info.update(save_best_checkpoints(
+                generator, info, metadata, checkpoints_path, best_scores,
+            ))
+            history.append(info)
 
             if wandb_run is not None:
                 wandb.log(info, step=epoch + 1)
-
-            if loss < best_loss:
-                best_loss = loss
-                metadata = build_checkpoint_metadata(
-                    epoch=epoch,
-                    best_loss=best_loss,
-                    log_z=log_z,
-                    sequences=sequences,
-                    sequence_length=sequence_length,
-                    bp_per_blocks=bp_per_blocks,
-                    time_metadata=env.time_metadata,
-                    rho=env.rho,
-                    effective_population_size=effective_population_size,
-                    mutation_rate=mutation_rate,
-                    recombination_rate=recombination_rate,
-                    policy_lr=policy_lr,
-                    log_z_lr=log_z_lr,
-                    grad_clip=grad_clip,
-                    grad_accum_steps=grad_accum_steps,
-                    eval_episodes=eval_episodes,
-                    eval_every=eval_every,
-                    model_kwargs=model_kwargs,
-                    seed=seed,
-                    init_z_sample_count=init_z_sample_count,
-                    model_version=MODEL_VERSION,
-                )
-                generator.save(best_checkpoint_path, metadata=metadata)
-                info["best_checkpoint_path"] = best_checkpoint_path
 
             eval_text = ""
             if "eval_tb_mse" in info:
                 eval_text = (
                     f" eval_tb_mse={info['eval_tb_mse']:.4f}"
                     f" eval_residual_mean={info['eval_residual_mean']:.4f}"
+                    f" eval_residual_std={info['eval_residual_std']:.4f}"
                 )
             print(f"Epoch {epoch + 1} loss={loss:.4f} logZ={log_z:.4f}{eval_text}")
 
@@ -397,12 +439,15 @@ def build_checkpoint_metadata(
         "model": dict(model_kwargs),
         "seed": int(seed),
         "init_z_sample_count": int(init_z_sample_count),
+        "log_z_initialization": "policy_tb_mean",
         "model_version": str(model_version),
     }
 
 
-def main():
+def parse_train_args(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Train the simplified ARG GFlowNet demo.")
+    parser.add_argument("--config", help="YAML settings file; command-line options override its values")
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--dataset-path",required=True)
     parser.add_argument("--epochs", type=int, required=True)
@@ -414,8 +459,11 @@ def main():
         default=1,
         help="Number of bp per block",
     )
-    parser.add_argument("--init-z-sample-count", type=int, default=DEFAULT_INIT_Z_SAMPLE_COUNT)
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--init-z-sample-count", type=int, default=DEFAULT_INIT_Z_SAMPLE_COUNT,
+        help="Initial-policy trajectories used to center the trajectory-balance residual",
+    )
+    parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--effective-population-size", type=float, default=DEFAULT_NE)
     parser.add_argument("--mutation-rate", type=float, default=DEFAULT_MU_PER_BP)
     parser.add_argument("--recombination-rate", type=float, default=DEFAULT_R_PER_BP)
@@ -441,8 +489,41 @@ def main():
     parser.add_argument("--transformer-heads", type=int, default=DEFAULT_TRANSFORMER_HEADS)
     parser.add_argument("--transformer-mlp-ratio", type=float, default=DEFAULT_TRANSFORMER_MLP_RATIO)
     parser.add_argument("--attention-dropout", type=float, default=DEFAULT_ATTENTION_DROPOUT)
-    parser.add_argument("--wandb", action="store_true", default=True)
-    args = parser.parse_args()
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True)
+
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config")
+    config_path = config_parser.parse_known_args(argv)[0].config
+    config_args = []
+    if config_path:
+        import yaml
+
+        try:
+            with open(config_path) as handle:
+                settings = yaml.safe_load(handle)
+        except (OSError, yaml.YAMLError) as exc:
+            parser.error(f"Cannot read config {config_path}: {exc}")
+        if not isinstance(settings, dict):
+            parser.error("Config must contain a mapping of argument names to values")
+        actions = {action.dest: action for action in parser._actions
+                   if action.dest not in {"help", "config"}}
+        for key, value in settings.items():
+            if key not in actions:
+                parser.error(f"Unknown config setting: {key}")
+            action = actions[key]
+            if isinstance(action, argparse.BooleanOptionalAction):
+                if not isinstance(value, bool):
+                    parser.error(f"Config setting {key} must be true or false")
+                config_args.append(action.option_strings[0 if value else 1])
+            else:
+                if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+                    parser.error(f"Config setting {key} must be a scalar value")
+                config_args.append(f"{action.option_strings[0]}={value}")
+    return parser.parse_args(config_args + argv)
+
+
+def main():
+    args = parse_train_args()
 
     selected_device = "cuda" if torch.cuda.is_available() else "cpu"
                 

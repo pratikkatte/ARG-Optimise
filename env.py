@@ -486,7 +486,7 @@ class ARGReward:
     Terminal reward helpers for constructed ARG states.
     """
 
-    def __init__(self, C=30000):
+    def __init__(self, C=3000):
         self.C = C
 
     def __call__(self, log_likelihood, accumulated_log_prior):

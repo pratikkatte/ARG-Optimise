@@ -70,7 +70,7 @@ def run_inference(
         verbose=verbose,
         log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
         model_kwargs=dict(metadata.get("model", {})),
-        initialize_z_from_prior=False,
+        initialize_z_from_policy=False,
     )
     generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
     generator.eval()

@@ -1,11 +1,11 @@
 import math
 import os
 
-import numpy as np
 import torch
 
 from models import ARGModel
 from env import RecombinationChoice
+from rollout_worker_arg import RolloutWorker
 from dataclasses import replace
 
 LOSS_FN = {
@@ -27,7 +27,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         model_kwargs=None,
         policy_lr=None,
         log_z_lr=None,
-        initialize_z_from_prior=True,
+        initialize_z_from_policy=True,
     ):
         super().__init__()
         print(f"verbose: {verbose}")
@@ -45,7 +45,9 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 self.env.block_seq_arrays.detach().to(self.device),
                 requires_grad=False,
             )
-        self.init_z_sample_count = init_z_sample_count
+        self.init_z_sample_count = int(init_z_sample_count)
+        if initialize_z_from_policy and self.init_z_sample_count < 1:
+            raise ValueError("init_z_sample_count must be at least 1 for policy initialization")
 
         ## Policy model
         if policy_lr is not None:
@@ -61,15 +63,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         ## Z partition
         self.max_reward_seen = float("-inf")
-        if initialize_z_from_prior:
-            log_rewards = env.sample_log_rewards(self.init_z_sample_count, verbose=verbose)
-            self.max_reward_seen = float(np.max(log_rewards))
-            init_Z = self.max_reward_seen
-        else:
-            self.max_reward_seen = 0.0
-            init_Z = 0.0
         self._Z = torch.nn.Parameter(  # in log
-                torch.ones(256, device=self.device) * init_Z / 256, requires_grad=True
+                torch.zeros(256, device=self.device), requires_grad=True
                 )
         
         self.arg_model_params = list(self.arg_model.parameters())
@@ -107,6 +102,52 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.log_z_target_sum = 0.0
         self.log_z_target_count = 0
         self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
+
+        if initialize_z_from_policy:
+            self.initialize_log_z_from_policy()
+
+    @torch.no_grad()
+    def initialize_log_z_from_policy(self):
+        """Center TB residuals on rollouts from the initial, unchanged policy.
+
+        Preserve the policy's mode (including training dropout) to match its
+        rollout distribution. This is a sampled TB minimizer for fixed policy
+        weights, not an exact estimate of the target's log partition function.
+        """
+        if self.init_z_sample_count < 1:
+            raise ValueError("init_z_sample_count must be at least 1 for policy initialization")
+        worker = RolloutWorker(self.env)
+        targets = []
+        max_reward = float("-inf")
+        for index in range(self.init_z_sample_count):
+            if self.verbose:
+                print(
+                    f"Sampling initial-policy trajectory {index + 1}/"
+                    f"{self.init_z_sample_count} for log Z init..."
+                )
+            # One trajectory at a time bounds initialization memory for long sequences.
+            outputs, _ = worker.rollout(self, episodes=1)
+            log_pf = outputs["log_paths_pf"].sum(-1).double()
+            log_pb = outputs["log_paths_pb"].sum(-1).double()
+            log_rewards = outputs["log_rewards"].double()
+            target = log_rewards + log_pb - log_pf
+            if not torch.isfinite(target).all():
+                raise ValueError("Initial-policy rollout produced a non-finite log Z target")
+            targets.append(target.cpu())
+            max_reward = max(max_reward, float(log_rewards.max().item()))
+
+        targets = torch.cat(targets)
+        initial_log_z = float(targets.mean().item())
+        # Keep the existing parameter and optimizer references/checkpoint shape.
+        self._Z.fill_(initial_log_z / self._Z.numel())
+        self.max_reward_seen = max_reward
+        self.last_log_z_target = initial_log_z
+        if self.verbose:
+            print(
+                f"Initialized logZ={self.compute_log_Z().item():.4f} from "
+                f"{targets.numel()} initial-policy trajectories "
+                f"(target_std={targets.std(unbiased=False).item():.4f})"
+            )
 
 
     def _encode_states(self, states):

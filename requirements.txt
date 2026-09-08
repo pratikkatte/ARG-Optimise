@@ -13,6 +13,7 @@
 numpy
 torch
 wandb
+PyYAML
 
 # --- Environment & export (env.py: .trees export via tskit) ---
 tskit

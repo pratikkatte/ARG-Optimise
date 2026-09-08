@@ -539,10 +539,12 @@ def load_singer_bed_segments(
 
 
 def aggregate_pairs_linear(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.assign(
+        Simulated=df["Simulated"].round(1),
+        PosteriorMean=df["PosteriorMean"].round(1),
+    )
     return (
-        df.groupby(
-            [df["Simulated"].round(1), df["PosteriorMean"].round(1)], as_index=False
-        )["len"]
+        d.groupby(["Simulated", "PosteriorMean"], as_index=False)["len"]
         .sum()
         .rename(columns={"len": "x"})
     )
@@ -552,10 +554,10 @@ def aggregate_pairs_log10(df: pd.DataFrame) -> pd.DataFrame:
     d = df[(df["Simulated"] > 0) & (df["PosteriorMean"] > 0)].copy()
     if d.empty:
         return pd.DataFrame(columns=["Simulated", "PosteriorMean", "x"])
-    d["ls"] = np.log10(d["Simulated"].values)
-    d["lp"] = np.log10(d["PosteriorMean"].values)
+    d["ls"] = np.log10(d["Simulated"].values).round(1)
+    d["lp"] = np.log10(d["PosteriorMean"].values).round(1)
     return (
-        d.groupby([d["ls"].round(1), d["lp"].round(1)], as_index=False)["len"]
+        d.groupby(["ls", "lp"], as_index=False)["len"]
         .sum()
         .rename(columns={"ls": "Simulated", "lp": "PosteriorMean", "len": "x"})
     )
