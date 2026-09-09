@@ -5,7 +5,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from operator import index
+
+
+@dataclass(frozen=True)
+class PackedLineageFeatures:
+    """Real lineage sequences in batch order, with immutable row boundaries."""
+
+    tensor: torch.Tensor
+    row_offsets: tuple[int, ...]
+
+    def __post_init__(self):
+        offsets = tuple(index(value) for value in self.row_offsets)
+        object.__setattr__(self, "row_offsets", offsets)
+        if self.tensor.ndim != 3 or self.tensor.shape[-1] != 4:
+            raise ValueError("Packed sequence features must have shape (lineages, num_blocks, 4)")
+        if (len(offsets) < 2 or offsets[0] != 0
+                or offsets[-1] != self.tensor.shape[0]
+                or any(end <= start for start, end in zip(offsets, offsets[1:]))):
+            raise ValueError("Packed row offsets must delimit nonempty states and cover all lineages")
+
+    def get_lineage(self, batch_index, lineage_index):
+        """Return a sequence view; negative indices and padded rows are invalid."""
+        batch_index, lineage_index = index(batch_index), index(lineage_index)
+        if not 0 <= batch_index < len(self.row_offsets) - 1:
+            raise IndexError(f"Batch index {batch_index} out of bounds")
+        start, end = self.row_offsets[batch_index:batch_index + 2]
+        if not 0 <= lineage_index < end - start:
+            raise IndexError(f"Lineage index {lineage_index} out of bounds for batch {batch_index}")
+        return self.tensor[start + lineage_index]
 
 
 class TransformerMLP(nn.Module):
@@ -242,59 +271,50 @@ class ARGModel(nn.Module):
         return list(self.parameters())
 
     def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
-        batch_size, active_lineages, seq_len, channels = lineage_seq_features.shape
-        if seq_len != int(self.env.num_blocks) or channels != 4:
+        """Project packed real sequences, then pad only the small embeddings."""
+        packed = lineage_seq_features.tensor
+        offsets = lineage_seq_features.row_offsets
+        if tuple(packed.shape[1:]) != (int(self.env.num_blocks), 4):
             raise ValueError(
-                "sequence features must have shape "
-                f"(batch, active_lineages, {int(self.env.num_blocks)}, 4), "
-                f"got {tuple(lineage_seq_features.shape)}"
+                f"Packed sequence features must have shape (lineages, {int(self.env.num_blocks)}, 4), "
+                f"got {tuple(packed.shape)}"
             )
-
-        batch_input = lineage_seq_features.reshape(batch_size, active_lineages, -1)
-        if batch_input.shape[-1] != self.seq_embedding.in_features:
-            raise ValueError(
-                "Encoded batch_input last dimension must match num_blocks * 4 "
-                f"({self.seq_embedding.in_features}), got {batch_input.shape[-1]}"
-            )
-
-        batch_input = batch_input.to(device=self.device, dtype=torch.float32)
+        batch_size = len(offsets) - 1
+        active_lineages = max(end - start for start, end in zip(offsets, offsets[1:]))
         batch_active_lineage_counts = batch_active_lineage_counts.to(device=self.device, dtype=torch.long)
-
         valid_mask = (
             torch.arange(active_lineages, device=self.device)[None, :]
             < batch_active_lineage_counts[:, None]
         )
-        lineage_reps = self.seq_embedding(batch_input)
+        projected = self.seq_embedding(packed.reshape(packed.shape[0], -1).to(
+            device=self.device, dtype=torch.float32,
+        ))
+        # Zero-padded inputs previously projected to the bias. Preserve those
+        # values (and their gradient path) for the unchanged transformer.
+        lineage_reps = self.seq_embedding.bias.expand(batch_size, active_lineages, -1).clone()
+        lineage_reps[valid_mask] = projected
         summary_token = self.summary_token.expand(batch_size, -1, -1)
         transformer_input = torch.cat([summary_token, lineage_reps], dim=1)
-
         key_padding_mask = F.pad(~valid_mask, (1, 0), value=False)
         encoded = self.encoder(transformer_input, key_padding_mask=key_padding_mask)
-
         summary_reps = encoded[:, 0]
-        lineage_reps = encoded[:, 1:]
-        lineage_reps = lineage_reps * valid_mask.unsqueeze(-1)
+        lineage_reps = encoded[:, 1:] * valid_mask.unsqueeze(-1)
         return lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts
 
     def _encode_states(self, states):
-        batch_size = len(states)
-        if batch_size == 0:
+        """Return lineage/summary embeddings, packed sequences, and active counts."""
+        if not states:
             raise ValueError("ARGModel.forward requires at least one state")
-
         active_counts = [len(state.active_lineages) for state in states]
-        batch_active_lineage_counts = torch.tensor(
-            active_counts, dtype=torch.long, device=self.device,
+        offsets = [0]
+        for batch_index, count in enumerate(active_counts):
+            if count == 0:
+                raise ValueError(f"State {batch_index} has no active lineages")
+            offsets.append(offsets[-1] + count)
+        batch_active_lineage_counts = torch.tensor(active_counts, dtype=torch.long, device=self.device)
+        packed = torch.empty(
+            (offsets[-1], int(self.env.num_blocks), 4), device=self.device, dtype=torch.float32,
         )
-
-        num_blocks = self.env.num_blocks
-        max_active_lineages = max(active_counts, default=0)
-        lineage_seq_features = self.env.block_seq_arrays.new_zeros(
-            batch_size,
-            max_active_lineages,
-            num_blocks,
-            4,
-        )
-
         for batch_idx, state in enumerate(states):
             for lineage_idx, lineage in enumerate(state.active_lineages):
                 feature = self._lineage_partials_tensor(lineage)
@@ -303,12 +323,12 @@ class ARGModel(nn.Module):
                     device=self.device,
                     dtype=self.env.block_seq_arrays.dtype,
                 )
-                masked_feature = feature * weights[:, None]
-                lineage_seq_features[batch_idx, lineage_idx] = (
-                    self.env.evolution_model.normalize_partials(masked_feature)
+                packed[offsets[batch_idx] + lineage_idx] = self.env.evolution_model.normalize_partials(
+                    feature * weights[:, None]
                 )
-
-        return self._encode_lineage_features(lineage_seq_features, batch_active_lineage_counts)
+        return self._encode_lineage_features(
+            PackedLineageFeatures(packed, tuple(offsets)), batch_active_lineage_counts,
+        )
 
     def _lineage_partials_tensor(self, lineage):
         if lineage.partials is None:
@@ -476,7 +496,7 @@ class ARGModel(nn.Module):
 
 
     def forward(self, all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec):
-        
+        """Score actions; lineage_seq_features is internally PackedLineageFeatures."""
         all_candidate_actions = all_actions
 
 

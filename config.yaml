@@ -4,7 +4,7 @@
 dataset_path: validation/datasets/human_25kb_super_easy/rep0/human_25kb_super_easy.fa
 output_path: runs/human_25kb_super_easy_sparse_mixture
 epochs: 1000
-batch_size: 64
+batch_size: 32
 seed: 7
 verbose: true
 wandb: true

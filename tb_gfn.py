@@ -268,7 +268,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         for idx, chosen_action in enumerate(choosen_actions):
             if isinstance(chosen_action, RecombinationChoice):
                 lineage_idx = int(chosen_action.active_lineage_i)
-                lineage_feature = lineage_seq_features[idx, lineage_idx]
+                lineage_feature = lineage_seq_features.get_lineage(idx, lineage_idx)
                 breakpoint, log_p_breakpoint = self.breakpoint_model(
                     chosen_action,
                     lineage_feature,
