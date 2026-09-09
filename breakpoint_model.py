@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 import torch.nn.functional as F
+import math
+import numbers
 
 class ResidualDilatedConvBlock(nn.Module):
     def __init__(self, hidden_dim, kernel_size=5, dilation=1, dropout=0.1):
@@ -234,3 +236,182 @@ class BreakpointSplitPositionCNN(nn.Module):
         breakpoint = int(valid_breakpoints[int(local_idx.detach().cpu().item())])
         log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
         return breakpoint, log_p
+
+
+class SparseMixtureBreakpointPolicy(nn.Module):
+    """Sparse block tokens and a mixture of discretized, truncated logistics.
+
+    Gaps remain in environment block coordinates, even for multi-base blocks.
+    The alignment-derived index cache is rebuilt from the environment on load;
+    it is deliberately not part of the checkpoint state dictionary.
+    """
+
+    def __init__(self, source_alignment, hidden_dim=128, layers=4, components=4,
+                 dropout=0.1, action_context_dim=128, gap_hidden_dim=64,
+                 gap_layers=1, gap_dropout=0.0):
+        super().__init__()
+        if hidden_dim < 1 or layers < 0 or components < 1 or gap_layers < 0:
+            raise ValueError("Invalid sparse mixture architecture dimensions")
+        if source_alignment.ndim != 3 or source_alignment.shape[-1] != 4:
+            raise ValueError("source_alignment must have shape [samples, blocks, 4]")
+        if min(source_alignment.shape[:2]) < 1:
+            raise ValueError("source_alignment must contain samples and blocks")
+        self.num_blocks = source_alignment.shape[1]
+        self.hidden_dim = int(hidden_dim)
+        self.components = int(components)
+        self.action_context_dim = int(action_context_dim)
+        with torch.no_grad():
+            variable = (source_alignment != source_alignment[:1]).any(dim=0).any(dim=-1)
+            indices = variable.nonzero(as_tuple=True)[0]
+        self.register_buffer("informative_indices", indices, persistent=False)
+        self.input_projection = nn.Linear(8, hidden_dim)
+        self.blocks = nn.ModuleList(
+            ResidualDilatedConvBlock(hidden_dim, kernel_size=5, dilation=2 ** i,
+                                     dropout=dropout) for i in range(layers)
+        )
+        modules = []
+        width = hidden_dim + action_context_dim + 3
+        for _ in range(gap_layers):
+            modules.extend([nn.Linear(width, gap_hidden_dim), nn.Dropout(gap_dropout), nn.ReLU()])
+            width = gap_hidden_dim
+        modules.append(nn.Linear(width, 3 * components))
+        self.parameter_head = nn.Sequential(*modules)
+        self.parameter_head.apply(lambda module: BreakpointSplitPositionCNN._init_mlp_weights(self, module))
+        # Equal weights, evenly spaced centers, scales 0.1 + 0.1 * span.
+        # Zero final weights make the initialization independent of the input.
+        with torch.no_grad():
+            output = self.parameter_head[-1]
+            output.weight.zero_()
+            fractions = (torch.arange(components, dtype=output.bias.dtype) + 0.5) / components
+            output.bias[components:2 * components].copy_(torch.logit(fractions))
+            output.bias[2 * components:].fill_(math.log(0.1 / 0.9))
+
+    @staticmethod
+    def valid_span(candidates, num_blocks):
+        if hasattr(candidates, "span_start"):
+            a, z = int(candidates.span_start) + 1, int(candidates.span_end)
+        elif isinstance(candidates, range):
+            if not candidates:
+                raise ValueError("Recombination action has no valid breakpoints")
+            if candidates.step != 1:
+                raise ValueError("Sparse mixture requires contiguous ascending integer gaps")
+            a, z = candidates.start, candidates[-1]
+        else:
+            values = list(candidates)
+            if not values:
+                raise ValueError("Recombination action has no valid breakpoints")
+            if (any(not isinstance(b, numbers.Integral) for b in values)
+                    or any(v != values[0] + i for i, v in enumerate(values))):
+                raise ValueError("Sparse mixture requires contiguous ascending integer gaps")
+            a, z = int(values[0]), int(values[-1])
+        if a > z:
+            raise ValueError("Recombination action has no valid breakpoints")
+        if a < 1 or z >= num_blocks:
+            raise ValueError("Valid gaps must lie between blocks 1 and num_blocks - 1")
+        return a, z
+
+    def sparse_tokens(self, lineage_seq_feature, sequence_length, num_blocks):
+        x = lineage_seq_feature
+        if x.ndim == 3 and x.shape[0] == 1:
+            x = x[0]
+        if tuple(x.shape) != (num_blocks, 4) or num_blocks != self.num_blocks:
+            raise ValueError("lineage_seq_feature must match the alignment's [blocks, 4] shape")
+        if sequence_length < num_blocks:
+            raise ValueError("sequence_length must be at least num_blocks")
+        # Masked partials use zero rows for absent material, including at holes.
+        coverage = x.detach().ne(0).any(dim=-1)
+        changes = (coverage[1:] != coverage[:-1]).nonzero(as_tuple=True)[0]
+        indices = torch.cat((self.informative_indices, changes, changes + 1,
+                             changes.new_tensor([0, num_blocks - 1]))).unique(sorted=True)
+        selected = x[indices].to(dtype=self.input_projection.weight.dtype)
+        # Match the environment's rounded physical block boundaries.
+        position = (indices.to(torch.float64) * (sequence_length / num_blocks)).round()
+        position = (position / sequence_length).to(selected.dtype)
+        left = position - torch.cat((position.new_zeros(1), position[:-1]))
+        right = torch.cat((position[1:], position.new_ones(1))) - position
+        tokens = torch.cat((selected, position[:, None], left[:, None], right[:, None],
+                            coverage[indices, None].to(selected.dtype)), dim=-1)
+        return indices, tokens
+
+    def distribution_parameters(self, valid_breakpoints, lineage_seq_feature,
+                                sequence_length, num_blocks, action_context):
+        a, z = self.valid_span(valid_breakpoints, num_blocks)
+        _, tokens = self.sparse_tokens(lineage_seq_feature, sequence_length, num_blocks)
+        x = F.gelu(self.input_projection(tokens)).transpose(0, 1).unsqueeze(0)
+        for block in self.blocks:
+            x = block(x)
+        pooled = x.mean(dim=-1)[0]
+        context = BreakpointSplitPositionCNN._prepare_action_context(
+            self, action_context, pooled.device, pooled.dtype)
+        span = pooled.new_tensor([a / num_blocks, z / num_blocks,
+                                  (z - a + 1) / max(num_blocks - 1, 1)])
+        raw = self.parameter_head(torch.cat((pooled, context, span)))
+        weights, locations, scales = raw.double().chunk(3)
+        n = z - a + 1
+        return (F.log_softmax(weights, dim=-1), a - 0.5 + n * locations.sigmoid(),
+                0.1 + n * scales.sigmoid())
+
+    @staticmethod
+    def _log_interval_mass(lower, upper, locations, scales):
+        # sigmoid(v)-sigmoid(u) = sigmoid(v)*sigmoid(-u)*(1-exp(u-v)).
+        # Compute the width separately to avoid subtracting nearby tail logits.
+        u = (lower - locations) / scales
+        v = (upper - locations) / scales
+        return F.logsigmoid(v) + F.logsigmoid(-u) + torch.log(-torch.expm1(-(upper - lower) / scales))
+
+    @classmethod
+    def log_probabilities(cls, gaps, a, z, parameters):
+        """Marginal log mass, in float64, for scalar or tensor block gaps."""
+        log_weights, locations, scales = (p.double() for p in parameters)
+        gaps = torch.as_tensor(gaps, device=locations.device, dtype=torch.float64)
+        mass = cls._log_interval_mass(gaps[..., None] - 0.5, gaps[..., None] + 0.5,
+                                     locations, scales)
+        normalizer = cls._log_interval_mass(a - 0.5, z + 0.5, locations, scales)
+        result = torch.logsumexp(log_weights + mass - normalizer, dim=-1)
+        if a == z:
+            result = result * 0.0
+        return result.masked_fill((gaps < a) | (gaps > z) | (gaps != gaps.round()), -torch.inf)
+
+    @classmethod
+    @torch.no_grad()
+    def sample_gap(cls, a, z, parameters, temperature=1.0):
+        temperature = float(temperature)
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Breakpoint temperature must be finite and positive")
+        if a == z:
+            return a
+        weights, locations, scales = (p.detach().double() for p in parameters)
+        if temperature == 1.0:
+            j = Categorical(logits=weights).sample()
+            loc, scale = locations[j], scales[j]
+            low = torch.sigmoid((a - 0.5 - loc) / scale)
+            high = torch.sigmoid((z + 0.5 - loc) / scale)
+            uniform = torch.rand((), dtype=torch.float64, device=loc.device)
+            probability = low + uniform * (high - low)
+            eps = torch.finfo(torch.float64).eps
+            draw = loc + scale * torch.logit(probability.clamp(eps, 1 - eps))
+            return int(torch.floor(draw + 0.5).clamp(a, z).item())
+        best_score = locations.new_tensor(-torch.inf)
+        best_gap = locations.new_tensor(a, dtype=torch.long)
+        for start in range(a, z + 1, 1024):
+            gaps = torch.arange(start, min(start + 1024, z + 1), device=locations.device)
+            logits = cls.log_probabilities(gaps, a, z, (weights, locations, scales))
+            # -log(Exp(1)) is standard Gumbel; retain only one winning gap.
+            gumbel = -torch.empty_like(logits).exponential_().log()
+            # Multiplying all scores by T preserves the argmax and avoids
+            # overflowing log P / T at very small positive temperatures.
+            scores = (logits + temperature * gumbel if temperature < 1.0
+                      else logits / temperature + gumbel)
+            score, index = scores.max(dim=0)
+            best_gap = torch.where(score > best_score, gaps[index], best_gap)
+            best_score = torch.maximum(score, best_score)
+        return int(best_gap.item())
+
+    def forward(self, valid_breakpoints, lineage_seq_feature, sequence_length,
+                num_blocks, action_context, random_spec=None):
+        a, z = self.valid_span(valid_breakpoints, num_blocks)
+        parameters = self.distribution_parameters(range(a, z + 1), lineage_seq_feature,
+                                                   sequence_length, num_blocks, action_context)
+        breakpoint = self.sample_gap(a, z, parameters, (random_spec or {}).get("T", 1.0))
+        log_p = self.log_probabilities(breakpoint, a, z, parameters)
+        return breakpoint, log_p.to(dtype=self.input_projection.weight.dtype)

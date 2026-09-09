@@ -1,5 +1,5 @@
 from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
-from breakpoint_model import BreakpointSplitPositionCNN
+from breakpoint_model import BreakpointSplitPositionCNN, SparseMixtureBreakpointPolicy
 from time_model import TimeModel
 import torch
 import torch.nn as nn
@@ -170,6 +170,10 @@ class ARGModel(nn.Module):
         breakpoint_gap_layers=3,
         breakpoint_gap_dropout=0.0,
         breakpoint_use_position_features=True,
+        breakpoint_policy="cnn",
+        breakpoint_mixture_hidden_dim=128,
+        breakpoint_mixture_layers=4,
+        breakpoint_mixture_components=4,
     ):
         super().__init__()
         self.env = env
@@ -198,15 +202,29 @@ class ARGModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
-        self.breakpoint_scorer = BreakpointSplitPositionCNN(
-            hidden_dim=breakpoint_hidden_dim,
+        breakpoint_kwargs = dict(
             dropout=breakpoint_dropout,
             action_context_dim=embedding_size * 4,
             gap_hidden_dim=breakpoint_gap_hidden_size,
             gap_layers=breakpoint_gap_layers,
             gap_dropout=breakpoint_gap_dropout,
-            use_position_features=breakpoint_use_position_features,
-        ).to(self.device)
+        )
+        if breakpoint_policy == "cnn":
+            self.breakpoint_scorer = BreakpointSplitPositionCNN(
+                hidden_dim=breakpoint_hidden_dim,
+                use_position_features=breakpoint_use_position_features,
+                **breakpoint_kwargs,
+            ).to(self.device)
+        elif breakpoint_policy == "sparse_mixture":
+            self.breakpoint_scorer = SparseMixtureBreakpointPolicy(
+                source_alignment=env.block_seq_arrays,
+                hidden_dim=breakpoint_mixture_hidden_dim,
+                layers=breakpoint_mixture_layers,
+                components=breakpoint_mixture_components,
+                **breakpoint_kwargs,
+            ).to(self.device)
+        else:
+            raise ValueError(f"Unknown breakpoint_policy: {breakpoint_policy}")
 
         self.time_scorer = TimeModel(
             embedding_size * 4,

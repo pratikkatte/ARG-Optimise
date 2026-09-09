@@ -62,10 +62,6 @@ def run_inference(
     generator = TBGFlowNetGenerator(
         env,
         init_z_sample_count=metadata["init_z_sample_count"],
-        cfg={
-            "breakpoint_policy": metadata.get("breakpoint_policy", "continuous-bin"),
-            "breakpoint_mixtures": int(metadata.get("breakpoint_mixtures", 4)),
-        },
         device=resolved_device,
         verbose=verbose,
         log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),

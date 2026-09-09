@@ -33,7 +33,9 @@ DEFAULT_EVAL_EVERY = 10
 DEFAULT_EMBEDDING_SIZE = 32
 DEFAULT_HIDDEN_SIZE = 64
 DEFAULT_DROPOUT = 0.0
-DEFAULT_BREAKPOINT_HIDDEN_DIM = 128
+# New training runs use the smaller breakpoint policy. ARGModel keeps its legacy
+# constructor defaults so checkpoints without explicit model settings still load.
+DEFAULT_BREAKPOINT_HIDDEN_DIM = 32
 DEFAULT_BREAKPOINT_DROPOUT = 0.1
 DEFAULT_TRANSFORMER_DEPTH = 6
 DEFAULT_TRANSFORMER_HEADS = 4
@@ -42,10 +44,14 @@ DEFAULT_ATTENTION_DROPOUT = 0.0
 DEFAULT_TIME_HIDDEN_SIZE = 256
 DEFAULT_TIME_LAYERS = 3
 DEFAULT_TIME_DROPOUT = 0.0
-DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE = 256
-DEFAULT_BREAKPOINT_GAP_LAYERS = 3
+DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE = 64
+DEFAULT_BREAKPOINT_GAP_LAYERS = 1
 DEFAULT_BREAKPOINT_GAP_DROPOUT = 0.0
 DEFAULT_BREAKPOINT_USE_POSITION_FEATURES = True
+DEFAULT_BREAKPOINT_POLICY = "cnn"
+DEFAULT_BREAKPOINT_MIXTURE_HIDDEN_DIM = 128
+DEFAULT_BREAKPOINT_MIXTURE_LAYERS = 4
+DEFAULT_BREAKPOINT_MIXTURE_COMPONENTS = 4
 MODEL_VERSION = "cwr-event-transformer-block-partials-v3"
 
 def seed_everything(seed):
@@ -226,7 +232,12 @@ def train(
     transformer_mlp_ratio=DEFAULT_TRANSFORMER_MLP_RATIO,
     attention_dropout=DEFAULT_ATTENTION_DROPOUT,
     verbose=True,
-    
+    breakpoint_gap_hidden_size=DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE,
+    breakpoint_gap_layers=DEFAULT_BREAKPOINT_GAP_LAYERS,
+    breakpoint_policy=DEFAULT_BREAKPOINT_POLICY,
+    breakpoint_mixture_hidden_dim=DEFAULT_BREAKPOINT_MIXTURE_HIDDEN_DIM,
+    breakpoint_mixture_layers=DEFAULT_BREAKPOINT_MIXTURE_LAYERS,
+    breakpoint_mixture_components=DEFAULT_BREAKPOINT_MIXTURE_COMPONENTS,
 ):
     seed_everything(seed)
     device = torch.device(device)
@@ -251,6 +262,10 @@ def train(
         "hidden_size": int(hidden_size),
         "dropout": float(dropout),
         "breakpoint_hidden_dim": int(breakpoint_hidden_dim),
+        "breakpoint_policy": breakpoint_policy,
+        "breakpoint_mixture_hidden_dim": int(breakpoint_mixture_hidden_dim),
+        "breakpoint_mixture_layers": int(breakpoint_mixture_layers),
+        "breakpoint_mixture_components": int(breakpoint_mixture_components),
         "breakpoint_dropout": float(breakpoint_dropout),
         "transformer_depth": int(transformer_depth),
         "transformer_heads": int(transformer_heads),
@@ -259,8 +274,8 @@ def train(
         "time_hidden_size": int(DEFAULT_TIME_HIDDEN_SIZE),
         "time_layers": int(DEFAULT_TIME_LAYERS),
         "time_dropout": float(DEFAULT_TIME_DROPOUT),
-        "breakpoint_gap_hidden_size": int(DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE),
-        "breakpoint_gap_layers": int(DEFAULT_BREAKPOINT_GAP_LAYERS),
+        "breakpoint_gap_hidden_size": int(breakpoint_gap_hidden_size),
+        "breakpoint_gap_layers": int(breakpoint_gap_layers),
         "breakpoint_gap_dropout": float(DEFAULT_BREAKPOINT_GAP_DROPOUT),
         "breakpoint_use_position_features": bool(DEFAULT_BREAKPOINT_USE_POSITION_FEATURES),
     }
@@ -484,7 +499,19 @@ def parse_train_args(argv=None):
     parser.add_argument("--hidden-size", type=int, default=DEFAULT_HIDDEN_SIZE)
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--breakpoint-hidden-dim", type=int, default=DEFAULT_BREAKPOINT_HIDDEN_DIM)
+    parser.add_argument("--breakpoint-policy", choices=("cnn", "sparse_mixture"), default=DEFAULT_BREAKPOINT_POLICY)
+    parser.add_argument("--breakpoint-mixture-hidden-dim", type=int, default=DEFAULT_BREAKPOINT_MIXTURE_HIDDEN_DIM)
+    parser.add_argument("--breakpoint-mixture-layers", type=int, default=DEFAULT_BREAKPOINT_MIXTURE_LAYERS)
+    parser.add_argument("--breakpoint-mixture-components", type=int, default=DEFAULT_BREAKPOINT_MIXTURE_COMPONENTS)
     parser.add_argument("--breakpoint-dropout", type=float, default=DEFAULT_BREAKPOINT_DROPOUT)
+    parser.add_argument(
+        "--breakpoint-gap-hidden-size", type=int, default=DEFAULT_BREAKPOINT_GAP_HIDDEN_SIZE,
+        help="Width of the breakpoint scoring MLP's hidden layers",
+    )
+    parser.add_argument(
+        "--breakpoint-gap-layers", type=int, default=DEFAULT_BREAKPOINT_GAP_LAYERS,
+        help="Number of hidden layers in the breakpoint scoring MLP (0 for a linear head)",
+    )
     parser.add_argument("--transformer-depth", type=int, default=DEFAULT_TRANSFORMER_DEPTH)
     parser.add_argument("--transformer-heads", type=int, default=DEFAULT_TRANSFORMER_HEADS)
     parser.add_argument("--transformer-mlp-ratio", type=float, default=DEFAULT_TRANSFORMER_MLP_RATIO)
@@ -555,7 +582,13 @@ def main():
         hidden_size=args.hidden_size,
         dropout=args.dropout,
         breakpoint_hidden_dim=args.breakpoint_hidden_dim,
+        breakpoint_policy=args.breakpoint_policy,
+        breakpoint_mixture_hidden_dim=args.breakpoint_mixture_hidden_dim,
+        breakpoint_mixture_layers=args.breakpoint_mixture_layers,
+        breakpoint_mixture_components=args.breakpoint_mixture_components,
         breakpoint_dropout=args.breakpoint_dropout,
+        breakpoint_gap_hidden_size=args.breakpoint_gap_hidden_size,
+        breakpoint_gap_layers=args.breakpoint_gap_layers,
         transformer_depth=args.transformer_depth,
         transformer_heads=args.transformer_heads,
         transformer_mlp_ratio=args.transformer_mlp_ratio,

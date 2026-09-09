@@ -1,8 +1,8 @@
 # Run from the repository root: python train.py --config config.yaml
 # CLI options override these settings. Paths are relative to the working directory.
 # First experiment from the wxv8mptu analysis: faster log-Z adaptation.
-dataset_path: validation/fasta/sim_2k_super_easy_0.fa
-output_path: runs/sim_2k_super_easy_epoch1000
+dataset_path: validation/datasets/human_25kb_super_easy/rep0/human_25kb_super_easy.fa
+output_path: runs/human_25kb_super_easy_sparse_mixture
 epochs: 1000
 batch_size: 64
 seed: 7
@@ -25,12 +25,18 @@ recombination_rate: 1.0e-8
 time_bins: 32
 time_delta_bin_width: 0.001
 
-# Preserve the policy architecture.
+# Smaller breakpoint CNN and head; retain the other policy settings.
 embedding_size: 32
 hidden_size: 64
 dropout: 0.0
-breakpoint_hidden_dim: 128
+breakpoint_hidden_dim: 32
+breakpoint_policy: sparse_mixture   # Set sparse_mixture to enable the experimental policy.
+breakpoint_mixture_hidden_dim: 128
+breakpoint_mixture_layers: 4
+breakpoint_mixture_components: 4
 breakpoint_dropout: 0.1
+breakpoint_gap_hidden_size: 64
+breakpoint_gap_layers: 1
 transformer_depth: 6
 transformer_heads: 4
 transformer_mlp_ratio: 2.0

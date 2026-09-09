@@ -57,6 +57,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.arg_model_lr = float(arg_model_lr)
         self.z_lr = float(z_lr)
         self.model_kwargs = dict(model_kwargs or {})
+        self.model_kwargs.setdefault("breakpoint_policy", "cnn")
+        self.model_kwargs.setdefault("breakpoint_mixture_hidden_dim", 128)
+        self.model_kwargs.setdefault("breakpoint_mixture_layers", 4)
+        self.model_kwargs.setdefault("breakpoint_mixture_components", 4)
         self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
         self.time_model = self.arg_model.time_scorer
         self.breakpoint_model = self.arg_model.breakpoint_scorer
@@ -158,11 +162,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
         directory = os.path.dirname(os.path.abspath(path))
         if directory:
             os.makedirs(directory, exist_ok=True)
+        metadata = dict(metadata or {})
+        metadata["model"] = {**metadata.get("model", {}), **self.model_kwargs}
         torch.save(
             {
                 "generator_state_dict": self.state_dict(),
                 "opt_state_dict": self.opt.state_dict(),
-                "metadata": dict(metadata or {}),
+                "metadata": metadata,
             },
             path,
         )
@@ -176,6 +182,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
             else self._torch_load(path, map_location=map_location)
         )
         state_dict = checkpoint.get("generator_state_dict", checkpoint)
+        if "metadata" in checkpoint:
+            saved_policy = checkpoint["metadata"].get("model", {}).get("breakpoint_policy", "cnn")
+            if saved_policy != self.model_kwargs["breakpoint_policy"]:
+                raise ValueError("Cannot load weights across breakpoint policy types; create a new model for training")
         self.load_state_dict(state_dict)
         self.to(self.device)
         self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())

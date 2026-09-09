@@ -2,7 +2,7 @@
 # CLI options override these settings. Paths are relative to the working directory.
 # Human simulation: eight haplotypes, each 2,000 bp long, from replicate 0.
 dataset_path: validation/datasets/human_2kb_super_easy/rep0/human_2kb_super_easy.fa
-output_path: runs/human_2kb_super_easy
+output_path: runs/human_2kb_super_easy_small_breakpoint
 epochs: 1000
 batch_size: 64
 seed: 7
@@ -30,8 +30,14 @@ time_delta_bin_width: 0.001
 embedding_size: 32
 hidden_size: 64
 dropout: 0.0
-breakpoint_hidden_dim: 128
+breakpoint_hidden_dim: 32
+breakpoint_policy: cnn   # Set sparse_mixture to enable the experimental policy.
+breakpoint_mixture_hidden_dim: 128
+breakpoint_mixture_layers: 4
+breakpoint_mixture_components: 4
 breakpoint_dropout: 0.1
+breakpoint_gap_hidden_size: 64
+breakpoint_gap_layers: 1
 transformer_depth: 6
 transformer_heads: 4
 transformer_mlp_ratio: 2.0
