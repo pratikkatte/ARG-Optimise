@@ -17,8 +17,12 @@ class RolloutWorker:
         episodes,
         random_spec=None,
         return_states=False,
+        collect_flows=False,
         ):
         
+        if collect_flows and generator.loss_type != "subtb":
+            raise ValueError("Flow collection requires loss_type=subtb")
+        flows_by_traj = [[] for _ in range(episodes)] if collect_flows else None
         states = [self.env.get_initial_state() for _ in range(episodes)]
         trajectories = [SimpleTrajectory() for _ in states]
         
@@ -42,7 +46,12 @@ class RolloutWorker:
                 random_spec=random_spec,
             )
 
-            total_log_pf, log_probs, choosen_actions = generator(input_dict)
+            if collect_flows:
+                total_log_pf, log_probs, choosen_actions, state_flows = generator(input_dict, return_flows=True)
+                for batch_idx, traj_idx in enumerate(unfinished):
+                    flows_by_traj[traj_idx].append(state_flows[batch_idx])
+            else:
+                total_log_pf, log_probs, choosen_actions = generator(input_dict)
 
             for batch_idx, traj_idx in enumerate(unfinished):
                 state = states[traj_idx]
@@ -86,6 +95,13 @@ class RolloutWorker:
             "log_paths_pb": log_paths_pb,
             "log_rewards": log_rewards,
         }
+        if collect_flows:
+            # Keep terminal posterior precision; the legacy TB outputs stay float32.
+            data["log_rewards"] = torch.tensor([s.log_reward for s in states], dtype=torch.float64, device=self.device)
+            data["lengths"] = torch.tensor([len(p) for p in log_paths_pf_by_traj], dtype=torch.long, device=self.device)
+            for idx, values in enumerate(flows_by_traj):
+                values.append(data["log_rewards"][idx] if values else generator.compute_log_Z().double())
+            data["state_flows"] = self._pad_log_path_lists(flows_by_traj, torch.float64, self.device)
         if return_states:
             data["states"] = states
 
@@ -97,6 +113,7 @@ class RolloutWorker:
         episodes=1,
         random_spec=None,
         return_states=False,
+        collect_flows=False,
     ):
         """Run one or more model-guided ARG rollouts."""
         if generator is None:
@@ -106,6 +123,7 @@ class RolloutWorker:
             episodes=episodes,
             random_spec=random_spec,
             return_states=return_states,
+            collect_flows=collect_flows,
         )
 
     def _states_to_padded_tree_features(self, states, device=None):

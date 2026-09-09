@@ -1,0 +1,68 @@
+"""Exact geometric SubTB with linear scalar work and autograd storage."""
+import math
+
+import torch
+
+
+def validate_objective(loss_type, subtb_lambda, flow_lr):
+    if loss_type not in ("tb", "subtb"):
+        raise ValueError("loss_type must be tb or subtb")
+    if not math.isfinite(subtb_lambda) or subtb_lambda < 0:
+        raise ValueError("subtb_lambda must be finite and >= 0")
+    if not math.isfinite(flow_lr) or flow_lr <= 0:
+        raise ValueError("flow_lr must be finite and > 0")
+
+
+def _logadd(a, b):
+    m = max(a, b)
+    return m + math.log1p(math.exp(min(a, b) - m))
+
+
+def geometric_subtb_loss(log_pf, log_pb, flows, lengths, log_rewards, subtb_lambda=0.9):
+    """Average normalized all-segment losses equally across complete trajectories.
+
+    ``flows[b, :lengths[b]+1]`` includes exact source and terminal boundaries.
+    For zero actions, flows[b, 0] is the source; log_rewards supplies the terminal.
+    Padding is ignored, including nonfinite padding. Arithmetic is float64.
+    """
+    validate_objective("subtb", subtb_lambda, 1.0)
+    if log_pf.ndim != 2 or log_pb.shape != log_pf.shape:
+        raise ValueError("forward/backward paths must have matching [B,T] shapes")
+    b, t = log_pf.shape
+    if b == 0 or flows.shape != (b, t + 1) or lengths.shape != (b,) or log_rewards.shape != (b,):
+        raise ValueError("invalid flows, lengths, rewards or empty batch shape")
+    if lengths.dtype not in (torch.int32, torch.int64):
+        raise ValueError("lengths must be integer tensors")
+    if any(x.device != log_pf.device for x in (log_pb, flows, lengths, log_rewards)):
+        raise ValueError("all inputs must be on the same device")
+    if bool(((lengths < 0) | (lengths > t)).any()):
+        raise ValueError("lengths outside padded trajectory bounds")
+    mask = torch.arange(t, device=lengths.device)[None, :] < lengths[:, None]
+    state_mask = torch.arange(t + 1, device=lengths.device)[None, :] <= lengths[:, None]
+    pf = torch.where(mask, log_pf.double(), 0.0)
+    pb = torch.where(mask, log_pb.double(), 0.0)
+    f = torch.where(state_mask, flows.double(), 0.0)
+    rewards = log_rewards.double()
+    if not all(bool(torch.isfinite(x).all()) for x in (pf, pb, f, rewards)):
+        raise ValueError("non-finite active trajectory inputs")
+    # Subtract endpoints first, preserving small residuals at large flow offsets.
+    delta = torch.where(mask, (f[:, :-1] - f[:, 1:]) + (pf - pb), 0.0)
+    mean = f.new_zeros(b)
+    variance = f.new_zeros(b)
+    result = (f[:, 0] - rewards).square() * (lengths == 0)
+    log_suffix_weight = log_total_weight = -math.inf
+    log_lambda = math.log(subtb_lambda) if subtb_lambda else -math.inf
+    for end in range(t):
+        log_extended = log_lambda + log_suffix_weight
+        log_suffix_weight = _logadd(0.0, log_extended)
+        # Mixture of a new one-step suffix and all extended previous suffixes.
+        old_fraction = math.exp(log_extended - log_suffix_weight)
+        new_fraction = math.exp(-log_suffix_weight)
+        variance = old_fraction * variance + old_fraction * new_fraction * mean.square()
+        mean = delta[:, end] + old_fraction * mean
+        log_total_new = _logadd(log_total_weight, log_suffix_weight)
+        weight = math.exp(log_suffix_weight - log_total_new)
+        old_weight = math.exp(log_total_weight - log_total_new)
+        result = torch.where(mask[:, end], old_weight * result + weight * (variance + mean.square()), result)
+        log_total_weight = log_total_new
+    return result.mean()

@@ -4,6 +4,7 @@ import os
 import torch
 
 from models import ARGModel
+from subtb import geometric_subtb_loss, validate_objective
 from env import RecombinationChoice
 from rollout_worker_arg import RolloutWorker
 from dataclasses import replace
@@ -28,8 +29,16 @@ class TBGFlowNetGenerator(torch.nn.Module):
         policy_lr=None,
         log_z_lr=None,
         initialize_z_from_policy=True,
+        loss_type="tb",
+        subtb_lambda=0.9,
+        flow_lr=None,
     ):
         super().__init__()
+        resolved_policy_lr = arg_model_lr if policy_lr is None else policy_lr
+        self.flow_lr = float(resolved_policy_lr if flow_lr is None else flow_lr)
+        self.loss_type = loss_type
+        self.subtb_lambda = float(subtb_lambda)
+        validate_objective(self.loss_type, self.subtb_lambda, self.flow_lr)
         print(f"verbose: {verbose}")
         self.env = env
         self.verbose = verbose
@@ -102,6 +111,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.loss = 0
 
         self.loss = torch.tensor(0.0, device=self.device)
+        self.tb_reporting_loss = 0.0
         self.accumulated_batches = 0
         self.log_z_target_sum = 0.0
         self.log_z_target_count = 0
@@ -109,6 +119,24 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         if initialize_z_from_policy:
             self.initialize_log_z_from_policy()
+
+        self.flow_params = []
+        if self.loss_type == "subtb":
+            # CPU construction under fork_rng leaves policy/sampling RNG unchanged.
+            with torch.random.fork_rng(devices=[]):
+                self.flow_head = torch.nn.Sequential(
+                    torch.nn.Linear(self.model_kwargs.get("embedding_size", 32) + 4,
+                                    self.model_kwargs.get("hidden_size", 64), device="cpu"),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(self.model_kwargs.get("hidden_size", 64), 1, device="cpu"),
+                ).to(self.device)
+                torch.nn.init.zeros_(self.flow_head[-1].weight)
+                torch.nn.init.zeros_(self.flow_head[-1].bias)
+            self.register_buffer("flow_init_offset", torch.tensor(
+                self.last_log_z_target, dtype=torch.float64, device=self.device))
+            self.flow_params = list(self.flow_head.parameters())
+            self.opt.add_param_group({"params": self.flow_params, "lr": self.flow_lr})
+            self.gradient_clipping_params.extend(self.flow_params)
 
     @torch.no_grad()
     def initialize_log_z_from_policy(self):
@@ -163,6 +191,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if directory:
             os.makedirs(directory, exist_ok=True)
         metadata = dict(metadata or {})
+        metadata.update(loss_type=self.loss_type, subtb_lambda=self.subtb_lambda,
+                        flow_lr=self.flow_lr, policy_lr=self.arg_model_lr, log_z_lr=self.z_lr)
+        if self.loss_type == "subtb":
+            metadata.update(flow_head_version=1, flow_init_offset=self.flow_init_offset.item())
         metadata["model"] = {**metadata.get("model", {}), **self.model_kwargs}
         torch.save(
             {
@@ -181,6 +213,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
             if isinstance(path, dict)
             else self._torch_load(path, map_location=map_location)
         )
+        metadata = checkpoint.get("metadata", {})
+        if metadata.get("loss_type", "tb") != self.loss_type:
+            raise ValueError("Cannot load checkpoints across loss_type objectives")
+        if self.loss_type == "subtb":
+            if metadata.get("flow_head_version") != 1:
+                raise ValueError("Unsupported flow-head checkpoint version")
+            if load_optimizer and metadata.get("subtb_lambda") != self.subtb_lambda:
+                raise ValueError("Cannot restore optimizer with a different subtb_lambda")
         state_dict = checkpoint.get("generator_state_dict", checkpoint)
         if "metadata" in checkpoint:
             saved_policy = checkpoint["metadata"].get("model", {}).get("breakpoint_policy", "cnn")
@@ -193,6 +233,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if load_optimizer and "opt_state_dict" in checkpoint:
             self.opt.load_state_dict(checkpoint["opt_state_dict"])
             self._move_optimizer_state_to_device()
+            self.arg_model_lr = self.opt.param_groups[0]["lr"]
+            self.z_lr = self.opt.param_groups[1]["lr"]
+            if self.loss_type == "subtb":
+                self.flow_lr = self.opt.param_groups[2]["lr"]
         return checkpoint.get("metadata", {})
 
     def _move_optimizer_state_to_device(self):
@@ -238,9 +282,25 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return self._grad_norm([self._Z])
 
     def compute_log_Z(self, scale_key=None):
-        return self._Z.sum()
+        return self._Z.double().sum() if self.loss_type == "subtb" else self._Z.sum()
 
-    def forward(self, input_dict):
+    def state_flows(self, states, summary_reps):
+        features = summary_reps.new_tensor([
+            [s.accumulated_log_prior / self.env.sequence_length,
+             math.log1p(s.current_time), math.log1p(len(s.active_lineages)),
+             s.total_active_blocks / self.env.num_blocks] for s in states
+        ])
+        residual = self.flow_head(torch.cat((summary_reps, features), dim=-1)).squeeze(-1).double()
+        prior = torch.tensor([s.accumulated_log_prior for s in states],
+                             dtype=torch.float64, device=self.device)
+        predicted = self.flow_init_offset + prior + residual
+        # Each forward event allocates new node IDs, so this identifies the source in O(1).
+        source = torch.tensor([s.max_node_idx == self.env.num_sequences - 1 for s in states], device=self.device)
+        return torch.where(source, self.compute_log_Z().double(), predicted)
+
+    def forward(self, input_dict, return_flows=False):
+        if return_flows and self.loss_type != "subtb":
+            raise ValueError("State flows require loss_type=subtb")
 
         states = input_dict.get("states")
 
@@ -298,6 +358,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         log_probs = torch.exp(total_log_pf)
         
+        if return_flows:
+            return total_log_pf, log_probs, choosen_actions, self.state_flows(states, summary_reps)
         return total_log_pf, log_probs, choosen_actions
 
 
@@ -308,6 +370,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 'param_norm': self.param_norm(self),
                 'loss': self.loss.detach().cpu().numpy().tolist()}
         
+        if self.loss_type == "subtb":
+            info["subtb_loss"] = info["loss"]
+            info["tb_loss"] = self.tb_reporting_loss
+            self.tb_reporting_loss = 0.0
+            info["flow_head_grad_norm"] = self._grad_norm(self.flow_params)
         torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
         self.opt.step()
         self.opt.zero_grad()
@@ -517,6 +584,15 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return {lineage.node_id: idx for idx, lineage in enumerate(state.active_lineages)}
 
     def get_loss_from_rollout_outputs(self, rollout_outputs):
+        if self.loss_type == "subtb":
+            return geometric_subtb_loss(
+                rollout_outputs["log_paths_pf"], rollout_outputs["log_paths_pb"],
+                rollout_outputs["state_flows"], rollout_outputs["lengths"],
+                rollout_outputs["log_rewards"], self.subtb_lambda,
+            )
+        return self.get_tb_loss_from_rollout_outputs(rollout_outputs)
+
+    def get_tb_loss_from_rollout_outputs(self, rollout_outputs):
         log_paths_pf = rollout_outputs['log_paths_pf']
         log_paths_pb = rollout_outputs['log_paths_pb']
         log_rewards = torch.as_tensor(
@@ -540,7 +616,10 @@ class TBGFlowNetGenerator(torch.nn.Module):
         
     
     def accumulate_loss(self, rollout_outputs, factor=1.0):
+        if self.loss_type == "subtb":
+            with torch.no_grad():
+                self.tb_reporting_loss += self.get_tb_loss_from_rollout_outputs(rollout_outputs).item() / factor
         loss = self.get_loss_from_rollout_outputs(rollout_outputs)
         loss = (loss / factor)
         loss.backward()
-        self.loss += loss 
+        self.loss = self.loss + loss.detach()

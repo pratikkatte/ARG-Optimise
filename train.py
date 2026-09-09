@@ -16,6 +16,7 @@ except ImportError:
 from env import SimpleARGEnvironment, action_as_dict
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
+from subtb import validate_objective
 from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
 from utils import load_sequences
 
@@ -70,17 +71,29 @@ def train_epoch(
 ):
     grad_accum_steps = max(int(grad_accum_steps), 1)
 
+    lengths = []
     for _ in range(grad_accum_steps):
         ret, trajectories = rollout_worker.rollout(
             generator,
             episodes=batch_size,
+            **({"collect_flows": True} if generator.loss_type == "subtb" else {}),
         )
+        lengths.extend(len(traj) for traj in trajectories)
         generator.accumulate_loss(
             ret,
             factor=grad_accum_steps,
         )
 
-    return generator.update_model()
+    info = generator.update_model()
+    info.update(length_statistics(lengths))
+    return info
+
+
+def length_statistics(lengths, prefix=""):
+    values = torch.as_tensor(lengths, dtype=torch.float64)
+    return {prefix + "trajectory_length_" + key: float(value) for key, value in (
+        ("median", values.quantile(0.5)), ("p95", values.quantile(0.95)), ("max", values.max()))}
+
 
 
 def evaluate_generator(rollout_worker, generator, episodes, seed):
@@ -107,10 +120,13 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             env.rng.seed(seed)
 
         with torch.no_grad():
-            outputs, trajectories = rollout_worker.rollout(generator, episodes=episodes)
+            outputs, trajectories = rollout_worker.rollout(
+                generator, episodes=episodes,
+                **({"collect_flows": True} if getattr(generator, "loss_type", "tb") == "subtb" else {}),
+            )
             log_pf = outputs["log_paths_pf"].sum(-1)
             log_pb = outputs["log_paths_pb"].sum(-1)
-            log_rewards = outputs["log_rewards"]
+            log_rewards = outputs["log_rewards"].to(log_pf)
             residuals = generator.compute_log_Z().detach().to(log_pf) + log_pf - (
                 log_rewards + log_pb
             )
@@ -140,7 +156,12 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             ],
             dtype=torch.float32,
         )
+        extra = length_statistics(lengths, "eval_")
+        if getattr(generator, "loss_type", "tb") == "subtb":
+            with torch.no_grad():
+                extra["eval_subtb_loss"] = generator.get_loss_from_rollout_outputs(outputs).item()
         return {
+            **extra,
             "eval_tb_mse": float(residuals.pow(2).mean().detach().cpu().item()),
             "eval_residual_mean": float(residuals.mean().detach().cpu().item()),
             "eval_residual_std": float(
@@ -170,8 +191,9 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
 def save_best_checkpoints(generator, info, metadata, checkpoints_path, best_scores):
     """Keep independent minima; residual mean is best when closest to zero."""
     criteria = (
-        ("loss", "best.pt", "best_loss"),
+        ("tb_loss" if getattr(generator, "loss_type", "tb") == "subtb" else "loss", "best.pt", "best_loss"),
         ("eval_tb_mse", "best_eval_loss.pt", "best_eval_loss"),
+        ("eval_subtb_loss", "best_eval_subtb_loss.pt", "best_eval_subtb_loss"),
         ("eval_residual_mean", "best_residual_mean.pt", "best_abs_residual_mean"),
         ("eval_residual_std", "best_residual_std.pt", "best_residual_std"),
     )
@@ -188,14 +210,14 @@ def save_best_checkpoints(generator, info, metadata, checkpoints_path, best_scor
             checkpoint_metadata = {
                 **metadata,
                 **{key: float(value) for key, value in info.items()
-                   if key == "loss" or key.startswith("eval_")},
+                   if key in {"loss", "tb_loss", "subtb_loss"} or key.startswith("eval_")},
                 "checkpoint_metric": metric,
                 "checkpoint_metric_value": value,
                 "checkpoint_score": score,
             }
             generator.save(path, metadata=checkpoint_metadata)
             best_scores[metric] = score
-            path_key = "best_checkpoint_path" if metric == "loss" else f"{best_key}_checkpoint_path"
+            path_key = "best_checkpoint_path" if metric in {"loss", "tb_loss"} else f"{best_key}_checkpoint_path"
             logged[path_key] = path
         logged[best_key] = best_scores[metric]
     return logged
@@ -238,7 +260,12 @@ def train(
     breakpoint_mixture_hidden_dim=DEFAULT_BREAKPOINT_MIXTURE_HIDDEN_DIM,
     breakpoint_mixture_layers=DEFAULT_BREAKPOINT_MIXTURE_LAYERS,
     breakpoint_mixture_components=DEFAULT_BREAKPOINT_MIXTURE_COMPONENTS,
+    loss_type="tb",
+    subtb_lambda=0.9,
+    flow_lr=None,
 ):
+    flow_lr = policy_lr if flow_lr is None else flow_lr
+    validate_objective(loss_type, subtb_lambda, flow_lr)
     seed_everything(seed)
     device = torch.device(device)
 
@@ -289,6 +316,7 @@ def train(
         log_z_lr=log_z_lr,
         grad_clip=grad_clip,
         model_kwargs=model_kwargs,
+        loss_type=loss_type, subtb_lambda=subtb_lambda, flow_lr=flow_lr,
     )
     print(f"Generator device: {generator.device}")
 
@@ -312,6 +340,7 @@ def train(
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
             "recombination_rate": float(recombination_rate),
+            "loss_type": loss_type, "subtb_lambda": subtb_lambda, "flow_lr": flow_lr,
             "policy_lr": float(policy_lr),
             "log_z_lr": float(log_z_lr),
             "log_z_initialization": "policy_tb_mean",
@@ -361,7 +390,7 @@ def train(
 
             metadata = build_checkpoint_metadata(
                 epoch=epoch,
-                best_loss=min(best_scores.get("loss", float("inf")), loss),
+                best_loss=min(best_scores.get("tb_loss" if loss_type == "subtb" else "loss", float("inf")), info.get("tb_loss", loss)),
                 log_z=log_z,
                 sequences=sequences,
                 sequence_length=sequence_length,
@@ -482,6 +511,9 @@ def parse_train_args(argv=None):
     parser.add_argument("--effective-population-size", type=float, default=DEFAULT_NE)
     parser.add_argument("--mutation-rate", type=float, default=DEFAULT_MU_PER_BP)
     parser.add_argument("--recombination-rate", type=float, default=DEFAULT_R_PER_BP)
+    parser.add_argument("--loss-type", choices=("tb", "subtb"), default="tb")
+    parser.add_argument("--subtb-lambda", type=float, default=0.9)
+    parser.add_argument("--flow-lr", type=float, default=None)
     parser.add_argument("--policy-lr", type=float, default=DEFAULT_POLICY_LR)
     parser.add_argument("--log-z-lr", type=float, default=DEFAULT_LOG_Z_LR)
     parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP)
@@ -546,7 +578,14 @@ def parse_train_args(argv=None):
                 if isinstance(value, bool) or not isinstance(value, (str, int, float)):
                     parser.error(f"Config setting {key} must be a scalar value")
                 config_args.append(f"{action.option_strings[0]}={value}")
-    return parser.parse_args(config_args + argv)
+    args = parser.parse_args(config_args + argv)
+    if args.flow_lr is None:
+        args.flow_lr = args.policy_lr
+    try:
+        validate_objective(args.loss_type, args.subtb_lambda, args.flow_lr)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def main():
@@ -571,6 +610,7 @@ def main():
         mutation_rate=args.mutation_rate,
         recombination_rate=args.recombination_rate,
         policy_lr=args.policy_lr,
+        loss_type=args.loss_type, subtb_lambda=args.subtb_lambda, flow_lr=args.flow_lr,
         log_z_lr=args.log_z_lr,
         grad_clip=args.grad_clip,
         grad_accum_steps=args.grad_accum_steps,

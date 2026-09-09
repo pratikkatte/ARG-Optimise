@@ -67,6 +67,9 @@ def run_inference(
         log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
         model_kwargs=dict(metadata.get("model", {})),
         initialize_z_from_policy=False,
+        loss_type=metadata.get("loss_type", "tb"),
+        subtb_lambda=metadata.get("subtb_lambda", 0.9),
+        flow_lr=metadata.get("flow_lr", metadata.get("policy_lr", 0.001)),
     )
     generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
     generator.eval()
