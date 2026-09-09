@@ -20,7 +20,6 @@ HG38_FASTA = refdir + 'hg38.fa.gz'
 HG38_CONTIG = 'chr1'
 HG38_START = 10_000_000
 _ACGT = frozenset('ACGT')
-_ALT_BASE = {'A': 'T', 'T': 'A', 'C': 'G', 'G': 'C'}
 
 
 def ensure_hg38_reference():
@@ -106,19 +105,6 @@ def read_reference_window(length, contig=HG38_CONTIG, start=HG38_START):
     return ''.join(seq_parts)
 
 
-def _allele_to_base(allele, reference_base):
-    if allele is None:
-        return 'N'
-    base = str(allele).upper()
-    if len(base) == 1 and base in _ACGT:
-        return base
-    if base == '0':
-        return reference_base if reference_base in _ACGT else 'N'
-    if base == '1':
-        return _ALT_BASE.get(reference_base, 'N')
-    return 'N'
-
-
 def vcf_site_mask(ts):
     mask = [False] * ts.num_sites
     seen_positions = set()
@@ -128,7 +114,7 @@ def vcf_site_mask(ts):
         int_position = int(position)
         bad = (
             position != int_position
-            or int_position <= 0
+            or int_position < 0
             or any(
                 len(str(allele).upper()) != 1 or str(allele).upper() not in _ACGT
                 for allele in variant.alleles
@@ -144,39 +130,43 @@ def vcf_site_mask(ts):
     return mask
 
 
-def write_haplotype_fasta(ts, fasta_path, site_mask=None):
+def write_vcf(ts, vcf_path, contig_id=contig_id, site_mask=None):
+    """Export an existing tree sequence using one-based VCF coordinates."""
+    if site_mask is None:
+        site_mask = vcf_site_mask(ts)
+    vcf_kwargs = {
+        'contig_id': contig_id,
+        'individual_names': ['spl' + str(s) for s in range(ts.num_samples // 2)],
+        'site_mask': np.asarray(site_mask, dtype=bool),
+        # tskit also transforms the contig length; keep that endpoint fixed.
+        'position_transform': lambda positions: np.minimum(
+            np.asarray(positions) + 1, ts.sequence_length
+        ),
+    }
+    if ts.num_individuals == 0:
+        vcf_kwargs['ploidy'] = 2
+    with open(vcf_path, 'w', encoding='utf-8') as vcffh:
+        ts.write_vcf(vcffh, **vcf_kwargs)
+
+
+def write_haplotype_fasta(ts, fasta_path, site_mask=None, reference_sequence=None):
+    """Use tskit's FASTA exporter with the same site selection as the VCF.
+
+    The reference supplies nonvariant bases. Native FASTA headers are n<node ID>,
+    in ts.samples() order. Filtering an export copy leaves the truth ARG intact.
+    """
     sequence_length = int(ts.sequence_length)
     if sequence_length != float(ts.sequence_length):
         raise ValueError('FASTA export requires integer sequence length')
 
-    reference = read_reference_window(sequence_length)
-    seqs = [bytearray(reference.encode('ascii')) for _ in range(ts.num_samples)]
-    for variant in ts.variants():
-        if site_mask is not None and site_mask[variant.site.id]:
-            continue
-        site_pos = int(variant.site.position)
-        if not (0 <= site_pos < sequence_length):
-            continue
-        alleles = variant.alleles
-        if not alleles:
-            for seq in seqs:
-                seq[site_pos] = ord('N')
-            continue
-        reference_base = reference[site_pos].upper()
-        allele_bases = [_allele_to_base(allele, reference_base) for allele in alleles]
-        for sample_idx, allele_idx in enumerate(variant.genotypes):
-            if allele_idx < 0 or allele_idx >= len(alleles):
-                base = 'N'
-            else:
-                base = allele_bases[int(allele_idx)]
-            seqs[sample_idx][site_pos] = ord(base if base in _ACGT else 'N')
-
-    with open(fasta_path, 'w', encoding='utf-8') as handle:
-        for sample_idx, seq in enumerate(seqs):
-            handle.write('>hap{:03d}\n'.format(sample_idx))
-            text = seq.decode('ascii')
-            for start in range(0, len(text), 80):
-                handle.write(text[start : start + 80] + '\n')
+    if reference_sequence is None:
+        reference_sequence = read_reference_window(sequence_length)
+    if site_mask is None:
+        site_mask = vcf_site_mask(ts)
+    export_ts = ts.delete_sites(np.flatnonzero(site_mask), record_provenance=False)
+    export_ts.write_fasta(
+        fasta_path, reference_sequence=reference_sequence, wrap_width=80
+    )
 
 
 def simulate(
@@ -193,7 +183,10 @@ def simulate(
     tcdir=tcdir,
     tsdir=tsdir,
     fastadir=fastadir,
+    output_name=None,
 ):
+    if output_name is not None and nrep != 1:
+        raise ValueError('output_name requires exactly one replicate')
     os.makedirs(vcfdir, exist_ok=True)
     os.makedirs(tsdir, exist_ok=True)
     os.makedirs(fastadir, exist_ok=True)
@@ -219,17 +212,9 @@ def simulate(
         )
         site_mask = vcf_site_mask(ts)
         sample_ids = list(ts.samples())
-        outname = 'sim_' + pref + str(i)
+        outname = output_name or 'sim_' + pref + str(i)
         vcfpath = vcfdir + outname + '.vcf'
-        vcf_kwargs = {
-            'contig_id': contig_id,
-            'individual_names': ['spl' + str(s) for s in range(n // 2)],
-            'site_mask': np.asarray(site_mask, dtype=bool),
-        }
-        if ts.num_individuals == 0:
-            vcf_kwargs['ploidy'] = 2
-        with open(vcfpath, 'w', encoding='utf-8') as vcffh:
-            ts.write_vcf(vcffh, **vcf_kwargs)
+        write_vcf(ts, vcfpath, contig_id=contig_id, site_mask=site_mask)
         print('writing vcf to', vcfpath)
         tsfile = tsdir + outname + '.trees'
         ts.dump(tsfile)
@@ -257,8 +242,17 @@ def simulate(
 # mutation 2e-8 (JC69)
 # length 1mb
 # replicates 1
-print('1mb sequence length')
-simulate(nrep=1, pref='l1mb_', n=8, rec=2e-8, Ne=10000, length=10**6)
+# print('1mb sequence length')
+# simulate(nrep=1, pref='l1mb_', n=8, rec=2e-8, Ne=10000, length=10**6)
+
+## 2 kb with human mutation and recombination rates (per bp per generation)
+if __name__ == '__main__':
+    print('2kb sequence length, human rates')
+    simulate(
+        nrep=1, pref='2k_super_easy_human_', n=8,
+        mu=1.29e-8, rec=1.253e-8, Ne=10000, length=2000, seed=42,
+        output_name='sim_2k_super_easy_human',
+    )
 
 ## change number of samples
 # coalescent model
@@ -323,5 +317,5 @@ simulate(nrep=1, pref='l1mb_', n=8, rec=2e-8, Ne=10000, length=10**6)
 # simulate(nrep=1, pref='l5mb_', n=8, rec=2e-8, Ne=10000, length=5*10**6)
 # print('250kb sequence length')
 # simulate(nrep=1, pref='l250kb_', n=8, rec=2e-8, Ne=10000, length=250*10**3)
-print('25kb sequence length')
-simulate(nrep=1, pref='l25kb_', n=8, rec=2e-8, Ne=10000, length=25_000)
+# print('25kb sequence length')
+# simulate(nrep=1, pref='l25kb_', n=8, rec=2e-8, Ne=10000, length=25_000)

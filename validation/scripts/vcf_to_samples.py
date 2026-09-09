@@ -23,12 +23,14 @@ def add_diploid_sites(vcf, samples):
             for row in variant.genotypes
             for old in row[0:2]
         ]
-        samples.add_site(pos, genotypes=genotypes, alleles=ordered, ancestral_allele=0)
+        # VCF POS is one-based; tsinfer/tree-sequence sites are zero-based.
+        samples.add_site(pos - 1, genotypes=genotypes, alleles=ordered, ancestral_allele=0)
 
-vcf = cyvcf2.VCF(vcf_path)
-seq_len = vcf.seqlens[0]
+if __name__ == '__main__':
+    vcf = cyvcf2.VCF(vcf_path)
+    seq_len = vcf.seqlens[0]
 
-with tsinfer.SampleData(path=samples_path, sequence_length=seq_len) as samples:
-    add_diploid_sites(vcf, samples)
+    with tsinfer.SampleData(path=samples_path, sequence_length=seq_len) as samples:
+        add_diploid_sites(vcf, samples)
 
-print(samples_path, samples.num_samples, "haplotypes,", samples.num_sites, "sites")
+    print(samples_path, samples.num_samples, "haplotypes,", samples.num_sites, "sites")
