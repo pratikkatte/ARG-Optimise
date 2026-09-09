@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 try:
@@ -12,6 +13,7 @@ try:
         dataframe_from_tree_sequences,
         load_posterior_tree_samples,
         load_singer_bed_segments,
+        load_tree_sequence,
         parse_limits,
         plot_limits_from_args,
         prepare_output_prefix,
@@ -24,6 +26,7 @@ except ImportError:
         dataframe_from_tree_sequences,
         load_posterior_tree_samples,
         load_singer_bed_segments,
+        load_tree_sequence,
         parse_limits,
         plot_limits_from_args,
         prepare_output_prefix,
@@ -36,6 +39,10 @@ METHOD_LABEL = "SINGER"
 
 
 def add_input_args(ap: argparse.ArgumentParser) -> None:
+    ap.add_argument(
+        "folder_dir", nargs="?", type=Path,
+        help="SINGER output directory; discover posterior samples and matching ground truth.",
+    )
     ap.add_argument(
         "--from-bed",
         action="store_true",
@@ -60,6 +67,7 @@ def add_input_args(ap: argparse.ArgumentParser) -> None:
     )
     ap.add_argument(
         "--input-dir",
+        "--folder-dir",
         type=Path,
         default=None,
         help="Directory of posterior .trees samples.",
@@ -73,13 +81,91 @@ def add_input_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--max-posterior-samples", type=int, default=None)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="ARGsims-style point accuracy for SINGER.")
-    add_common_args(ap)
+    add_common_args(ap, required_inputs=False)
+    ap.set_defaults(ne=None)
     add_input_args(ap)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    resolve_input_defaults(args)
     validate_args(args)
     return args
+
+
+def resolve_input_defaults(args: argparse.Namespace) -> None:
+    if args.folder_dir is not None:
+        if args.input_dir is not None:
+            raise SystemExit("Use either a positional folder or --input-dir/--folder-dir")
+        args.input_dir = args.folder_dir
+    if args.from_bed:
+        if args.ne is None:
+            args.ne = 10000.0
+        return
+    if args.input_dir is None:
+        raise SystemExit("Provide a SINGER output folder or --input-dir")
+    args.input_dir = args.input_dir.expanduser().resolve()
+    if not args.input_dir.is_dir():
+        raise SystemExit(f"SINGER output directory does not exist: {args.input_dir}")
+    if args.sample_prefix is None:
+        args.sample_prefix = "singer_"
+    if args.output_prefix is None:
+        args.output_prefix = args.input_dir / "point_accuracy" / "singer"
+
+    # run_singer.sh copies metadata into the output, but leaves truth in the
+    # original DATASET/repN directory. Prefer truth beside the output if present.
+    truth_dirs = [args.input_dir]
+    for parent in args.input_dir.parents:
+        if parent.name == "output":
+            truth_dirs.extend([parent.parent / args.input_dir.name, parent.parent])
+            break
+    metadata = {}
+    for directory in truth_dirs:
+        for name in ("input_metadata.json", "metadata.json"):
+            path = directory / name
+            if path.is_file():
+                try:
+                    metadata = json.loads(path.read_text())
+                except (ValueError, OSError) as exc:
+                    raise SystemExit(f"Cannot read metadata {path}: {exc}") from exc
+                break
+        if metadata:
+            break
+
+    if args.truth_trees is None and args.truth_dir is None:
+        truth_name = metadata.get("files", {}).get("ground_truth_trees")
+        for directory in truth_dirs:
+            if truth_name and (directory / truth_name).is_file():
+                args.truth_trees = directory / truth_name
+                break
+            candidates = sorted(
+                path for path in directory.glob("*.trees")
+                if not path.name.startswith(args.sample_prefix)
+            )
+            if len(candidates) > 1:
+                raise SystemExit(
+                    f"Multiple possible ground-truth files in {directory}; specify --truth-trees"
+                )
+            if candidates:
+                args.truth_trees = candidates[0]
+                break
+        if args.truth_trees is None:
+            raise SystemExit(
+                "Could not discover ground truth beside the SINGER output or in the "
+                "matching dataset replicate; specify --truth-trees or --truth-dir/--truth-prefix"
+            )
+    if args.nspl is None:
+        if args.truth_trees is not None:
+            args.nspl = load_tree_sequence(
+                args.truth_trees.expanduser(), "ground-truth tree sequence"
+            ).num_samples
+        else:
+            args.nspl = metadata.get("summary", {}).get("num_haplotypes")
+    if args.ne is None:
+        population_size = (
+            metadata.get("simulation", {}).get("sim_ancestry", {})
+            .get("parameters", {}).get("population_size")
+        )
+        args.ne = float(population_size) if population_size is not None else 10000.0
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -87,6 +173,10 @@ def validate_args(args: argparse.Namespace) -> None:
     parse_limits(args.ylim)
     parse_limits(args.xlim_log)
     parse_limits(args.ylim_log)
+    if args.nspl is None:
+        raise SystemExit("Could not infer the number of haplotypes; specify --nspl")
+    if args.output_prefix is None:
+        raise SystemExit("--output-prefix is required with --from-bed")
     if args.from_bed:
         if args.bed_prefix is None:
             raise SystemExit("--bed-prefix is required with --from-bed")

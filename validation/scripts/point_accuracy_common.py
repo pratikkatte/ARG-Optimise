@@ -53,7 +53,7 @@ class PairSegment:
         return self.right - self.left
 
 
-def add_common_args(ap: argparse.ArgumentParser) -> None:
+def add_common_args(ap: argparse.ArgumentParser, *, required_inputs: bool = True) -> None:
     ap.add_argument(
         "--truth-dir",
         type=Path,
@@ -77,7 +77,7 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
         default=10000.0,
         help="Effective population size Ne; tree-sequence times are divided by 2*Ne.",
     )
-    ap.add_argument("-n", "--nspl", type=int, required=True, help="Number of haplotypes.")
+    ap.add_argument("-n", "--nspl", type=int, required=required_inputs, help="Number of haplotypes.")
     ap.add_argument(
         "-s",
         "--skip",
@@ -89,7 +89,7 @@ def add_common_args(ap: argparse.ArgumentParser) -> None:
         "-o",
         "--output-prefix",
         type=Path,
-        required=True,
+        required=required_inputs,
         help="Output path prefix; files are written as <prefix><suffix>.",
     )
     ap.add_argument("--max-pairs", type=int, default=None)
