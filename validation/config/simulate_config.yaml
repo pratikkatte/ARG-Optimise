@@ -12,13 +12,13 @@
 # Additional replicates use rep1/, rep2/, etc. with the same filenames.
 # Each replicate also includes metadata.json with counts, sites, breakpoints and settings.
 # Existing files with matching names are overwritten; use a new name for a new dataset.
-dataset_name: sim_2k_super_easy_human
+dataset_name: sim_10k
 num_replicates: 1
 num_samples: 8                 # Haplotypes; must be even. 8 = 4 diploid individuals.
 population_size: 10000         # Effective diploid population size (Ne).
-mutation_rate: 1.29e-8         # Per base per generation; JC69 mutation model.
-recombination_rate: 1.253e-8    # Per base per generation.
-sequence_length: 2000         # Integer number of bases.
+mutation_rate: 1.0e-7         # Per base per generation; JC69 mutation model.
+recombination_rate: 5.0e-8    # Per base per generation.
+sequence_length: 10000         # Integer number of bases.
 seed: 42                      # Replicate i: ancestry seed + i*100000; mutations +1.
 contig_id: "1"                # Contig label in the exported VCF.
 

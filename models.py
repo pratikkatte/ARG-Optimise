@@ -1,12 +1,14 @@
 from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
 from breakpoint_model import BreakpointSplitPositionCNN, SparseMixtureBreakpointPolicy
-from time_model import TimeModel
+from time_model import TimeModel, CwrExponentialTimeModel
+from time_env import validate_time_policy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from dataclasses import dataclass, replace
 from operator import index
+import math
 
 
 @dataclass(frozen=True)
@@ -203,8 +205,16 @@ class ARGModel(nn.Module):
         breakpoint_mixture_hidden_dim=128,
         breakpoint_mixture_layers=4,
         breakpoint_mixture_components=4,
+        event_policy="cwr",
+        time_policy=None,
     ):
         super().__init__()
+        if event_policy not in {"cwr", "cwr_residual"}:
+            raise ValueError(f"Unknown event_policy: {event_policy}")
+        self.event_policy = event_policy
+        self.time_policy = validate_time_policy(env.time_policy if time_policy is None else time_policy)
+        if self.time_policy != env.time_policy:
+            raise ValueError("Environment and model time_policy disagree")
         self.env = env
         self.device = env.device
         if int(embedding_size) % int(transformer_heads) != 0:
@@ -255,14 +265,55 @@ class ARGModel(nn.Module):
         else:
             raise ValueError(f"Unknown breakpoint_policy: {breakpoint_policy}")
 
-        self.time_scorer = TimeModel(
-            embedding_size * 4,
-            time_hidden_size,
-            time_dropout,
-            env.time_env.bins,
-            layers=time_layers,
-        )
+        if self.time_policy == "categorical":
+            self.time_scorer = TimeModel(
+                embedding_size * 4,
+                time_hidden_size,
+                time_dropout,
+                env.time_env.bins,
+                layers=time_layers,
+            )
+        else:
+            self.time_scorer = CwrExponentialTimeModel(
+                embedding_size * 4 + 4, time_hidden_size, time_dropout, layers=time_layers,
+            )
         self.logsoftmax = nn.LogSoftmax(dim=1)
+        if self.event_policy == "cwr_residual":
+            self.event_head = nn.Sequential(
+                nn.Linear(embedding_size + 3, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, 2),
+            )
+            nn.init.zeros_(self.event_head[-1].weight)
+            nn.init.zeros_(self.event_head[-1].bias)
+
+    def event_log_probs(self, states, summary_reps, event_actions, prior_probs):
+        """Untempered CwR-residual policy, ordered as (coal, recomb).
+
+        Terminal rows have no forward distribution and return two -infinities.
+        Take prior logs before casting so small positive priors do not underflow.
+        """
+        features = summary_reps.new_tensor([
+            [math.log1p(s.current_time), math.log1p(len(s.active_lineages)),
+             s.total_active_blocks / self.env.num_blocks] for s in states
+        ])
+        corrections = self.event_head(torch.cat((summary_reps, features), dim=-1))
+        prior_logs = corrections.new_tensor([
+            [math.log(p) if p > 0 else -math.inf for p in row] for row in prior_probs
+        ])
+        valid = torch.tensor([
+            [bool(actions) and p > 0 and not state.is_done
+             for actions, p in zip(candidates, probabilities)]
+            for state, candidates, probabilities in zip(states, event_actions, prior_probs)
+        ], dtype=torch.bool, device=corrections.device)
+        available = valid.any(dim=-1)
+        nonterminal = torch.tensor([not s.is_done for s in states], device=corrections.device)
+        if (nonterminal & ~available).any():
+            raise ValueError("Nonterminal state has no available event under the CwR prior")
+        logits = (prior_logs + corrections).masked_fill(~valid, -math.inf)
+        # Avoid undefined log-softmax/gradients on terminal rows.
+        logits = torch.where(available[:, None], logits, torch.zeros_like(logits))
+        return F.log_softmax(logits, dim=-1).masked_fill(~valid, -math.inf)
 
     def _build_source_sequence_features(self):
         return self.env.block_seq_arrays.detach().to(dtype=torch.float32).clone()

@@ -1,13 +1,14 @@
 import argparse
 import json
 import os
+import math
 
 import torch
 
 from env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
-from time_env import DEFAULT_TIME_BIN_SCHEME
+from time_env import DEFAULT_TIME_BIN_SCHEME, checkpoint_time_policy
 from train import (
     DEFAULT_LOG_Z_LR,
     MODEL_VERSION,
@@ -23,9 +24,6 @@ REQUIRED_METADATA_KEYS = {
     "sequence_length",
     "num_blocks",
     "rho",
-    "time_bin_scheme",
-    "time_bins",
-    "time_delta_bin_width",
     "seed",
     "init_z_sample_count",
     "model_version",
@@ -119,13 +117,15 @@ def resolve_device(device):
 
 
 def validate_metadata(metadata):
-    missing = sorted(REQUIRED_METADATA_KEYS - set(metadata))
+    policy = checkpoint_time_policy(metadata)
+    timing_keys = {"time_bin_scheme", "time_bins", "time_delta_bin_width"} if policy == "categorical" else set()
+    missing = sorted((REQUIRED_METADATA_KEYS | timing_keys) - set(metadata))
     if missing:
         raise ValueError(
             "Checkpoint metadata is missing fields required for inference: "
             + ", ".join(missing)
         )
-    if metadata["time_bin_scheme"] != DEFAULT_TIME_BIN_SCHEME:
+    if policy == "categorical" and metadata["time_bin_scheme"] != DEFAULT_TIME_BIN_SCHEME:
         raise ValueError(
             "This inference path requires fixed-delta time-bin checkpoints "
             f"({DEFAULT_TIME_BIN_SCHEME}), got {metadata['time_bin_scheme']!r}."
@@ -138,13 +138,13 @@ def validate_metadata(metadata):
 
 
 def environment_from_metadata(metadata, seed, device=None):
+    policy = checkpoint_time_policy(metadata)
     env_kwargs = {
+        "time_policy": policy,
         "num_sequences": int(metadata["num_sequences"]),
         "sequence_length": int(metadata["sequence_length"]),
         "num_blocks": int(metadata["num_blocks"]),
         "rho": float(metadata["rho"]),
-        "time_bins": int(metadata["time_bins"]),
-        "time_delta_bin_width": float(metadata["time_delta_bin_width"]),
         "population_size": float(
             metadata.get("effective_population_size", DEFAULT_NE)
         ),
@@ -152,6 +152,9 @@ def environment_from_metadata(metadata, seed, device=None):
         "sequences": list(metadata["sequences"]),
         "seed": seed,
     }
+    if policy == "categorical":
+        env_kwargs.update(time_bins=int(metadata["time_bins"]),
+                          time_delta_bin_width=float(metadata["time_delta_bin_width"]))
     if device is not None:
         env_kwargs["device"] = device
     return SimpleARGEnvironment(**env_kwargs)
@@ -225,8 +228,8 @@ def _pad_log_path_rows(rows):
 
 def build_random_spec(temperature=None):
     if temperature is not None:
-        if temperature <= 0:
-            raise ValueError("temperature must be positive")
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be finite and positive")
         return {"T": float(temperature)}
     return None
 
@@ -276,6 +279,8 @@ def build_manifest(
         "seed": int(seed),
         "num_args": len(records),
         "random_spec": random_spec,
+        "time": env.time_metadata,
+        "score_convention": "untempered policy; not the behavior density when T != 1",
         "outputs": records,
     }
 

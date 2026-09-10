@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from env import SimpleTrajectory, action_as_dict
+from time_env import validate_temperature
 
 
 class RolloutWorker:
@@ -22,6 +23,10 @@ class RolloutWorker:
         
         if collect_flows and generator.loss_type != "subtb":
             raise ValueError("Flow collection requires loss_type=subtb")
+        continuous = self.env.time_policy == "cwr_exponential"
+        score_dtype = torch.float64 if continuous else torch.float32
+        if continuous:
+            validate_temperature(random_spec)
         flows_by_traj = [[] for _ in range(episodes)] if collect_flows else None
         states = [self.env.get_initial_state() for _ in range(episodes)]
         trajectories = [SimpleTrajectory() for _ in states]
@@ -44,6 +49,7 @@ class RolloutWorker:
             input_dict = self.env.prepare_state_rollout_inputs(
                 active_states,
                 random_spec=random_spec,
+                event_policy=generator.arg_model.event_policy,
             )
 
             if collect_flows:
@@ -78,16 +84,20 @@ class RolloutWorker:
                     )
             unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
 
-        log_paths_pf = self._pad_log_path_lists(log_paths_pf_by_traj, torch.float32, self.device)
+        log_paths_pf = self._pad_log_path_lists(log_paths_pf_by_traj, score_dtype, self.device)
 
         log_paths_pb = [
-            -torch.log(torch.tensor(num_parents, dtype=torch.float32, device=self.device))
+            -torch.log(torch.tensor(num_parents, dtype=score_dtype, device=self.device))
             for num_parents in backward_num_parents_by_traj
             ]
         
-        log_paths_pb = self._pad_log_path_vectors(log_paths_pb, torch.float32, self.device)
+        log_paths_pb = self._pad_log_path_vectors(log_paths_pb, score_dtype, self.device)
 
-        log_rewards = torch.tensor([state.log_reward for state in states], dtype=torch.float32, device=self.device)
+        log_rewards = torch.tensor([state.log_reward for state in states], dtype=score_dtype, device=self.device)
+        if continuous and not all(bool(torch.isfinite(x).all()) for x in (
+            log_paths_pf, log_paths_pb, log_rewards, log_paths_pf.sum(-1), log_paths_pb.sum(-1)
+        )):
+            raise ValueError("non-finite continuous rollout scores")
 
 
         data = {

@@ -131,7 +131,11 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
                 log_rewards + log_pb
             )
             initial_state = env.get_initial_state()
-            initial_event_probs = env.compute_event_probabilities(initial_state)
+            initial_prior_probs = env.compute_event_probabilities(initial_state)
+            initial_event_probs = (
+                generator.compute_event_probabilities(initial_state)
+                if hasattr(generator, "compute_event_probabilities") else initial_prior_probs
+            )
 
         lengths = torch.tensor([len(traj) for traj in trajectories], dtype=torch.float32)
         coal_counts = torch.tensor(
@@ -175,6 +179,8 @@ def evaluate_generator(rollout_worker, generator, episodes, seed):
             "eval_recombination_count_mean": float(recomb_counts.mean().item()),
             "eval_initial_coalescence_prob": float(initial_event_probs.get("coal", 0.0)),
             "eval_initial_recombination_prob": float(initial_event_probs.get("recomb", 0.0)),
+            "eval_initial_prior_coalescence_prob": float(initial_prior_probs.get("coal", 0.0)),
+            "eval_initial_prior_recombination_prob": float(initial_prior_probs.get("recomb", 0.0)),
         }
     finally:
         for module, training in module_modes:
@@ -263,9 +269,13 @@ def train(
     loss_type="tb",
     subtb_lambda=0.9,
     flow_lr=None,
+    event_policy="cwr",
+    time_policy="categorical",
 ):
     flow_lr = policy_lr if flow_lr is None else flow_lr
     validate_objective(loss_type, subtb_lambda, flow_lr)
+    if time_policy == "cwr_exponential" and os.path.exists(output_path) and os.listdir(output_path):
+        raise ValueError("Continuous training requires a fresh checkpoint and separate empty output directory")
     seed_everything(seed)
     device = torch.device(device)
 
@@ -283,8 +293,11 @@ def train(
         mutation_rate=mutation_rate,
         time_bins=time_bins,
         time_delta_bin_width=time_delta_bin_width,
+        time_policy=time_policy,
     )
     model_kwargs = {
+        "time_policy": time_policy,
+        "event_policy": event_policy,
         "embedding_size": int(embedding_size),
         "hidden_size": int(hidden_size),
         "dropout": float(dropout),
@@ -512,6 +525,7 @@ def parse_train_args(argv=None):
     parser.add_argument("--mutation-rate", type=float, default=DEFAULT_MU_PER_BP)
     parser.add_argument("--recombination-rate", type=float, default=DEFAULT_R_PER_BP)
     parser.add_argument("--loss-type", choices=("tb", "subtb"), default="tb")
+    parser.add_argument("--event-policy", choices=("cwr", "cwr_residual"), default="cwr")
     parser.add_argument("--subtb-lambda", type=float, default=0.9)
     parser.add_argument("--flow-lr", type=float, default=None)
     parser.add_argument("--policy-lr", type=float, default=DEFAULT_POLICY_LR)
@@ -526,6 +540,7 @@ def parse_train_args(argv=None):
     parser.add_argument("--eval-episodes", type=int, default=DEFAULT_EVAL_EPISODES)
     parser.add_argument("--eval-every", type=int, default=DEFAULT_EVAL_EVERY)
     parser.add_argument("--time-bins", type=int, default=DEFAULT_TIME_BINS)
+    parser.add_argument("--time-policy", choices=("categorical", "cwr_exponential"), default="categorical")
     parser.add_argument("--time-delta-bin-width", type=float, default=DEFAULT_TIME_DELTA_BIN_WIDTH)
     parser.add_argument("--embedding-size", type=int, default=DEFAULT_EMBEDDING_SIZE)
     parser.add_argument("--hidden-size", type=int, default=DEFAULT_HIDDEN_SIZE)
@@ -610,6 +625,7 @@ def main():
         mutation_rate=args.mutation_rate,
         recombination_rate=args.recombination_rate,
         policy_lr=args.policy_lr,
+        event_policy=args.event_policy,
         loss_type=args.loss_type, subtb_lambda=args.subtb_lambda, flow_lr=args.flow_lr,
         log_z_lr=args.log_z_lr,
         grad_clip=args.grad_clip,
@@ -617,6 +633,7 @@ def main():
         eval_episodes=args.eval_episodes,
         eval_every=args.eval_every,
         time_bins=args.time_bins,
+        time_policy=args.time_policy,
         time_delta_bin_width=args.time_delta_bin_width,
         embedding_size=args.embedding_size,
         hidden_size=args.hidden_size,

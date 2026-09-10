@@ -10,7 +10,7 @@ from evo import EvolutionModelTorch
 
 import numpy as np
 
-from time_env import TimeEnvFixedDelta
+from time_env import TimeEnvFixedDelta, TimeEnvCwrExponential, validate_time_policy
 
 CHARACTERS_MAPS = {
     'DNA_WITH_GAP': {
@@ -166,6 +166,7 @@ class RecombinationChoice:
     span_end: int
     time_action: Optional[int] = None
     breakpoint: Optional[int] = None
+    delta_t: Optional[float] = None
 
     @property
     def breakpoint_count(self):
@@ -203,6 +204,7 @@ class RecombinationChoice:
             span_end=int(span_end),
             time_action=int(time_action) if time_action is not None else None,
             breakpoint=int(breakpoint) if breakpoint is not None else None,
+            delta_t=float(action["delta_t"]) if action.get("delta_t") is not None else None,
         )
 
     def is_valid_for(self, active_lineages):
@@ -233,6 +235,7 @@ class CoalescenceChoice:
     active_lineage_i: int
     active_lineage_j: int
     time_action: Optional[int] = None
+    delta_t: Optional[float] = None
 
     def as_dict(self):
         action = {
@@ -242,6 +245,8 @@ class CoalescenceChoice:
         }
         if self.time_action is not None:
             action["time_action"] = self.time_action
+        if self.delta_t is not None:
+            action["delta_t"] = float(self.delta_t)
         return action
 
     def is_valid_for(self, active_lineages):
@@ -272,6 +277,7 @@ class CoalescenceChoice:
             active_lineage_i=int(i),
             active_lineage_j=int(j),
             time_action=int(time_action) if time_action is not None else None,
+            delta_t=float(action["delta_t"]) if action.get("delta_t") is not None else None,
         )
 
     @classmethod
@@ -478,6 +484,8 @@ def action_as_dict(action):
         }
         if action.time_action is not None:
             result["time_action"] = int(action.time_action)
+        if action.delta_t is not None:
+            result["delta_t"] = float(action.delta_t)
         return result
     raise ValueError(f"Unknown ARG action: {action}")
 
@@ -520,6 +528,7 @@ class SimpleARGEnvironment:
         device: Optional[torch.device] = 'cpu',
         time_bins: Optional[int] = None,
         time_delta_bin_width: Optional[float] = None,
+        time_policy: str = "categorical",
     ):
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
@@ -561,7 +570,9 @@ class SimpleARGEnvironment:
             time_env_kwargs["bins"] = int(time_bins)
         if time_delta_bin_width is not None:
             time_env_kwargs["delta_bin_width"] = float(time_delta_bin_width)
-        self.time_env = TimeEnvFixedDelta(**time_env_kwargs)
+        self.time_policy = validate_time_policy(time_policy)
+        self.time_env = (TimeEnvFixedDelta(**time_env_kwargs) if self.time_policy == "categorical"
+                         else TimeEnvCwrExponential())
 
         self.rng = random.Random(seed)
 
@@ -600,7 +611,10 @@ class SimpleARGEnvironment:
 
     @property
     def time_metadata(self):
+        if self.time_policy == "cwr_exponential":
+            return self.time_env.metadata
         return {
+            "time_policy": "categorical",
             "time_bin_scheme": type(self.time_env).__name__,
             "time_bins": int(self.time_env.bins),
             "time_delta_bin_width": float(self.time_env.delta_bin_width),
@@ -613,9 +627,32 @@ class SimpleARGEnvironment:
 
     def _total_event_rate(self, rates):
         total_rate = float(rates["lambda_coal"] + rates["lambda_recomb"])
-        if total_rate <= 0 or total_rate is None:
-            raise ValueError("waiting-time rate must be positive")
+        if not math.isfinite(total_rate) or total_rate <= 0:
+            raise ValueError("waiting-time rate must be finite and positive")
         return total_rate
+
+    def _validate_timing(self, action):
+        if self.time_policy == "cwr_exponential":
+            if action.time_action is not None or action.delta_t is None:
+                raise ValueError("cwr_exponential actions require only delta_t timing")
+            self.time_env.positive(action.delta_t, "wait")
+        elif action.delta_t is not None or not isinstance(action.time_action, numbers.Integral):
+            raise ValueError("categorical actions require only integer time_action timing")
+        else:
+            self.time_env._validate_action(action.time_action)
+
+    def resolve_event_time(self, state, action, rates):
+        """Both event types resolve their wait against the pre-action rate."""
+        self._validate_timing(action)
+        rate = self._total_event_rate(rates)
+        if self.time_policy == "cwr_exponential":
+            return self.time_env.event_time(state.current_time, action.delta_t)
+        return float(state.current_time) + self.time_env.time_action_to_delta(action.time_action, rate)
+
+    def timing_for_delta(self, delta_t, rates):
+        if self.time_policy == "cwr_exponential":
+            return {"delta_t": self.time_env.positive(delta_t, "reconstructed wait")}
+        return {"time_action": self.time_env.delta_to_time_action(delta_t, self._total_event_rate(rates))}
 
     def get_initial_state(self):
         active_lineages = []
@@ -946,6 +983,11 @@ class SimpleARGEnvironment:
             next_state.log_reward = self.compute_terminal_log_reward(next_state, log_likelihood)
         else:
             next_state.log_reward = None
+        if self.time_policy == "cwr_exponential" and (
+            not math.isfinite(next_state.accumulated_log_prior)
+            or (next_state.log_reward is not None and not math.isfinite(next_state.log_reward))
+        ):
+            raise ValueError("non-finite continuous accumulated prior or reward")
         return next_state
 
     def apply_coalescence(self, state, action, log_prior=None):
@@ -965,8 +1007,7 @@ class SimpleARGEnvironment:
         parent_id = next_state.max_node_idx + 1
         parent_segments = child_i.material_segments.union(child_j.material_segments)
         overlap_count = child_i.material_segments.intersection_count(child_j.material_segments)
-        delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
-        parent_time = float(state.current_time) + delta_t
+        parent_time = self.resolve_event_time(state, action, rates)
         next_state.current_time = parent_time
         parent_partials = self._coalesced_parent_partials(
             child_i,
@@ -1020,9 +1061,7 @@ class SimpleARGEnvironment:
 
         left_parent_id = next_state.max_node_idx + 1
         right_parent_id = next_state.max_node_idx + 2
-        delta_t = self.time_env.time_action_to_delta(action.time_action, self._total_event_rate(rates))
-
-        event_time = float(state.current_time) + delta_t
+        event_time = self.resolve_event_time(state, action, rates)
         next_state.current_time = event_time
         left_partials = self._recombined_parent_partials(child, left_segments, event_time)
         right_partials = self._recombined_parent_partials(child, right_segments, event_time)
@@ -1066,7 +1105,8 @@ class SimpleARGEnvironment:
         return self._finalize_transition_state(next_state, log_prior)
 
     def apply_action(self, state, action, log_prior=None):
-        
+        if isinstance(action, dict):
+            action = CoalescenceChoice.from_action(action) or RecombinationChoice.from_action(action)
         if isinstance(action, RecombinationChoice):
             return self.apply_recombination(
                 state,
@@ -1138,10 +1178,11 @@ class SimpleARGEnvironment:
                 breakpoint=action_dict["breakpoint"],
             )
 
-        time_action = self.time_env.sample_action_from_prior(
-            self._total_event_rate(state.rates), self.rng
-        )
-        chosen_action = replace(chosen_action, time_action=time_action)
+        rate = self._total_event_rate(state.rates)
+        if self.time_policy == "cwr_exponential":
+            chosen_action = replace(chosen_action, delta_t=self.time_env.sample_from_prior(rate, self.rng))
+        else:
+            chosen_action = replace(chosen_action, time_action=self.time_env.sample_action_from_prior(rate, self.rng))
         log_prior = self.compute_cwr_event_log_prior(state, combined_actions, chosen_action)
         return chosen_action, log_prior
 
@@ -1166,6 +1207,12 @@ class SimpleARGEnvironment:
             combined_actions = self.enumerate_actions(state)
         coal_actions, recomb_actions = combined_actions
 
+        if isinstance(action, dict):
+            action = CoalescenceChoice.from_action(action) or RecombinationChoice.from_action(action)
+        if action is None:
+            raise ValueError("Invalid ARG action")
+        self._validate_timing(action)
+
         if rates is None:
             rates = state.rates if state.rates is not None else self.compute_event_rates((coal_actions, recomb_actions))
         state.rates = rates
@@ -1173,7 +1220,9 @@ class SimpleARGEnvironment:
         total_rate = self._total_event_rate(rates)
         recomb_total_weight = sum(choice.material_count for choice in recomb_actions)
 
-        wait_log_prior = self.time_env.time_action_log_probability(action.time_action, total_rate)
+        wait_log_prior = (self.time_env.log_density(action.delta_t, total_rate)
+                          if self.time_policy == "cwr_exponential" else
+                          self.time_env.time_action_log_probability(action.time_action, total_rate))
 
         if isinstance(action, CoalescenceChoice) and CoalescenceChoice.is_valid_for(action, state.active_lineages):
             action_log_prior = math.log((rates["lambda_coal"] / total_rate) / len(coal_actions))
@@ -1183,16 +1232,35 @@ class SimpleARGEnvironment:
         else:
             raise ValueError(f"Invalid action: {action}")
 
-        return action_log_prior + wait_log_prior
+        score = action_log_prior + wait_log_prior
+        if self.time_policy == "cwr_exponential" and not math.isfinite(score):
+            raise ValueError("non-finite continuous event prior score")
+        return score
 
     def prepare_state_rollout_inputs(
         self,
         states,
         random_spec=None,
+        event_policy="cwr",
     ):
         batch_size = len(states)
         if batch_size == 0:
             raise ValueError("states must contain at least one ARGState")
+
+        if event_policy == "cwr_residual":
+            event_actions = [self.enumerate_actions(state) for state in states]
+            prior_probs = [
+                self.compute_event_probabilities(state, actions)
+                for state, actions in zip(states, event_actions)
+            ]
+            return {
+                "states": states,
+                "event_actions": event_actions,
+                "event_prior_probs": [[p[e] for e in self.event_types] for p in prior_probs],
+                "random_spec": random_spec,
+            }
+        if event_policy != "cwr":
+            raise ValueError(f"Unknown event_policy: {event_policy}")
 
         event = {}
         input_actions = []

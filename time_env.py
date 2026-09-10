@@ -5,6 +5,73 @@ import random
 DEFAULT_TIME_BINS = 32
 DEFAULT_TIME_DELTA_BIN_WIDTH = 0.001
 DEFAULT_TIME_BIN_SCHEME = "TimeEnvFixedDelta"
+TIME_POLICIES = ("categorical", "cwr_exponential")
+CONTINUOUS_TIME_SCHEME = "cwr_exponential_v1"
+CONTINUOUS_TIME_UNITS = "2Ne"
+
+
+def validate_time_policy(policy):
+    if policy not in TIME_POLICIES:
+        raise ValueError(f"Unknown time_policy: {policy!r}")
+    return policy
+
+
+def validate_temperature(random_spec):
+    temperature = 1.0 if random_spec is None else float(random_spec["T"])
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive")
+    return temperature
+
+
+def checkpoint_time_policy(metadata):
+    """Validate redundant timing metadata; missing legacy modes are categorical."""
+    timing = metadata.get("time", {})
+    policy = validate_time_policy(metadata.get("time_policy", timing.get("time_policy", "categorical")))
+    model_policy = metadata.get("model", {}).get("time_policy", "categorical")
+    if model_policy != policy or timing.get("time_policy", policy) != policy:
+        raise ValueError("Checkpoint environment and model time_policy disagree")
+    if policy == "cwr_exponential":
+        for key, expected in (("time_scheme", CONTINUOUS_TIME_SCHEME),
+                              ("time_units", CONTINUOUS_TIME_UNITS)):
+            if metadata.get(key, timing.get(key)) != expected or timing.get(key, expected) != expected:
+                raise ValueError(f"Unsupported continuous {key}; expected {expected!r}")
+    return policy
+
+
+class TimeEnvCwrExponential:
+    """Continuous CwR waiting-time prior in internal 2Ne units (not the policy)."""
+
+    @property
+    def metadata(self):
+        return {"time_policy": "cwr_exponential", "time_scheme": CONTINUOUS_TIME_SCHEME,
+                "time_units": CONTINUOUS_TIME_UNITS}
+
+    @staticmethod
+    def positive(value, name):
+        if value is None or not math.isfinite(float(value)) or float(value) <= 0:
+            raise ValueError(f"continuous {name} must be finite and positive")
+        return float(value)
+
+    def log_density(self, delta_t, rate):
+        rate = self.positive(rate, "rate")
+        delta_t = self.positive(delta_t, "wait")
+        score = math.log(rate) - rate * delta_t
+        if not math.isfinite(score):
+            raise ValueError("non-finite continuous prior log density")
+        return score
+
+    def event_time(self, current_time, delta_t):
+        delta_t = self.positive(delta_t, "wait")
+        current_time = float(current_time)
+        event_time = current_time + delta_t
+        if not math.isfinite(current_time) or current_time < 0 or not math.isfinite(event_time) or event_time <= current_time:
+            raise ValueError("continuous event time must be finite and strictly increasing in float64")
+        return event_time
+
+    def sample_from_prior(self, rate, rng=None):
+        rate = self.positive(rate, "rate")
+        rng = random if rng is None else rng
+        return self.positive(rng.expovariate(rate), "sampled wait")
 
 class TimeEnvFixedDelta:
     """Fixed-width delta-time helper for bottom-up ARG construction.

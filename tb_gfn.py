@@ -9,6 +9,7 @@ from subtb import geometric_subtb_loss, validate_objective
 from env import RecombinationChoice
 from rollout_worker_arg import RolloutWorker
 from dataclasses import replace
+from time_env import checkpoint_time_policy, validate_temperature
 
 LOSS_FN = {
     'MSE': torch.nn.MSELoss(),
@@ -67,11 +68,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.arg_model_lr = float(arg_model_lr)
         self.z_lr = float(z_lr)
         self.model_kwargs = dict(model_kwargs or {})
+        self.model_kwargs.setdefault("time_policy", env.time_policy)
+        self.model_kwargs.setdefault("event_policy", "cwr")
         self.model_kwargs.setdefault("breakpoint_policy", "cnn")
         self.model_kwargs.setdefault("breakpoint_mixture_hidden_dim", 128)
         self.model_kwargs.setdefault("breakpoint_mixture_layers", 4)
         self.model_kwargs.setdefault("breakpoint_mixture_components", 4)
         self.arg_model = ARGModel(env, **self.model_kwargs).to(self.device)
+        self.model_kwargs["time_policy"] = self.arg_model.time_policy
         self.time_model = self.arg_model.time_scorer
         self.breakpoint_model = self.arg_model.breakpoint_scorer
 
@@ -199,6 +203,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if self.loss_type == "subtb":
             metadata.update(flow_head_version=1, flow_init_offset=self.flow_init_offset.item())
         metadata["model"] = {**metadata.get("model", {}), **self.model_kwargs}
+        metadata["time"] = dict(self.env.time_metadata)
+        metadata.update(self.env.time_metadata)
         torch.save(
             {
                 "generator_state_dict": self.state_dict(),
@@ -217,6 +223,18 @@ class TBGFlowNetGenerator(torch.nn.Module):
             else self._torch_load(path, map_location=map_location)
         )
         metadata = checkpoint.get("metadata", {})
+        saved_time_policy = checkpoint_time_policy(metadata)
+        if saved_time_policy != self.arg_model.time_policy:
+            raise ValueError(
+                "Cannot load checkpoints across time_policy modes: "
+                f"checkpoint={saved_time_policy!r}, model={self.arg_model.time_policy!r}; use a fresh checkpoint"
+            )
+        saved_event_policy = metadata.get("model", {}).get("event_policy", "cwr")
+        if saved_event_policy != self.arg_model.event_policy:
+            raise ValueError(
+                "Cannot load checkpoints across event_policy modes: "
+                f"checkpoint={saved_event_policy!r}, model={self.arg_model.event_policy!r}"
+            )
         if metadata.get("loss_type", "tb") != self.loss_type:
             raise ValueError("Cannot load checkpoints across loss_type objectives")
         if self.loss_type == "subtb":
@@ -323,6 +341,19 @@ class TBGFlowNetGenerator(torch.nn.Module):
         source = torch.tensor([s.max_node_idx == self.env.num_sequences - 1 for s in states], device=self.device)
         return torch.where(source, self.compute_log_Z().double(), predicted)
 
+    def compute_event_probabilities(self, state):
+        """Actual untempered forward event policy for evaluation."""
+        if self.arg_model.event_policy == "cwr":
+            return self.env.compute_event_probabilities(state)
+        if state.is_done:
+            return {event: 0.0 for event in self.env.event_types}
+        inputs = self.env.prepare_state_rollout_inputs([state], event_policy="cwr_residual")
+        _, summary, _, _ = self._encode_states([state])
+        probs = self.arg_model.event_log_probs(
+            [state], summary, inputs["event_actions"], inputs["event_prior_probs"],
+        ).exp()[0]
+        return dict(zip(self.env.event_types, probs.unbind()))
+
     def forward(self, input_dict, return_flows=False):
         if return_flows and self.loss_type != "subtb":
             raise ValueError("State flows require loss_type=subtb")
@@ -330,20 +361,30 @@ class TBGFlowNetGenerator(torch.nn.Module):
         states = input_dict.get("states")
 
         random_spec = input_dict.get("random_spec")
+        if self.arg_model.time_policy == "cwr_exponential":
+            validate_temperature(random_spec)
         
 
-        event = input_dict.get("event")
-        event_probs = [
-            float(event[idx]["probability"])
-            for idx in range(len(states))
-        ]
-        log_event_pf = torch.log(
-            torch.tensor(event_probs, dtype=torch.float32, device=self.device)
-        )
-
-        all_actions = input_dict.get("input_actions")
-
         lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts = self._encode_states(states)
+        if self.arg_model.event_policy == "cwr_residual":
+            event_actions = input_dict["event_actions"]
+            event_log_probs = self.arg_model.event_log_probs(
+                states, summary_reps, event_actions, input_dict["event_prior_probs"],
+            )
+            event_indices = self.arg_model.sample(event_log_probs, random_spec)
+            log_event_pf = event_log_probs.gather(1, event_indices[:, None]).squeeze(1)
+            all_actions = [
+                candidates[event_idx]
+                for candidates, event_idx in zip(event_actions, event_indices.detach().cpu().tolist())
+            ]
+        else:
+            event = input_dict["event"]
+            event_probs = [float(event[idx]["probability"]) for idx in range(len(states))]
+            log_event_pf = torch.log(
+                torch.tensor(event_probs, dtype=(torch.float64 if self.arg_model.time_policy == "cwr_exponential"
+                                                  else torch.float32), device=self.device)
+            )
+            all_actions = input_dict["input_actions"]
         # input_dict = self._move_input_to_device(input_dict)
         ret = self.arg_model(all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec)
 
@@ -370,22 +411,48 @@ class TBGFlowNetGenerator(torch.nn.Module):
         log_breakpoint_pf = torch.stack(log_p_breakpoints)
 
         selected_action_features = torch.stack(choosen_action_features, dim=0)  # shape: [B, F]
-        time_logits = self.time_model(selected_action_features)
-        time_actions = self.time_model.sample(time_logits, random_spec)
+        if self.arg_model.time_policy == "cwr_exponential":
+            time_features, baseline_rates = self.continuous_time_inputs(states, choosen_actions, selected_action_features)
+            corrections = self.time_model(time_features)
+            waits = self.time_model.sample(corrections, baseline_rates, random_spec)
+            for batch_idx, (action, wait) in enumerate(zip(choosen_actions, waits.cpu().tolist())):
+                self.env.time_env.event_time(states[batch_idx].current_time, wait)
+                choosen_actions[batch_idx] = replace(action, delta_t=wait)
+            log_time_pf = self.time_model.compute_log_time_pf(corrections, waits, baseline_rates)
+            total_log_pf = log_event_pf.double() + log_action_pf.double() + log_breakpoint_pf.double() + log_time_pf
+            if not bool(torch.isfinite(total_log_pf).all()):
+                raise ValueError("non-finite continuous joint forward score")
+        else:
+            time_logits = self.time_model(selected_action_features)
+            time_actions = self.time_model.sample(time_logits, random_spec)
 
-        for batch_idx, action in enumerate(choosen_actions):
-            time = int(time_actions[batch_idx].detach().cpu().item())
-            choosen_actions[batch_idx] = replace(action, time_action=time)
+            for batch_idx, action in enumerate(choosen_actions):
+                time = int(time_actions[batch_idx].detach().cpu().item())
+                choosen_actions[batch_idx] = replace(action, time_action=time)
 
-        log_time_pf = self.time_model.compute_log_time_pf(time_logits, time_actions)
-
-        total_log_pf = log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
+            log_time_pf = self.time_model.compute_log_time_pf(time_logits, time_actions)
+            total_log_pf = log_event_pf + log_action_pf + log_breakpoint_pf + log_time_pf
 
         log_probs = torch.exp(total_log_pf)
         
         if return_flows:
             return total_log_pf, log_probs, choosen_actions, self.state_flows(states, summary_reps)
         return total_log_pf, log_probs, choosen_actions
+
+    def continuous_time_inputs(self, states, actions, selected_action_features):
+        rates = [self.env._total_event_rate(
+            state.rates if state.rates is not None else self.env.enumerate_prior_options(state).rates
+        ) for state in states]
+        features = selected_action_features.new_tensor([
+            [math.log1p(state.current_time), math.log(rate),
+             float(isinstance(action, RecombinationChoice)),
+             action.breakpoint / self.env.num_blocks if isinstance(action, RecombinationChoice) else 0.0]
+            for state, action, rate in zip(states, actions, rates)
+        ])
+        if not bool(torch.isfinite(features).all()):
+            raise ValueError("non-finite continuous timing features")
+        return torch.cat((selected_action_features, features), dim=-1), torch.tensor(
+            rates, dtype=torch.float64, device=selected_action_features.device)
 
 
     def update_model(self):
@@ -418,6 +485,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         )
 
     def count_backward_parents(self, arg_state):
+        # Reversing a stored wait contributes no new time density. The triangular
+        # map from waits to chronological event times has unit Jacobian.
         return len(self._enumerate_inverse_arg_actions(arg_state))
 
     def _is_initial_arg_state(self, state):
@@ -509,6 +578,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
     def _is_latest_time_event(self, state, *node_ids):
         current_time = float(state.current_time)
+        if self.env.time_policy == "cwr_exponential":
+            expected = set(range(state.max_node_idx - len(node_ids) + 1, state.max_node_idx + 1))
+            return set(node_ids) == expected and all(
+                float(state.all_nodes[node_id].time) == current_time for node_id in node_ids
+            )
         return all(
             math.isclose(
                 float(state.all_nodes[node_id].time),
@@ -546,7 +620,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
             child.parents = [node_id for node_id in child.parents if node_id != parent_id]
             parent_state.active_lineages.append(child)
         parent_state.active_lineages.extend(remaining_lineages)
-        parent_state.total_active_blocks = None
+        self._restore_backward_material(parent_state)
 
         active_idx_by_id = self._active_index_by_node_id(parent_state)
         forward_action = {
@@ -557,7 +631,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         parent_state.current_time = self._max_node_time(parent_state)
         delta_t = float(state.current_time) - float(parent_state.current_time)
         rates = self.env.enumerate_prior_options(parent_state).rates
-        forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
+        forward_action.update(self.env.timing_for_delta(delta_t, rates))
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 
@@ -575,20 +649,47 @@ class TBGFlowNetGenerator(torch.nn.Module):
         child = parent_state.all_nodes[child_id]
         child.parents = []
         parent_state.active_lineages = [child] + remaining_lineages
-        parent_state.total_active_blocks = None
+        self._restore_backward_material(parent_state)
 
         active_idx_by_id = self._active_index_by_node_id(parent_state)
         forward_action = {
             "event_type": "recomb",
             "active_lineage_i": active_idx_by_id[child_id],
             "breakpoint": inverse_action["breakpoint"],
+            "span_start": child.material_span[0],
+            "span_end": child.material_span[1],
+            "material_count": child.material_span[2],
         }
         parent_state.current_time = self._max_node_time(parent_state)
         delta_t = float(state.current_time) - float(parent_state.current_time)
         rates = self.env.enumerate_prior_options(parent_state).rates
-        forward_action["time_action"] = self.env._time_action_for_delta(delta_t, rates)
+        forward_action.update(self.env.timing_for_delta(delta_t, rates))
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
+
+    def _restore_backward_material(self, state):
+        state.total_active_blocks = sum(lineage.material_segments.count for lineage in state.active_lineages)
+        state.action_options = state.rates = state.prior_options = None
+        # Forward transitions discard inactive partials. Rebuild in allocation
+        # order, which is topological, using the same block-resolution helpers.
+        needed = {lineage.node_id for lineage in state.active_lineages if lineage.partials is None}
+        pending = list(needed)
+        while pending:
+            node = state.all_nodes[pending.pop()]
+            for child_id in node.children:
+                if state.all_nodes[child_id].partials is None and child_id not in needed:
+                    needed.add(child_id)
+                    pending.append(child_id)
+        for node_id in sorted(needed):
+            node = state.all_nodes[node_id]
+            if not node.children:
+                node.partials = self.env._initial_lineage_partials(node_id, node.material_segments)
+            elif node.event_type == "coal":
+                node.partials = self.env._coalesced_parent_partials(
+                    *(state.all_nodes[c] for c in node.children), node.material_segments, node.time)
+            else:
+                node.partials = self.env._recombined_parent_partials(
+                    state.all_nodes[node.children[0]], node.material_segments, node.time)
 
     def _finalize_backward_parent_state(self, parent_state, child_state, forward_action):
         parent_state.max_node_idx = max(parent_state.all_nodes) if parent_state.all_nodes else -1
@@ -601,6 +702,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
         log_prior = self.env.compute_cwr_event_log_prior(parent_state, forward_action)
         if math.isfinite(log_prior):
             parent_state.accumulated_log_prior = child_state.accumulated_log_prior - log_prior
+        if self.env.time_policy == "cwr_exponential" and not math.isfinite(parent_state.accumulated_log_prior):
+            raise ValueError("non-finite reconstructed continuous prior score")
         parent_state.action_options = None
         parent_state.rates = None
         parent_state.prior_options = None
