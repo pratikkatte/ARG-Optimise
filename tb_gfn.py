@@ -1,5 +1,6 @@
 import math
 import os
+import warnings
 
 import torch
 
@@ -76,9 +77,11 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         ## Z partition
         self.max_reward_seen = float("-inf")
-        self._Z = torch.nn.Parameter(  # in log
-                torch.zeros(256, device=self.device), requires_grad=True
-                )
+        # One scalar makes log_z_lr control the normalizer directly. Float64
+        # preserves small updates even when log rewards have large magnitudes.
+        self._Z = torch.nn.Parameter(
+            torch.zeros((), dtype=torch.float64, device=self.device)
+        )
         
         self.arg_model_params = list(self.arg_model.parameters())
         self.policy_params = self.arg_model_params
@@ -170,8 +173,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         targets = torch.cat(targets)
         initial_log_z = float(targets.mean().item())
-        # Keep the existing parameter and optimizer references/checkpoint shape.
-        self._Z.fill_(initial_log_z / self._Z.numel())
+        # Keep the existing parameter and optimizer references.
+        self._Z.fill_(initial_log_z)
         self.max_reward_seen = max_reward
         self.last_log_z_target = initial_log_z
         if self.verbose:
@@ -222,6 +225,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
             if load_optimizer and metadata.get("subtb_lambda") != self.subtb_lambda:
                 raise ValueError("Cannot restore optimizer with a different subtb_lambda")
         state_dict = checkpoint.get("generator_state_dict", checkpoint)
+        saved_z = state_dict.get("_Z")
+        legacy_vector_z = saved_z is not None and saved_z.shape == (256,)
+        if legacy_vector_z:
+            state_dict = state_dict.copy()
+            # Match the old objective's reduction precision when preserving logZ.
+            state_dict["_Z"] = (
+                saved_z.double().sum() if self.loss_type == "subtb" else saved_z.sum()
+            )
         if "metadata" in checkpoint:
             saved_policy = checkpoint["metadata"].get("model", {}).get("breakpoint_policy", "cnn")
             if saved_policy != self.model_kwargs["breakpoint_policy"]:
@@ -231,7 +242,21 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.last_log_z_target = float(self.compute_log_Z().detach().cpu().item())
 
         if load_optimizer and "opt_state_dict" in checkpoint:
-            self.opt.load_state_dict(checkpoint["opt_state_dict"])
+            optimizer_state = checkpoint["opt_state_dict"]
+            if legacy_vector_z:
+                # The scalar has different update semantics. Preserve all policy
+                # and flow moments, but start its Adam history afresh.
+                optimizer_state = optimizer_state.copy()
+                optimizer_state["state"] = optimizer_state["state"].copy()
+                z_id = optimizer_state["param_groups"][1]["params"][0]
+                optimizer_state["state"].pop(z_id, None)
+                warnings.warn(
+                    "Converted legacy 256-value logZ to one scalar; reset only "
+                    "logZ optimizer state. log_z_lr now controls one scalar update.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self.opt.load_state_dict(optimizer_state)
             self._move_optimizer_state_to_device()
             self.arg_model_lr = self.opt.param_groups[0]["lr"]
             self.z_lr = self.opt.param_groups[1]["lr"]
@@ -282,7 +307,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return self._grad_norm([self._Z])
 
     def compute_log_Z(self, scale_key=None):
-        return self._Z.double().sum() if self.loss_type == "subtb" else self._Z.sum()
+        return self._Z
 
     def state_flows(self, states, summary_reps):
         features = summary_reps.new_tensor([

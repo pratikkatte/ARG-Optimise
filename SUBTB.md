@@ -44,6 +44,19 @@ preserves policy and sampling RNG state. Head parameters have a separate Adam
 learning rate and share policy gradient clipping; log Z remains separately
 optimized and excluded from clipping.
 
+Log Z is one trainable float64 scalar for both objectives. `log_z_lr` therefore
+controls a single scalar Adam update; the old sum of 256 parameters multiplied
+the effective step size by 256 when their gradients and optimizer states matched.
+Policy-rollout initialization still sets the initial log Z and SubTB flow offset.
+Existing learning-rate values are retained, so the scalar adapts more slowly than
+the old vector at the same configured rate.
+
+Loading an old 256-value checkpoint through `generator.load(...)` preserves log Z
+by summing its values. Policy and flow optimizer states are preserved; only log Z
+Adam history is reset, with a migration warning. New scalar checkpoints restore
+all optimizer state normally. A process already running keeps its existing model;
+start a new process to use this parameterization.
+
 Training reports `loss` for the selected objective, `subtb_loss` and `tb_loss`
 when SubTB is enabled, `flow_head_grad_norm`, and trajectory-length median/p95/max.
 Evaluation retains the existing TB metrics and adds `eval_subtb_loss` and length
