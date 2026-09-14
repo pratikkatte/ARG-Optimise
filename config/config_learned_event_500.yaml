@@ -1,0 +1,62 @@
+# 500 bp diagnostic of the same corrected Hudson/Gamma/neural-flow comparison.
+# Run from the repository root: python train.py --config config_learned_event_500.yaml
+# CLI options override these settings. Paths are relative to the working directory.
+# Rates match validation/datasets/sim_500/rep0/metadata.json and sim_10k.
+# Fresh joint policy-and-flow experiment; judge posterior progress over 10,000 updates.
+dataset_path: validation/datasets/sim_500/rep0/sim_500.fa
+output_path: runs/sim_500_subtb_hudson_corrected_baseline
+epochs: 10000
+batch_size: 128
+seed: 7
+verbose: true
+wandb: true
+
+# Exact all-segment SubTB is optional; TB preserves the existing objective.
+# Learn a zero-initialized correction to the CwR event prior.
+event_policy: cwr_residual
+loss_type: subtb             # Set subtb for fresh SubTB training.
+subtb_lambda: 2.0         # Emphasize long segments; settings under joint-training validation.
+flow_head_version: 5      # Shared neural log F at source/intermediate states; no trainable logZ.
+flow_lr: 0.001
+flow_warmup_steps: 0      # Joint training from the first update, with no resumed weights.
+flow_warmup_episodes: 128
+policy_lr: 0.0001
+grad_clip: 10.0
+grad_accum_steps: 1
+init_z_sample_count: 200
+eval_episodes: 256
+eval_every: 50
+terminal_eval: true
+terminal_eval_grid_size: 100
+terminal_eval_repeats: 3
+terminal_eval_repeat_every: 250
+tmrca_method: point_accuracy  # Independent copy of point_accuracy_gfn's span-weighted calculation.
+
+# Full Hudson: every lineage pair and every eligible link, including trapped gaps.
+arg_prior: hudson
+bp_per_blocks: 1
+effective_population_size: 10000
+mutation_rate: 1.0e-7
+recombination_rate: 5.0e-8
+time_policy: cwr_exponential
+continuous_time_head: gamma  # Learn waiting-time mean and shape; exponential Hudson prior.
+# Bin settings apply only when time_policy is categorical.
+time_bins: 32
+time_delta_bin_width: 0.001
+
+# Smaller breakpoint CNN and head; retain the other policy settings.
+embedding_size: 64
+hidden_size: 128
+dropout: 0.0
+breakpoint_hidden_dim: 64
+breakpoint_policy: sparse_mixture   # Set sparse_mixture to enable the experimental policy.
+breakpoint_mixture_hidden_dim: 128
+breakpoint_mixture_layers: 4
+breakpoint_mixture_components: 4
+breakpoint_dropout: 0.1
+breakpoint_gap_hidden_size: 64
+breakpoint_gap_layers: 1
+transformer_depth: 6
+transformer_heads: 4
+transformer_mlp_ratio: 2.0
+attention_dropout: 0.0

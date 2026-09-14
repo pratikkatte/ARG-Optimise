@@ -23,6 +23,13 @@ import tskit
 from matplotlib.colors import LogNorm
 from matplotlib.ticker import LogFormatterMathtext
 
+# Share numerical calculations while preserving the legacy plotting CLI.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from eval.posterior_summary import (
+    TruthInterval, PairSegment, iter_pairs, _truth_value_at, _posterior_values_at, combine_pair_segments, collect_segments_from_trees, segments_to_dataframe, _finite_weighted_arrays, common_metric_values)
+
 PAIR_RE = re.compile(r"_spls(\d+)-(\d+)\.tc$")
 SAMPLE_RE = re.compile(r"_(\d+)\.trees$")
 
@@ -32,25 +39,8 @@ DEFAULT_XLIM_LOG = (-4.0, 1.5)
 DEFAULT_YLIM_LOG = (-4.0, 1.5)
 
 
-@dataclass(frozen=True)
-class TruthInterval:
-    left: float
-    right: float
-    tcoal_2ne: float
 
 
-@dataclass(frozen=True)
-class PairSegment:
-    pair: tuple[int, int]
-    left: float
-    right: float
-    truth: float
-    posterior_mean: float
-    posterior_median: float
-
-    @property
-    def length(self) -> float:
-        return self.right - self.left
 
 
 def add_common_args(ap: argparse.ArgumentParser, *, required_inputs: bool = True) -> None:
@@ -274,12 +264,6 @@ def select_pairs(
     return sorted(rng.sample(ordered, max_pairs))
 
 
-def iter_pairs(nspl: int, skip: int) -> list[tuple[int, int]]:
-    return [
-        (s1, s2)
-        for s1 in range(0, nspl - 1, skip)
-        for s2 in range(s1 + 1, nspl, skip)
-    ]
 
 
 def _sample_path_key(path: Path) -> tuple[str, int, str]:
@@ -324,110 +308,12 @@ def load_posterior_tree_samples(
     ]
 
 
-def _truth_value_at(
-    intervals: list[TruthInterval], position: float, start_idx: int
-) -> tuple[float, int]:
-    idx = start_idx
-    while idx < len(intervals) and position >= intervals[idx].right:
-        idx += 1
-    if idx >= len(intervals):
-        return float("nan"), idx
-    if intervals[idx].left <= position < intervals[idx].right:
-        return intervals[idx].tcoal_2ne, idx
-    return float("nan"), idx
 
 
-def _posterior_values_at(
-    trees: list[tskit.TreeSequence],
-    pair: tuple[int, int],
-    position: float,
-    scale: float,
-) -> tuple[float, ...]:
-    left_idx, right_idx = pair
-    vals: list[float] = []
-    for ts in trees:
-        samples = ts.samples()
-        n = len(samples)
-        if left_idx < 0 or right_idx < 0 or left_idx >= n or right_idx >= n:
-            raise ValueError(
-                f"Pair {pair} is out of range for tree sequence with {n} samples"
-            )
-        tree = ts.at(position)
-        try:
-            tmrca = tree.tmrca(samples[left_idx], samples[right_idx]) / scale
-        except ValueError:
-            tmrca = float("nan")
-        vals.append(float(tmrca))
-    return tuple(vals)
 
 
-def combine_pair_segments(
-    pair: tuple[int, int],
-    truth_intervals: list[TruthInterval],
-    trees: list[tskit.TreeSequence],
-    ne: float,
-) -> list[PairSegment]:
-    sequence_length = float(trees[0].sequence_length)
-    for ts in trees[1:]:
-        if not math.isclose(float(ts.sequence_length), sequence_length):
-            raise ValueError("Tree samples have inconsistent sequence lengths")
-
-    truth_intervals = sorted(truth_intervals, key=lambda iv: (iv.left, iv.right))
-    breakpoints = {0.0, sequence_length}
-    breakpoints.update(interval.left for interval in truth_intervals)
-    breakpoints.update(interval.right for interval in truth_intervals)
-    for ts in trees:
-        breakpoints.update(float(bp) for bp in ts.breakpoints())
-
-    sorted_bp = sorted(bp for bp in breakpoints if 0.0 <= bp <= sequence_length)
-    segments: list[PairSegment] = []
-    truth_idx = 0
-    scale = 2.0 * ne
-    for left, right in zip(sorted_bp[:-1], sorted_bp[1:]):
-        if right <= left:
-            continue
-        mid = (left + right) / 2.0
-        truth_val, truth_idx = _truth_value_at(truth_intervals, mid, truth_idx)
-        if not math.isfinite(truth_val):
-            continue
-        posterior_vals = _posterior_values_at(trees, pair, mid, scale)
-        finite_vals = [x for x in posterior_vals if math.isfinite(x)]
-        if not finite_vals:
-            continue
-        segments.append(
-            PairSegment(
-                pair=pair,
-                left=left,
-                right=right,
-                truth=truth_val,
-                posterior_mean=float(np.mean(finite_vals)),
-                posterior_median=float(np.median(finite_vals)),
-            )
-        )
-    return segments
 
 
-def collect_segments_from_trees(
-    *,
-    truth_tracks: dict[tuple[int, int], list[TruthInterval]],
-    pairs: list[tuple[int, int]],
-    inferred_trees: list[tskit.TreeSequence],
-    ne: float,
-    verbose: bool,
-) -> list[PairSegment]:
-    all_segments: list[PairSegment] = []
-    for pi, pair in enumerate(pairs, start=1):
-        if pair not in truth_tracks:
-            print(f"skip pair {pair}: no truth track", file=sys.stderr)
-            continue
-        if verbose:
-            print(f"pair {pi}/{len(pairs)} {pair}: aligning segments ...", flush=True)
-        all_segments.extend(
-            combine_pair_segments(pair, truth_tracks[pair], inferred_trees, ne)
-        )
-    if not all_segments:
-        raise RuntimeError("No aligned segments were generated.")
-    return all_segments
 
 
 def dataframe_from_tree_sequences(
@@ -449,30 +335,6 @@ def dataframe_from_tree_sequences(
     return segments_to_dataframe(segments)
 
 
-def segments_to_dataframe(segments: list[PairSegment]) -> pd.DataFrame:
-    columns = [
-        "chr",
-        "start",
-        "end",
-        "Simulated",
-        "PosteriorMean",
-        "PosteriorMedian",
-        "len",
-    ]
-    if not segments:
-        return pd.DataFrame(columns=columns)
-    return pd.DataFrame(
-        {
-            "chr": "1",
-            "start": [int(round(s.left)) for s in segments],
-            "end": [int(round(s.right)) for s in segments],
-            "Simulated": [s.truth for s in segments],
-            "PosteriorMean": [s.posterior_mean for s in segments],
-            "PosteriorMedian": [s.posterior_median for s in segments],
-            "len": [s.length for s in segments],
-        },
-        columns=columns,
-    )
 
 
 def load_bed_pair(path: Path, *, has_median: bool) -> pd.DataFrame:
@@ -947,44 +809,8 @@ def run_singer_plots(
     return mseall
 
 
-def _finite_weighted_arrays(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    mask = (
-        np.isfinite(df["Simulated"].to_numpy(dtype=float))
-        & np.isfinite(df["PosteriorMean"].to_numpy(dtype=float))
-        & np.isfinite(df["len"].to_numpy(dtype=float))
-        & (df["len"].to_numpy(dtype=float) > 0)
-    )
-    return (
-        df.loc[mask, "Simulated"].to_numpy(dtype=float),
-        df.loc[mask, "PosteriorMean"].to_numpy(dtype=float),
-        df.loc[mask, "len"].to_numpy(dtype=float),
-    )
 
 
-def common_metric_values(df: pd.DataFrame, legacy_mse: float) -> dict[str, float | str]:
-    sim, post, weights = _finite_weighted_arrays(df)
-    total_weight = float(weights.sum()) if len(weights) else 0.0
-    if total_weight <= 0:
-        return {
-            "n_segments": int(len(df)),
-            "total_length": 0.0,
-            "weighted_mse": float("nan"),
-            "weighted_rmse": float("nan"),
-            "weighted_mae": float("nan"),
-            "weighted_bias": float("nan"),
-            "legacy_mseall": legacy_mse,
-        }
-    diff = post - sim
-    mse = float(np.sum((diff**2) * weights) / total_weight)
-    return {
-        "n_segments": int(len(df)),
-        "total_length": total_weight,
-        "weighted_mse": mse,
-        "weighted_rmse": math.sqrt(mse),
-        "weighted_mae": float(np.sum(np.abs(diff) * weights) / total_weight),
-        "weighted_bias": float(np.sum(diff * weights) / total_weight),
-        "legacy_mseall": legacy_mse,
-    }
 
 
 def write_common_metrics(

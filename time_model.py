@@ -46,7 +46,7 @@ class TimeModel(nn.Module):
     def sample(self, time_logits, random_spec):
         if random_spec is None:
             return Categorical(logits=time_logits).sample()
-        temperature = random_spec["T"]
+        temperature = validate_temperature(random_spec, time_component=True)
         return Categorical(logits=time_logits / temperature).sample()
 
     def forward(self, action_features):
@@ -79,7 +79,7 @@ class CwrExponentialTimeModel(TimeModel):
         return baseline_rates.log() + g, rates
 
     def sample(self, corrections, baseline_rates, random_spec=None):
-        temperature = validate_temperature(random_spec)
+        temperature = validate_temperature(random_spec, time_component=True)
         with torch.no_grad():
             _, rates = self.rates(corrections, baseline_rates)
             behavior_rates = rates / temperature
@@ -95,4 +95,68 @@ class CwrExponentialTimeModel(TimeModel):
         scores = log_rates - rates * waits
         if not bool(torch.isfinite(scores).all()):
             raise ValueError("non-finite continuous policy log density")
+        return scores
+
+
+def validate_continuous_time_head(head, time_policy):
+    if head not in ('exponential', 'gamma'):
+        raise ValueError(f'Unknown continuous_time_head: {head!r}')
+    if head == 'gamma' and time_policy != 'cwr_exponential':
+        raise ValueError('The gamma head requires continuous CwR timing')
+    return head
+
+
+class CwrGammaTimeModel(CwrExponentialTimeModel):
+    """Learn the mean and shape while retaining the exponential CwR prior.
+
+    Given residual mean-rate g and log shape h, concentration=exp(h) and
+    rate=baseline_rate*exp(g+h). Thus mean=exp(-g)/baseline_rate, independently
+    of shape. At h=0 this exactly recovers the previous exponential policy.
+    """
+
+    def __init__(self, input_dim, hidden_dim, dropout, layers=3):
+        super().__init__(input_dim, hidden_dim, dropout, layers)
+        self.shape_layer = nn.Linear(hidden_dim if layers > 0 else input_dim, 1)
+        nn.init.zeros_(self.shape_layer.weight)
+        nn.init.zeros_(self.shape_layer.bias)
+
+    def forward(self, action_features):
+        if self.feature is not None:
+            action_features = self.feature(action_features)
+        return torch.cat((self.output_layer(action_features), self.shape_layer(action_features)), dim=-1)
+
+    def gamma_parameters(self, corrections, baseline_rates):
+        if corrections.ndim != 2 or corrections.shape[-1] != 2:
+            raise ValueError('Gamma timing requires mean-rate and log-shape corrections')
+        log_mean_rates, mean_rates = super().rates(corrections[:, :1], baseline_rates)
+        log_shape = corrections[:, 1].double()
+        shape = log_shape.exp()
+        self._positive(shape, 'gamma shapes')
+        rates = mean_rates*shape
+        self._positive(rates, 'gamma rates')
+        return shape, log_mean_rates+log_shape, rates
+
+    def sample(self, corrections, baseline_rates, random_spec=None):
+        temperature = validate_temperature(random_spec, time_component=True)
+        with torch.no_grad():
+            shape, _, rates = self.gamma_parameters(corrections, baseline_rates)
+            behavior_rates = rates/temperature
+            self._positive(behavior_rates, 'behavior rates')
+            # Preserve the exact old sampling stream at checkpoint migration.
+            # General gamma exploration scales the mean by T; scores remain
+            # those of the untempered policy, as for the exponential head.
+            if bool((shape == 1).all()):
+                waits = torch.distributions.Exponential(behavior_rates).sample()
+            else:
+                waits = torch.distributions.Gamma(shape, behavior_rates).sample()
+            self._positive(waits, 'sampled waits')
+            return waits
+
+    def compute_log_time_pf(self, corrections, waits, baseline_rates):
+        shape, log_rates, rates = self.gamma_parameters(corrections, baseline_rates)
+        waits = torch.as_tensor(waits, device=rates.device, dtype=torch.float64).detach()
+        self._positive(waits, 'waits')
+        scores = shape*log_rates-torch.lgamma(shape)+(shape-1)*waits.log()-rates*waits
+        if not bool(torch.isfinite(scores).all()):
+            raise ValueError('non-finite continuous gamma policy log density')
         return scores

@@ -68,6 +68,7 @@ def run_inference(
         loss_type=metadata.get("loss_type", "tb"),
         subtb_lambda=metadata.get("subtb_lambda", 0.9),
         flow_lr=metadata.get("flow_lr", metadata.get("policy_lr", 0.001)),
+        flow_head_version=metadata.get("flow_head_version", 1),
     )
     generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
     generator.eval()
@@ -118,6 +119,8 @@ def resolve_device(device):
 
 def validate_metadata(metadata):
     policy = checkpoint_time_policy(metadata)
+    from time_model import validate_continuous_time_head
+    validate_continuous_time_head(metadata.get('model', {}).get('continuous_time_head', 'exponential'), policy)
     timing_keys = {"time_bin_scheme", "time_bins", "time_delta_bin_width"} if policy == "categorical" else set()
     missing = sorted((REQUIRED_METADATA_KEYS | timing_keys) - set(metadata))
     if missing:
@@ -139,15 +142,22 @@ def validate_metadata(metadata):
 
 def environment_from_metadata(metadata, seed, device=None):
     policy = checkpoint_time_policy(metadata)
+    population_size = float(metadata.get("effective_population_size", DEFAULT_NE))
+    sequence_length = int(metadata["sequence_length"])
+    rho = float(metadata["rho"])
     env_kwargs = {
         "time_policy": policy,
+        "arg_prior": metadata.get('arg_prior', 'overlap'),
         "num_sequences": int(metadata["num_sequences"]),
-        "sequence_length": int(metadata["sequence_length"]),
+        "sequence_length": sequence_length,
         "num_blocks": int(metadata["num_blocks"]),
-        "rho": float(metadata["rho"]),
-        "population_size": float(
-            metadata.get("effective_population_size", DEFAULT_NE)
-        ),
+        "rho": rho,
+        "population_size": population_size,
+        # Legacy checkpoints stored only rho. Recover its per-base rate rather
+        # than reporting the constructor's unrelated default after restoration.
+        "recombination_rate": float(metadata.get(
+            "recombination_rate", rho / (4 * population_size * sequence_length)
+        )),
         "mutation_rate": float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
         "sequences": list(metadata["sequences"]),
         "seed": seed,
@@ -280,6 +290,8 @@ def build_manifest(
         "num_args": len(records),
         "random_spec": random_spec,
         "time": env.time_metadata,
+        "continuous_time_head": metadata.get('model', {}).get('continuous_time_head', 'exponential'),
+        "arg_prior": env.arg_prior,
         "score_convention": "untempered policy; not the behavior density when T != 1",
         "outputs": records,
     }

@@ -1,6 +1,6 @@
 from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
 from breakpoint_model import BreakpointSplitPositionCNN, SparseMixtureBreakpointPolicy
-from time_model import TimeModel, CwrExponentialTimeModel
+from time_model import TimeModel, CwrExponentialTimeModel, CwrGammaTimeModel, validate_continuous_time_head
 from time_env import validate_time_policy
 import torch
 import torch.nn as nn
@@ -207,6 +207,8 @@ class ARGModel(nn.Module):
         breakpoint_mixture_components=4,
         event_policy="cwr",
         time_policy=None,
+        continuous_time_head='exponential',
+        cache_lineage_features=False,
     ):
         super().__init__()
         if event_policy not in {"cwr", "cwr_residual"}:
@@ -215,8 +217,13 @@ class ARGModel(nn.Module):
         self.time_policy = validate_time_policy(env.time_policy if time_policy is None else time_policy)
         if self.time_policy != env.time_policy:
             raise ValueError("Environment and model time_policy disagree")
+        self.continuous_time_head = validate_continuous_time_head(continuous_time_head, self.time_policy)
         self.env = env
         self.device = env.device
+        self.cache_lineage_features = bool(cache_lineage_features)
+        if self.cache_lineage_features:
+            from lineage_features import LineageFeatureCache
+            self.lineage_feature_cache = LineageFeatureCache()
         if int(embedding_size) % int(transformer_heads) != 0:
             raise ValueError(
                 "embedding_size must be divisible by transformer_heads "
@@ -274,7 +281,8 @@ class ARGModel(nn.Module):
                 layers=time_layers,
             )
         else:
-            self.time_scorer = CwrExponentialTimeModel(
+            time_model_type = CwrGammaTimeModel if self.continuous_time_head == 'gamma' else CwrExponentialTimeModel
+            self.time_scorer = time_model_type(
                 embedding_size * 4 + 4, time_hidden_size, time_dropout, layers=time_layers,
             )
         self.logsoftmax = nn.LogSoftmax(dim=1)
@@ -368,18 +376,22 @@ class ARGModel(nn.Module):
         )
         for batch_idx, state in enumerate(states):
             for lineage_idx, lineage in enumerate(state.active_lineages):
-                feature = self._lineage_partials_tensor(lineage)
-                weights = self._material_segments_masking(
-                    lineage.material_segments,
-                    device=self.device,
-                    dtype=self.env.block_seq_arrays.dtype,
-                )
-                packed[offsets[batch_idx] + lineage_idx] = self.env.evolution_model.normalize_partials(
-                    feature * weights[:, None]
-                )
+                if self.cache_lineage_features:
+                    feature = self.lineage_feature_cache.get(
+                        lineage, self.device, self.env.num_blocks,
+                        lambda: self._normalized_lineage_feature(lineage))
+                else:
+                    feature = self._normalized_lineage_feature(lineage)
+                packed[offsets[batch_idx] + lineage_idx] = feature
         return self._encode_lineage_features(
             PackedLineageFeatures(packed, tuple(offsets)), batch_active_lineage_counts,
         )
+
+    def _normalized_lineage_feature(self, lineage):
+        feature = self._lineage_partials_tensor(lineage)
+        weights = self._material_segments_masking(
+            lineage.material_segments, device=self.device, dtype=self.env.block_seq_arrays.dtype)
+        return self.env.evolution_model.normalize_partials(feature * weights[:, None])
 
     def _lineage_partials_tensor(self, lineage):
         if lineage.partials is None:
@@ -485,7 +497,10 @@ class ARGModel(nn.Module):
                 summary_reps
             )
             features[batch_idx, :n] = state_action_features
-        logits = self.action_scorer(features.reshape(-1, feat_dim)).reshape(batch_size, max_candidates).squeeze(-1)
+        # Keep both axes even when every state has exactly one candidate.
+        # Squeezing [B, 1] into [B] makes the [B, 1] mask broadcast it to
+        # [B, B], mixing other states' scores into the action normalization.
+        logits = self.action_scorer(features.reshape(-1, feat_dim)).reshape(batch_size, max_candidates)
 
         counts = torch.tensor(candidate_counts, device=self.device)
         valid = torch.arange(max_candidates, device=self.device).unsqueeze(0) < counts.unsqueeze(1)
@@ -546,7 +561,8 @@ class ARGModel(nn.Module):
 
 
 
-    def forward(self, all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec):
+    def forward(self, all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec,
+                action_indices=None):
         """Score actions; lineage_seq_features is internally PackedLineageFeatures."""
         all_candidate_actions = all_actions
 
@@ -576,7 +592,8 @@ class ARGModel(nn.Module):
 
         # Sample actions in a vectorized way
         # In case there are -inf rows in invalid entries, Categorical supports this
-        sampled_action_indices = self.sample(logits_masked, random_spec)
+        sampled_action_indices = (self.sample(logits_masked, random_spec) if action_indices is None
+                                  else torch.as_tensor(action_indices, device=logits.device, dtype=torch.long))
         # sampled_action_indices shape: (batch,)
 
         # Convert to standard Python ints and collect for indexing
@@ -590,6 +607,6 @@ class ARGModel(nn.Module):
             choosen_action_features.append(action_features[batch_idx, action_idx])
 
         # Compute log pf for action scorer (policy) selection
-        log_action_pf = self.compute_log_path_pf(logits, selected_action_indices)
+        log_action_pf = self.compute_log_path_pf(logits_masked, selected_action_indices)
 
         return log_action_pf, selected_action_indices, choosen_actions, choosen_action_features

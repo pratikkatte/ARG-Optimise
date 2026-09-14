@@ -16,11 +16,14 @@ def validate_time_policy(policy):
     return policy
 
 
-def validate_temperature(random_spec):
+def validate_temperature(random_spec, *, time_component=False):
     temperature = 1.0 if random_spec is None else float(random_spec["T"])
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("temperature must be finite and positive")
-    return temperature
+    time_temperature = temperature if random_spec is None else float(random_spec.get('time_T', temperature))
+    if not math.isfinite(time_temperature) or time_temperature <= 0:
+        raise ValueError('waiting-time temperature must be finite and positive')
+    return time_temperature if time_component else temperature
 
 
 def checkpoint_time_policy(metadata):

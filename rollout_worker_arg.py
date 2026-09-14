@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from env import SimpleTrajectory, action_as_dict
+from env import SimpleTrajectory, action_as_dict, CoalescenceChoice, RecombinationChoice
 from time_env import validate_temperature
 
 
@@ -19,6 +19,7 @@ class RolloutWorker:
         random_spec=None,
         return_states=False,
         collect_flows=False,
+        fixed_actions=None,
         ):
         
         if collect_flows and generator.loss_type != "subtb":
@@ -28,7 +29,8 @@ class RolloutWorker:
         if continuous:
             validate_temperature(random_spec)
         flows_by_traj = [[] for _ in range(episodes)] if collect_flows else None
-        states = [self.env.get_initial_state() for _ in range(episodes)]
+        corrections_by_traj = [[] for _ in range(episodes)] if collect_flows else None
+        states = [self.env.get_initial_state(track_likelihood=collect_flows) for _ in range(episodes)]
         trajectories = [SimpleTrajectory() for _ in states]
         
         
@@ -45,6 +47,22 @@ class RolloutWorker:
 
         while unfinished:
             active_states = [states[idx] for idx in unfinished]
+            forced = None
+            if fixed_actions is not None:
+                forced = []
+                for idx in unfinished:
+                    step = len(trajectories[idx])
+                    if step >= len(fixed_actions[idx]):
+                        raise ValueError("Replay trajectory ends before reaching a terminal state")
+                    record = fixed_actions[idx][step]
+                    action = CoalescenceChoice.from_action(record) or RecombinationChoice.from_action(record)
+                    if action is None:
+                        raise ValueError("Invalid replay action")
+                    if isinstance(action, RecombinationChoice) and action.breakpoint is None:
+                        raise ValueError("Replay recombination is missing its breakpoint")
+                    if (continuous and action.delta_t is None) or (not continuous and action.time_action is None):
+                        raise ValueError("Replay action is missing its waiting time")
+                    forced.append(action)
             
             input_dict = self.env.prepare_state_rollout_inputs(
                 active_states,
@@ -53,11 +71,14 @@ class RolloutWorker:
             )
 
             if collect_flows:
-                total_log_pf, log_probs, choosen_actions, state_flows = generator(input_dict, return_flows=True)
+                total_log_pf, log_probs, choosen_actions, state_flows = generator(
+                    input_dict, return_flows=True, **({'forced_actions': forced} if forced is not None else {}))
                 for batch_idx, traj_idx in enumerate(unfinished):
                     flows_by_traj[traj_idx].append(state_flows[batch_idx])
+                    corrections_by_traj[traj_idx].append(generator._last_flow_corrections[batch_idx])
             else:
-                total_log_pf, log_probs, choosen_actions = generator(input_dict)
+                total_log_pf, log_probs, choosen_actions = generator(
+                    input_dict, **({'forced_actions': forced} if forced is not None else {}))
 
             for batch_idx, traj_idx in enumerate(unfinished):
                 state = states[traj_idx]
@@ -83,6 +104,9 @@ class RolloutWorker:
                     generator.count_backward_parents(next_state)
                     )
             unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
+
+        if fixed_actions is not None and any(len(traj) != len(actions) for traj, actions in zip(trajectories, fixed_actions)):
+            raise ValueError("Replay trajectory contains actions after its terminal state")
 
         log_paths_pf = self._pad_log_path_lists(log_paths_pf_by_traj, score_dtype, self.device)
 
@@ -112,6 +136,7 @@ class RolloutWorker:
             for idx, values in enumerate(flows_by_traj):
                 values.append(data["log_rewards"][idx] if values else generator.compute_log_Z().double())
             data["state_flows"] = self._pad_log_path_lists(flows_by_traj, torch.float64, self.device)
+            data["flow_corrections"] = self._pad_log_path_lists(corrections_by_traj, torch.float64, self.device)
         if return_states:
             data["states"] = states
 
@@ -135,6 +160,20 @@ class RolloutWorker:
             return_states=return_states,
             collect_flows=collect_flows,
         )
+
+    def replay(self, generator, trajectories, collect_flows=True, return_states=False):
+        """Rescore fixed complete paths with the current policy and exact rewards.
+
+        Only action records are reused; every PF, PB, and state flow is recomputed.
+        The caller controls eval mode/no_grad, just as for ordinary rollout.
+        """
+        if generator.arg_model.event_policy != 'cwr_residual':
+            raise ValueError('Replay currently requires event_policy=cwr_residual')
+        actions = [traj.actions if hasattr(traj, 'actions') else traj for traj in trajectories]
+        if not actions:
+            raise ValueError('Replay requires at least one trajectory')
+        return self._rollout_batch(generator, len(actions), collect_flows=collect_flows,
+                                   return_states=return_states, fixed_actions=actions)
 
     def _states_to_padded_tree_features(self, states, device=None):
         lineage_features = [

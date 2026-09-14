@@ -218,6 +218,7 @@ class BreakpointSplitPositionCNN(nn.Module):
         num_blocks,
         action_context,
         random_spec=None,
+        breakpoint=None,
     ):
         valid_breakpoints = self._valid_breakpoints_list(valid_breakpoints)
         valid_logits = self.valid_breakpoint_logits(
@@ -232,8 +233,9 @@ class BreakpointSplitPositionCNN(nn.Module):
         else:
             sample_logits = valid_logits
 
-        local_idx = Categorical(logits=sample_logits).sample()
-        breakpoint = int(valid_breakpoints[int(local_idx.detach().cpu().item())])
+        local_idx = (Categorical(logits=sample_logits).sample() if breakpoint is None
+                     else valid_breakpoints.index(breakpoint))
+        breakpoint = int(valid_breakpoints[int(local_idx)])
         log_p = F.log_softmax(valid_logits, dim=0)[local_idx]
         return breakpoint, log_p
 
@@ -408,10 +410,13 @@ class SparseMixtureBreakpointPolicy(nn.Module):
         return int(best_gap.item())
 
     def forward(self, valid_breakpoints, lineage_seq_feature, sequence_length,
-                num_blocks, action_context, random_spec=None):
+                num_blocks, action_context, random_spec=None, breakpoint=None):
         a, z = self.valid_span(valid_breakpoints, num_blocks)
         parameters = self.distribution_parameters(range(a, z + 1), lineage_seq_feature,
                                                    sequence_length, num_blocks, action_context)
-        breakpoint = self.sample_gap(a, z, parameters, (random_spec or {}).get("T", 1.0))
+        if breakpoint is None:
+            breakpoint = self.sample_gap(a, z, parameters, (random_spec or {}).get("T", 1.0))
+        elif not isinstance(breakpoint, numbers.Integral) or not a <= breakpoint <= z:
+            raise ValueError("Replay breakpoint is outside the action's valid span")
         log_p = self.log_probabilities(breakpoint, a, z, parameters)
         return breakpoint, log_p.to(dtype=self.input_projection.weight.dtype)

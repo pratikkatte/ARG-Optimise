@@ -249,14 +249,14 @@ class CoalescenceChoice:
             action["delta_t"] = float(self.delta_t)
         return action
 
-    def is_valid_for(self, active_lineages):
+    def is_valid_for(self, active_lineages, allow_nonoverlap=False):
         i = self.active_lineage_i
         j = self.active_lineage_j
         if i == j:
             return False
         if not (0 <= i < len(active_lineages) and 0 <= j < len(active_lineages)):
             return False
-        return active_lineages[i].material_segments.overlaps(
+        return allow_nonoverlap or active_lineages[i].material_segments.overlaps(
             active_lineages[j].material_segments
         )
 
@@ -281,7 +281,10 @@ class CoalescenceChoice:
         )
 
     @classmethod
-    def enumerate_from_active_lineages(cls, active_lineages):
+    def enumerate_from_active_lineages(cls, active_lineages, allow_nonoverlap=False):
+        if allow_nonoverlap:
+            return tuple(cls(i, j) for i in range(len(active_lineages))
+                         for j in range(i + 1, len(active_lineages)))
         events = []
         for active_idx, lineage in enumerate(active_lineages):
             for start, end in lineage.material_segments.segments:
@@ -313,10 +316,12 @@ class PriorActionOptions:
     coal_actions: Tuple[CoalescenceChoice, ...]
     recomb_choices: Tuple[RecombinationChoice, ...]
     rates: Dict[str, float]
+    arg_prior: str = 'overlap'
 
     @property
     def total_recomb_weight(self):
-        return sum(choice.material_count for choice in self.recomb_choices)
+        return sum(choice.breakpoint_count if self.arg_prior == 'hudson' else choice.material_count
+                   for choice in self.recomb_choices)
 
 
 class ARGLineage:
@@ -334,6 +339,8 @@ class ARGLineage:
         breakpoint: Optional[int] = None,
         recombination_side: Optional[str] = None,
         time: float = 0.0,
+        likelihood_partials=None,
+        likelihood_log_increment: float = 0.0,
     ):
         self.node_id = int(node_id)
         self.children = list(children or [])
@@ -344,6 +351,8 @@ class ARGLineage:
         self.breakpoint = breakpoint
         self.recombination_side = recombination_side
         self.time = float(time)
+        self.likelihood_partials = likelihood_partials
+        self.likelihood_log_increment = float(likelihood_log_increment)
         self._material_mask = None
 
         if material_segments is None:
@@ -411,6 +420,10 @@ class ARGLineage:
             breakpoint=self.breakpoint,
             recombination_side=self.recombination_side,
             time=float(self.time),
+            likelihood_partials=(self.likelihood_partials.clone()
+                                 if copy_partials and self.likelihood_partials is not None
+                                 else self.likelihood_partials),
+            likelihood_log_increment=self.likelihood_log_increment,
         )
         if copy_mask and self._material_mask is not None:
             clone._material_mask = self._material_mask.copy()
@@ -429,6 +442,7 @@ class ARGState:
     prior_options: Optional[PriorActionOptions] = None
     total_active_blocks: Optional[int] = None
     current_time: float = 0.0
+    partial_log_likelihood: Optional[float] = None
 
     def clone(self, copy_partials=False):
         all_nodes = {
@@ -445,6 +459,7 @@ class ARGState:
             is_done=self.is_done,
             total_active_blocks=self.total_active_blocks,
             current_time=float(self.current_time),
+            partial_log_likelihood=self.partial_log_likelihood,
         )
 
 
@@ -529,11 +544,18 @@ class SimpleARGEnvironment:
         time_bins: Optional[int] = None,
         time_delta_bin_width: Optional[float] = None,
         time_policy: str = "categorical",
+        arg_prior: str = "overlap",
     ):
+        if arg_prior not in ('overlap', 'hudson'):
+            raise ValueError("arg_prior must be 'overlap' (legacy) or 'hudson'")
+        if arg_prior == 'hudson' and time_policy != 'cwr_exponential':
+            raise ValueError('Hudson requires continuous waiting times')
+        self.arg_prior = arg_prior
         self.sequences = list(sequences) if sequences is not None else None
         self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
         self.event_types = ["coal", "recomb"]
         self.device = torch.device(device)
+        self.flow_likelihood = None
 
         if self.sequences is not None:
             num_sequences = len(self.sequences)
@@ -654,7 +676,7 @@ class SimpleARGEnvironment:
             return {"delta_t": self.time_env.positive(delta_t, "reconstructed wait")}
         return {"time_action": self.time_env.delta_to_time_action(delta_t, self._total_event_rate(rates))}
 
-    def get_initial_state(self):
+    def get_initial_state(self, track_likelihood=True):
         active_lineages = []
         all_nodes = {}
         material_segments = MaterialSegments.full(self.num_blocks)
@@ -690,6 +712,8 @@ class SimpleARGEnvironment:
             current_time=0.0,
         )
         state.is_done = self.is_terminal(state)
+        if track_likelihood and self.flow_likelihood is not None:
+            self.flow_likelihood.initialize(state)
         if state.is_done:
             log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
             state.log_reward = self.compute_terminal_log_reward(state, log_likelihood)
@@ -930,7 +954,8 @@ class SimpleARGEnvironment:
         return log_reward
 
     def compute_coalescence_actions(self, state):
-        return list(CoalescenceChoice.enumerate_from_active_lineages(state.active_lineages))
+        return list(CoalescenceChoice.enumerate_from_active_lineages(
+            state.active_lineages, allow_nonoverlap=self.arg_prior == 'hudson'))
 
     def compute_recombination_actions(self, state):
         return list(RecombinationChoice.enumerate_from_active_lineages(state.active_lineages))
@@ -943,6 +968,7 @@ class SimpleARGEnvironment:
             coal_actions=tuple(coal_actions),
             recomb_choices=tuple(recomb_actions),
             rates=rates,
+            arg_prior=self.arg_prior,
         )
         state.prior_options = prior_options
         return prior_options
@@ -1029,8 +1055,11 @@ class SimpleARGEnvironment:
 
         child_i.parents.append(parent.node_id)
         child_j.parents.append(parent.node_id)
+        if self.flow_likelihood is not None and next_state.partial_log_likelihood is not None:
+            next_state.partial_log_likelihood += self.flow_likelihood.parent(parent, [child_i, child_j])
         child_i.partials = None
         child_j.partials = None
+        child_i.likelihood_partials = child_j.likelihood_partials = None
         next_state.active_lineages[i] = child_i
         next_state.active_lineages[j] = child_j
         next_state.all_nodes[child_i.node_id] = child_i
@@ -1093,7 +1122,11 @@ class SimpleARGEnvironment:
         )
 
         child.parents = [left_parent.node_id, right_parent.node_id]
+        if self.flow_likelihood is not None and next_state.partial_log_likelihood is not None:
+            next_state.partial_log_likelihood += self.flow_likelihood.parent(left_parent, [child])
+            next_state.partial_log_likelihood += self.flow_likelihood.parent(right_parent, [child])
         child.partials = None
+        child.likelihood_partials = None
         next_state.all_nodes[child.node_id] = child
         next_state.all_nodes[left_parent.node_id] = left_parent
         next_state.all_nodes[right_parent.node_id] = right_parent
@@ -1127,7 +1160,10 @@ class SimpleARGEnvironment:
 
         lambda_coal = float(len(coal_actions))
 
-        total_blocks = sum(choice.material_count for choice in recomb_actions)
+        # In Hudson every link between the leftmost and rightmost ancestral
+        # base is eligible, including links in trapped nonancestral gaps.
+        # One pair has hazard 1 and one link has hazard 2 Ne r (in 2 Ne units).
+        total_blocks = sum(self._recomb_weight(choice) for choice in recomb_actions)
         total_active_material_length = float(total_blocks) / float(self.num_blocks)
         lambda_recomb = self.rho / 2.0 * total_active_material_length
         
@@ -1218,17 +1254,23 @@ class SimpleARGEnvironment:
         state.rates = rates
         
         total_rate = self._total_event_rate(rates)
-        recomb_total_weight = sum(choice.material_count for choice in recomb_actions)
+        recomb_total_weight = sum(self._recomb_weight(choice) for choice in recomb_actions)
 
         wait_log_prior = (self.time_env.log_density(action.delta_t, total_rate)
                           if self.time_policy == "cwr_exponential" else
                           self.time_env.time_action_log_probability(action.time_action, total_rate))
 
-        if isinstance(action, CoalescenceChoice) and CoalescenceChoice.is_valid_for(action, state.active_lineages):
+        if isinstance(action, CoalescenceChoice) and action.is_valid_for(
+                state.active_lineages, allow_nonoverlap=self.arg_prior == 'hudson'):
             action_log_prior = math.log((rates["lambda_coal"] / total_rate) / len(coal_actions))
             
         elif isinstance(action, RecombinationChoice) and RecombinationChoice.is_valid_for(action, state.active_lineages):
-            action_log_prior = math.log((rates["lambda_recomb"] / total_rate) * (action.material_count / recomb_total_weight) / action.breakpoint_count)
+            canonical = next((choice for choice in recomb_actions
+                              if choice.active_lineage_i == action.active_lineage_i), None)
+            if (canonical is None or action.breakpoint not in range(canonical.span_start + 1, canonical.span_end + 1)
+                    or replace(action, breakpoint=None, time_action=None, delta_t=None) != canonical):
+                raise ValueError('Invalid recombination lineage span or breakpoint')
+            action_log_prior = math.log((rates["lambda_recomb"] / total_rate) * (self._recomb_weight(action) / recomb_total_weight) / action.breakpoint_count)
         else:
             raise ValueError(f"Invalid action: {action}")
 
@@ -1329,7 +1371,8 @@ class SimpleARGEnvironment:
 
     def _recomb_weight(self, recomb_weight):
         if isinstance(recomb_weight, RecombinationChoice):
-            return recomb_weight.material_count
+            return (recomb_weight.breakpoint_count if self.arg_prior == 'hudson'
+                    else recomb_weight.material_count)
         return recomb_weight[1]
 
     def _choice_from_recomb_weight(self, recomb_weight):

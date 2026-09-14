@@ -1,8 +1,8 @@
 # Run from the repository root: python train.py --config config_learned_event_10kb.yaml
 # CLI options override these settings. Paths are relative to the working directory.
-# First experiment from the wxv8mptu analysis: faster log-Z adaptation.
+# Rates match validation/datasets/sim_10k/rep0/metadata.json.
 dataset_path: validation/datasets/sim_10k/rep0/sim_10k.fa
-output_path: runs/sim_10k_cwr_exponential
+output_path: runs/sim_10k_subtb_simulation_rates
 epochs: 1000
 batch_size: 32
 seed: 7
@@ -13,10 +13,13 @@ wandb: true
 # Learn a zero-initialized correction to the CwR event prior.
 event_policy: cwr_residual
 loss_type: subtb             # Set subtb for fresh SubTB training.
-subtb_lambda: 0.9         # Finite >= 0; 0: one-step, 1: equal, >1: longer segments.
-flow_lr: 0.0001           # Defaults to policy_lr when omitted; SubTB flow head only.
+subtb_lambda: 2.0         # Emphasize long segments; settings under joint-training validation.
+flow_head_version: 4      # Intermediate flows are independent of the live logZ.
+flow_lr: 0.001
+flow_warmup_steps: 200
+flow_warmup_episodes: 32
 policy_lr: 0.0001
-log_z_lr: 0.003            # wxv8mptu used 0.001
+log_z_lr: 10.0             # Source-only scalar normalizer; intermediate flows stay fixed under Z updates.
 grad_clip: 10.0
 grad_accum_steps: 1
 init_z_sample_count: 200
@@ -27,7 +30,7 @@ eval_every: 10
 bp_per_blocks: 1
 effective_population_size: 10000
 mutation_rate: 1.0e-7
-recombination_rate: 1.0e-8
+recombination_rate: 5.0e-8
 time_policy: cwr_exponential
 # Bin settings apply only when time_policy is categorical.
 time_bins: 32

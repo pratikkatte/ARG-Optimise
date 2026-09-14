@@ -66,3 +66,37 @@ def geometric_subtb_loss(log_pf, log_pb, flows, lengths, log_rewards, subtb_lamb
         result = torch.where(mask[:, end], old_weight * result + weight * (variance + mean.square()), result)
         log_total_weight = log_total_new
     return result.mean()
+
+
+@torch.no_grad()
+def subtb_diagnostics(log_pf, log_pb, flows, lengths, log_rewards, loss, subtb_lambda=0.9):
+    """Separate terminal-boundary error from interior error without enumerating segments."""
+    b, t = log_pf.shape
+    if t == 0:
+        return {"subtb_terminal_loss": float(loss), "subtb_interior_loss": 0.0,
+                "subtb_terminal_weight": 1.0}
+    index = torch.arange(t, device=lengths.device)[None, :]
+    active = index < lengths[:, None]
+    increments = torch.where(active, log_pf.double() - log_pb.double(), 0.0)
+    prefix = torch.cat((increments.new_zeros(b, 1), increments.cumsum(-1)), dim=-1)
+    tail = (flows[:, :-1].double() - log_rewards[:, None].double()
+            + prefix.gather(1, lengths[:, None]) - prefix[:, :-1])
+    tail = torch.where(active, tail, 0.0)
+    distance = lengths[:, None] - index
+    if subtb_lambda == 0:
+        weights = (distance == 1).double() / lengths[:, None].clamp_min(1)
+    else:
+        log_lambda = math.log(subtb_lambda)
+        # Sum over segment lengths, accounting for every possible start.
+        log_total = torch.logsumexp(torch.where(
+            active, distance.clamp_min(1).double().log() + index.double() * log_lambda, -torch.inf
+        ), dim=-1, keepdim=True)
+        log_total = torch.where(lengths[:, None] > 0, log_total, 0.0)
+        weights = torch.where(active, ((distance - 1).double() * log_lambda - log_total).exp(), 0.0)
+    terminal = (weights * tail.square()).sum(-1)
+    terminal = torch.where(lengths == 0, (flows[:, 0] - log_rewards).square(), terminal)
+    terminal_loss = float(terminal.mean())
+    weight = torch.where(lengths == 0, 1.0, weights.sum(-1)).mean()
+    return {"subtb_terminal_loss": terminal_loss,
+            "subtb_interior_loss": max(0.0, float(loss) - terminal_loss),
+            "subtb_terminal_weight": float(weight)}
