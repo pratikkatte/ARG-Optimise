@@ -15,7 +15,7 @@ try:
 except ImportError:
     wandb = None
 
-from env import SimpleARGEnvironment, action_as_dict
+from env.env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from subtb import validate_objective
@@ -93,7 +93,7 @@ def train_epoch(
         )
         lengths.extend(len(traj) for traj in trajectories)
         if sampling_config is not None:
-            recombinations.extend(sum(action_as_dict(a).get('event_type') == 'recomb' for a in t.actions)
+            recombinations.extend(sum(a.event_type == 'recomb' for a in t.actions)
                                   for t in trajectories)
         generator.accumulate_loss(
             ret,
@@ -183,7 +183,7 @@ def evaluate_generator(rollout_worker, generator, episodes, seed, fixed_trajecto
                 sum(
                     1
                     for action in traj.actions
-                    if action_as_dict(action).get("event_type") == "coal"
+                    if action.event_type == "coal"
                 )
                 for traj in trajectories
             ],
@@ -194,7 +194,7 @@ def evaluate_generator(rollout_worker, generator, episodes, seed, fixed_trajecto
                 sum(
                     1
                     for action in traj.actions
-                    if action_as_dict(action).get("event_type") == "recomb"
+                    if action.event_type == "recomb"
                 )
                 for traj in trajectories
             ],

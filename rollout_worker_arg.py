@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from env import SimpleTrajectory, action_as_dict, CoalescenceChoice, RecombinationChoice
+from env.env import SimpleTrajectory, CoalescenceChoice, RecombinationChoice
 from time_env import validate_temperature
 
 
@@ -54,9 +54,8 @@ class RolloutWorker:
                     step = len(trajectories[idx])
                     if step >= len(fixed_actions[idx]):
                         raise ValueError("Replay trajectory ends before reaching a terminal state")
-                    record = fixed_actions[idx][step]
-                    action = CoalescenceChoice.from_action(record) or RecombinationChoice.from_action(record)
-                    if action is None:
+                    action = fixed_actions[idx][step]
+                    if not isinstance(action, (CoalescenceChoice, RecombinationChoice)):
                         raise ValueError("Invalid replay action")
                     if isinstance(action, RecombinationChoice) and action.breakpoint is None:
                         raise ValueError("Replay recombination is missing its breakpoint")
@@ -262,7 +261,7 @@ class RolloutWorker:
     def _trajectory_record(self, step, action, log_prior, state, record_diagnostics):
         record = {
             "step": step,
-            "action": action_as_dict(action),
+            "action": action,
             "log_prior": log_prior,
             "active_lineage_count": len(state.active_lineages),
             "is_done": state.is_done,

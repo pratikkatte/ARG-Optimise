@@ -15,11 +15,16 @@ import pandas as pd
 from scipy.stats import wasserstein_distance
 import torch
 import tskit
+from eval.interval_coverage import tmrca_interval_coverage
+from eval.rank_kl import rank_kl_divergence
+from eval.tmrca_ranks import tmrca_rank_histogram
 from utils import load_sequences, read_fasta
 
 # Retain the historical reference identifier for legacy report readers.
 COPIED_FROM_SHA256 = '472b144be54e4b0f674baf90a946710b8ddf35af1b50fa70f31cd259b21f395c'
 IMPLEMENTATION_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+CALIBRATION_SHA256 = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                     for name in ('_calibration.py', 'tmrca_ranks.py', 'rank_kl.py', 'interval_coverage.py')}
 
 @dataclass(frozen=True)
 class TruthInterval:
@@ -264,15 +269,38 @@ def aligned_pair_times(truth, posterior, ne, truth_samples=None, posterior_sampl
     return boundaries, pairs, values[0], values[1:]
 
 
-def point_accuracy_metrics(truth, posterior, ne, truth_samples=None, posterior_samples=None):
+def tmrca_calibration_metrics(expected, values, spans=None, rank_bins=20):
+    """Shared array dispatch used by exact-span and legacy-grid evaluation."""
+    ranks = tmrca_rank_histogram(expected, values, spans, bins=rank_bins)
+    ranks['kl_from_uniform'] = rank_kl_divergence(ranks['probabilities'], ranks['uniform_probabilities'])
+    coverage = tmrca_interval_coverage(expected, values, spans)
+    metrics = dict(eval_truth_tmrca_rank_kl=ranks['kl_from_uniform'],
+                   eval_truth_tmrca_rank_tie_fraction=ranks['tie_cell_fraction'])
+    for interval in coverage['intervals']:
+        level = round(100*interval['level'])
+        metrics[f'eval_truth_interval_{level}_coverage'] = interval['coverage']
+        metrics[f'eval_pair_tmrca_interval_{level}_width_mean'] = interval['mean_width']
+    metrics['eval_pair_tmrca_interval_width_mean'] = metrics['eval_pair_tmrca_interval_90_width_mean']
+    details = dict(rank_histogram=ranks, interval_coverage=coverage,
+        weighting='Exact genomic spans and equal pairs' if spans is not None else 'Equal grid positions and pairs',
+        interpretation='Single-dataset descriptive calibration; linked positions and pairs are dependent. '
+                       'Uniform ranks require repeated datasets from the assumed generative model and posterior draws. '
+                       'Sampling repeats from one dataset are not independent simulated datasets.',
+        kl_definition='D_KL(observed binned ranks || discrete-uniform rank bin masses), natural logarithm')
+    return metrics, details
+
+
+def point_accuracy_metrics(truth, posterior, ne, truth_samples=None, posterior_samples=None, *, rank_bins=20):
     """Exact genomic-span weighted metrics in 2Ne units, plus spread/coverage."""
     boundaries, pairs, expected, values = aligned_pair_times(
         truth, posterior, ne, truth_samples, posterior_samples)
     means = values.mean(axis=0)
     medians = np.median(values, axis=0)
     spread = values.std(axis=0, ddof=0)
-    low, high = np.quantile(values, [.05,.95], axis=0)
     spans = np.diff(boundaries)
+    calibration_metrics, calibration = tmrca_calibration_metrics(expected, values, spans, rank_bins)
+    interval_90 = calibration['interval_coverage']['intervals'][-1]
+    low, high = np.asarray(interval_90['lower']), np.asarray(interval_90['upper'])
     # Match the pair-major ordering of collect_segments_from_trees exactly.
     segments = [PairSegment(pair, float(left), float(right), float(expected[j,i]),
                             float(means[j,i]), float(medians[j,i]))
@@ -290,15 +318,14 @@ def point_accuracy_metrics(truth, posterior, ne, truth_samples=None, posterior_s
         eval_truth_pair_tmrca_bias=common['weighted_bias'],
         eval_pair_tmrca_sample_std_mean=average(spread),
         eval_pair_tmrca_sample_std_rms=math.sqrt(average(spread**2)),
-        eval_pair_tmrca_interval_width_mean=average(high-low),
-        eval_truth_interval_90_coverage=average((low<=expected)&(expected<=high)),
         eval_pair_tmrca_sample_mean=average(means),
-        eval_truth_pair_tmrca_mean=average(expected))
+        eval_truth_pair_tmrca_mean=average(expected), **calibration_metrics)
     details = dict(method='Shared exact interval alignment and span-weighted RMSE',
         copied_source_sha256=COPIED_FROM_SHA256, time_units='2 Ne', time_divisor=2*ne,
         boundaries=boundaries.tolist(), pairs=[list(pair) for pair in pairs],
         truth=expected.tolist(), mean=means.tolist(), median=medians.tolist(),
-        std=spread.tolist(), q05=low.tolist(), q95=high.tolist(), common_metrics=common)
+        std=spread.tolist(), q05=low.tolist(), q95=high.tolist(), common_metrics=common,
+        tmrca_calibration=calibration)
     return metrics, details, frame
 
 
@@ -412,6 +439,10 @@ class TerminalSamplingEvaluator:
                                  tmrca_copied_reference_sha256=COPIED_FROM_SHA256)
         self.protocol['metric_implementation'] = 'eval/posterior_summary.py'
         self.protocol['metric_implementation_sha256'] = IMPLEMENTATION_SHA256
+        self.protocol['calibration_implementation_sha256'] = CALIBRATION_SHA256
+        self.protocol['calibration_definition'] = dict(rank_bins=20, ranks='0 through draw count inclusive',
+            ties='Uniform mass over exact-tie ranks', kl='observed || uniform rank bin mass, in nats',
+            coverage_levels=[.5, .7, .9], quantile_method='linear', endpoints='inclusive')
         self.protocol['sha256'] = hashlib.sha256(json.dumps(self.protocol, sort_keys=True).encode()).hexdigest()
 
     @classmethod
@@ -521,8 +552,6 @@ class TerminalSamplingEvaluator:
             eval_truth_pair_tmrca_rmse=float(np.sqrt(np.mean((mean-self.expected)**2))),
             eval_pair_tmrca_sample_std_mean=float(spread.mean()),
             eval_pair_tmrca_sample_std_rms=float(np.sqrt(np.mean(spread**2))),
-            eval_pair_tmrca_interval_width_mean=float((high-low).mean()),
-            eval_truth_interval_90_coverage=float(np.mean((low<=self.expected)&(self.expected<=high))),
             eval_truth_rooted_rf_mean=float(np.mean(truth_distances)),
             eval_truth_rooted_rf_grid_mean=float(np.mean([
                 rooted_rf(sig, target, self.n) for row in signatures for sig, target in zip(row, truth_grid)])),
@@ -541,6 +570,10 @@ class TerminalSamplingEvaluator:
                 posterior_samples=[list(ts.samples()) for ts in tree_sequences])
             metrics.update(exact)
             details['pair_tmrca_exact'] = point_details
+        else:
+            calibration_metrics, calibration = tmrca_calibration_metrics(self.expected, values)
+            metrics.update(calibration_metrics)
+            details['tmrca_calibration'] = calibration
         return metrics, details
 
     @torch.no_grad()
@@ -564,7 +597,7 @@ class TerminalSamplingEvaluator:
             except (ValueError, tskit.LibraryError) as exc:
                 invalid[str(exc)] += 1
         metrics, details = self.summarize_trees(trees)
-        recombinations = [sum(a['event_type']=='recomb' for a in traj.actions) for traj in trajectories]
+        recombinations = [sum(a.event_type=='recomb' for a in traj.actions) for traj in trajectories]
         rewards = outputs['log_rewards'].detach().cpu().numpy()
         metrics.update(distribution_summary(rewards, 'eval_log_reward'))
         metrics.update(distribution_summary(recombinations, 'eval_recombination_count'))
@@ -675,8 +708,8 @@ def compare_ensembles(first, reference):
                 time_units='2 Ne', clade_definition='Union of observed nontrivial rooted clades per position; equal position weights')
 
 
-def ensemble_truth_metrics(trees, sample_maps, truth, truth_samples, ne, features=None):
-    metrics, details, _ = point_accuracy_metrics(truth, trees, ne, truth_samples, sample_maps)
+def ensemble_truth_metrics(trees, sample_maps, truth, truth_samples, ne, features=None, *, rank_bins=20):
+    metrics, details, _ = point_accuracy_metrics(truth, trees, ne, truth_samples, sample_maps, rank_bins=rank_bins)
     truth_segments = topology_segments(truth, truth_samples)
     distances = [genome_rf(topology_segments(ts, samples), truth_segments,
                           len(truth_samples), truth.sequence_length) for ts, samples in zip(trees, sample_maps)]

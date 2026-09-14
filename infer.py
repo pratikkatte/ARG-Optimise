@@ -5,7 +5,7 @@ import math
 
 import torch
 
-from env import SimpleARGEnvironment
+from env.env import SimpleARGEnvironment
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
 from time_env import DEFAULT_TIME_BIN_SCHEME, checkpoint_time_policy

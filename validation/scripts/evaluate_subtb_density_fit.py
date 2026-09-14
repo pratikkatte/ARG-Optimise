@@ -31,7 +31,7 @@ from scipy.special import logsumexp
 import torch
 from audit_importance import DensityAudit, independent_log_likelihood, numpy
 from audit_fixed_balance import segment_oracle, state_fingerprint
-from env import SimpleTrajectory
+from env.env import SimpleTrajectory
 from flow_training import preserve_sampling
 from infer import environment_from_metadata, load_checkpoint
 from rollout_worker_arg import RolloutWorker
@@ -41,6 +41,7 @@ from eval.density_fit import fit_stats, density_summary, select_bank
 from eval.ess import importance
 from train import evaluate_generator
 from trajectory_buffer import action_fingerprint
+from utils import action_as_dict, action_from_dict
 
 DEFAULT_MANIFEST = AUDITS / 'sim_500/replay_ablation/controlled_variants_manifest.json'
 METRICS = ['ess_fraction', 'max_weight', 'log_weight_std', 'log_evidence',
@@ -115,18 +116,18 @@ def history_audit(g, state, actions):
         count = 1 if node.event_type == 'coal' else 2
         parents = list(range(next_id, next_id + count))
         children = list(node.children)
-        assert node.event_type == action['event_type']
-        assert children[0] == active[action['active_lineage_i']]
+        assert node.event_type == action.event_type
+        assert children[0] == active[action.active_lineage_i]
         if count == 1:
-            assert children[1] == active[action['active_lineage_j']]
+            assert children[1] == active[action.active_lineage_j]
             nonoverlap += nodes[children[0]].material_segments.intersection_count(nodes[children[1]].material_segments) == 0
         else:
             other = nodes[next_id + 1]
             assert other.children == children and other.time == node.time
             assert node.recombination_side == 'left' and other.recombination_side == 'right'
-            assert node.breakpoint == other.breakpoint == action['breakpoint']
+            assert node.breakpoint == other.breakpoint == action.breakpoint
         dt = float(node.time) - previous_time
-        assert dt > 0 and math.isclose(dt, action['delta_t'], rel_tol=1e-9, abs_tol=2e-13)
+        assert dt > 0 and math.isclose(dt, action.delta_t, rel_tol=1e-9, abs_tol=2e-13)
         for child in children:
             prefixes[child].parents = parents[:]
         for parent in parents:
@@ -136,10 +137,10 @@ def history_audit(g, state, actions):
         prefix = SimpleNamespace(all_nodes=prefixes, active_lineages=[prefixes[i] for i in active],
                                  max_node_idx=parents[-1], current_time=float(node.time))
         inverse = g._enumerate_inverse_arg_actions(prefix)
-        assert len(inverse) == 1 and inverse[0]['event_type'] == action['event_type']
+        assert len(inverse) == 1 and inverse[0]['event_type'] == action.event_type
         events.append(dict(event_type=node.event_type, child_ids=children, parent_ids=parents,
-                           time=float(node.time), delta_t=action['delta_t'],
-                           breakpoint=action.get('breakpoint'), inverse_count=1))
+                           time=float(node.time), delta_t=action.delta_t,
+                           breakpoint=getattr(action, 'breakpoint', None), inverse_count=1))
         previous_time, next_id = float(node.time), next_id + count
     assert next_id == state.max_node_idx + 1 == len(nodes)
     assert active == [n.node_id for n in state.active_lineages]
@@ -189,6 +190,8 @@ def structure(env, state, protocol):
 
 
 def collect(g, protocol, count, seed, fixed=None):
+    if fixed is not None:
+        fixed = [[action_from_dict(a) for a in path] for path in fixed]
     before = rng_fingerprint(g)
     worker, details = CaptureWorker(g.env), {}
     audit = TimedDensityAudit(g)
@@ -215,6 +218,7 @@ def collect(g, protocol, count, seed, fixed=None):
                  log_reward=float(outputs['log_rewards'][i]), reward_constant=float(g.env.reward_fn.C),
                  event_count=length, nonoverlap_coalescences=nonoverlap, events=events,
                  fingerprint=action_fingerprint(path.actions), balance=balance, **structure(g.env, state, protocol))
+        r['actions'] = [action_as_dict(a) for a in path.actions]
         r['log_weight'] = r['log_reward'] + r['log_backward_probability'] - r['log_policy_density']
         if details:
             r['truth_rooted_rf'] = details['per_arg_truth_rooted_rf'][i]
@@ -275,7 +279,7 @@ def prepare_protocol(args):
         candidate_seed_base=91000000, selection_seed=91919191, heldout_sha256=heldout,
         forbidden_fingerprints=sorted(forbidden), replay_overlap_sources=overlap_sources,
         source_sha256={str(f.relative_to(ROOT)): digest(f) for f in
-            [Path(__file__)] + [ROOT/n for n in ['env.py','evo.py','tb_gfn.py','models.py','time_model.py',
+            [Path(__file__)] + [ROOT/n for n in ['env/env.py', 'env/actions.py', 'env/states.py','utils.py','evo.py','tb_gfn.py','models.py','time_model.py',
               'breakpoint_model.py','rollout_worker_arg.py','subtb.py','terminal_evaluation.py',
               'eval/density_fit.py','eval/ess.py','eval/posterior_summary.py']]
             + [AUDITS/'audit_importance.py', AUDITS/'audit_fixed_balance.py']},

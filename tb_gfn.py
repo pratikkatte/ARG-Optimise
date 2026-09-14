@@ -6,7 +6,7 @@ import torch
 
 from models import ARGModel, PackedLineageFeatures
 from subtb import geometric_subtb_loss, subtb_diagnostics, validate_objective
-from env import RecombinationChoice
+from env.actions import CoalescenceChoice, RecombinationChoice
 from rollout_worker_arg import RolloutWorker
 from dataclasses import replace
 from time_env import checkpoint_time_policy, validate_temperature
@@ -812,15 +812,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self._restore_backward_material(parent_state)
 
         active_idx_by_id = self._active_index_by_node_id(parent_state)
-        forward_action = {
-            "event_type": "coal",
-            "active_lineage_i": active_idx_by_id[child_ids[0]],
-            "active_lineage_j": active_idx_by_id[child_ids[1]],
-        }
+        forward_action = CoalescenceChoice(
+            active_lineage_i=active_idx_by_id[child_ids[0]],
+            active_lineage_j=active_idx_by_id[child_ids[1]],
+        )
         parent_state.current_time = self._max_node_time(parent_state)
         delta_t = float(state.current_time) - float(parent_state.current_time)
         rates = self.env.enumerate_prior_options(parent_state).rates
-        forward_action.update(self.env.timing_for_delta(delta_t, rates))
+        forward_action = replace(forward_action, **self.env.timing_for_delta(delta_t, rates))
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 
@@ -841,18 +840,17 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self._restore_backward_material(parent_state)
 
         active_idx_by_id = self._active_index_by_node_id(parent_state)
-        forward_action = {
-            "event_type": "recomb",
-            "active_lineage_i": active_idx_by_id[child_id],
-            "breakpoint": inverse_action["breakpoint"],
-            "span_start": child.material_span[0],
-            "span_end": child.material_span[1],
-            "material_count": child.material_span[2],
-        }
+        forward_action = RecombinationChoice(
+            active_lineage_i=active_idx_by_id[child_id],
+            breakpoint=inverse_action["breakpoint"],
+            span_start=child.material_span[0],
+            span_end=child.material_span[1],
+            material_count=child.material_span[2],
+        )
         parent_state.current_time = self._max_node_time(parent_state)
         delta_t = float(state.current_time) - float(parent_state.current_time)
         rates = self.env.enumerate_prior_options(parent_state).rates
-        forward_action.update(self.env.timing_for_delta(delta_t, rates))
+        forward_action = replace(forward_action, **self.env.timing_for_delta(delta_t, rates))
         self._finalize_backward_parent_state(parent_state, state, forward_action)
         return parent_state, forward_action
 

@@ -1,4 +1,4 @@
-from env import CoalescenceChoice, MaterialSegments, RecombinationChoice
+from env.env import CoalescenceChoice, MaterialSegments, RecombinationChoice
 from breakpoint_model import BreakpointSplitPositionCNN, SparseMixtureBreakpointPolicy
 from time_model import TimeModel, CwrExponentialTimeModel, CwrGammaTimeModel, validate_continuous_time_head
 from time_env import validate_time_policy

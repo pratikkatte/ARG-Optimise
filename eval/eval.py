@@ -32,6 +32,7 @@ from eval.ess import importance_stats, log_importance_weights
 from eval.posterior_summary import (TerminalSamplingEvaluator, compare_ensembles,
     ensemble_truth_metrics, summarize_ensemble, topology_signature, validate_tree_sequence)
 from flow_training import preserve_sampling
+from utils import action_as_dict, action_from_dict
 from infer import environment_from_metadata, load_checkpoint, resolve_device, validate_metadata
 from rollout_worker_arg import RolloutWorker
 from tb_gfn import TBGFlowNetGenerator
@@ -42,7 +43,7 @@ from utils import load_sequences
 METRICS = ('density_fit', 'ess', 'posterior_summary')
 OPTION_KEYS = {'checkpoint', 'metrics', 'output_dir', 'num_samples', 'batch_size', 'repeats',
                'seed', 'device', 'grid_size', 'density_bank', 'bank_per_stratum',
-               'bank_candidates', 'baselines'}
+               'bank_candidates', 'baselines', 'rank_bins'}
 
 
 def digest(path):
@@ -100,9 +101,9 @@ def load_config(path, overrides=None):
         num_samples=settings.get('eval_episodes', 256), batch_size=32,
         repeats=settings.get('terminal_eval_repeats', 3), seed=int(settings.get('seed', 7))+100000,
         device='auto', grid_size=settings.get('terminal_eval_grid_size', 100),
-        density_bank=None, bank_per_stratum=64, bank_candidates=768, baselines={}, output_dir=None)
+        density_bank=None, bank_per_stratum=64, bank_candidates=768, baselines={}, output_dir=None, rank_bins=20)
     options.update(custom)
-    for key in ('num_samples', 'batch_size', 'repeats', 'grid_size', 'bank_per_stratum', 'bank_candidates'):
+    for key in ('num_samples', 'batch_size', 'repeats', 'grid_size', 'bank_per_stratum', 'bank_candidates', 'rank_bins'):
         if isinstance(options[key], bool) or not isinstance(options[key], int) or options[key] < 1:
             raise ValueError(f'evaluation.{key} must be a positive integer')
     if not isinstance(options['seed'], int) or isinstance(options['seed'], bool) or not 0 <= options['seed'] < 2**32:
@@ -274,12 +275,12 @@ def collect(model, count, batch_size, seed, *, fixed=None, prior=False, grid_siz
                 positions = (np.arange(grid_size)+.5)*ts.sequence_length/grid_size
                 topology = [list(topology_signature(ts.at(p), samples)) for p in positions]
                 unique = bool(torch.all(outputs['log_paths_pb'][j] == 0))
-                records.append(dict(actions=path.actions, fingerprint=action_fingerprint(path.actions),
+                records.append(dict(actions=[action_as_dict(a) for a in path.actions], fingerprint=action_fingerprint(path.actions),
                     log_reward=reward, log_prior=log_prior, log_likelihood=likelihood,
                     log_policy_density=float(pf[j]), log_backward_probability=float(pb[j]),
                     log_weight=float(log_importance_weights([reward], [pf[j]], [pb[j]])[0]),
                     reward_constant=offset, event_count=len(path),
-                    recombinations=sum(a['event_type'] == 'recomb' for a in path.actions),
+                    recombinations=sum(a.event_type == 'recomb' for a in path.actions),
                     topology_sha256=object_hash(topology), unique_backward_history=unique,
                     density_space='full_history' if unique else 'trajectory_balance',
                     provenance=dict(source='prior' if prior else 'fixed' if fixed is not None else 'policy', seed=seed)))
@@ -356,7 +357,7 @@ def weight_summary(rows):
     return importance_stats([r['log_weight'] for r in rows], reward_constant=offsets[0])
 
 
-def posterior_report(trees, names, ne, grid_size, truth, baselines):
+def posterior_report(trees, names, ne, grid_size, truth, baselines, rank_bins=20):
     methods = {'gfn': dict(trees=trees, maps=[list(map(int, t.samples())) for t in trees], kind='posterior'), **baselines}
     features, result = {}, dict(methods={}, comparisons={}, unavailable_baselines=[])
     for name, sample in methods.items():
@@ -366,10 +367,20 @@ def posterior_report(trees, names, ne, grid_size, truth, baselines):
                      medoid_index=feature['medoid_index'], medoid_mean_grid_rf=feature['medoid_mean_grid_rf'],
                      covariance=feature['covariance'],
                      mean_pair_tmrca=float(feature['times'].mean()),
-                     truth_status='unavailable' if truth is None else 'ok')
+                     truth_status='unavailable' if truth is None else 'ok',
+                     tmrca_calibration=dict(status='truth_unavailable'))
         if truth is not None:
             metrics, details = ensemble_truth_metrics(sample['trees'], sample['maps'], truth.truth,
-                                                      truth.truth_samples, ne, feature)
+                                                      truth.truth_samples, ne, feature, rank_bins=rank_bins)
+            calibration = details.pop('tmrca_calibration')
+            if sample['kind'] == 'point' or len(sample['trees']) < 2:
+                # Retain legacy descriptive interval coverage, but do not
+                # advertise point estimates as calibrated posterior ensembles.
+                entry['tmrca_calibration'] = dict(status='requires_multiple_draws', kind=sample['kind'])
+                metrics.pop('eval_truth_tmrca_rank_kl')
+                metrics.pop('eval_truth_tmrca_rank_tie_fraction')
+            else:
+                entry['tmrca_calibration'] = dict(calibration, status='ok', kind=sample['kind'])
             entry.update(metrics=metrics, truth_details=details)
         result['methods'][name] = entry
     if 'singer' in features and baselines['singer']['kind'] == 'posterior':
@@ -381,7 +392,9 @@ def posterior_report(trees, names, ne, grid_size, truth, baselines):
     result['protocol'] = dict(sample_names=names, positions=features['gfn']['positions'].tolist(),
         pairs=[list(p) for p in features['gfn']['pairs']], time_units='2 Ne', time_divisor=2*ne,
         truth_weighting='Exact genomic spans, equal haplotype-pair weights',
-        reference_weighting='Equal genomic midpoint-grid and haplotype-pair weights')
+        reference_weighting='Equal genomic midpoint-grid and haplotype-pair weights',
+        rank_bins=rank_bins, coverage_levels=[.5, .7, .9],
+        calibration_scope='Truth-based summaries of this dataset; Relate ensembles describe conditional time uncertainty')
     return result
 
 
@@ -395,7 +408,71 @@ def flatten_scalars(value, prefix=''):
     return result
 
 
+def write_calibration_report(folder, result):
+    """Export all repeat/pooled summaries; plot the pooled posterior ensembles."""
+    summaries = [(f"repeat_{r['repeat']}", r['metrics'].get('posterior_summary')) for r in result['repeats']]
+    summaries.append(('pooled', result.get('posterior_summary')))
+    rank_rows, coverage_rows, pooled = [], [], []
+    for population, summary in summaries:
+        for name, entry in (summary or {}).get('methods', {}).items():
+            calibration = entry.get('tmrca_calibration', {})
+            if calibration.get('status') != 'ok':
+                continue
+            rank = calibration['rank_histogram']
+            shared = dict(population=population, method=name, kind=entry['kind'], draw_count=entry['draw_count'])
+            for index, (probability, uniform) in enumerate(zip(rank['probabilities'], rank['uniform_probabilities'])):
+                rank_rows.append(dict(shared, bin_index=index,
+                    rank_min=int(rank['bin_edges'][index]+.5), rank_max=int(rank['bin_edges'][index+1]-.5),
+                    probability=probability, uniform_probability=uniform,
+                    kl_from_uniform_nats=rank['kl_from_uniform'], tie_cell_fraction=rank['tie_cell_fraction']))
+            for interval in calibration['interval_coverage']['intervals']:
+                coverage_rows.append(dict(shared, **{key: interval[key] for key in
+                    ('level', 'coverage', 'coverage_error', 'mean_width', 'lower_quantile', 'upper_quantile')},
+                    time_units='2 Ne'))
+            if population == 'pooled':
+                pooled.append((name, entry, calibration))
+    for filename, rows in [('tmrca_ranks.csv', rank_rows), ('interval_coverage.csv', coverage_rows)]:
+        if rows:
+            with (folder/filename).open('w', newline='') as handle:
+                writer = csv.DictWriter(handle, list(rows[0])); writer.writeheader(); writer.writerows(rows)
+    if not pooled:
+        return ['TMRCA calibration unavailable: simulated truth and multiple ARG draws are required.', '']
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, len(pooled), figsize=(5*len(pooled), 4), squeeze=False)
+    for ax, (name, entry, calibration) in zip(axes[0], pooled):
+        rank = calibration['rank_histogram']
+        edges = (np.asarray(rank['bin_edges'])+.5)/(rank['draw_count']+1)
+        ax.bar(edges[:-1], rank['probabilities'], width=np.diff(edges), align='edge', alpha=.7, label='Observed')
+        ax.stairs(rank['uniform_probabilities'], edges, color='black', linestyle='--', label='Uniform-rank reference')
+        ax.set(xlabel='Normalized rank category', ylabel='Span-weighted probability',
+               title=f"{name} ({entry['kind']})\nKL = {rank['kl_from_uniform']:.4g} nats")
+        ax.legend(fontsize='small')
+    fig.tight_layout(); fig.savefig(folder/'tmrca_ranks.png', dpi=160); plt.close(fig)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot([0, 1], [0, 1], 'k--', label='Nominal coverage')
+    lines = ['| Method | Rank KL (nats) | 50% coverage | 70% coverage | 90% coverage |',
+             '|---|---:|---:|---:|---:|']
+    for name, entry, calibration in pooled:
+        intervals = calibration['interval_coverage']['intervals']
+        ax.plot([i['level'] for i in intervals], [i['coverage'] for i in intervals], 'o-',
+                label=f"{name} ({entry['kind']})")
+        coverages = ' | '.join(f"{i['coverage']:.3%}" for i in intervals)
+        lines.append(f"| {name} ({entry['kind']}) | {calibration['rank_histogram']['kl_from_uniform']:.6g} | {coverages} |")
+    ax.set(xlabel='Nominal interval level', ylabel='Span-weighted truth coverage', xlim=(0, 1), ylim=(0, 1))
+    ax.legend(fontsize='small')
+    fig.tight_layout(); fig.savefig(folder/'interval_coverage.png', dpi=160); plt.close(fig)
+    return lines + ['', 'These describe one dataset. Linked positions/pairs are dependent; sampling repeats '
+                    'do not replace independently simulated datasets for calibration. '
+                    'KL is descriptive, with no independent-observation significance test. '
+                    'Exact ties are averaged over possible ranks and their fraction is recorded in the CSV. '
+                    'Relate ensembles describe conditional branch-time uncertainty.', '',
+                    '[Rank histogram and KL CSV](tmrca_ranks.csv) · [Coverage CSV](interval_coverage.csv)', '']
+
+
 def write_report(folder, result, fixed_rows, fresh_rows):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
     rows = [dict(population='pooled', **flatten_scalars(result['pooled']))]
     rows.extend(dict(population=f"repeat_{r['repeat']}", **flatten_scalars(r['metrics'])) for r in result['repeats'])
     if result.get('density_fit'):
@@ -422,11 +499,9 @@ def write_report(folder, result, fixed_rows, fresh_rows):
             m = entry.get('metrics', {})
             lines.append(f"| {name} | {m.get('eval_truth_pair_tmrca_rmse', 'unavailable')} | {m.get('eval_truth_rooted_rf_mean', 'unavailable')} | {m.get('eval_truth_rooted_rf_medoid', 'unavailable')} |")
         lines.extend(['', 'Unavailable baselines: '+', '.join(result['posterior_summary']['unavailable_baselines']), ''])
+        lines.extend(write_calibration_report(folder, result))
     lines.extend(['[Machine-readable results](results.json) · [Metrics CSV](metrics.csv)', ''])
     (folder/'report.md').write_text('\n'.join(lines))
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
     if fixed_rows:
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
         for ax, kind in zip(axes, ('raw', 'prior_relative')):
@@ -482,7 +557,7 @@ def _run_evaluation(options):
                     source_sha256={str(p.relative_to(ROOT)): digest(p) for p in
                                    [*sorted((ROOT/'eval').glob('*.py')),
                                     *[ROOT/name for name in ('rollout_worker_arg.py', 'infer.py',
-                                       'env.py', 'evo.py', 'tb_gfn.py', 'models.py', 'time_model.py',
+                                       'env/env.py', 'env/actions.py', 'env/states.py', 'evo.py', 'tb_gfn.py', 'models.py', 'time_model.py',
                                        'time_env.py', 'breakpoint_model.py', 'trajectory_buffer.py',
                                        'training_exploration.py', 'flow_training.py', 'utils.py',
                                        'lineage_features.py', 'flow_encoder.py', 'flow_likelihood.py')]]})
@@ -503,7 +578,7 @@ def _run_evaluation(options):
     if bank_path:
         print(f'Scoring {len(bank["records"])} frozen histories', flush=True)
         fixed_rows, _ = collect(model, len(bank['records']), options['batch_size'],
-            (options['seed']+900007) % 2**32, fixed=[r['actions'] for r in bank['records']], grid_size=options['grid_size'])
+            (options['seed']+900007) % 2**32, fixed=[[action_from_dict(a) for a in r['actions']] for r in bank['records']], grid_size=options['grid_size'])
         for actual, saved in zip(fixed_rows, bank['records']):
             if actual['fingerprint'] != saved['fingerprint']:
                 raise ValueError('Rescored history actions differ from the frozen bank')
@@ -526,7 +601,7 @@ def _run_evaluation(options):
         if 'ess' in options['metrics']: scores['ess'] = weight_summary(current)
         if 'posterior_summary' in options['metrics']:
             scores['posterior_summary'] = posterior_report(sampled, names, model.env.population_size,
-                                                           options['grid_size'], truth, baselines)
+                                                           options['grid_size'], truth, baselines, options['rank_bins'])
         repeats.append(dict(repeat=repeat, seed=seed, metrics=scores))
         write_json(folder/f'repeat_{repeat:03d}/scores.json.gz', current)
         rows.extend(current); trees.extend(sampled)
@@ -535,7 +610,7 @@ def _run_evaluation(options):
         pooled['ess'] = weight_summary(rows)
         pooled['ess_repeat_mean'] = float(np.mean([r['metrics']['ess']['ess_fraction'] for r in repeats]))
         pooled['ess_repeat_sd'] = float(np.std([r['metrics']['ess']['ess_fraction'] for r in repeats], ddof=0))
-    posterior = (posterior_report(trees, names, model.env.population_size, options['grid_size'], truth, baselines)
+    posterior = (posterior_report(trees, names, model.env.population_size, options['grid_size'], truth, baselines, options['rank_bins'])
                  if 'posterior_summary' in options['metrics'] else None)
     result = dict(complete=False, checkpoint=str(checkpoint), checkpoint_sha256=checkpoint_hash,
         step=step, protocol_sha256=protocol_hash, output_dir=str(folder),
@@ -558,7 +633,7 @@ def main(argv=None):
     parser.add_argument('--config', required=True)
     for flag in ('checkpoint', 'output-dir', 'density-bank', 'device'):
         parser.add_argument('--'+flag)
-    for flag in ('num-samples', 'batch-size', 'repeats', 'seed', 'grid-size', 'bank-per-stratum', 'bank-candidates'):
+    for flag in ('num-samples', 'batch-size', 'repeats', 'seed', 'grid-size', 'bank-per-stratum', 'bank-candidates', 'rank-bins'):
         parser.add_argument('--'+flag, type=int)
     parser.add_argument('--metrics', nargs='+', choices=METRICS)
     args = vars(parser.parse_args(argv))

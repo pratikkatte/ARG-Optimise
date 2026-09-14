@@ -13,11 +13,13 @@ import random
 
 import numpy as np
 
+from utils import action_as_dict, action_from_dict
+
 from eval.posterior_summary import topology_signature, mean_pairwise_rf
 
 
 def action_text(actions):
-    return json.dumps(actions, sort_keys=True, separators=(',', ':'), allow_nan=False)
+    return json.dumps([action_as_dict(a) for a in actions], sort_keys=True, separators=(',', ':'), allow_nan=False)
 
 
 def action_fingerprint(actions):
@@ -42,7 +44,7 @@ class ReplayEntry:
     added_step: int
 
     def actions(self):
-        return json.loads(self.actions_json)
+        return [action_from_dict(a) for a in json.loads(self.actions_json)]
 
 
 class DiverseTrajectoryBuffer:

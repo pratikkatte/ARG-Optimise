@@ -4,7 +4,7 @@ These trajectories are generated for training. No evaluation paths or cached
 policy/flow scores enter this module.
 """
 import torch
-from env import SimpleTrajectory
+from env.env import SimpleTrajectory
 
 
 @torch.no_grad()
