@@ -405,72 +405,62 @@ class ARGModel(nn.Module):
         log_p = self.logsoftmax(logits)
         return log_p[batch_idx, action_indices]
 
-    def _batched_action_features(self, actions, batch_idx, lineage_reps, summary_reps):
-        num_actions = len(actions)
-        embedding_size = lineage_reps.shape[-1]
-
-        primary_rep = lineage_reps.new_zeros(num_actions, embedding_size)
-        secondary_rep = lineage_reps.new_zeros(num_actions, embedding_size)
-        tertiary_rep = lineage_reps.new_zeros(num_actions, embedding_size)
-
-        coal_rows = [(row_idx, action.active_lineage_i, action.active_lineage_j) for row_idx, action in enumerate(actions) if isinstance(action, CoalescenceChoice)]
-        if coal_rows:
-            rows, left_indices, right_indices = zip(*coal_rows)
-            rows = torch.tensor(rows, dtype=torch.long, device=self.device)
-            left_indices = torch.tensor(left_indices, dtype=torch.long, device=self.device)
-            right_indices = torch.tensor(right_indices, dtype=torch.long, device=self.device)
-            left_rep = lineage_reps[batch_idx, left_indices]
-            right_rep = lineage_reps[batch_idx, right_indices]
-            primary_rep[rows] = left_rep + right_rep
-            secondary_rep[rows] = torch.abs(left_rep - right_rep)
-            tertiary_rep[rows] = left_rep * right_rep
-
-        recomb_rows = [(row_idx, action.active_lineage_i) for row_idx, action in enumerate(actions) if isinstance(action, RecombinationChoice)]
-
-        if recomb_rows:
-            rows, lineage_indices = zip(*recomb_rows)
-            rows = torch.tensor(rows, dtype=torch.long, device=self.device)
-            lineage_indices = torch.tensor(lineage_indices, dtype=torch.long, device=self.device)
-            primary_rep[rows] = lineage_reps[batch_idx, lineage_indices]
-
-        summary_for_actions = summary_reps[batch_idx].expand(num_actions, -1)
-        return torch.cat([
-            primary_rep,
-            secondary_rep,
-            tertiary_rep,
-            summary_for_actions,
-        ], dim=-1)
-
     def _score_candidates(
         self,
         candidate_actions,
         lineage_reps,
         summary_reps
         ):
+        """Build candidate features across states with one index transfer.
+
+        Group rows by event type for batched gathers, then scatter features
+        back to their original state/candidate positions before scoring.
+        """
         batch_size = len(candidate_actions)
         max_candidates = max(len(actions) for actions in candidate_actions)
+        embedding_size = lineage_reps.shape[-1]
         feat_dim = self.seq_embedding.out_features * 4
         features = lineage_reps.new_zeros(batch_size, max_candidates, feat_dim)
 
-        candidate_counts = []
-
+        coal_rows, recomb_rows, other_rows = [], [], []
         for batch_idx, actions in enumerate(candidate_actions):
-            n = len(actions)
-            candidate_counts.append(n)
-            state_action_features  = self._batched_action_features(
-                actions,
-                batch_idx,
-                lineage_reps,
-                summary_reps
-            )
-            features[batch_idx, :n] = state_action_features
+            for row_idx, action in enumerate(actions):
+                if isinstance(action, CoalescenceChoice):
+                    coal_rows.append((batch_idx, row_idx,
+                                      action.active_lineage_i, action.active_lineage_j))
+                elif isinstance(action, RecombinationChoice):
+                    recomb_rows.append((batch_idx, row_idx, action.active_lineage_i, 0))
+                else:
+                    # Preserve the summary-only features of unrecognized actions.
+                    other_rows.append((batch_idx, row_idx, 0, 0))
+
+        indices = torch.tensor(coal_rows + recomb_rows + other_rows,
+                               dtype=torch.long, device=lineage_reps.device).reshape(-1, 4)
+        coal_count = len(coal_rows)
+        recomb_end = coal_count + len(recomb_rows)
+        coal = indices[:coal_count]
+        recomb = indices[coal_count:recomb_end]
+        left = lineage_reps[coal[:, 0], coal[:, 2]]
+        right = lineage_reps[coal[:, 0], coal[:, 3]]
+        recombined = lineage_reps[recomb[:, 0], recomb[:, 2]]
+        other_zeros = lineage_reps.new_zeros(len(other_rows), embedding_size)
+        noncoal_zeros = lineage_reps.new_zeros(len(recomb_rows) + len(other_rows), embedding_size)
+        packed_features = torch.cat([
+            torch.cat([left + right, recombined, other_zeros], dim=0),
+            torch.cat([torch.abs(left - right), noncoal_zeros], dim=0),
+            torch.cat([left * right, noncoal_zeros], dim=0),
+            summary_reps[indices[:, 0]],
+        ], dim=-1)
+        batch_indices, candidate_indices = indices[:, 0], indices[:, 1]
+        features[batch_indices, candidate_indices] = packed_features
+        valid = torch.zeros(batch_size, max_candidates, dtype=torch.bool,
+                            device=lineage_reps.device)
+        valid[batch_indices, candidate_indices] = True
         # Keep both axes even when every state has exactly one candidate.
         # Squeezing [B, 1] into [B] makes the [B, 1] mask broadcast it to
         # [B, B], mixing other states' scores into the action normalization.
         logits = self.action_scorer(features.reshape(-1, feat_dim)).reshape(batch_size, max_candidates)
 
-        counts = torch.tensor(candidate_counts, device=self.device)
-        valid = torch.arange(max_candidates, device=self.device).unsqueeze(0) < counts.unsqueeze(1)
         masked_logits = logits.masked_fill(~valid, float("-inf"))
         return masked_logits, features
 

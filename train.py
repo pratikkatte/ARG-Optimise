@@ -5,6 +5,7 @@ import os
 import pickle
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -502,13 +503,20 @@ def train(
 
     try:
         for epoch in range(epochs_num):
+            if generator.device.type == 'cuda':
+                torch.cuda.synchronize(generator.device)
+            epoch_start = time.perf_counter()
             info = trainer.train_epoch(epoch + 1, batch_size, grad_accum_steps)
+            if generator.device.type == 'cuda':
+                torch.cuda.synchronize(generator.device)
+            train_seconds = time.perf_counter() - epoch_start
             log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
             if info is None:
                 continue
 
             info = dict(info)
             info["epoch"] = epoch
+            info['train_seconds'] = train_seconds
             info['source_log_flow' if generator.neural_source_flow else 'log_z'] = log_z
             should_eval = int(eval_episodes) > 0 and (
                 (epoch == 0 and not terminal_eval)
@@ -569,6 +577,10 @@ def train(
                 generator.save(path, metadata={**metadata, **warmup_metrics,
                     **{key: value for key, value in info.items() if key.startswith('eval_')}})
                 info['checkpoint_path'] = path
+            if generator.device.type == 'cuda':
+                torch.cuda.synchronize(generator.device)
+            # Includes evaluation and checkpoints; excludes history/log output below.
+            info['epoch_seconds'] = time.perf_counter() - epoch_start
             history.append(info)
             if 'checkpoint_path' in info:
                 with open(os.path.join(output_path, 'training_history.pkl'), 'wb') as handle:
@@ -579,7 +591,8 @@ def train(
 
             eval_text = ''.join(f" eval_{name}_loss={info['eval_' + name + '_loss']:.4f}"
                                 for name in log_loss if 'eval_' + name + '_loss' in info)
-            print(f"Epoch {epoch + 1} loss={loss:.4f} source_log_flow={log_z:.4f}{eval_text}")
+            print(f"Epoch {epoch + 1} loss={loss:.4f} source_log_flow={log_z:.4f}"
+                  f" time={info['epoch_seconds']:.2f}s train={train_seconds:.2f}s{eval_text}")
 
         with open(os.path.join(output_path, "training_history.pkl"), "wb") as handle:
             pickle.dump(history, handle)
