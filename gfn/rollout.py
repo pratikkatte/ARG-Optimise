@@ -79,19 +79,16 @@ class RolloutWorker:
                 total_log_pf, log_probs, choosen_actions = generator(
                     input_dict, **({'forced_actions': forced} if forced is not None else {}))
 
+            log_priors = [
+                self.env.compute_cwr_event_log_prior(state, self.env.enumerate_actions(state), action)
+                for state, action in zip(active_states, choosen_actions)
+            ]
+            next_states = self.env.apply_actions(active_states, choosen_actions, log_priors)
             for batch_idx, traj_idx in enumerate(unfinished):
-                state = states[traj_idx]
-                coal_actions, recomb_actions = self.env.enumerate_actions(state)
-
                 action = choosen_actions[batch_idx]
                 log_paths_pf_by_traj[traj_idx].append(total_log_pf[batch_idx])
-                log_prior = self.env.compute_cwr_event_log_prior(state, (coal_actions, recomb_actions), action)
-
-                next_state = self.env.apply_action(
-                    state,
-                    action,
-                    log_prior=log_prior,
-                )
+                log_prior = log_priors[batch_idx]
+                next_state = next_states[batch_idx]
                 states[traj_idx] = next_state
                 trajectories[traj_idx].update(
                     action,

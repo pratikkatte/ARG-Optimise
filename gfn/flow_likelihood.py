@@ -78,3 +78,51 @@ class PartialLikelihoodTracker:
         state.partial_log_likelihood = self.initial_log_likelihood + sum(
             node.likelihood_log_increment for node in state.all_nodes.values()
         )
+
+    def parent_values_batch(self, specs):
+        """Return (partials, increment) for independent (time, material, children).
+
+        Group by child count to keep the scalar pruning order. All increments
+        share one device-to-host transfer instead of synchronizing per parent.
+        """
+        if self.env.sequences is None:
+            return [(None, 0.0) for _ in specs]
+        if not specs:
+            return []
+        results = [None] * len(specs)
+        increment_batches, result_indices = [], []
+        evo = self.env.evolution_model
+        for child_count in sorted({len(children) for _, _, children in specs}):
+            indices = [i for i, (_, _, children) in enumerate(specs) if len(children) == child_count]
+            group = [specs[i] for i in indices]
+            combined = torch.ones(len(group), self.env.sequence_length, 4,
+                                  dtype=torch.float64, device=self.env.device)
+            for slot in range(child_count):
+                children = [children[slot] for _, _, children in group]
+                if any(child.likelihood_partials is None for child in children):
+                    raise ValueError("Missing incremental likelihood partials for an active lineage")
+                times = [float(time) - float(child.time)
+                         for (time, _, _), child in zip(group, children)]
+                if any(time <= 0 for time in times):
+                    raise ValueError("Likelihood branches require increasing node times")
+                # Match parent(): float64 transition coefficients computed on the host.
+                decays = [math.exp(-4.0 * (time * evo._branch_length_scale) / 3.0) for time in times]
+                coefficients = combined.new_tensor([(0.25 - 0.25 * d, 0.25 + 0.75 * d) for d in decays])
+                transitions = coefficients[:, 0, None, None].expand(-1, 4, 4).clone()
+                transitions.diagonal(dim1=1, dim2=2).copy_(coefficients[:, 1, None])
+                partials = torch.stack([child.likelihood_partials for child in children])
+                transitioned = torch.bmm(partials.clamp_min(1e-300), transitions.transpose(1, 2))
+                mask = evo.material_masks_batch([child.material_segments for child in children],
+                                                site_resolution=True)
+                combined = combined * torch.where(mask[:, :, None], transitioned, 1.0)
+            mask = evo.material_masks_batch([material for _, material, _ in group], site_resolution=True)
+            norm = combined.sum(-1).clamp_min(1e-300)
+            increment_batches.append(torch.where(mask, norm.log(), 0.0).sum(-1))
+            partials = torch.where(mask[:, :, None], combined / norm[:, :, None], 0.0)
+            for index, value in zip(indices, partials.unbind()):
+                results[index] = value
+            result_indices.extend(indices)
+        increments = torch.cat(increment_batches).detach().cpu().tolist()
+        for index, increment in zip(result_indices, increments):
+            results[index] = (results[index], increment)
+        return results

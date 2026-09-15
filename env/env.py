@@ -283,6 +283,45 @@ class SimpleARGEnvironment:
         masked = self.evolution_model.mask_partials(transitioned, parent_segments)
         return self.evolution_model.normalize_partials(masked)
 
+    def _parent_partials_batch(self, specs):
+        """Calculate block features for independent (time, material, children)."""
+        results = [None] * len(specs)
+        evo = self.evolution_model
+
+        def normalize(partials):
+            sums = partials.sum(-1, keepdim=True)
+            return torch.where(sums > 0, partials / sums.clamp_min(1e-12),
+                               torch.zeros_like(partials))
+
+        for child_count in (1, 2):
+            indices = [i for i, (_, _, children) in enumerate(specs) if len(children) == child_count]
+            if not indices:
+                continue
+            group = [specs[i] for i in indices]
+            combined = None
+            for slot in range(child_count):
+                children = [children[slot] for _, _, children in group]
+                times = [float(time) - float(child.time)
+                         for (time, _, _), child in zip(group, children)]
+                if any(time <= 0 for time in times):
+                    raise ValueError("ARG node times must increase from child to parent")
+                partials = torch.stack([self._require_lineage_partials(child) for child in children])
+                transitioned = evo.transition_partials_batch(partials, times)
+                if child_count == 1:
+                    combined = transitioned
+                else:
+                    transitioned = normalize(transitioned)
+                    mask = evo.material_masks_batch([child.material_segments for child in children])
+                    child_partials = transitioned * mask[:, :, None]
+                    if combined is None:
+                        combined = torch.ones_like(transitioned)
+                    combined = torch.where(mask[:, :, None], combined * child_partials, combined)
+            mask = evo.material_masks_batch([material for _, material, _ in group])
+            parent_partials = normalize(combined * mask[:, :, None])
+            for index, value in zip(indices, parent_partials.unbind()):
+                results[index] = value
+        return results
+
     def get_active_counts(self, state):
         if not state.active_lineages:
             return np.zeros(self.num_blocks, dtype=int)
@@ -495,7 +534,7 @@ class SimpleARGEnvironment:
             raise ValueError("non-finite continuous accumulated prior or reward")
         return next_state
 
-    def apply_coalescence(self, state, action, log_prior=None):
+    def apply_coalescence(self, state, action, log_prior=None, *, _prepared=None):
 
         rates = self._get_state_rates(state)
 
@@ -509,14 +548,14 @@ class SimpleARGEnvironment:
         parent_id = next_state.max_node_idx + 1
         parent_segments = child_i.material_segments.union(child_j.material_segments)
         overlap_count = child_i.material_segments.intersection_count(child_j.material_segments)
-        parent_time = self.resolve_event_time(state, action, rates)
+        parent_time = self.resolve_event_time(state, action, rates) if _prepared is None else _prepared[0]
         next_state.current_time = parent_time
         parent_partials = self._coalesced_parent_partials(
             child_i,
             child_j,
             parent_segments,
             parent_time,
-        )
+        ) if _prepared is None else _prepared[1][0]
         parent = ARGLineage(
             node_id=parent_id,
             children=[child_i.node_id, child_j.node_id],
@@ -532,7 +571,12 @@ class SimpleARGEnvironment:
         child_i.parents.append(parent.node_id)
         child_j.parents.append(parent.node_id)
         if self.flow_likelihood is not None and next_state.partial_log_likelihood is not None:
-            next_state.partial_log_likelihood += self.flow_likelihood.parent(parent, [child_i, child_j])
+            if _prepared is None:
+                increment = self.flow_likelihood.parent(parent, [child_i, child_j])
+            else:
+                parent.likelihood_partials, increment = _prepared[2][0]
+                parent.likelihood_log_increment = increment
+            next_state.partial_log_likelihood += increment
         child_i.partials = None
         child_j.partials = None
         child_i.likelihood_partials = child_j.likelihood_partials = None
@@ -550,7 +594,7 @@ class SimpleARGEnvironment:
             next_state.total_active_blocks = int(next_state.total_active_blocks) - overlap_count
         return self._finalize_transition_state(next_state, log_prior)
 
-    def apply_recombination(self, state, action, log_prior=None):
+    def apply_recombination(self, state, action, log_prior=None, *, _prepared=None):
         rates = self._get_state_rates(state)
 
         next_state = state.clone(copy_partials=False)
@@ -561,11 +605,14 @@ class SimpleARGEnvironment:
 
         left_parent_id = next_state.max_node_idx + 1
         right_parent_id = next_state.max_node_idx + 2
-        event_time = self.resolve_event_time(state, action, rates)
+        event_time = self.resolve_event_time(state, action, rates) if _prepared is None else _prepared[0]
         next_state.current_time = event_time
-        transitioned = self._transition_lineage_partials(child, event_time)
-        left_partials = self._recombined_parent_partials(transitioned, left_segments)
-        right_partials = self._recombined_parent_partials(transitioned, right_segments)
+        if _prepared is None:
+            transitioned = self._transition_lineage_partials(child, event_time)
+            left_partials = self._recombined_parent_partials(transitioned, left_segments)
+            right_partials = self._recombined_parent_partials(transitioned, right_segments)
+        else:
+            left_partials, right_partials = _prepared[1]
         left_parent = ARGLineage(
             node_id=left_parent_id,
             children=[child.node_id],
@@ -595,8 +642,13 @@ class SimpleARGEnvironment:
 
         child.parents = [left_parent.node_id, right_parent.node_id]
         if self.flow_likelihood is not None and next_state.partial_log_likelihood is not None:
-            next_state.partial_log_likelihood += self.flow_likelihood.parent(left_parent, [child])
-            next_state.partial_log_likelihood += self.flow_likelihood.parent(right_parent, [child])
+            for index, parent in enumerate((left_parent, right_parent)):
+                if _prepared is None:
+                    increment = self.flow_likelihood.parent(parent, [child])
+                else:
+                    parent.likelihood_partials, increment = _prepared[2][index]
+                    parent.likelihood_log_increment = increment
+                next_state.partial_log_likelihood += increment
         child.partials = None
         child.likelihood_partials = None
         next_state.all_nodes[child.node_id] = child
@@ -624,6 +676,47 @@ class SimpleARGEnvironment:
             )
         else:
             raise ValueError(f"Unknown action event_type: {action}")
+
+    def apply_actions(self, states, actions, log_priors=None):
+        """Apply one action per state, batching independent tensor calculations.
+
+        The scalar transition methods still assemble topology and compute exact
+        terminal rewards. Prepared tensors belong only to this call; no mutable
+        state or learned values are cached across rollout steps.
+        """
+        if log_priors is None:
+            log_priors = [None] * len(states)
+        if len(states) != len(actions) or len(states) != len(log_priors):
+            raise ValueError("Expected one action and log prior per state")
+        specs, spans, tracked_indices = [], [], []
+        for state, action in zip(states, actions):
+            time = self.resolve_event_time(state, action, self._get_state_rates(state))
+            start = len(specs)
+            if isinstance(action, CoalescenceChoice):
+                children = [state.active_lineages[action.active_lineage_i],
+                            state.active_lineages[action.active_lineage_j]]
+                material = children[0].material_segments.union(children[1].material_segments)
+                specs.append((time, material, children))
+            elif isinstance(action, RecombinationChoice):
+                child = state.active_lineages[action.active_lineage_i]
+                for material in child.material_segments.split(action.breakpoint):
+                    specs.append((time, material, [child]))
+            else:
+                raise ValueError(f"Unknown action event_type: {action}")
+            spans.append((time, start, len(specs)))
+            wh
+        partials = self._parent_partials_batch(specs)
+        likelihoods = [None] * len(specs)
+        if tracked_indices:
+            values = self.flow_likelihood.parent_values_batch([specs[i] for i in tracked_indices])
+            for index, value in zip(tracked_indices, values):
+                likelihoods[index] = value
+        results = []
+        for state, action, prior, (time, start, end) in zip(states, actions, log_priors, spans):
+            apply = self.apply_coalescence if isinstance(action, CoalescenceChoice) else self.apply_recombination
+            results.append(apply(state, action, prior,
+                                 _prepared=(time, partials[start:end], likelihoods[start:end])))
+        return results
 
     def _get_state_rates(self, state, actions=None):
         """Compute and cache rates when the state has none."""

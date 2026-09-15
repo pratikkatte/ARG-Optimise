@@ -152,6 +152,26 @@ class EvolutionModelTorch(torch.nn.Module):
 
         return weights
 
+    def material_masks_batch(self, segments, *, site_resolution=False):
+        """Build interval masks on the host and transfer the whole batch once."""
+        width = self.env.sequence_length if site_resolution else self.env.num_blocks
+        masks = np.zeros((len(segments), width), dtype=np.bool_)
+        for row, material in enumerate(segments):
+            for left, right in material.segments:
+                if site_resolution:
+                    left, right = self._block_to_site(left), self._block_to_site(right)
+                masks[row, max(0, left):min(width, right)] = True
+        return torch.as_tensor(masks, device=self.env.device)
+
+    def transition_partials_batch(self, partials, edge_times):
+        """Apply the same JC69 branch calculation to a batch of partial arrays."""
+        times = torch.as_tensor(edge_times, dtype=partials.dtype, device=partials.device)
+        branch_lengths = times * self._branch_length_scale
+        decay = torch.exp(-4.0 * branch_lengths / 3.0)[:, None, None]
+        eye = torch.eye(4, dtype=partials.dtype, device=partials.device)
+        transitions = eye * (0.25 + 0.75 * decay) + (1.0 - eye) * (0.25 - 0.25 * decay)
+        return torch.bmm(partials, transitions.transpose(1, 2))
+
     def mask_partials(self, partials, material_segments):
         """Zero out blocks where this lineage carries no ancestral material."""
         partials = self._as_partials_tensor(partials)
