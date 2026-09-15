@@ -98,10 +98,13 @@ class EvolutionModelTorch(torch.nn.Module):
     def _seq_arrays_numpy(self):
         return self.env.seq_arrays.detach().cpu().numpy().astype(float, copy=False)
 
+    def _jc69_transition_probabilities(self, edge_length):
+        """Float64 JC69 coefficients without cancellation on short branches."""
+        diff_prob = -0.25 * math.expm1(-4.0 * float(edge_length) / 3.0)
+        return 1.0 - 3.0 * diff_prob, diff_prob
+
     def _jc69_transition_matrix(self, edge_length):
-        decay = math.exp(-4.0 * float(edge_length) / 3.0)
-        same_prob = 0.25 + 0.75 * decay
-        diff_prob = 0.25 - 0.25 * decay
+        same_prob, diff_prob = self._jc69_transition_probabilities(edge_length)
         transition_matrix = np.full((4, 4), diff_prob, dtype=float)
         np.fill_diagonal(transition_matrix, same_prob)
         return transition_matrix

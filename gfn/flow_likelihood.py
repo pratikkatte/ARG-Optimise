@@ -48,9 +48,9 @@ class PartialLikelihoodTracker:
             if edge_time <= 0:
                 raise ValueError("Likelihood branches require increasing node times")
             branch_length = edge_time * self.env.evolution_model._branch_length_scale
-            decay = math.exp(-4.0 * branch_length / 3.0)
-            transition = combined.new_full((4, 4), 0.25 - 0.25 * decay)
-            transition.diagonal().fill_(0.25 + 0.75 * decay)
+            same, different = self.env.evolution_model._jc69_transition_probabilities(branch_length)
+            transition = combined.new_full((4, 4), different)
+            transition.diagonal().fill_(same)
             transitioned = child.likelihood_partials.clamp_min(1e-300) @ transition.T
             mask = self.mask(child.material_segments)
             combined *= torch.where(mask[:, None], transitioned, 1.0)
@@ -106,10 +106,10 @@ class PartialLikelihoodTracker:
                 if any(time <= 0 for time in times):
                     raise ValueError("Likelihood branches require increasing node times")
                 # Match parent(): float64 transition coefficients computed on the host.
-                decays = [math.exp(-4.0 * (time * evo._branch_length_scale) / 3.0) for time in times]
-                coefficients = combined.new_tensor([(0.25 - 0.25 * d, 0.25 + 0.75 * d) for d in decays])
-                transitions = coefficients[:, 0, None, None].expand(-1, 4, 4).clone()
-                transitions.diagonal(dim1=1, dim2=2).copy_(coefficients[:, 1, None])
+                coefficients = combined.new_tensor([
+                    evo._jc69_transition_probabilities(time * evo._branch_length_scale) for time in times])
+                transitions = coefficients[:, 1, None, None].expand(-1, 4, 4).clone()
+                transitions.diagonal(dim1=1, dim2=2).copy_(coefficients[:, 0, None])
                 partials = torch.stack([child.likelihood_partials for child in children])
                 transitioned = torch.bmm(partials.clamp_min(1e-300), transitions.transpose(1, 2))
                 mask = evo.material_masks_batch([child.material_segments for child in children],

@@ -215,8 +215,7 @@ class SimpleARGEnvironment:
         if track_likelihood and self.flow_likelihood is not None:
             self.flow_likelihood.initialize(state)
         if state.is_done:
-            log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
-            state.log_reward = self.compute_terminal_log_reward(state, log_likelihood)
+            state.log_reward = self.compute_terminal_log_reward(state)
         return state
 
     def _initial_lineage_partials(self, node_id, material_segments):
@@ -474,11 +473,22 @@ class SimpleARGEnvironment:
         return float(block_index) * float(self.sequence_length) / float(self.num_blocks)
 
     def compute_terminal_log_reward(self, state, log_likelihood=None):
-        """Return the posterior terminal target for a completed ARG."""
+        """Return the posterior target, reusing a tracked terminal likelihood.
+
+        Untracked states still use independent marginal-tree pruning. At zero
+        mutation, impossible observations activate normalization-dependent
+        probability floors; retain that independent reward convention there.
+        An explicit likelihood remains available for independent validation.
+        """
         if not self.is_terminal(state):
             raise ValueError("terminal reward requires a terminal ARGState")
         if log_likelihood is None:
-            log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
+            tracked = state.partial_log_likelihood
+            if (tracked is not None and math.isfinite(tracked)
+                    and self.evolution_model._branch_length_scale > 0):
+                log_likelihood = tracked
+            else:
+                log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
         log_reward = self.reward_fn(log_likelihood, state.accumulated_log_prior)
         return log_reward
 
@@ -523,8 +533,7 @@ class SimpleARGEnvironment:
             next_state.accumulated_log_prior += log_prior
         next_state.is_done = self.is_terminal(next_state)
         if next_state.is_done:
-            log_likelihood = self.evolution_model.compute_arg_log_likelihood(next_state)
-            next_state.log_reward = self.compute_terminal_log_reward(next_state, log_likelihood)
+            next_state.log_reward = self.compute_terminal_log_reward(next_state)
         else:
             next_state.log_reward = None
         if (
@@ -704,7 +713,8 @@ class SimpleARGEnvironment:
             else:
                 raise ValueError(f"Unknown action event_type: {action}")
             spans.append((time, start, len(specs)))
-            wh
+            if self.flow_likelihood is not None and state.partial_log_likelihood is not None:
+                tracked_indices.extend(range(start, len(specs)))
         partials = self._parent_partials_batch(specs)
         likelihoods = [None] * len(specs)
         if tracked_indices:
