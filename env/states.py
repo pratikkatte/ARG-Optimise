@@ -73,11 +73,6 @@ class MaterialSegments:
             blocks.extend(range(start, end))
         return blocks
 
-    def valid_breakpoint_count(self):
-        if self.count < 2 or self.span_start is None or self.span_end is None:
-            return 0
-        return int(self.span_end - self.span_start)
-
     def split(self, breakpoint):
         breakpoint = int(breakpoint)
         left = []
@@ -93,26 +88,12 @@ class MaterialSegments:
         other = MaterialSegments.from_segments(other)
         return MaterialSegments(self.segments + other.segments)
 
-    def intersection(self, other):
+    def _iter_intersections(self, other, interval_start=None, interval_end=None):
         other = MaterialSegments.from_segments(other)
-        intersections = []
-        i = j = 0
-        while i < len(self.segments) and j < len(other.segments):
-            left_start, left_end = self.segments[i]
-            right_start, right_end = other.segments[j]
-            start = max(left_start, right_start)
-            end = min(left_end, right_end)
-            if start < end:
-                intersections.append((start, end))
-            if left_end <= right_end:
-                i += 1
-            else:
-                j += 1
-        return MaterialSegments(intersections)
-
-    def intersection_count(self, other, interval_start=None, interval_end=None):
-        other = MaterialSegments.from_segments(other)
-        total = 0
+        if interval_start is not None:
+            interval_start = int(interval_start)
+        if interval_end is not None:
+            interval_end = int(interval_end)
         i = j = 0
         while i < len(self.segments) and j < len(other.segments):
             left_start, left_end = self.segments[i]
@@ -120,16 +101,22 @@ class MaterialSegments:
             start = max(left_start, right_start)
             end = min(left_end, right_end)
             if interval_start is not None:
-                start = max(start, int(interval_start))
+                start = max(start, interval_start)
             if interval_end is not None:
-                end = min(end, int(interval_end))
+                end = min(end, interval_end)
             if start < end:
-                total += end - start
+                yield start, end
             if left_end <= right_end:
                 i += 1
             else:
                 j += 1
-        return int(total)
+
+    def intersection(self, other):
+        return MaterialSegments(self._iter_intersections(other))
+
+    def intersection_count(self, other, interval_start=None, interval_end=None):
+        return sum(end - start for start, end in
+                   self._iter_intersections(other, interval_start, interval_end))
 
     def overlaps(self, other):
         return self.intersection_count(other) > 0
@@ -174,10 +161,9 @@ class ARGLineage:
         self._material_mask = None
 
         if material_segments is None:
-            mask = np.asarray([] if material_mask is None else material_mask, dtype=bool)
-            self._material_mask = mask.copy()
-            self.material_segments = MaterialSegments.from_mask(self._material_mask)
-            self.num_blocks = int(mask.size if num_blocks is None else num_blocks)
+            self.material_mask = [] if material_mask is None else material_mask
+            if num_blocks is not None:
+                self.num_blocks = int(num_blocks)
         else:
             self.material_segments = MaterialSegments.from_segments(material_segments)
             self.num_blocks = int(
@@ -186,8 +172,7 @@ class ARGLineage:
                 else max((end for _, end in self.material_segments.segments), default=0)
             )
             if material_mask is not None:
-                self._material_mask = np.asarray(material_mask, dtype=bool).copy()
-                self.num_blocks = int(self._material_mask.size)
+                self._cache_material_mask(material_mask)
 
     @property
     def material_mask(self):
@@ -200,9 +185,12 @@ class ARGLineage:
         if value is None:
             self._material_mask = None
             return
+        self._cache_material_mask(value)
+        self.material_segments = MaterialSegments.from_mask(self._material_mask)
+
+    def _cache_material_mask(self, value):
         self._material_mask = np.asarray(value, dtype=bool).copy()
         self.num_blocks = int(self._material_mask.size)
-        self.material_segments = MaterialSegments.from_mask(self._material_mask)
 
     @property
     def material_count(self):
@@ -228,12 +216,12 @@ class ARGLineage:
 
         clone = ARGLineage(
             node_id=self.node_id,
-            children=list(self.children),
-            parents=list(self.parents),
+            children=self.children,
+            parents=self.parents,
             material_segments=self.material_segments,
             num_blocks=self.num_blocks,
             partials=partials,
-            sequences_indices=list(self.sequences_indices),
+            sequences_indices=self.sequences_indices,
             event_type=self.event_type,
             breakpoint=self.breakpoint,
             recombination_side=self.recombination_side,
@@ -255,7 +243,6 @@ class ARGState:
     log_reward: Optional[float] = None
     accumulated_log_prior: float = 0.0
     is_done: bool = False
-    action_options: Tuple[List[Dict[str, Any]], List[Tuple[int, int, List[int]]], List[Dict[str, Any]]] = None
     rates: Optional[Dict[str, float]] = None
     prior_options: Optional[PriorActionOptions] = None
     total_active_blocks: Optional[int] = None

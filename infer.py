@@ -6,9 +6,9 @@ import math
 import torch
 
 from env.env import SimpleARGEnvironment
-from rollout_worker_arg import RolloutWorker
-from tb_gfn import TBGFlowNetGenerator
-from time_env import DEFAULT_TIME_BIN_SCHEME, checkpoint_time_policy
+from gfn.rollout import RolloutWorker
+from generator import GFlowNetGenerator, TBGFlowNetGenerator
+from env.time_env import DEFAULT_TIME_BIN_SCHEME, checkpoint_time_policy
 from train import (
     DEFAULT_LOG_Z_LR,
     MODEL_VERSION,
@@ -57,7 +57,7 @@ def run_inference(
         seed=inference_seed,
         device=resolved_device,
     )
-    generator = TBGFlowNetGenerator(
+    generator = GFlowNetGenerator(
         env,
         init_z_sample_count=metadata["init_z_sample_count"],
         device=resolved_device,
@@ -118,8 +118,10 @@ def resolve_device(device):
 
 
 def validate_metadata(metadata):
+    if metadata.get("arg_prior") != "hudson":
+        raise ValueError("Only explicit Hudson ARG checkpoints are supported; start a fresh Hudson run")
     policy = checkpoint_time_policy(metadata)
-    from time_model import validate_continuous_time_head
+    from policy.time_model import validate_continuous_time_head
     validate_continuous_time_head(metadata.get('model', {}).get('continuous_time_head', 'exponential'), policy)
     timing_keys = {"time_bin_scheme", "time_bins", "time_delta_bin_width"} if policy == "categorical" else set()
     missing = sorted((REQUIRED_METADATA_KEYS | timing_keys) - set(metadata))
@@ -147,7 +149,7 @@ def environment_from_metadata(metadata, seed, device=None):
     rho = float(metadata["rho"])
     env_kwargs = {
         "time_policy": policy,
-        "arg_prior": metadata.get('arg_prior', 'overlap'),
+        "arg_prior": metadata.get('arg_prior'),
         "num_sequences": int(metadata["num_sequences"]),
         "sequence_length": sequence_length,
         "num_blocks": int(metadata["num_blocks"]),

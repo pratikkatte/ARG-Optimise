@@ -11,6 +11,7 @@ wandb: true
 
 # Exact all-segment SubTB is optional; TB preserves the existing objective.
 loss_type: subtb             # Set subtb for fresh SubTB training.
+# log_loss: [subtb]          # Defaults to loss_type; use [subtb, tb] to report both.
 subtb_lambda: 0.9         # Finite >= 0; 0: one-step, 1: equal, >1: longer segments.
 flow_lr: 0.0001           # Defaults to policy_lr when omitted; SubTB flow head only.
 policy_lr: 0.0001

@@ -1,12 +1,14 @@
-from env.env import CoalescenceChoice, MaterialSegments, RecombinationChoice
+from env.env import CoalescenceChoice, RecombinationChoice
 from breakpoint_model import BreakpointSplitPositionCNN, SparseMixtureBreakpointPolicy
-from time_model import TimeModel, CwrExponentialTimeModel, CwrGammaTimeModel, validate_continuous_time_head
-from time_env import validate_time_policy
+from policy.time_model import TimeModel, CwrExponentialTimeModel, CwrGammaTimeModel, validate_continuous_time_head
+from env.time_env import validate_time_policy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from policy.encoding import encode_packed_lineages
+from policy.lineage_feature_cache import LineageFeatureCache
 from operator import index
 import math
 
@@ -222,7 +224,6 @@ class ARGModel(nn.Module):
         self.device = env.device
         self.cache_lineage_features = bool(cache_lineage_features)
         if self.cache_lineage_features:
-            from lineage_features import LineageFeatureCache
             self.lineage_feature_cache = LineageFeatureCache()
         if int(embedding_size) % int(transformer_heads) != 0:
             raise ValueError(
@@ -323,39 +324,19 @@ class ARGModel(nn.Module):
         logits = torch.where(available[:, None], logits, torch.zeros_like(logits))
         return F.log_softmax(logits, dim=-1).masked_fill(~valid, -math.inf)
 
-    def _build_source_sequence_features(self):
-        return self.env.block_seq_arrays.detach().to(dtype=torch.float32).clone()
-
-    def model_params(self):
-        return list(self.parameters())
-
     def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
         """Project packed real sequences, then pad only the small embeddings."""
         packed = lineage_seq_features.tensor
-        offsets = lineage_seq_features.row_offsets
         if tuple(packed.shape[1:]) != (int(self.env.num_blocks), 4):
             raise ValueError(
                 f"Packed sequence features must have shape (lineages, {int(self.env.num_blocks)}, 4), "
                 f"got {tuple(packed.shape)}"
             )
-        batch_size = len(offsets) - 1
-        active_lineages = max(end - start for start, end in zip(offsets, offsets[1:]))
         batch_active_lineage_counts = batch_active_lineage_counts.to(device=self.device, dtype=torch.long)
-        valid_mask = (
-            torch.arange(active_lineages, device=self.device)[None, :]
-            < batch_active_lineage_counts[:, None]
+        encoded, valid_mask = encode_packed_lineages(
+            lineage_seq_features, batch_active_lineage_counts,
+            self.seq_embedding, self.summary_token, self.encoder,
         )
-        projected = self.seq_embedding(packed.reshape(packed.shape[0], -1).to(
-            device=self.device, dtype=torch.float32,
-        ))
-        # Zero-padded inputs previously projected to the bias. Preserve those
-        # values (and their gradient path) for the unchanged transformer.
-        lineage_reps = self.seq_embedding.bias.expand(batch_size, active_lineages, -1).clone()
-        lineage_reps[valid_mask] = projected
-        summary_token = self.summary_token.expand(batch_size, -1, -1)
-        transformer_input = torch.cat([summary_token, lineage_reps], dim=1)
-        key_padding_mask = F.pad(~valid_mask, (1, 0), value=False)
-        encoded = self.encoder(transformer_input, key_padding_mask=key_padding_mask)
         summary_reps = encoded[:, 0]
         lineage_reps = encoded[:, 1:] * valid_mask.unsqueeze(-1)
         return lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts
@@ -389,9 +370,8 @@ class ARGModel(nn.Module):
 
     def _normalized_lineage_feature(self, lineage):
         feature = self._lineage_partials_tensor(lineage)
-        weights = self._material_segments_masking(
-            lineage.material_segments, device=self.device, dtype=self.env.block_seq_arrays.dtype)
-        return self.env.evolution_model.normalize_partials(feature * weights[:, None])
+        masked = self.env.evolution_model.mask_partials(feature, lineage.material_segments)
+        return self.env.evolution_model.normalize_partials(masked)
 
     def _lineage_partials_tensor(self, lineage):
         if lineage.partials is None:
@@ -411,18 +391,6 @@ class ARGModel(nn.Module):
                 f"{expected_shape}, got {tuple(partials.shape)}"
             )
         return partials
-
-    def _material_segments_masking(self, material_segments, device, dtype):
-        num_blocks = int(self.env.num_blocks)
-        weights = torch.zeros(num_blocks, dtype=dtype, device=device)
-
-        for segment_start, segment_end in material_segments.segments:
-            start = max(int(segment_start), 0)
-            end = min(int(segment_end), num_blocks)
-            if end <= start:
-                continue
-            weights[start:end] = 1.0
-        return weights
 
     def sample(self, logits, random_spec=None):
         if random_spec is None:
@@ -457,10 +425,10 @@ class ARGModel(nn.Module):
             secondary_rep[rows] = torch.abs(left_rep - right_rep)
             tertiary_rep[rows] = left_rep * right_rep
 
-        recomb_rows = [(row_idx, action.active_lineage_i, action.breakpoint) for row_idx, action in enumerate(actions) if isinstance(action, RecombinationChoice)]
+        recomb_rows = [(row_idx, action.active_lineage_i) for row_idx, action in enumerate(actions) if isinstance(action, RecombinationChoice)]
 
         if recomb_rows:
-            rows, lineage_indices, _ = zip(*recomb_rows)
+            rows, lineage_indices = zip(*recomb_rows)
             rows = torch.tensor(rows, dtype=torch.long, device=self.device)
             lineage_indices = torch.tensor(lineage_indices, dtype=torch.long, device=self.device)
             primary_rep[rows] = lineage_reps[batch_idx, lineage_indices]
@@ -481,7 +449,6 @@ class ARGModel(nn.Module):
         ):
         batch_size = len(candidate_actions)
         max_candidates = max(len(actions) for actions in candidate_actions)
-        logits = lineage_reps.new_full((batch_size, max_candidates), float("-inf"))
         feat_dim = self.seq_embedding.out_features * 4
         features = lineage_reps.new_zeros(batch_size, max_candidates, feat_dim)
 
@@ -504,109 +471,26 @@ class ARGModel(nn.Module):
 
         counts = torch.tensor(candidate_counts, device=self.device)
         valid = torch.arange(max_candidates, device=self.device).unsqueeze(0) < counts.unsqueeze(1)
-        masked_logits = logits.masked_fill(~valid, -1e9)
+        masked_logits = logits.masked_fill(~valid, float("-inf"))
         return masked_logits, features
 
-    def _select_breakpoints(self, action):
-        """
-        Select breakpoints for a given action.
-        """
-        breakpoint = self.env.rng.choice(range(action.span_start + 1, action.span_end + 1))
-        action = replace(action, breakpoint=breakpoint)
-        return action
-
-    def _valid_breakpoints_for_action(self, action):
-        return list(range(int(action.span_start) + 1, int(action.span_end) + 1))
-
-    def _breakpoint_logit_indices(self, breakpoints, device):
-        num_blocks = int(self.env.num_blocks)
-        indices = []
-        for breakpoint in breakpoints:
-            index = min(max(int(breakpoint), 1), num_blocks - 1) - 1
-            indices.append(index)
-        return torch.tensor(indices, dtype=torch.long, device=device)
-
-    def _sample_recombination_breakpoint(self, action, lineage_seq_feature, action_context, random_spec=None):
-        return self.breakpoint_scorer(
-            action,
-            lineage_seq_feature,
-            int(self.env.sequence_length),
-            int(self.env.num_blocks),
-            action_context,
-            random_spec=random_spec,
-        )
-
-    def _event_log_probs_from_action_logits(self, candidate_actions, logits):
-        event_log_probs = logits.new_full(
-            (len(candidate_actions), len(self.env.event_types)),
-            float("-inf"),
-        )
-        normalizers = torch.logsumexp(logits, dim=1)
-        for batch_idx, actions in enumerate(candidate_actions):
-            for event_idx, event_type in enumerate(self.env.event_types):
-                indices = [
-                    action_idx
-                    for action_idx, action in enumerate(actions)
-                    if (
-                        (event_type == "coal" and isinstance(action, CoalescenceChoice))
-                        or (event_type == "recomb" and isinstance(action, RecombinationChoice))
-                    )
-                ]
-                if indices:
-                    event_logits = logits[batch_idx, torch.tensor(indices, device=logits.device)]
-                    event_log_probs[batch_idx, event_idx] = (
-                        torch.logsumexp(event_logits, dim=0) - normalizers[batch_idx]
-                    )
-        return event_log_probs
-
-
-
-    def forward(self, all_actions, lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts, random_spec,
+    def forward(self, all_actions, lineage_reps, summary_reps, random_spec,
                 action_indices=None):
-        """Score actions; lineage_seq_features is internally PackedLineageFeatures."""
-        all_candidate_actions = all_actions
-
-
-        if any(len(actions) == 0 for actions in all_candidate_actions):
+        """Score and select candidates, returning untempered policy log probabilities."""
+        if any(len(actions) == 0 for actions in all_actions):
             raise ValueError("ARGModel.forward received a batch item with no candidate actions.")
 
-        logits, action_features = self._score_candidates(
-            all_candidate_actions,
-            lineage_reps,
-            summary_reps,
+        logits, action_features = self._score_candidates(all_actions, lineage_reps, summary_reps)
+        sampled_action_indices = (
+            self.sample(logits, random_spec) if action_indices is None
+            else torch.as_tensor(action_indices, device=logits.device, dtype=torch.long)
         )
-        
-        # Vectorize processing instead of multiple for-loops.
-
-        # Compute lengths of actions per batch and build index tensor
-        action_lengths = [len(actions) for actions in all_candidate_actions]
-        max_len = max(action_lengths)
-
-        # Create mask for valid actions in logits
-        mask = torch.zeros_like(logits, dtype=torch.bool)
-        for i, n in enumerate(action_lengths):
-            mask[i, :n] = True
-
-        # Build valid logits tensor (invalid entries set to very low value)
-        logits_masked = logits.masked_fill(~mask, float('-inf'))
-
-        # Sample actions in a vectorized way
-        # In case there are -inf rows in invalid entries, Categorical supports this
-        sampled_action_indices = (self.sample(logits_masked, random_spec) if action_indices is None
-                                  else torch.as_tensor(action_indices, device=logits.device, dtype=torch.long))
-        # sampled_action_indices shape: (batch,)
-
-        # Convert to standard Python ints and collect for indexing
         selected_action_indices = sampled_action_indices.detach().cpu().tolist()
-
-        # Now, retrieve chosen actions and features in a single loop
-        choosen_actions = []
-        choosen_action_features = []
+        chosen_actions = []
+        chosen_action_features = []
         for batch_idx, action_idx in enumerate(selected_action_indices):
-            choosen_actions.append(all_candidate_actions[batch_idx][action_idx])
-            choosen_action_features.append(action_features[batch_idx, action_idx])
+            chosen_actions.append(all_actions[batch_idx][action_idx])
+            chosen_action_features.append(action_features[batch_idx, action_idx])
 
-        # Compute log pf for action scorer (policy) selection
-        log_action_pf = self.compute_log_path_pf(logits_masked, selected_action_indices)
-
-        return log_action_pf, selected_action_indices, choosen_actions, choosen_action_features
+        log_action_pf = self.compute_log_path_pf(logits, selected_action_indices)
+        return log_action_pf, selected_action_indices, chosen_actions, chosen_action_features

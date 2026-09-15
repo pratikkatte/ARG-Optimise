@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from time_env import validate_temperature
+from env.time_env import validate_temperature
 
 
 class TimeModel(nn.Module):
@@ -13,14 +13,10 @@ class TimeModel(nn.Module):
             raise ValueError(f"layers must be non-negative, got {layers}")
 
         if layers > 0:
-            modules = [
-                nn.Linear(input_dim, hidden_dim),
-                nn.Dropout(dropout),
-                nn.ReLU(),
-            ]
-            for _ in range(layers - 1):
+            modules = []
+            for layer in range(layers):
                 modules.extend([
-                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.Linear(input_dim if layer == 0 else hidden_dim, hidden_dim),
                     nn.Dropout(dropout),
                     nn.ReLU(),
                 ])
@@ -44,8 +40,6 @@ class TimeModel(nn.Module):
         return log_p[batch_idx, time_actions]
 
     def sample(self, time_logits, random_spec):
-        if random_spec is None:
-            return Categorical(logits=time_logits).sample()
         temperature = validate_temperature(random_spec, time_component=True)
         return Categorical(logits=time_logits / temperature).sample()
 

@@ -18,6 +18,62 @@ remains making SubTB trainable on `validation/datasets/sim_10k`; the shorter
 sequence provides faster diagnostics first. See the
 [current experiment report](validation/reports/subtb_trainability_2026-09-10/hudson_neural_source_experiment.md).
 
+## Code layout
+
+`generator.GFlowNetGenerator` is the shared entry point for both objectives.
+It owns shared policy initialization, rollout scoring, backward transitions,
+checkpointing, scheduling, and optimizer stepping. `gfn/rollout.py`
+continues to handle rollout and replay for both objectives.
+
+- `gfn/tb.py`: `TBMixin` implements the TB loss; TB evaluation metrics also live here.
+- `gfn/subtb.py`: `SubTBMixin` implements flow initialization, state/source
+  flows, SubTB loss, diagnostics, and SubTB-specific clipping and reporting.
+  The geometric loss functions also live here. Shared configuration validation
+  lives in `gfn/objectives.py`; neither loss implementation imports the other.
+- `gfn/flow_encoder.py`, `gfn/flow_likelihood.py`, and `gfn/flow_training.py`:
+  frozen encoding, partial-likelihood tracking, and flow warm-up helpers.
+- `gfn/rollout.py`: policy-driven rollout and replay orchestration shared by
+  both objectives.
+
+The mixins have no constructors or separate model state. Parameters and buffers
+remain on the generator under their existing names, preserving checkpoint and
+optimizer layouts. Import flow helpers directly from `gfn.flow_encoder`,
+`gfn.flow_likelihood`, and `gfn.flow_training`. Policy networks and lineage
+features remain shared.
+
+Import the generator from `generator` and SubTB loss functions from `gfn.subtb`.
+
+## Selecting loss metrics
+
+`loss_type` selects the single objective used for backpropagation. `log_loss`
+selects reported losses and defaults to that objective when omitted:
+
+```yaml
+loss_type: subtb
+log_loss: [subtb]       # No TB loss or TB residual metrics are computed.
+```
+
+To report both while still optimizing only SubTB, use `log_loss: [subtb, tb]`,
+or pass `--log-loss subtb tb`. CLI values replace the YAML reporting list.
+The extra TB loss is calculated without gradients; it does not affect updates.
+TB-only training uses `loss_type: tb` and `log_loss: [tb]`.
+
+The list must contain the optimized objective. Logging SubTB from a TB-only
+model is rejected because it has no trained state-flow head. Empty lists,
+unknown loss names, and duplicates are also rejected.
+
+Training always reports `loss` (the optimized objective), plus the selected
+`subtb_loss` and/or `tb_loss`. Evaluation follows the same selection:
+`eval_subtb_loss` for SubTB, and `eval_tb_loss`, the existing `eval_tb_mse`, and
+TB residual metrics only when TB is requested. Importance-weight and sampling
+quality metrics remain independent of this choice.
+
+`best.pt` tracks the optimized training loss, including when both are reported.
+Evaluation checkpoints are written only for the requested losses. The reporting
+list is saved in checkpoint metadata and restored on load; an explicit
+constructor setting overrides it. Old checkpoints without `log_loss` default
+to their optimized objective. Parameter names and optimizer layouts are unchanged.
+
 ## Neural source and intermediate flows
 
 `flow_head_version: 5` has no trainable logZ scalar. The same scalar-output flow
@@ -45,7 +101,7 @@ receive flow-head gradients. Exact terminal rewards receive no flow gradient.
 
 The head receives the separate encoder's summary, accumulated prior, elapsed
 time, lineage/material counts, partial likelihood, remaining material fraction,
-and lineage-age mean/SD. `flow_likelihood.py` tracks float64 site-resolution
+and lineage-age mean/SD. `gfn/flow_likelihood.py` tracks float64 site-resolution
 pruning partials and normalization factors, separately from normalized policy
 features. Recombination partitions likelihood contributions; nonoverlapping
 common ancestry preserves their sum. At termination, the potential equals the
@@ -58,8 +114,9 @@ apply to version 5.
 
 ## Hudson prior and Gamma policy
 
-`arg_prior: hudson` permits common-ancestor events between every unordered
-lineage pair, including nonoverlapping material. In units of 2Ne, each pair's
+Hudson is the only supported ARG prior (`arg_prior: hudson`) and requires
+`time_policy: cwr_exponential`; both are defaults for new runs. It permits
+common-ancestor events between every unordered lineage pair, including nonoverlapping material. In units of 2Ne, each pair's
 hazard is 1. Recombination uses every integer link between a lineage's leftmost
 and rightmost ancestral bases, including trapped gaps. Each one-base link has
 hazard `2Ne*r`. Lineage selection is proportional to eligible links; breakpoint
@@ -73,7 +130,8 @@ extra unary ancestral history; local TMRCA and topology are the validation
 targets. The convention is explicit in checkpoints. Independent simulation at
 the actual 2 kb parameters agrees with msprime's marginal TMRCA distributions
 under both stopping conventions; see the experiment report and JSON results.
-Legacy checkpoints missing `arg_prior` retain the old overlap-only prior.
+Checkpoints must explicitly declare `arg_prior: hudson`. Legacy checkpoints
+with a different or missing prior are rejected; start a fresh Hudson run.
 
 `continuous_time_head: gamma` learns waiting-time mean and shape:
 

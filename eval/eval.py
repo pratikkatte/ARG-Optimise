@@ -31,13 +31,13 @@ from eval.density_fit import density_summary, select_bank
 from eval.ess import importance_stats, log_importance_weights
 from eval.posterior_summary import (TerminalSamplingEvaluator, compare_ensembles,
     ensemble_truth_metrics, summarize_ensemble, topology_signature, validate_tree_sequence)
-from flow_training import preserve_sampling
+from gfn.flow_training import preserve_sampling
 from utils import action_as_dict, action_from_dict
 from infer import environment_from_metadata, load_checkpoint, resolve_device, validate_metadata
-from rollout_worker_arg import RolloutWorker
-from tb_gfn import TBGFlowNetGenerator
-from training_exploration import sample_prior_trajectories
-from trajectory_buffer import action_fingerprint, environment_fingerprint
+from gfn.rollout import RolloutWorker
+from generator import GFlowNetGenerator, TBGFlowNetGenerator
+from training.trainer import sample_prior_trajectories
+from training.trajectories import action_fingerprint, environment_fingerprint
 from utils import load_sequences
 
 METRICS = ('density_fit', 'ess', 'posterior_summary')
@@ -170,7 +170,7 @@ def load_model(path, options):
     if 'sample_names' in metadata and names != list(metadata['sample_names']):
         raise ValueError('FASTA sample names/order differ from the checkpoint')
     env = environment_from_metadata(metadata, options['seed'], resolve_device(options['device']))
-    model = TBGFlowNetGenerator(env, init_z_sample_count=metadata['init_z_sample_count'],
+    model = GFlowNetGenerator(env, init_z_sample_count=metadata['init_z_sample_count'],
         device=env.device, verbose=False, initialize_z_from_policy=False,
         model_kwargs=dict(metadata.get('model', {})), loss_type=metadata.get('loss_type', 'tb'),
         subtb_lambda=metadata.get('subtb_lambda', .9), flow_head_version=metadata.get('flow_head_version', 1),
@@ -556,11 +556,12 @@ def _run_evaluation(options):
                     baselines={name: b['provenance'] for name, b in baselines.items()},
                     source_sha256={str(p.relative_to(ROOT)): digest(p) for p in
                                    [*sorted((ROOT/'eval').glob('*.py')),
-                                    *[ROOT/name for name in ('rollout_worker_arg.py', 'infer.py',
-                                       'env/env.py', 'env/actions.py', 'env/states.py', 'evo.py', 'tb_gfn.py', 'models.py', 'time_model.py',
-                                       'time_env.py', 'breakpoint_model.py', 'trajectory_buffer.py',
-                                       'training_exploration.py', 'flow_training.py', 'utils.py',
-                                       'lineage_features.py', 'flow_encoder.py', 'flow_likelihood.py')]]})
+                                    *sorted((ROOT/'gfn').glob('*.py')),
+                                    *sorted((ROOT/'training').glob('*.py')),
+                                    *[ROOT/name for name in ('infer.py',
+                                       'env/env.py', 'env/actions.py', 'env/states.py', 'env/evo.py', 'generator.py', 'policy/models.py', 'policy/encoding.py', 'policy/time_model.py',
+                                       'env/time_env.py', 'breakpoint_model.py', 'utils.py',
+                                       'policy/lineage_feature_cache.py')]]})
     protocol_hash = object_hash(protocol)
     step = int(metadata.get('epoch', -1))+1
     folder = Path(options['output_dir'])/f'step_{step:06d}_{checkpoint_hash[:12]}_{protocol_hash[:12]}'

@@ -51,10 +51,12 @@ class LineageFeatureCache:
         while self.entries and self.bytes + size > self.max_bytes:
             self._remove(next(iter(self.entries)))
         cache_ref = weakref.ref(self)
+
         def release(ref):
             cache = cache_ref()
             if cache is not None:
                 cache._remove(key, ref)
+
         self.entries[key] = (weakref.ref(source, release), signature, size, value)
         self.bytes += size
         return value

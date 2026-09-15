@@ -32,15 +32,15 @@ import torch
 from audit_importance import DensityAudit, independent_log_likelihood, numpy
 from audit_fixed_balance import segment_oracle, state_fingerprint
 from env.env import SimpleTrajectory
-from flow_training import preserve_sampling
+from gfn.flow_training import preserve_sampling
 from infer import environment_from_metadata, load_checkpoint
-from rollout_worker_arg import RolloutWorker
-from tb_gfn import TBGFlowNetGenerator
+from gfn.rollout import RolloutWorker
+from generator import GFlowNetGenerator, TBGFlowNetGenerator
 from eval.posterior_summary import TerminalSamplingEvaluator, topology_signature
 from eval.density_fit import fit_stats, density_summary, select_bank
 from eval.ess import importance
 from train import evaluate_generator
-from trajectory_buffer import action_fingerprint
+from training.trajectories import action_fingerprint
 from utils import action_as_dict, action_from_dict
 
 DEFAULT_MANIFEST = AUDITS / 'sim_500/replay_ablation/controlled_variants_manifest.json'
@@ -172,7 +172,7 @@ def load_model(job, args):
     assert m['arg_prior'] == 'hudson' and m['action_probability_version'] == 2
     assert m['flow_head_version'] == 5 and m['loss_type'] == 'subtb'
     env = environment_from_metadata(m, seed=m['seed'], device=args.device)
-    g = TBGFlowNetGenerator(env, 0, device=args.device, verbose=False,
+    g = GFlowNetGenerator(env, 0, device=args.device, verbose=False,
         initialize_z_from_policy=False, model_kwargs=m['model'], loss_type=m['loss_type'],
         subtb_lambda=m['subtb_lambda'], flow_head_version=m['flow_head_version'])
     g.load(c, load_optimizer=False)
@@ -279,8 +279,8 @@ def prepare_protocol(args):
         candidate_seed_base=91000000, selection_seed=91919191, heldout_sha256=heldout,
         forbidden_fingerprints=sorted(forbidden), replay_overlap_sources=overlap_sources,
         source_sha256={str(f.relative_to(ROOT)): digest(f) for f in
-            [Path(__file__)] + [ROOT/n for n in ['env/env.py', 'env/actions.py', 'env/states.py','utils.py','evo.py','tb_gfn.py','models.py','time_model.py',
-              'breakpoint_model.py','rollout_worker_arg.py','subtb.py','terminal_evaluation.py',
+            [Path(__file__)] + sorted((ROOT/'gfn').glob('*.py')) + sorted((ROOT/'training').glob('*.py')) + [ROOT/n for n in ['env/env.py', 'env/actions.py', 'env/states.py','utils.py','env/evo.py','generator.py','policy/models.py', 'policy/encoding.py','policy/time_model.py',
+              'breakpoint_model.py',
               'eval/density_fit.py','eval/ess.py','eval/posterior_summary.py']]
             + [AUDITS/'audit_importance.py', AUDITS/'audit_fixed_balance.py']},
         allocation_end_utc=source['allocation_end_utc'], training_stop_at_unix=source['stop_at_unix'],
@@ -327,7 +327,7 @@ def prepare_bank(args, p):
                         state, traj = g.env.get_initial_state(), SimpleTrajectory()
                         while not state.is_done:
                             check_deadline(args)
-                            action, prior = g.env._sample_prior_step(state)
+                            action, prior = g.env.sample_prior_step(state)
                             state = g.env.apply_action(state, action, log_prior=prior)
                             traj.update(action, log_prior=prior, log_reward=state.log_reward)
                         paths.append(traj.actions)

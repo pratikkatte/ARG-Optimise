@@ -16,13 +16,14 @@ except ImportError:
     wandb = None
 
 from env.env import SimpleARGEnvironment
-from rollout_worker_arg import RolloutWorker
-from tb_gfn import TBGFlowNetGenerator
-from subtb import validate_objective
-from time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
+from gfn.rollout import RolloutWorker
+from generator import GFlowNetGenerator, TBGFlowNetGenerator
+from gfn.objectives import resolve_log_loss, validate_objective
+from gfn.tb import tb_diagnostics
+from env.time_env import DEFAULT_TIME_BINS, DEFAULT_TIME_DELTA_BIN_WIDTH
 from utils import load_sequences
-from learning_rate_schedule import LearningRateConfig
-from policy_temperature_schedule import PolicyTemperatureConfig
+from training.schedules import LearningRateConfig, PolicyTemperatureConfig
+from training.trainer import Trainer, TrajectoryMixConfig, trajectory_length_statistics
 
 
 DEFAULT_NE = 10000
@@ -64,74 +65,22 @@ from eval.ess import importance_stats, log_importance_weights
 
 
 def seed_everything(seed):
+    """Seed Python, NumPy, and Torch random-number generators."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def train_epoch(
-    epoch_id,
-    rollout_worker,
-    generator,
-    batch_size=1,
-    grad_accum_steps=1,
-    sampling_config=None,
-    completed_updates=0,
-):
-    grad_accum_steps = max(int(grad_accum_steps), 1)
-
-    lengths = []
-    recombinations = []
-    random_spec = sampling_config.random_spec(completed_updates) if sampling_config else None
-    for _ in range(grad_accum_steps):
-        ret, trajectories = rollout_worker.rollout(
-            generator,
-            episodes=batch_size,
-            **({"collect_flows": True} if generator.loss_type == "subtb" else {}),
-            **({'random_spec': random_spec} if random_spec is not None else {}),
-        )
-        lengths.extend(len(traj) for traj in trajectories)
-        if sampling_config is not None:
-            recombinations.extend(sum(a.event_type == 'recomb' for a in t.actions)
-                                  for t in trajectories)
-        generator.accumulate_loss(
-            ret,
-            factor=grad_accum_steps,
-        )
-
-    info = generator.update_model()
-    info.update(length_statistics(lengths))
-    if sampling_config is not None:
-        temperature = sampling_config.temperature(completed_updates)
-        info.update(sampling_policy_temperature=temperature, sampling_time_temperature=1., reward_temperature=1.,
-                    policy_temperature_completed_updates=completed_updates+1,
-                    training_sample_source='tempered_policy' if temperature > 1 else 'policy',
-                    tempered_policy_training_episodes=len(lengths) if temperature > 1 else 0,
-                    on_policy_training_episodes=len(lengths) if temperature == 1 else 0,
-                    scored_training_episodes=len(lengths), generated_training_episodes=len(lengths),
-                    total_scored_training_episodes=(completed_updates+1)*len(lengths),
-                    total_generated_training_episodes=(completed_updates+1)*len(lengths),
-                    prior_training_episodes=0, replay_training_episodes=0,
-                    training_event_count_mean=float(np.mean(lengths)),
-                    training_recombination_count_mean=float(np.mean(recombinations)))
-    return info
-
-
-def length_statistics(lengths, prefix=""):
-    values = torch.as_tensor(lengths, dtype=torch.float64)
-    return {prefix + "trajectory_length_" + key: float(value) for key, value in (
-        ("median", values.quantile(0.5)), ("p95", values.quantile(0.95)), ("max", values.max()))}
-
-
-
 def evaluate_generator(rollout_worker, generator, episodes, seed, fixed_trajectories=None,
                        terminal_evaluator=None, terminal_details=None, eval_density_slope=False):
+    """Evaluate fresh or fixed trajectories without perturbing training state."""
     episodes = int(episodes)
     if episodes <= 0:
         return {}
     if fixed_trajectories is not None and terminal_evaluator is not None:
         raise ValueError('Terminal sampling quality requires fresh-policy samples')
+    log_loss = getattr(generator, 'log_loss', (getattr(generator, 'loss_type', 'tb'),))
 
     env = rollout_worker.env
     python_state = random.getstate()
@@ -152,7 +101,7 @@ def evaluate_generator(rollout_worker, generator, episodes, seed, fixed_trajecto
             env.rng.seed(seed)
 
         with torch.no_grad():
-            collect = getattr(generator, "loss_type", "tb") == "subtb"
+            collect = 'subtb' in log_loss
             if fixed_trajectories is None:
                 outputs, trajectories = rollout_worker.rollout(
                     generator, episodes=episodes, **({'collect_flows': True} if collect else {}),
@@ -164,9 +113,6 @@ def evaluate_generator(rollout_worker, generator, episodes, seed, fixed_trajecto
             log_pf = outputs["log_paths_pf"].double().sum(-1)
             log_pb = outputs["log_paths_pb"].double().sum(-1)
             log_rewards = outputs["log_rewards"].to(log_pf)
-            residuals = generator.compute_log_Z().detach().to(log_pf) + log_pf - (
-                log_rewards + log_pb
-            )
             log_weights = log_rewards + log_pb - log_pf
             weight_stats = importance_stats(
                 log_importance_weights(log_rewards, log_pf, log_pb), fresh=fixed_trajectories is None)
@@ -200,7 +146,11 @@ def evaluate_generator(rollout_worker, generator, episodes, seed, fixed_trajecto
             ],
             dtype=torch.float32,
         )
-        extra = length_statistics(lengths, "eval_")
+        extra = trajectory_length_statistics(lengths, "eval_")
+        if 'tb' in log_loss:
+            with torch.no_grad():
+                extra.update({'eval_' + key: value for key, value in
+                              tb_diagnostics(log_pf, log_pb, log_rewards, generator.compute_log_Z()).items()})
         if eval_density_slope:
             # Fit log(P_F/P_B) = intercept + slope * log R on the T=1 evaluation
             # histories. The balance identity gives slope 1 at the target density.
@@ -213,7 +163,7 @@ def evaluate_generator(rollout_worker, generator, episodes, seed, fixed_trajecto
                 extra.update(terminal_metrics)
                 if terminal_details is not None:
                     terminal_details.update(details)
-        if getattr(generator, "loss_type", "tb") == "subtb":
+        if 'subtb' in log_loss:
             with torch.no_grad():
                 extra["eval_subtb_loss"] = generator.get_loss_from_rollout_outputs(outputs).item()
                 extra.update({"eval_" + key: value for key, value in
@@ -227,12 +177,6 @@ def evaluate_generator(rollout_worker, generator, episodes, seed, fixed_trajecto
             ('eval_source_log_flow' if getattr(generator, 'neural_source_flow', False) else 'eval_log_z'):
                 float(generator.compute_log_Z().detach()),
             "eval_importance_max_weight": weight_stats['max_normalized_weight'],
-            "eval_tb_mse": float(residuals.pow(2).mean().detach().cpu().item()),
-            "eval_residual_rmse": float(residuals.pow(2).mean().sqrt().detach().cpu()),
-            "eval_residual_mean": float(residuals.mean().detach().cpu().item()),
-            "eval_residual_std": float(
-                residuals.std(unbiased=False).detach().cpu().item()
-            ),
             "eval_log_pf_mean": float(log_pf.mean().detach().cpu().item()),
             "eval_log_pb_mean": float(log_pb.mean().detach().cpu().item()),
             "eval_log_reward_mean": float(log_rewards.mean().detach().cpu().item()),
@@ -259,7 +203,7 @@ def evaluate_generator(rollout_worker, generator, episodes, seed, fixed_trajecto
 def save_best_checkpoints(generator, info, metadata, checkpoints_path, best_scores):
     """Keep independent minima; residual mean is best when closest to zero."""
     criteria = (
-        ("tb_loss" if getattr(generator, "loss_type", "tb") == "subtb" else "loss", "best.pt", "best_loss"),
+        ("loss", "best.pt", "best_loss"),
         ("eval_tb_mse", "best_eval_loss.pt", "best_eval_loss"),
         ("eval_subtb_loss", "best_eval_subtb_loss.pt", "best_eval_subtb_loss"),
         ("eval_residual_mean", "best_residual_mean.pt", "best_abs_residual_mean"),
@@ -380,14 +324,14 @@ def train(
     flow_warmup_episodes=32,
     flow_head_version=4,
     event_policy="cwr",
-    time_policy="categorical",
+    time_policy="cwr_exponential",
     continuous_time_head='exponential',
     terminal_eval=False,
     terminal_eval_grid_size=100,
     terminal_eval_repeats=3,
     terminal_eval_repeat_every=250,
     tmrca_method='grid',
-    arg_prior='overlap',
+    arg_prior='hudson',
     exploration_fraction=0.,
     replay_fraction=0.,
     replay_capacity=2048,
@@ -405,12 +349,13 @@ def train(
     init_checkpoint=None,
     checkpoint_every=0,
     eval_density_slope=False,
+    log_loss=None,
 ):
+    """Train a GFlowNet from a sequence dataset and write run artifacts."""
     from dataclasses import asdict
-    from training_replay import ReplayTrainingConfig, ReplayTrainer
-    replay_config = ReplayTrainingConfig(exploration_fraction, replay_fraction, replay_capacity,
-                                          replay_grid_size, replay_per_topology, replay_min_size)
-    replay_config.validate()
+    mix_config = TrajectoryMixConfig(exploration_fraction, replay_fraction, replay_capacity,
+                                     replay_grid_size, replay_per_topology, replay_min_size)
+    mix_config.validate()
     lr_config = LearningRateConfig(lr_schedule, lr_schedule_steps or epochs_num,
                                    lr_warmup_steps, lr_warmup_start_factor, lr_min_factor)
     lr_config.validate()
@@ -420,6 +365,7 @@ def train(
                                          flow_warmup_steps)
     flow_lr = policy_lr if flow_lr is None else flow_lr
     validate_objective(loss_type, subtb_lambda, flow_lr)
+    log_loss = resolve_log_loss(log_loss, loss_type)
     if checkpoint_every < 0:
         raise ValueError('checkpoint_every must be nonnegative; 0 disables periodic saves')
     if eval_density_slope and eval_episodes < 2:
@@ -474,7 +420,7 @@ def train(
         "breakpoint_use_position_features": bool(DEFAULT_BREAKPOINT_USE_POSITION_FEATURES),
     }
 
-    generator = TBGFlowNetGenerator(
+    generator = GFlowNetGenerator(
         env,
         init_z_sample_count=init_z_sample_count,
         device=device,
@@ -484,6 +430,7 @@ def train(
         grad_clip=grad_clip,
         model_kwargs=model_kwargs,
         loss_type=loss_type, subtb_lambda=subtb_lambda, flow_lr=flow_lr,
+        log_loss=log_loss,
         flow_head_version=flow_head_version,
         initialize_z_from_policy=init_checkpoint is None,
     )
@@ -503,14 +450,14 @@ def train(
                                     phase='initial', repeats=terminal_eval_repeats,
                                     eval_density_slope=eval_density_slope)
     generator.configure_lr_schedule(lr_config)
-    from flow_training import warmup_flow
+    from gfn.flow_training import warmup_flow
     warmup_metrics = warmup_flow(generator, flow_warmup_steps, flow_warmup_episodes, seed + 100019)
     if warmup_metrics:
         print(f"Flow warm-up: {warmup_metrics}")
 
     rollout_worker = RolloutWorker(env)
     print(f"Training on device: {generator.device}")
-    replay_trainer = ReplayTrainer(generator, replay_config, seed) if replay_config.enabled else None
+    trainer = Trainer(generator, rollout_worker, mix_config, temperature_config, seed)
 
     os.makedirs(output_path, exist_ok=True)
     checkpoints_path = os.path.join(output_path, "checkpoints")
@@ -529,7 +476,7 @@ def train(
             "effective_population_size": float(effective_population_size),
             "mutation_rate": float(mutation_rate),
             "recombination_rate": float(recombination_rate),
-            "loss_type": loss_type, "subtb_lambda": subtb_lambda, "flow_lr": flow_lr,
+            "loss_type": loss_type, "log_loss": list(log_loss), "subtb_lambda": subtb_lambda, "flow_lr": flow_lr,
             "flow_head_version": generator.flow_head_version if loss_type == "subtb" else None,
             **warmup_metrics,
             **initialization_metadata,
@@ -549,22 +496,13 @@ def train(
             "bp_per_blocks": int(bp_per_blocks),
             **model_kwargs,
             "model_version": MODEL_VERSION, 'arg_prior': arg_prior, 'tmrca_method': tmrca_method,
-            **asdict(replay_config),
+            **asdict(mix_config),
             'lr_schedule': asdict(lr_config),
         })
 
     try:
         for epoch in range(epochs_num):
-            info = replay_trainer.train_epoch(epoch+1, rollout_worker, generator, batch_size,
-                                              grad_accum_steps) if replay_trainer else train_epoch(
-                epoch,
-                rollout_worker,
-                generator,
-                batch_size=batch_size,
-                grad_accum_steps=grad_accum_steps,
-                sampling_config=temperature_config if temperature_config.schedule != 'constant' else None,
-                completed_updates=epoch,
-            )
+            info = trainer.train_epoch(epoch + 1, batch_size, grad_accum_steps)
             log_z = generator.compute_log_Z().detach().cpu().reshape(-1)[0].item()
             if info is None:
                 continue
@@ -593,7 +531,7 @@ def train(
 
             metadata = build_checkpoint_metadata(
                 epoch=epoch,
-                best_loss=min(best_scores.get("tb_loss" if loss_type == "subtb" else "loss", float("inf")), info.get("tb_loss", loss)),
+                best_loss=min(best_scores.get("loss", float("inf")), loss),
                 log_z=log_z,
                 sequences=sequences,
                 sequence_length=sequence_length,
@@ -619,8 +557,8 @@ def train(
             metadata.update(initialization_metadata)
             if temperature_config.schedule != 'constant':
                 metadata['policy_temperature_state'] = temperature_config.state_dict(epoch+1)
-            if replay_trainer is not None:
-                metadata['replay_training_state'] = replay_trainer.state_dict()
+            if mix_config.enabled:
+                metadata['replay_training_state'] = trainer.state_dict()
             if terminal_evaluator is not None:
                 metadata['terminal_protocol_sha256'] = terminal_evaluator.protocol['sha256']
             info.update(save_best_checkpoints(
@@ -639,13 +577,8 @@ def train(
             if wandb_run is not None:
                 wandb.log(info, step=epoch + 1)
 
-            eval_text = ""
-            if "eval_tb_mse" in info:
-                eval_text = (
-                    f" eval_tb_mse={info['eval_tb_mse']:.4f}"
-                    f" eval_residual_mean={info['eval_residual_mean']:.4f}"
-                    f" eval_residual_std={info['eval_residual_std']:.4f}"
-                )
+            eval_text = ''.join(f" eval_{name}_loss={info['eval_' + name + '_loss']:.4f}"
+                                for name in log_loss if 'eval_' + name + '_loss' in info)
             print(f"Epoch {epoch + 1} loss={loss:.4f} source_log_flow={log_z:.4f}{eval_text}")
 
         with open(os.path.join(output_path, "training_history.pkl"), "wb") as handle:
@@ -679,6 +612,7 @@ def build_checkpoint_metadata(
     init_z_sample_count,
     model_version,
 ):
+    """Build stable model, environment, optimizer, and run metadata."""
     return {
         "epoch": int(epoch),
         "best_loss": float(best_loss),
@@ -709,6 +643,7 @@ def build_checkpoint_metadata(
 
 
 def parse_train_args(argv=None):
+    """Parse CLI and YAML configuration values and validate their combination."""
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Train the simplified ARG GFlowNet demo.")
     parser.add_argument("--config", help="YAML settings file; command-line options override its values")
@@ -734,6 +669,8 @@ def parse_train_args(argv=None):
     parser.add_argument("--mutation-rate", type=float, default=DEFAULT_MU_PER_BP)
     parser.add_argument("--recombination-rate", type=float, default=DEFAULT_R_PER_BP)
     parser.add_argument("--loss-type", choices=("tb", "subtb"), default="tb")
+    parser.add_argument('--log-loss', nargs='+', choices=('tb', 'subtb'), default=None,
+                        help='Losses to report; defaults to loss-type. SubTB can optionally also report TB.')
     parser.add_argument("--event-policy", choices=("cwr", "cwr_residual"), default="cwr")
     parser.add_argument("--subtb-lambda", type=float, default=0.9)
     parser.add_argument("--flow-lr", type=float, default=None)
@@ -750,7 +687,7 @@ def parse_train_args(argv=None):
     parser.add_argument("--flow-warmup-steps", type=int, default=0)
     parser.add_argument("--flow-warmup-episodes", type=int, default=32)
     parser.add_argument("--flow-head-version", type=int, choices=(1, 2, 3, 4, 5), default=4)
-    parser.add_argument('--arg-prior', choices=('overlap', 'hudson'), default='overlap')
+    parser.add_argument('--arg-prior', choices=('hudson',), default='hudson')
     parser.add_argument('--exploration-fraction', type=float, default=0.,
                         help='Fraction of the training trajectory budget drawn freshly from the prior')
     parser.add_argument('--replay-fraction', type=float, default=0.,
@@ -780,7 +717,7 @@ def parse_train_args(argv=None):
     parser.add_argument('--terminal-eval-repeat-every', type=int, default=250)
     parser.add_argument('--tmrca-method', choices=('grid', 'point_accuracy'), default='grid')
     parser.add_argument("--time-bins", type=int, default=DEFAULT_TIME_BINS)
-    parser.add_argument("--time-policy", choices=("categorical", "cwr_exponential"), default="categorical")
+    parser.add_argument("--time-policy", choices=("cwr_exponential",), default="cwr_exponential")
     parser.add_argument('--continuous-time-head', choices=('exponential', 'gamma'), default='exponential',
                         help='Learned wait distribution; the continuous CwR prior stays exponential')
     parser.add_argument("--time-delta-bin-width", type=float, default=DEFAULT_TIME_DELTA_BIN_WIDTH)
@@ -831,7 +768,13 @@ def parse_train_args(argv=None):
             if key not in actions:
                 parser.error(f"Unknown config setting: {key}")
             action = actions[key]
-            if isinstance(action, argparse.BooleanOptionalAction):
+            if key == 'log_loss':
+                if isinstance(value, str):
+                    value = [value]
+                if not isinstance(value, list) or not value or not all(isinstance(v, str) for v in value):
+                    parser.error('Config setting log_loss must be a nonempty list of loss names')
+                config_args.extend([action.option_strings[0], *value])
+            elif isinstance(action, argparse.BooleanOptionalAction):
                 if not isinstance(value, bool):
                     parser.error(f"Config setting {key} must be true or false")
                 config_args.append(action.option_strings[0 if value else 1])
@@ -844,18 +787,18 @@ def parse_train_args(argv=None):
         args.flow_lr = args.policy_lr
     try:
         validate_objective(args.loss_type, args.subtb_lambda, args.flow_lr)
+        args.log_loss = list(resolve_log_loss(args.log_loss, args.loss_type))
         if args.lr_schedule_steps < 0:
             raise ValueError('lr_schedule_steps must be nonnegative')
         LearningRateConfig.from_namespace(args).validate()
         PolicyTemperatureConfig.from_namespace(args).validate_training(
             args.loss_type, args.event_policy, args.exploration_fraction, args.replay_fraction,
             args.flow_warmup_steps)
-        from training_replay import ReplayTrainingConfig
-        replay_config = ReplayTrainingConfig.from_namespace(args)
-        replay_config.validate()
-        if replay_config.enabled and (args.loss_type != 'subtb' or args.event_policy != 'cwr_residual'):
+        mix_config = TrajectoryMixConfig.from_namespace(args)
+        mix_config.validate()
+        if mix_config.enabled and (args.loss_type != 'subtb' or args.event_policy != 'cwr_residual'):
             raise ValueError('Exploration/replay requires SubTB with cwr_residual policy')
-        from time_model import validate_continuous_time_head
+        from policy.time_model import validate_continuous_time_head
         validate_continuous_time_head(args.continuous_time_head, args.time_policy)
         if args.flow_warmup_steps < 0 or args.flow_warmup_episodes < 1:
             raise ValueError("Flow warm-up needs nonnegative steps and positive episodes")
@@ -873,6 +816,7 @@ def parse_train_args(argv=None):
 
 
 def main():
+    """Run training from command-line arguments."""
     args = parse_train_args()
 
     selected_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -897,6 +841,7 @@ def main():
         policy_lr=args.policy_lr,
         event_policy=args.event_policy,
         loss_type=args.loss_type, subtb_lambda=args.subtb_lambda, flow_lr=args.flow_lr,
+        log_loss=args.log_loss,
         flow_warmup_steps=args.flow_warmup_steps, flow_warmup_episodes=args.flow_warmup_episodes,
         lr_schedule=args.lr_schedule, lr_schedule_steps=args.lr_schedule_steps,
         lr_warmup_steps=args.lr_warmup_steps, lr_warmup_start_factor=args.lr_warmup_start_factor,

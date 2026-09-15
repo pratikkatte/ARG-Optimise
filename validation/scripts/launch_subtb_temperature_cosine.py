@@ -44,8 +44,7 @@ def preflight(output, resume, allocation_end):
     import torch
     from train import parse_train_args
     from infer import load_checkpoint
-    from learning_rate_schedule import LearningRateConfig
-    from policy_temperature_schedule import PolicyTemperatureConfig
+    from training.schedules import LearningRateConfig, PolicyTemperatureConfig
 
     if output.exists():
         raise ValueError('Output already exists; choose a new directory to preserve the run')

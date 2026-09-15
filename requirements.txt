@@ -9,7 +9,7 @@
 # cyvcf2 and msprime often install more reliably via conda on macOS:
 #   conda install -c conda-forge -c bioconda cyvcf2 msprime tskit tsinfer tsdate
 
-# --- Training & inference (train.py, infer.py, models.py, ...) ---
+# --- Training & inference (train.py, infer.py, policy/models.py, ...) ---
 numpy
 torch
 wandb

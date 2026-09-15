@@ -68,7 +68,7 @@ def prepare_extension(args):
                 raise ValueError('Run has a different shared initialization: '+str(root))
             hp = root/'heldout_trajectories.json'
             heldout[str(hp)] = digest(hp)
-            from trajectory_buffer import action_fingerprint
+            from training.trajectories import action_fingerprint
             forbidden.update(action_fingerprint(a) for a in read_json(hp)['actions'])
             for cp in sorted(root.glob('checkpoint_*.pt')):
                 check_deadline(args)
@@ -107,8 +107,21 @@ def prepare_extension(args):
              bank_origin=dict(path=str(base/'bank.json.gz'), sha256=digest(base/'bank.json.gz'),
                               protocol_sha256=bank['protocol_sha256']),
              base_source_sha256=old['source_sha256'],
-             source_sha256={name: digest(ROOT/name) for name in set(old['source_sha256']) | {
-                 'time_env.py', 'policy_temperature_schedule.py', 'learning_rate_schedule.py',
+             source_sha256={name: digest(ROOT/name) for name in {{'time_env.py': 'env/time_env.py', 'tb_gfn.py': 'generator.py',
+                     'subtb.py': 'gfn/subtb.py',
+                     'flow_encoder.py': 'gfn/flow_encoder.py',
+                     'flow_likelihood.py': 'gfn/flow_likelihood.py',
+                     'flow_training.py': 'gfn/flow_training.py',
+                     'trajectory_buffer.py': 'training/trajectories.py',
+                     'training_exploration.py': 'training/trainer.py',
+                     'training_replay.py': 'training/trainer.py',
+                     'learning_rate_schedule.py': 'training/schedules.py',
+                     'policy_temperature_schedule.py': 'training/schedules.py',
+                     'time_training.py': 'training/checkpoints.py'}.get(name, name)
+                     for name in old['source_sha256']} | {
+                 str(path.relative_to(ROOT)) for path in (ROOT/'gfn').glob('*.py')} | {
+                 'generator.py', 'env/time_env.py',
+                 *[str(path.relative_to(ROOT)) for path in (ROOT/'training').glob('*.py')],
                  'eval/density_fit.py', 'eval/ess.py', 'eval/posterior_summary.py',
                  'validation/scripts/subtb_density_extension.py', 'validation/scripts/subtb_density_report.py'}},
              reused_artifacts=[])

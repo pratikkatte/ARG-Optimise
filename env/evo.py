@@ -15,22 +15,7 @@ class EvolutionModelTorch(torch.nn.Module):
         self._branch_length_scale = (
             2.0 * float(env.population_size) * float(env.mutation_rate)
         )
-        self._site_grid_cache = {}
         self._full_material_weights_cache = {}
-
-    def _site_interval_grid(self, device, dtype):
-        key = (device, dtype)
-        cached = self._site_grid_cache.get(key)
-        if cached is not None:
-            return cached
-
-        sequence_length = int(self.env.sequence_length)
-        num_blocks = float(max(int(self.env.num_blocks), 1))
-        site_width = num_blocks / float(max(sequence_length, 1))
-        sites = torch.arange(sequence_length, device=device, dtype=dtype)
-        grid = (sites * site_width, sites * site_width + site_width, site_width)
-        self._site_grid_cache[key] = grid
-        return grid
 
     def _full_material_site_weights(self, device, dtype):
         key = (device, dtype)
@@ -86,7 +71,7 @@ class EvolutionModelTorch(torch.nn.Module):
 
         if not math.isfinite(log_likelihood):
             return self._NON_FINITE_LOG_LIKELIHOOD
-        return float(log_likelihood)
+        return log_likelihood
 
     def get_arg_sequence_segments(self, state):
         breakpoints = self.env._arg_edge_breakpoints(state)
@@ -114,8 +99,9 @@ class EvolutionModelTorch(torch.nn.Module):
         return self.env.seq_arrays.detach().cpu().numpy().astype(float, copy=False)
 
     def _jc69_transition_matrix(self, edge_length):
-        same_prob = 0.25 + 0.75 * math.exp(-4.0 * float(edge_length) / 3.0)
-        diff_prob = 0.25 - 0.25 * math.exp(-4.0 * float(edge_length) / 3.0)
+        decay = math.exp(-4.0 * float(edge_length) / 3.0)
+        same_prob = 0.25 + 0.75 * decay
+        diff_prob = 0.25 - 0.25 * decay
         transition_matrix = np.full((4, 4), diff_prob, dtype=float)
         np.fill_diagonal(transition_matrix, same_prob)
         return transition_matrix
@@ -258,7 +244,7 @@ class EvolutionModelTorch(torch.nn.Module):
         node = state.all_nodes[node_id]
         if node_id < self.env.num_sequences:
             partials = self._normalize_leaf_partials(
-                seq_arrays[node_id, site_start:site_end].copy()
+                seq_arrays[node_id, site_start:site_end]
             )
             log_scale = np.zeros(site_end - site_start, dtype=float)
             partials, log_scale = self._rescale_partials(partials, log_scale)

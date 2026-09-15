@@ -4,22 +4,25 @@ import warnings
 
 import torch
 
-from models import ARGModel, PackedLineageFeatures
-from subtb import geometric_subtb_loss, subtb_diagnostics, validate_objective
+from policy.models import ARGModel, PackedLineageFeatures
+from gfn.tb import TBMixin
+from gfn.subtb import SubTBMixin, geometric_subtb_loss, subtb_diagnostics
+from gfn.objectives import resolve_log_loss, validate_objective
+from env import priors
 from env.actions import CoalescenceChoice, RecombinationChoice
-from rollout_worker_arg import RolloutWorker
+from gfn.rollout import RolloutWorker
 from dataclasses import replace
-from time_env import checkpoint_time_policy, validate_temperature
-from flow_likelihood import PartialLikelihoodTracker
-from flow_encoder import FrozenFlowEncoder
-from learning_rate_schedule import WarmupCosineScheduler
+from env.time_env import checkpoint_time_policy, validate_temperature
+from gfn.flow_likelihood import PartialLikelihoodTracker
+from gfn.flow_encoder import FrozenFlowEncoder
+from training.schedules import WarmupCosineScheduler
 
 LOSS_FN = {
     'MSE': torch.nn.MSELoss(),
     'HUBER': torch.nn.HuberLoss(delta=1.0),
 }
 
-class TBGFlowNetGenerator(torch.nn.Module):
+class GFlowNetGenerator(TBMixin, SubTBMixin, torch.nn.Module):
     def __init__(
         self,
         env,
@@ -38,11 +41,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
         subtb_lambda=0.9,
         flow_lr=None,
         flow_head_version=4,
+        log_loss=None,
     ):
         super().__init__()
         resolved_policy_lr = arg_model_lr if policy_lr is None else policy_lr
         self.flow_lr = float(resolved_policy_lr if flow_lr is None else flow_lr)
         self.loss_type = loss_type
+        self._log_loss_explicit = log_loss is not None
+        self.log_loss = resolve_log_loss(log_loss, loss_type)
         self.subtb_lambda = float(subtb_lambda)
         validate_objective(self.loss_type, self.subtb_lambda, self.flow_lr)
         if flow_head_version not in (1, 2, 3, 4, 5):
@@ -57,7 +63,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.device = torch.device(device) if device is not None else torch.device(env.device)
         self.env.device = self.device
         if self.loss_type == "subtb" and self.flow_head_version >= 2:
-            self.env.flow_likelihood = PartialLikelihoodTracker(self.env)
+            self._initialize_subtb_environment()
         if hasattr(self.env, "seq_arrays"):
             self.env.seq_arrays = torch.nn.Parameter(
                 self.env.seq_arrays.detach().to(self.device),
@@ -133,7 +139,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         self.loss = 0
 
         self.loss = torch.tensor(0.0, device=self.device)
-        self.tb_reporting_loss = 0.0
+        self.reported_losses = {}
         self.accumulated_diagnostics = {}
         self.accumulated_batches = 0
         self.log_z_target_sum = 0.0
@@ -146,30 +152,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
         self.flow_params = []
         if self.loss_type == "subtb":
-            # CPU construction under fork_rng leaves policy/sampling RNG unchanged.
-            with torch.random.fork_rng(devices=[]):
-                self.flow_head = torch.nn.Sequential(
-                    torch.nn.Linear(self.model_kwargs.get("embedding_size", 32) + (8 if self.flow_head_version >= 2 else 4),
-                                    self.model_kwargs.get("hidden_size", 64), device="cpu"),
-                    torch.nn.SiLU(),
-                    torch.nn.Linear(self.model_kwargs.get("hidden_size", 64), 1, device="cpu"),
-                ).to(self.device)
-                torch.nn.init.zeros_(self.flow_head[-1].weight)
-                torch.nn.init.zeros_(self.flow_head[-1].bias)
-            self.register_buffer("flow_init_offset", torch.tensor(
-                self.last_log_z_target, dtype=torch.float64, device=self.device))
-            if self.flow_head_version >= 2:
-                self.register_buffer("flow_output_scale", torch.tensor(
-                    max(1.0, self.initial_log_z_target_std), dtype=torch.float64, device=self.device))
-            if self.flow_head_version >= 3:
-                self.flow_encoder = FrozenFlowEncoder(self.arg_model)
-            if self.flow_head_version == 4:
-                # A fixed initialization buffer, not a view or detached alias
-                # of the live normalizer. Subsequent Z updates cannot move it.
-                self.register_buffer('flow_baseline_log_z', self.compute_log_Z().detach().clone())
-            self.flow_params = list(self.flow_head.parameters())
-            self.opt.add_param_group({"params": self.flow_params, "lr": self.flow_lr})
-            self.gradient_clipping_params.extend(self.flow_params)
+            self._initialize_subtb_flow()
 
     def configure_lr_schedule(self, config, completed_updates=0):
         config.validate()
@@ -243,15 +226,14 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if directory:
             os.makedirs(directory, exist_ok=True)
         metadata = dict(metadata or {})
-        metadata.update(loss_type=self.loss_type, subtb_lambda=self.subtb_lambda,
+        metadata.update(loss_type=self.loss_type, log_loss=list(self.log_loss), subtb_lambda=self.subtb_lambda,
                         flow_lr=self.flow_lr, policy_lr=self.arg_model_lr, log_z_lr=self.z_lr)
         metadata['arg_prior'] = self.env.arg_prior
         metadata['action_probability_version'] = 2
         if hasattr(self, '_action_probability_migration'):
             metadata['action_probability_migration'] = self._action_probability_migration
-        if self.env.arg_prior == 'hudson':
-            metadata['prior_stop_at_local_mrca'] = False
-            metadata['prior_stopping_rule'] = 'Stop when every genomic position has one ancestor; retain resolved material until then'
+        metadata['prior_stop_at_local_mrca'] = False
+        metadata['prior_stopping_rule'] = 'Stop when every genomic position has one ancestor; retain resolved material until then'
         if self.neural_source_flow:
             for name in ('log_z_lr', 'log_z', 'initial_log_z', 'log_z_initialization'):
                 metadata.pop(name, None)
@@ -286,6 +268,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
             else self._torch_load(path, map_location=map_location)
         )
         metadata = checkpoint.get("metadata", {})
+        if metadata.get('arg_prior') != 'hudson':
+            raise ValueError('Only explicit Hudson ARG checkpoints are supported; start a fresh Hudson run')
         action_version = metadata.get('action_probability_version', 1)
         if action_version not in (1, 2):
             raise ValueError('Unsupported action probability version')
@@ -294,8 +278,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
             raise ValueError('Checkpoint used batch-dependent single-candidate action scores. '
                              'Load weights with load_optimizer=False, start from update 0, or explicitly '
                              'allow_action_probability_migration; old metrics are not a corrected baseline.')
-        if metadata.get('arg_prior', 'overlap') != self.env.arg_prior:
-            raise ValueError('Cannot load checkpoints across ARG priors; start a fresh run')
         saved_time_policy = checkpoint_time_policy(metadata)
         if saved_time_policy != self.arg_model.time_policy:
             raise ValueError(
@@ -313,6 +295,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
             )
         if metadata.get("loss_type", "tb") != self.loss_type:
             raise ValueError("Cannot load checkpoints across loss_type objectives")
+        saved_log_loss = resolve_log_loss(metadata.get("log_loss"), self.loss_type)
         if self.loss_type == "subtb":
             if metadata.get("flow_head_version") != self.flow_head_version:
                 raise ValueError("Incompatible flow-head checkpoint version; construct the saved flow_head_version")
@@ -370,6 +353,8 @@ class TBGFlowNetGenerator(torch.nn.Module):
             self._action_probability_migration = metadata['action_probability_migration']
         else:
             self.__dict__.pop('_action_probability_migration',None)
+        if not self._log_loss_explicit:
+            self.log_loss = saved_log_loss
         return checkpoint.get("metadata", {})
 
     def _move_optimizer_state_to_device(self):
@@ -423,71 +408,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
         if self.neural_source_flow:
             return self.compute_source_log_flow()
         return self._Z
-
-    def compute_source_log_flow(self):
-        if not self.neural_source_flow:
-            return self._Z
-        state = self.env.get_initial_state()
-        features = PackedLineageFeatures(
-            torch.stack([self.env.evolution_model.normalize_partials(node.partials)
-                         for node in state.active_lineages]),
-            (0, self.env.num_sequences))
-        summary = self.flow_encoder(features, torch.tensor([self.env.num_sequences], device=self.device))
-        previous = getattr(self, '_last_flow_corrections', None)
-        value = self.state_flows([state], summary)[0]
-        self._last_flow_corrections = previous
-        return value
-
-    def state_flows(self, states, summary_reps):
-        feature_rows = [
-            [s.accumulated_log_prior / self.env.sequence_length,
-             math.log1p(s.current_time), math.log1p(len(s.active_lineages)),
-             s.total_active_blocks / self.env.num_blocks] for s in states
-        ]
-        if self.flow_head_version >= 2:
-            initial_ll = self.env.flow_likelihood.initial_log_likelihood
-            scale = self.flow_output_scale.item()
-            remaining = []
-            partial_likelihoods = []
-            for state, row in zip(states, feature_rows):
-                partial_ll = state.partial_log_likelihood
-                if partial_ll is None and self.neural_source_flow and state.is_done:
-                    # The exact terminal boundary also accepts inference states,
-                    # where the optional intermediate likelihood tracker is off.
-                    partial_ll = state.log_reward - self.env.reward_fn.C - state.accumulated_log_prior
-                if partial_ll is None:
-                    raise ValueError("Likelihood flow requires tracked partial likelihoods")
-                partial_likelihoods.append(partial_ll)
-                fraction = (state.total_active_blocks / self.env.num_blocks - 1) / max(self.env.num_sequences - 1, 1)
-                ages = [max(0.0, state.current_time - node.time) for node in state.active_lineages]
-                mean_age = sum(ages) / len(ages)
-                age_std = math.sqrt(sum((age - mean_age)**2 for age in ages) / len(ages))
-                remaining.append(fraction)
-                row.extend([(partial_ll - initial_ll) / scale, fraction,
-                            math.log1p(mean_age), math.log1p(age_std)])
-        features = summary_reps.new_tensor(feature_rows)
-        residual = self.flow_head(torch.cat((summary_reps, features), dim=-1)).squeeze(-1).double()
-        prior = torch.tensor([s.accumulated_log_prior for s in states],
-                             dtype=torch.float64, device=self.device)
-        predicted = self.flow_init_offset + prior + residual
-        if self.flow_head_version >= 2:
-            partial_ll = prior.new_tensor(partial_likelihoods)
-            source_potential = self.env.reward_fn.C + initial_ll
-            baseline_log_z = (self.flow_init_offset if self.neural_source_flow else
-                              self.flow_baseline_log_z if self.flow_head_version == 4
-                              else self.compute_log_Z())
-            predicted = (self.env.reward_fn.C + prior + partial_ll
-                         + prior.new_tensor(remaining) * (baseline_log_z - source_potential)
-                         + self.flow_output_scale * residual)
-        self._last_flow_corrections = residual.detach() * (
-            self.flow_output_scale if self.flow_head_version >= 2 else 1.0)
-        # Each forward event allocates new node IDs, so this identifies the source in O(1).
-        source = torch.tensor([s.max_node_idx == self.env.num_sequences - 1 for s in states], device=self.device)
-        if self.neural_source_flow:
-            terminal = torch.tensor([s.is_done for s in states], device=self.device)
-            reward = prior.new_tensor([s.log_reward if s.is_done else 0. for s in states])
-            return torch.where(terminal, reward, predicted)
-        return torch.where(source, self.compute_log_Z().double(), predicted)
 
     def compute_event_probabilities(self, state):
         """Actual untempered forward event policy for evaluation."""
@@ -548,8 +468,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
                                   **({'breakpoint': None} if isinstance(a, RecombinationChoice) else {}))
                           for a in forced_actions]
             action_indices = [list(actions).index(action) for actions, action in zip(all_actions, candidates)]
-        ret = self.arg_model(all_actions, lineage_reps, summary_reps, lineage_seq_features,
-                             batch_active_lineage_counts, random_spec, action_indices=action_indices)
+        ret = self.arg_model(all_actions, lineage_reps, summary_reps, random_spec, action_indices=action_indices)
 
         log_action_pf, selected_action_indices, choosen_actions, choosen_action_features = ret
 
@@ -608,7 +527,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
         return total_log_pf, log_probs, choosen_actions
 
     def continuous_time_inputs(self, states, actions, selected_action_features):
-        rates = [self.env._total_event_rate(
+        rates = [priors.total_event_rate(
             state.rates if state.rates is not None else self.env.enumerate_prior_options(state).rates
         ) for state in states]
         features = selected_action_features.new_tensor([
@@ -630,20 +549,13 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 'param_norm': self.param_norm(self),
                 'loss': self.loss.detach().cpu().numpy().tolist()}
         
+        info.update({name + "_loss": info["loss"] if name == self.loss_type else self.reported_losses[name]
+                     for name in self.log_loss})
+        self.reported_losses = {}
         if self.loss_type == "subtb":
-            info["subtb_loss"] = info["loss"]
-            info["tb_loss"] = self.tb_reporting_loss
-            self.tb_reporting_loss = 0.0
-            info["policy_grad_norm"] = self.policy_grad_norm()
-            info["flow_head_grad_norm"] = self._grad_norm(self.flow_params)
-            if not self.neural_source_flow:
-                info["log_z_grad"] = self.log_z_grad()
-            info.update(self.accumulated_diagnostics)
-            self.accumulated_diagnostics = {}
+            self._update_subtb_info(info)
         if self.loss_type == "subtb" and self.flow_head_version >= 2:
-            # The scaled flow head must not determine the policy clipping factor.
-            torch.nn.utils.clip_grad_norm_(self.policy_params, self.grad_clip)
-            torch.nn.utils.clip_grad_norm_(self.flow_params, self.grad_clip)
+            self._clip_subtb_gradients()
         else:
             torch.nn.utils.clip_grad_norm_(self.gradient_clipping_params, self.grad_clip)
         if self.scheduler is not None:
@@ -856,7 +768,7 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
     def _restore_backward_material(self, state):
         state.total_active_blocks = sum(lineage.material_segments.count for lineage in state.active_lineages)
-        state.action_options = state.rates = state.prior_options = None
+        state.rates = state.prior_options = None
         # Forward transitions discard inactive partials. Rebuild in allocation
         # order, which is topological, using the same block-resolution helpers.
         needed = {lineage.node_id for lineage in state.active_lineages if lineage.partials is None}
@@ -875,15 +787,16 @@ class TBGFlowNetGenerator(torch.nn.Module):
                 node.partials = self.env._coalesced_parent_partials(
                     *(state.all_nodes[c] for c in node.children), node.material_segments, node.time)
             else:
+                transitioned = self.env._transition_lineage_partials(
+                    state.all_nodes[node.children[0]], node.time)
                 node.partials = self.env._recombined_parent_partials(
-                    state.all_nodes[node.children[0]], node.material_segments, node.time)
+                    transitioned, node.material_segments)
         if self.env.flow_likelihood is not None:
             self.env.flow_likelihood.restore(state)
 
     def _finalize_backward_parent_state(self, parent_state, child_state, forward_action):
         parent_state.max_node_idx = max(parent_state.all_nodes) if parent_state.all_nodes else -1
         parent_state.log_reward = None
-        parent_state.action_options = None
         parent_state.rates = None
         parent_state.prior_options = None
         parent_state.is_done = self.env.is_terminal(parent_state)
@@ -893,7 +806,6 @@ class TBGFlowNetGenerator(torch.nn.Module):
             parent_state.accumulated_log_prior = child_state.accumulated_log_prior - log_prior
         if self.env.time_policy == "cwr_exponential" and not math.isfinite(parent_state.accumulated_log_prior):
             raise ValueError("non-finite reconstructed continuous prior score")
-        parent_state.action_options = None
         parent_state.rates = None
         parent_state.prior_options = None
 
@@ -902,58 +814,22 @@ class TBGFlowNetGenerator(torch.nn.Module):
 
     def get_loss_from_rollout_outputs(self, rollout_outputs):
         if self.loss_type == "subtb":
-            return geometric_subtb_loss(
-                rollout_outputs["log_paths_pf"], rollout_outputs["log_paths_pb"],
-                rollout_outputs["state_flows"], rollout_outputs["lengths"],
-                rollout_outputs["log_rewards"], self.subtb_lambda,
-            )
+            return self._get_subtb_loss_from_rollout_outputs(rollout_outputs)
         return self.get_tb_loss_from_rollout_outputs(rollout_outputs)
 
-    @torch.no_grad()
-    def get_subtb_diagnostics(self, outputs, loss=None):
-        if loss is None:
-            loss = self.get_loss_from_rollout_outputs(outputs)
-        metrics = subtb_diagnostics(outputs['log_paths_pf'], outputs['log_paths_pb'],
-            outputs['state_flows'], outputs['lengths'], outputs['log_rewards'], loss, self.subtb_lambda)
-        if 'flow_corrections' in outputs:
-            corrections = outputs['flow_corrections']
-            index = torch.arange(corrections.shape[1], device=corrections.device)[None, :]
-            values = corrections[(index > 0) & (index < outputs['lengths'][:, None])]
-            metrics['flow_correction_mean'] = values.mean().item() if values.numel() else 0.0
-            metrics['flow_correction_std'] = values.std(unbiased=False).item() if values.numel() else 0.0
-        return metrics
-
-    def get_tb_loss_from_rollout_outputs(self, rollout_outputs):
-        log_paths_pf = rollout_outputs['log_paths_pf']
-        log_paths_pb = rollout_outputs['log_paths_pb']
-        log_rewards = torch.as_tensor(
-            rollout_outputs['log_rewards'],
-            dtype=log_paths_pf.dtype,
-            device=log_paths_pf.device,
-        )
-
-        log_pf = log_paths_pf.sum(-1)
-        log_pb = log_paths_pb.sum(-1)
-
-        
-        log_z = self.compute_log_Z(None).reshape(-1).to(log_paths_pf)
-
-        forward_value = log_z + log_pf
-        backward_value = log_rewards + log_pb
-
-        loss = self.loss_fn(forward_value, backward_value)
-
-        return loss
-        
-    
     def accumulate_loss(self, rollout_outputs, factor=1.0):
-        if self.loss_type == "subtb":
-            with torch.no_grad():
-                self.tb_reporting_loss += self.get_tb_loss_from_rollout_outputs(rollout_outputs).item() / factor
         loss = self.get_loss_from_rollout_outputs(rollout_outputs)
+        with torch.no_grad():
+            for name in self.log_loss:
+                if name != self.loss_type:
+                    value = self.get_tb_loss_from_rollout_outputs(rollout_outputs)
+                    self.reported_losses[name] = self.reported_losses.get(name, 0.0) + value.item() / factor
         if self.loss_type == "subtb":
-            for key, value in self.get_subtb_diagnostics(rollout_outputs, loss).items():
-                self.accumulated_diagnostics[key] = self.accumulated_diagnostics.get(key, 0.0) + value / factor
+            self._accumulate_subtb_diagnostics(rollout_outputs, loss, factor)
         loss = (loss / factor)
         loss.backward()
         self.loss = self.loss + loss.detach()
+
+
+# Compatibility name for existing callers and checkpoint tooling.
+TBGFlowNetGenerator = GFlowNetGenerator

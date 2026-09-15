@@ -1,11 +1,11 @@
 import torch
 import numpy as np
 from env.env import SimpleTrajectory, CoalescenceChoice, RecombinationChoice
-from time_env import validate_temperature
+from env.time_env import validate_temperature
 
 
 class RolloutWorker:
-    """Rollout orchestration for the simplified ARG environment."""
+    """Policy-driven rollout orchestration for the ARG environment."""
 
     def __init__(self, env, verbose=False):
         self.env = env

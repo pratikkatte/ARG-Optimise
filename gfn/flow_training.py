@@ -5,7 +5,7 @@ from copy import deepcopy
 
 import numpy as np
 import torch
-from subtb import geometric_subtb_loss
+from gfn.subtb import geometric_subtb_loss
 
 
 def migrate_independent_flow_checkpoint(checkpoint):
@@ -92,7 +92,7 @@ class FrozenFlowBatch:
     @classmethod
     @torch.no_grad()
     def sample(cls, generator, episodes=32, seed=100019):
-        from rollout_worker_arg import RolloutWorker
+        from gfn.rollout import RolloutWorker
 
         features = []
         with preserve_sampling(generator, seed):
