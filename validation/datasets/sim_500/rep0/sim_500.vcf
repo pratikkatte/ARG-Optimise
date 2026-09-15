@@ -1,0 +1,14 @@
+##fileformat=VCFv4.2
+##source=tskit 1.0.1
+##FILTER=<ID=PASS,Description="All filters passed">
+##contig=<ID=1,length=500>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	spl0	spl1	spl2	spl3
+1	27	0	A	C	.	PASS	.	GT	0|0	0|1	1|0	0|0
+1	32	1	T	A	.	PASS	.	GT	0|0	0|0	0|1	0|0
+1	50	2	C	A	.	PASS	.	GT	0|0	0|1	1|0	0|0
+1	334	3	C	G	.	PASS	.	GT	1|0	0|0	0|0	1|1
+1	378	4	C	G	.	PASS	.	GT	0|0	0|1	1|1	0|0
+1	390	5	T	C	.	PASS	.	GT	1|1	1|0	0|0	1|1
+1	405	6	A	T	.	PASS	.	GT	0|0	0|1	1|1	0|0
+1	426	7	C	T	.	PASS	.	GT	1|1	1|0	0|0	1|1
