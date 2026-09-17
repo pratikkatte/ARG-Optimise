@@ -14,7 +14,7 @@ DEFAULTS = dict(
     replay_fraction=.25, replay_min_size=8, replay_capacity=2048, replay_grid_size=16,
     replay_per_topology=4, exploration_fraction=0., max_events=10000, chunk_steps=16,
     checkpoint_every=10, resume_checkpoint=None, cpu_threads=1, grad_accum_steps=1,
-    verbose=True, wandb=False, wandb_project='ARG-Optimise', wandb_entity=None,
+    verbose=True, progress_every_seconds=15., wandb=False, wandb_project='ARG-Optimise', wandb_entity=None,
     wandb_name=None, wandb_mode='online',
     lr_schedule='constant', lr_schedule_steps=0, lr_warmup_steps=0,
     lr_warmup_start_factor=.1, lr_min_factor=.1,
@@ -110,7 +110,7 @@ def resolve_config(options):
     for key in ('verbose','wandb','eval_density_slope','eval_independent_likelihood','terminal_eval'):
         if not isinstance(c[key],bool):
             raise ValueError(key+' must be a YAML boolean')
-    for key in ('policy_lr','flow_lr','grad_clip','time_delta_bin_width'):
+    for key in ('policy_lr','flow_lr','grad_clip','time_delta_bin_width','progress_every_seconds'):
         if not math.isfinite(c[key]) or c[key]<=0:
             raise ValueError(key+' must be positive and finite')
     if not math.isfinite(c['reward_C']) or not math.isfinite(c['subtb_lambda']) or c['subtb_lambda']<0:

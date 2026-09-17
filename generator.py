@@ -128,13 +128,26 @@ class GFlowNetGenerator(nn.Module):
         from gfn.rollout import RolloutWorker
         if self.init_z_sample_count < 1:
             raise ValueError('Flow initialization requires at least one trajectory')
+        progress = getattr(self, 'progress_reporter', None)
+        if progress is not None:
+            progress.begin('flow_initialization', initialized=0, initialization_total=self.init_z_sample_count,
+                           neural_device=str(self.device), environment_device=self.env.device)
         targets = []
-        for _ in range(self.init_z_sample_count):
-            outputs, _ = RolloutWorker(self.env, max_events=self.max_events).rollout(self)
+        for index in range(self.init_z_sample_count):
+            if progress is not None:
+                progress.update(current_arg=index+1, events_max=0, batch_completed=0, batch_total=1)
+            outputs, paths = RolloutWorker(self.env, max_events=self.max_events).rollout(self)
             targets.append(outputs['log_rewards'][0]-outputs['log_paths_pf'][0].sum())
+            if progress is not None:
+                completed = index+1
+                progress.update(initialized=completed, events_max=len(paths[0]), batch_completed=1,
+                                active_lineages_max=0,
+                                force=completed == 1 or completed % 10 == 0 or completed == self.init_z_sample_count)
         values = torch.stack(targets)
         self.flow_init_offset.copy_(values.mean())
         self.flow_output_scale.copy_(values.std(unbiased=False).clamp_min(1.))
+        if progress is not None:
+            progress.update(force=True, status='complete', initialized=self.init_z_sample_count)
 
     def get_loss_from_rollout_outputs(self, outputs):
         return geometric_subtb_loss(outputs['log_paths_pf'], outputs['log_paths_pb'],

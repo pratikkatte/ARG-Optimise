@@ -155,13 +155,17 @@ def test_full_cli_training_eval_wandb_and_resume(tmp_path):
         lr_schedule='cosine',lr_schedule_steps=4,wandb=True,wandb_mode='offline',verbose=False)
     class Run:
         id='test-run'
-        def __init__(self): self.logged=[];self.finished=False
+        def __init__(self): self.logged=[];self.finished=False;self.summary={}
         def log(self,info,step): self.logged.append((step,info))
         def finish(self): self.finished=True
     run=Run()
     with patch('train.load_snp_dataset',return_value=data),patch('wandb.init',return_value=run):
         g,t=train(**options)
     assert run.finished and len(run.logged)==2
+    assert run.summary['progress']['phase']=='training_complete'
+    progress=[json.loads(s) for s in (tmp_path/'run/progress.jsonl').read_text().splitlines()]
+    assert progress[0]['phase']=='ready' and progress[-1]['phase']=='training_complete'
+    assert any(row['phase']=='flow_initialization' and row['initialized']==0 for row in progress)
     resolved=yaml.safe_load((tmp_path/'run/resolved_config.yaml').read_text())
     assert resolved['effective_population_size']==10 and resolved['lr_schedule_steps']==4
     assert t.buffer.grid_size==3 and t.buffer.per_topology==1

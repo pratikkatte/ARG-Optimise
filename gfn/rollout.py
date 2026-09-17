@@ -22,6 +22,10 @@ class RolloutWorker:
     def _walk(self, generator, episodes, fixed=None, collect_flows=False, temperature=1.0):
         states = [self.env.get_initial_state() for _ in range(episodes)]
         paths = [SimpleTrajectory() for _ in states]
+        progress = getattr(generator, 'progress_reporter', None)
+        if progress is not None:
+            progress.update(batch_completed=0, batch_total=episodes, events_max=0,
+                            active_lineages_max=self.env.num_sequences)
         while True:
             rows = [i for i, s in enumerate(states) if not s.is_done]
             if not rows:
@@ -51,6 +55,11 @@ class RolloutWorker:
                         raise FloatingPointError('Numerical failure in terminal reward')
             except (ValueError, FloatingPointError, RuntimeError) as exc:
                 raise RolloutFailure(str(exc), paths) from exc
+            if progress is not None and progress.due():
+                progress.update(force=True, batch_completed=sum(s.is_done for s in states),
+                                batch_total=episodes, events_max=max(len(p) for p in paths),
+                                active_lineages_max=max(len(s.active_lineages) for s in states if not s.is_done)
+                                if any(not s.is_done for s in states) else 0)
             yield rows, outputs, states, paths
         if fixed is not None and any(len(p) != len(a) for p, a in zip(paths, fixed)):
             raise RolloutFailure('Replay has actions after termination', paths)
