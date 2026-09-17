@@ -11,7 +11,33 @@ from gfn.subtb import geometric_subtb_loss
 MODEL_VERSION = 'infinite-sites-shared-v1'
 FLOW_VERSION = 6
 DEFAULT_MODEL = dict(embedding_size=64, hidden_size=128, transformer_depth=6,
-                     transformer_heads=4, breakpoint_mixture_components=4)
+                     transformer_heads=4, breakpoint_mixture_components=4,
+                     transformer_mlp_ratio=2.0, dropout=0.0, attention_dropout=0.0,
+                     breakpoint_mixture_hidden_dim=None, breakpoint_mixture_layers=1,
+                     breakpoint_gap_hidden_size=64, breakpoint_gap_layers=0, breakpoint_dropout=0.0,
+                     continuous_time_head='gamma', time_hidden_dim=None, time_layers=2)
+
+
+def validate_model_config(cfg):
+    for key in ('embedding_size','hidden_size','transformer_depth','transformer_heads',
+                'breakpoint_mixture_components','breakpoint_gap_hidden_size'):
+        if isinstance(cfg[key], bool) or not isinstance(cfg[key], int) or cfg[key] < 1:
+            raise ValueError(key+' must be a positive integer')
+    for key in ('breakpoint_mixture_hidden_dim','time_hidden_dim'):
+        if cfg[key] is not None and (isinstance(cfg[key], bool) or not isinstance(cfg[key], int) or cfg[key] < 1):
+            raise ValueError(key+' must be a positive integer or null')
+    for key in ('breakpoint_mixture_layers','breakpoint_gap_layers','time_layers'):
+        if isinstance(cfg[key], bool) or not isinstance(cfg[key], int) or cfg[key] < 0:
+            raise ValueError(key+' must be a nonnegative integer')
+    for key in ('dropout','attention_dropout','breakpoint_dropout'):
+        if cfg[key] != 0:
+            raise ValueError(key+' must be 0: exact policy replay and chunked gradients require deterministic scores')
+    if cfg['continuous_time_head'] not in ('gamma','exponential'):
+        raise ValueError('continuous_time_head must be gamma or exponential')
+    if not math.isfinite(cfg['transformer_mlp_ratio']) or cfg['transformer_mlp_ratio'] <= 0:
+        raise ValueError('transformer_mlp_ratio must be positive and finite')
+    if cfg['embedding_size'] % cfg['transformer_heads']:
+        raise ValueError('embedding_size must be divisible by transformer_heads')
 
 
 class GFlowNetGenerator(nn.Module):
@@ -39,10 +65,15 @@ class GFlowNetGenerator(nn.Module):
         if unknown:
             raise ValueError('Unsupported or legacy model settings: '+', '.join(sorted(unknown)))
         cfg = self.model_kwargs
+        validate_model_config(cfg)
         self.state_encoder = InfiniteSitesEncoder(env.num_sequences, **{k:cfg[k] for k in
-                                ('embedding_size','hidden_size','transformer_depth','transformer_heads')})
+                                ('embedding_size','hidden_size','transformer_depth','transformer_heads',
+                                 'transformer_mlp_ratio','dropout','attention_dropout')})
         self.arg_model = ARGModel(**{k:cfg[k] for k in
-                                 ('embedding_size','hidden_size','breakpoint_mixture_components')})
+                                 ('embedding_size','hidden_size','breakpoint_mixture_components',
+                                  'breakpoint_mixture_hidden_dim','breakpoint_mixture_layers',
+                                  'breakpoint_gap_hidden_size','breakpoint_gap_layers',
+                                  'continuous_time_head','time_hidden_dim','time_layers')})
         self.flow_head = mlp(cfg['embedding_size']+STATE_DIM, cfg['hidden_size'], 1)
         nn.init.zeros_(self.flow_head[-1].weight); nn.init.zeros_(self.flow_head[-1].bias)
         self.register_buffer('flow_init_offset', torch.tensor(env.reward_fn.C, dtype=torch.float64))
@@ -74,9 +105,9 @@ class GFlowNetGenerator(nn.Module):
         reward = value.new_tensor([s.log_reward if s.is_done else 0. for s in states])
         return torch.where(terminal, reward, value)
 
-    def forward(self, states, *, forced_actions=None, return_flows=False):
+    def forward(self, states, *, forced_actions=None, return_flows=False, temperature=1.0):
         batch, lineages, summary = self.encode(states)
-        log_pf, actions, factors = self.arg_model(self.env, states, batch, lineages, summary, forced_actions)
+        log_pf, actions, factors = self.arg_model(self.env, states, batch, lineages, summary, forced_actions, temperature)
         flow = self.state_flows(states, summary, batch.observations) if return_flows else None
         return dict(log_pf=log_pf, actions=actions, factors=factors, flows=flow)
 

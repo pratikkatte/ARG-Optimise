@@ -8,14 +8,20 @@ from env.actions import CoalescenceChoice, RecombinationChoice
 from env.priors import total_event_rate
 from breakpoint_model import SparseMixtureBreakpointPolicy
 from .encoder import mlp
-from .time_model import CwrGammaTimeModel
+from .time_model import CwrGammaTimeModel, CwrExponentialTimeModel
 
 
 class InfiniteSitesBreakpointHead(nn.Module):
-    def __init__(self, context_dim, hidden_size=128, components=4):
+    def __init__(self, context_dim, hidden_size=128, components=4, layers=1,
+                 gap_hidden_size=64, gap_layers=0):
         super().__init__()
         self.components = components
-        self.parameters_head = mlp(context_dim+3, hidden_size, 3*components)
+        modules, width = [], context_dim+3
+        for size, count in ((hidden_size, layers), (gap_hidden_size, gap_layers)):
+            for _ in range(count):
+                modules.extend([nn.Linear(width, size), nn.SiLU()]); width = size
+        modules.append(nn.Linear(width, 3*components))
+        self.parameters_head = nn.Sequential(*modules)
         output = self.parameters_head[-1]
         nn.init.zeros_(output.weight); nn.init.zeros_(output.bias)
         with torch.no_grad():
@@ -30,13 +36,22 @@ class InfiniteSitesBreakpointHead(nn.Module):
         return a, z, (weights.log_softmax(-1), a-.5+(z-a+1)*centers.sigmoid(),
                       .1+(z-a+1)*scales.sigmoid())
 
-    def forward(self, choice, context, length, breakpoint=None):
+    def forward(self, choice, context, length, breakpoint=None, temperature=1.0):
         a, z, parameters = self.parameters_for(choice, context, length)
         if breakpoint is None:
-            breakpoint = SparseMixtureBreakpointPolicy.sample_gap(a, z, parameters)
+            breakpoint = SparseMixtureBreakpointPolicy.sample_gap(a, z, parameters, temperature=temperature)
         if not isinstance(breakpoint, int) or not a <= breakpoint <= z:
             raise ValueError('Breakpoint is outside the physical recombination span')
-        return breakpoint, SparseMixtureBreakpointPolicy.log_probabilities(breakpoint, a, z, parameters)
+        score = SparseMixtureBreakpointPolicy.log_probabilities(breakpoint, a, z, parameters)
+        if temperature != 1.:
+            # Normalize the tempered distribution over EVERY physical link.
+            normalizer = score.new_tensor(-torch.inf)
+            for start in range(a, z+1, 1024):
+                gaps = torch.arange(start, min(start+1024, z+1), device=context.device)
+                logs = SparseMixtureBreakpointPolicy.log_probabilities(gaps, a, z, parameters)/temperature
+                normalizer = torch.logaddexp(normalizer, torch.logsumexp(logs, 0))
+            score = score/temperature-normalizer
+        return breakpoint, score
 
 
 class ARGModel(nn.Module):
@@ -44,22 +59,28 @@ class ARGModel(nn.Module):
     time_policy = 'cwr_exponential'
     continuous_time_head = 'gamma'
 
-    def __init__(self, embedding_size=64, hidden_size=128, breakpoint_mixture_components=4):
+    def __init__(self, embedding_size=64, hidden_size=128, breakpoint_mixture_components=4,
+                 breakpoint_mixture_hidden_dim=None, breakpoint_mixture_layers=1,
+                 breakpoint_gap_hidden_size=64, breakpoint_gap_layers=0,
+                 continuous_time_head='gamma', time_hidden_dim=None, time_layers=2):
         super().__init__()
         self.event_head = mlp(embedding_size, hidden_size, 2)
         self.action_head = mlp(4*embedding_size, hidden_size, 1)
-        self.breakpoint_head = InfiniteSitesBreakpointHead(4*embedding_size, hidden_size,
-                                                          breakpoint_mixture_components)
-        self.time_head = CwrGammaTimeModel(4*embedding_size+4, hidden_size, 0., layers=2)
+        self.breakpoint_head = InfiniteSitesBreakpointHead(4*embedding_size, breakpoint_mixture_hidden_dim or hidden_size,
+                    breakpoint_mixture_components, breakpoint_mixture_layers,
+                    breakpoint_gap_hidden_size, breakpoint_gap_layers)
+        self.continuous_time_head = continuous_time_head
+        head = CwrGammaTimeModel if continuous_time_head == 'gamma' else CwrExponentialTimeModel
+        self.time_head = head(4*embedding_size+4, time_hidden_dim or hidden_size, 0., layers=time_layers)
         for head in (self.event_head, self.action_head):
             nn.init.zeros_(head[-1].weight); nn.init.zeros_(head[-1].bias)
 
-    def event_log_probs(self, batch, summary):
+    def event_log_probs(self, batch, summary, temperature=1.0):
         hazards = summary.new_tensor(batch.allowed_hazards, dtype=torch.float64)
         available = hazards > 0
         if not available.any(-1).all():
             raise ValueError('Cannot sample an event from a terminal or dead-end state')
-        return (hazards.log()+self.event_head(summary).double()).masked_fill(~available, -torch.inf).log_softmax(-1)
+        return ((hazards.log()+self.event_head(summary).double())/temperature).masked_fill(~available, -torch.inf).log_softmax(-1)
 
     @staticmethod
     def contexts(choices, lineage, summary):
@@ -72,8 +93,10 @@ class ARGModel(nn.Module):
         return torch.cat((first, torch.zeros_like(first), torch.zeros_like(first),
                           summary.expand(len(choices), -1)), -1)
 
-    def forward(self, env, states, batch, lineages, summary, forced_actions=None):
-        event_logs = self.event_log_probs(batch, summary)
+    def forward(self, env, states, batch, lineages, summary, forced_actions=None, temperature=1.0):
+        if not math.isfinite(temperature) or temperature < 1:
+            raise ValueError('Policy temperature must be finite and >= 1')
+        event_logs = self.event_log_probs(batch, summary, temperature)
         event_indices = (Categorical(logits=event_logs).sample().tolist() if forced_actions is None else
                          [int(isinstance(a, RecombinationChoice)) for a in forced_actions])
         actions, contexts, factors = [], [], []
@@ -84,7 +107,7 @@ class ARGModel(nn.Module):
             context = self.contexts(choices, lineages[row], summary[row])
             baseline = context.new_tensor([a.breakpoint_count if kind else 1 for a in choices], dtype=torch.float64).log()
             logits = baseline+self.action_head(context).squeeze(-1).double()
-            logs = logits.log_softmax(-1)
+            logs = (logits/temperature).log_softmax(-1)
             if forced_actions is None:
                 selected = int(Categorical(logits=logs).sample())
             else:
@@ -99,7 +122,7 @@ class ARGModel(nn.Module):
             breakpoint_log = logs.new_zeros(())
             if kind:
                 bp, breakpoint_log = self.breakpoint_head(action, chosen_context, env.sequence_length,
-                                       None if forced_actions is None else forced_actions[row].breakpoint)
+                                       None if forced_actions is None else forced_actions[row].breakpoint, temperature=temperature)
                 action = replace(action, breakpoint=bp)
             actions.append(action); contexts.append(chosen_context)
             factors.append(torch.stack((event_logs[row, kind], logs[selected], breakpoint_log)))

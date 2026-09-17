@@ -11,7 +11,8 @@ def mlp(inputs, hidden, outputs):
 
 class InfiniteSitesEncoder(nn.Module):
     def __init__(self, sample_count, embedding_size=64, hidden_size=128,
-                 transformer_depth=6, transformer_heads=4):
+                 transformer_depth=6, transformer_heads=4, transformer_mlp_ratio=2.0,
+                 dropout=0.0, attention_dropout=0.0):
         super().__init__()
         self.embedding_size = embedding_size
         self.snp_encoder = mlp(7+2*sample_count, hidden_size, embedding_size)
@@ -19,7 +20,8 @@ class InfiniteSitesEncoder(nn.Module):
         self.lineage_projection = mlp(4*embedding_size+LINEAGE_DIM, hidden_size, embedding_size)
         self.summary_token = nn.Parameter(torch.zeros(1, 1, embedding_size))
         nn.init.normal_(self.summary_token, std=.02)
-        self.transformer = TransformerEncoder(embedding_size, transformer_depth, transformer_heads)
+        self.transformer = TransformerEncoder(embedding_size, transformer_depth, transformer_heads,
+                    mlp_ratio=transformer_mlp_ratio, dropout=dropout, attention_dropout=attention_dropout)
         self.state_projection = mlp(embedding_size+STATE_DIM, hidden_size, embedding_size)
 
     @staticmethod

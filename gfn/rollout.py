@@ -19,7 +19,7 @@ class RolloutWorker:
             raise ValueError('max_events must be positive')
         self.max_events = int(max_events)
 
-    def _walk(self, generator, episodes, fixed=None, collect_flows=False):
+    def _walk(self, generator, episodes, fixed=None, collect_flows=False, temperature=1.0):
         states = [self.env.get_initial_state() for _ in range(episodes)]
         paths = [SimpleTrajectory() for _ in states]
         while True:
@@ -35,7 +35,7 @@ class RolloutWorker:
                         raise ValueError('Replay ends before ancestry completes')
                     actions = [fixed[i][len(paths[i])] for i in rows]
                 active = [states[i] for i in rows]
-                outputs = generator(active, forced_actions=actions, return_flows=collect_flows)
+                outputs = generator(active, forced_actions=actions, return_flows=collect_flows, temperature=temperature)
                 for k, (row, action) in enumerate(zip(rows, outputs['actions'])):
                     previous = states[row]
                     state = self.env.apply_action(previous, action)
@@ -55,11 +55,11 @@ class RolloutWorker:
         if fixed is not None and any(len(p) != len(a) for p, a in zip(paths, fixed)):
             raise RolloutFailure('Replay has actions after termination', paths)
 
-    def _run(self, generator, episodes, fixed=None, collect_flows=False, return_states=False):
+    def _run(self, generator, episodes, fixed=None, collect_flows=False, return_states=False, temperature=1.0):
         if episodes < 1:
             raise ValueError('episodes must be positive')
         pf, flows, factors = ([[] for _ in range(episodes)] for _ in range(3))
-        for rows, output, states, paths in self._walk(generator, episodes, fixed, collect_flows):
+        for rows, output, states, paths in self._walk(generator, episodes, fixed, collect_flows, temperature):
             for k, row in enumerate(rows):
                 pf[row].append(output['log_pf'][k])
                 factors[row].append(output['factors'][k])
@@ -77,9 +77,11 @@ class RolloutWorker:
         return result, paths
 
     def rollout(self, generator, episodes=1, random_spec=None, return_states=False, collect_flows=False):
-        if random_spec is not None and float(random_spec.get('T', 1.)) != 1.:
-            raise ValueError('Phase 2 uses temperature 1; tempered densities are not implemented')
-        return self._run(generator, episodes, collect_flows=collect_flows, return_states=return_states)
+        temperature = float((random_spec or {}).get('T', 1.))
+        if set(random_spec or {})-{'T','time_T'} or (random_spec or {}).get('time_T', 1.) != 1.:
+            raise ValueError('Only discrete policy temperature is supported; waits remain untempered')
+        return self._run(generator, episodes, collect_flows=collect_flows,
+                         return_states=return_states, temperature=temperature)
 
     def replay(self, generator, trajectories, collect_flows=True, return_states=False):
         actions = [t.actions if hasattr(t, 'actions') else t for t in trajectories]

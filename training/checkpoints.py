@@ -97,14 +97,19 @@ def restore_generator(generator, data, load_optimizer=True):
     metadata = data['metadata']
     if metadata['environment_fingerprint'] != generator.env.dataset_fingerprint:
         raise ValueError('Checkpoint observations or environment differ')
-    if metadata['model'] != generator.model_kwargs:
+    from generator import DEFAULT_MODEL
+    if {**DEFAULT_MODEL, **metadata['model']} != generator.model_kwargs:
         raise ValueError('Checkpoint neural architecture differs')
     generator.load_state_dict(data['generator_state_dict'], strict=True)
     if load_optimizer:
         generator.opt.load_state_dict(data['opt_state_dict'])
         if data['scheduler'] is not None:
-            generator.scheduler = torch.optim.lr_scheduler.ExponentialLR(generator.opt, gamma=data['scheduler']['gamma'])
-            generator.scheduler.load_state_dict(data['scheduler'])
+            if 'config' in data['scheduler'] and 'completed_updates' in data['scheduler']:
+                from training.schedules import WarmupCosineScheduler
+                generator.scheduler = WarmupCosineScheduler.from_state_dict(generator.opt, data['scheduler'])
+            else:
+                generator.scheduler = torch.optim.lr_scheduler.ExponentialLR(generator.opt, gamma=data['scheduler']['gamma'])
+                generator.scheduler.load_state_dict(data['scheduler'])
 
 
 def generator_from_checkpoint(data, device='cpu', seed=7, optimizer=False, restore_random=False):

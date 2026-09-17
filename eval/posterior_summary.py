@@ -395,10 +395,13 @@ class TerminalSamplingEvaluator:
     """Reuse terminal rollout states; never sample actions or update any model."""
 
     def __init__(self, truth, truth_samples, sample_names, population_size, grid_size=100,
-                 provenance=None, tmrca_method='grid'):
+                 provenance=None, tmrca_method='grid', rank_bins=20):
         if tmrca_method not in ('grid', 'point_accuracy'):
             raise ValueError('Unknown TMRCA evaluation method')
         self.tmrca_method = tmrca_method
+        if not isinstance(rank_bins,int) or rank_bins < 1:
+            raise ValueError('rank_bins must be a positive integer')
+        self.rank_bins = rank_bins
         if truth.time_units != 'generations':
             raise ValueError('Truth tree times must explicitly be in generations')
         if grid_size < 1 or population_size <= 0:
@@ -440,13 +443,13 @@ class TerminalSamplingEvaluator:
         self.protocol['metric_implementation'] = 'eval/posterior_summary.py'
         self.protocol['metric_implementation_sha256'] = IMPLEMENTATION_SHA256
         self.protocol['calibration_implementation_sha256'] = CALIBRATION_SHA256
-        self.protocol['calibration_definition'] = dict(rank_bins=20, ranks='0 through draw count inclusive',
+        self.protocol['calibration_definition'] = dict(rank_bins=rank_bins, ranks='0 through draw count inclusive',
             ties='Uniform mass over exact-tie ranks', kl='observed || uniform rank bin mass, in nats',
             coverage_levels=[.5, .7, .9], quantile_method='linear', endpoints='inclusive')
         self.protocol['sha256'] = hashlib.sha256(json.dumps(self.protocol, sort_keys=True).encode()).hexdigest()
 
     @classmethod
-    def from_dataset(cls, dataset_path, env, grid_size=100, tmrca_method='grid'):
+    def from_dataset(cls, dataset_path, env, grid_size=100, tmrca_method='grid', rank_bins=20):
         from env.snp_data import load_snp_dataset
         dataset_path = Path(dataset_path)
         metadata = json.loads((dataset_path/'metadata.json').read_text())
@@ -472,7 +475,7 @@ class TerminalSamplingEvaluator:
         return cls(truth, samples, observed.haplotype_ids, env.population_size, grid_size,
                    dict(environment_fingerprint=env.dataset_fingerprint,
                         truth_sha256=hashlib.sha256(truth_path.read_bytes()).hexdigest(),
-                        verified_exported_sites=observed.num_variants), tmrca_method=tmrca_method)
+                        verified_exported_sites=observed.num_variants), tmrca_method=tmrca_method, rank_bins=rank_bins)
 
     def pair_times(self, ts, samples):
         return np.array([[tree.tmrca(samples[a], samples[b])/self.scale for a, b in self.pairs]
@@ -546,11 +549,11 @@ class TerminalSamplingEvaluator:
             exact, point_details, _ = point_accuracy_metrics(
                 self.truth, tree_sequences, self.scale / 2,
                 truth_samples=self.truth_samples,
-                posterior_samples=[list(ts.samples()) for ts in tree_sequences])
+                posterior_samples=[list(ts.samples()) for ts in tree_sequences], rank_bins=self.rank_bins)
             metrics.update(exact)
             details['pair_tmrca_exact'] = point_details
         else:
-            calibration_metrics, calibration = tmrca_calibration_metrics(self.expected, values)
+            calibration_metrics, calibration = tmrca_calibration_metrics(self.expected, values, rank_bins=self.rank_bins)
             metrics.update(calibration_metrics)
             details['tmrca_calibration'] = calibration
         return metrics, details
