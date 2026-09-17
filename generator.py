@@ -89,9 +89,13 @@ class GFlowNetGenerator(nn.Module):
         if initialize_z_from_policy:
             self.initialize_flow_center(verbose=verbose)
 
-    def encode(self, states):
+    def encode(self, states, *, pooled_cache=None):
         batch = pack_states(self.env, states, self.device, cache=self._observation_cache)
-        lineage, summary = self.state_encoder(batch.observations)
+        pooled = None
+        if pooled_cache is not None:
+            nodes = [node for state in states for node in state.active_lineages]
+            pooled = pooled_cache.get(self.state_encoder, batch.observations, nodes)
+        lineage, summary = self.state_encoder(batch.observations, pooled_embeddings=pooled)
         return batch, lineage, summary
 
     def state_flows(self, states, summary, observations):
@@ -106,8 +110,8 @@ class GFlowNetGenerator(nn.Module):
         reward = value.new_tensor([s.log_reward if s.is_done else 0. for s in states])
         return torch.where(terminal, reward, value)
 
-    def forward(self, states, *, forced_actions=None, return_flows=False, temperature=1.0):
-        batch, lineages, summary = self.encode(states)
+    def forward(self, states, *, forced_actions=None, return_flows=False, temperature=1.0, pooled_cache=None):
+        batch, lineages, summary = self.encode(states, pooled_cache=pooled_cache)
         log_pf, actions, factors = self.arg_model(self.env, states, batch, lineages, summary, forced_actions, temperature)
         flow = self.state_flows(states, summary, batch.observations) if return_flows else None
         return dict(log_pf=log_pf, actions=actions, factors=factors, flows=flow)

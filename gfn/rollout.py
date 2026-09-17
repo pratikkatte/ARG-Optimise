@@ -3,6 +3,7 @@ import math
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from env.env import SimpleTrajectory
+from policy.encoder import PooledLineageCache
 from utils import action_as_dict
 
 
@@ -13,13 +14,14 @@ class RolloutFailure(RuntimeError):
 
 
 class RolloutWorker:
-    def __init__(self, env, verbose=False, max_events=10000):
+    def __init__(self, env, verbose=False, max_events=10000, *, cache_pooled_embeddings=True):
         self.env, self.verbose = env, verbose
+        self.cache_pooled_embeddings = cache_pooled_embeddings
         if max_events < 1:
             raise ValueError('max_events must be positive')
         self.max_events = int(max_events)
 
-    def _walk(self, generator, episodes, fixed=None, collect_flows=False, temperature=1.0):
+    def _walk(self, generator, episodes, fixed=None, collect_flows=False, temperature=1.0, *, pooled_cache=None):
         states = [self.env.get_initial_state() for _ in range(episodes)]
         paths = [SimpleTrajectory() for _ in states]
         while True:
@@ -35,7 +37,8 @@ class RolloutWorker:
                         raise ValueError('Replay ends before ancestry completes')
                     actions = [fixed[i][len(paths[i])] for i in rows]
                 active = [states[i] for i in rows]
-                outputs = generator(active, forced_actions=actions, return_flows=collect_flows, temperature=temperature)
+                outputs = generator(active, forced_actions=actions, return_flows=collect_flows,
+                                    temperature=temperature, pooled_cache=pooled_cache)
                 proposal_scores = outputs['log_pf'].detach().tolist()
                 for k, (row, action) in enumerate(zip(rows, outputs['actions'])):
                     state, prior = self.env.step_owned_state(states[row], action)
@@ -58,12 +61,20 @@ class RolloutWorker:
         if episodes < 1:
             raise ValueError('episodes must be positive')
         pf, flows, factors = ([[] for _ in range(episodes)] for _ in range(3))
-        for rows, output, states, paths in self._walk(generator, episodes, fixed, collect_flows, temperature):
-            for k, row in enumerate(rows):
-                pf[row].append(output['log_pf'][k])
-                factors[row].append(output['factors'][k])
-                if collect_flows:
-                    flows[row].append(output['flows'][k])
+        # One _run belongs to one microbatch backward graph. No cache escapes
+        # into the next microbatch, a tempered rescore, or an optimizer update.
+        cache = PooledLineageCache() if self.cache_pooled_embeddings else None
+        try:
+            for rows, output, states, paths in self._walk(
+                    generator, episodes, fixed, collect_flows, temperature, pooled_cache=cache):
+                for k, row in enumerate(rows):
+                    pf[row].append(output['log_pf'][k])
+                    factors[row].append(output['factors'][k])
+                    if collect_flows:
+                        flows[row].append(output['flows'][k])
+        finally:
+            if cache is not None:
+                cache.clear()
         rewards = torch.tensor([s.log_reward for s in states], dtype=torch.float64, device=generator.device)
         lengths = torch.tensor([len(p) for p in paths], dtype=torch.long, device=generator.device)
         scores = pad_sequence([torch.stack(p) for p in pf], batch_first=True)
