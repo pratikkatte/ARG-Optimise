@@ -1,344 +1,115 @@
+"""Sample and independently verify ARGs from a self-contained neural checkpoint."""
 import argparse
 import json
-import os
 import math
-
+from pathlib import Path
+import numpy as np
 import torch
-
-from env.env import SimpleARGEnvironment
-from gfn.rollout import RolloutWorker
-from generator import GFlowNetGenerator, TBGFlowNetGenerator
-from env.time_env import DEFAULT_TIME_BIN_SCHEME, checkpoint_time_policy
-from train import (
-    DEFAULT_LOG_Z_LR,
-    MODEL_VERSION,
-    DEFAULT_MU_PER_BP,
-    DEFAULT_NE,
-    seed_everything,
-)
+from gfn.rollout import RolloutWorker, RolloutFailure
+from training.checkpoints import (load_checkpoint, generator_from_checkpoint, seed_everything,
+                                  environment_from_metadata, validate_metadata)
+from utils import action_as_dict
 
 
-REQUIRED_METADATA_KEYS = {
-    "sequences",
-    "num_sequences",
-    "sequence_length",
-    "num_blocks",
-    "rho",
-    "seed",
-    "init_z_sample_count",
-    "model_version",
-}
+def resolve_device(device='auto'):
+    device = ('cuda' if torch.cuda.is_available() else 'cpu') if device in (None,'auto') else device
+    if str(device) == 'mps':
+        raise ValueError('MPS does not support the required float64 scoring; use CPU or CUDA')
+    if str(device).startswith('cuda') and not torch.cuda.is_available():
+        raise ValueError('CUDA is unavailable')
+    return torch.device(device)
 
 
-def run_inference(
-    checkpoint,
-    output_dir="inferred_args",
-    num_args=1,
-    batch_size=1,
-    seed=None,
-    device="auto",
-    temperature=None,
-    verbose=False,
-):
-    from env.workflow import require_neural_migration
-    require_neural_migration()
-    if num_args < 1:
-        raise ValueError("num_args must be at least 1")
-    if batch_size < 1:
-        raise ValueError("batch_size must be at least 1")
-    checkpoint_data = load_checkpoint(checkpoint, map_location="cpu")
-    metadata = checkpoint_data.get("metadata", {})
-    validate_metadata(metadata)
+def validate_terminal(env, state):
+    if not state.is_done or not math.isfinite(state.log_reward):
+        raise ValueError('Inference requires a completed ARG with positive finite likelihood')
+    reference = env.evaluate_terminal(state)
+    if abs(reference.log_likelihood-state.partial_log_likelihood) > 1e-9:
+        raise AssertionError('Independent terminal likelihood disagrees')
+    np.testing.assert_allclose(reference.exposure, state.exposure*2*env.population_size, rtol=1e-12, atol=1e-8)
+    np.testing.assert_allclose(reference.compatible_branch_lengths,
+                               state.completed_site_lengths*2*env.population_size, rtol=1e-12, atol=1e-8)
+    return reference
 
-    inference_seed = int(metadata["seed"] if seed is None else seed)
-    seed_everything(inference_seed)
 
-    resolved_device = resolve_device(device)
-    env = environment_from_metadata(
-        metadata,
-        seed=inference_seed,
-        device=resolved_device,
-    )
-    generator = GFlowNetGenerator(
-        env,
-        init_z_sample_count=metadata["init_z_sample_count"],
-        device=resolved_device,
-        verbose=verbose,
-        log_z_lr=float(metadata.get("log_z_lr", DEFAULT_LOG_Z_LR)),
-        model_kwargs=dict(metadata.get("model", {})),
-        initialize_z_from_policy=False,
-        loss_type=metadata.get("loss_type", "tb"),
-        subtb_lambda=metadata.get("subtb_lambda", 0.9),
-        flow_lr=metadata.get("flow_lr", metadata.get("policy_lr", 0.001)),
-        flow_head_version=metadata.get("flow_head_version", 1),
-    )
-    generator.load(checkpoint_data, load_optimizer=False, map_location=generator.device)
+@torch.no_grad()
+def collect_samples(generator, num_args=16, batch_size=2, seed=100007, max_events=10000):
+    if num_args < 1 or batch_size < 1:
+        raise ValueError('Sample and batch counts must be positive')
+    seed_everything(seed); generator.env.rng.seed(seed)
     generator.eval()
+    worker = RolloutWorker(generator.env, max_events=max_events)
+    records, trees, paths = [], [], []
+    for start in range(0, num_args, batch_size):
+        try:
+            outputs, trajectories = worker.rollout(generator, min(batch_size,num_args-start), return_states=True)
+        except RolloutFailure as exc:
+            exc.histories = [[action_as_dict(a) for a in p.actions] for p in paths]+exc.histories
+            exc.completed_records = records
+            raise
+        for i, (state, path) in enumerate(zip(outputs['states'],trajectories)):
+            reference = validate_terminal(generator.env, state)
+            pf = float(outputs['log_paths_pf'][i].sum())
+            records.append(dict(index=len(records), status='complete', source='policy', temperature=1.,
+                log_likelihood=state.partial_log_likelihood, independent_log_likelihood=reference.log_likelihood,
+                log_prior=state.accumulated_log_prior, log_policy_density=pf, log_backward_probability=0.,
+                log_reward=state.log_reward, log_importance_weight=state.log_reward-pf,
+                event_count=len(path), recombinations=sum(a.event_type=='recomb' for a in path.actions),
+                actions=[action_as_dict(a) for a in path.actions]))
+            trees.append(generator.env.save_to_tree_sequence(state)); paths.append(path)
+    return records, trees, paths
 
-    random_spec = build_random_spec(temperature=temperature)
-    rollout_worker = RolloutWorker(env, verbose=verbose)
-    rollout_outputs, trajectories = run_batched_rollouts(
-        rollout_worker,
-        generator,
-        num_args=num_args,
-        batch_size=batch_size,
-        random_spec=random_spec,
-        verbose=verbose,
-    )
 
-    os.makedirs(output_dir, exist_ok=True)
-    manifest = build_manifest(
-        checkpoint=checkpoint,
-        metadata=metadata,
-        seed=inference_seed,
-        random_spec=random_spec,
-        output_dir=output_dir,
-        env=env,
-        rollout_outputs=rollout_outputs,
-        trajectories=trajectories,
-    )
-    manifest_path = os.path.join(output_dir, "manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2)
+def sample_summary(records):
+    weights = np.asarray([r['log_importance_weight'] for r in records])
+    weights = np.exp(weights-weights.max()); weights /= weights.sum()
+    return dict(num_completed=len(records), num_failed=0,
+                importance_ess=float(1/(weights@weights)), importance_ess_fraction=float(1/(weights@weights)/len(weights)),
+                max_normalized_importance_weight=float(weights.max()),
+                max_likelihood_error=max(abs(r['log_likelihood']-r['independent_log_likelihood']) for r in records))
+
+
+def run_inference(checkpoint, output_dir='inferred_args', num_args=16, batch_size=2, seed=100007,
+                  device='auto', temperature=None, max_events=10000, cpu_threads=1, verbose=False):
+    if temperature is not None and temperature != 1:
+        raise ValueError('Infinite-sites inference currently requires temperature 1')
+    torch.set_num_threads(cpu_threads)
+    data = load_checkpoint(checkpoint)
+    generator = generator_from_checkpoint(data, resolve_device(device), optimizer=False)
+    output = Path(output_dir)
+    if output.exists() and any(output.iterdir()):
+        raise ValueError('Inference requires an empty output directory')
+    output.mkdir(parents=True, exist_ok=True)
+    try:
+        records, trees, _ = collect_samples(generator, num_args, batch_size, seed, max_events)
+    except RolloutFailure as exc:
+        (output/'failure.json').write_text(json.dumps(dict(error=str(exc), histories=exc.histories, completed_samples=getattr(exc,'completed_records',[])), indent=2))
+        raise
+    for row, ts in zip(records, trees):
+        row['trees_file'] = f'arg_{row["index"]:04d}.trees'
+        ts.dump(output/row['trees_file'])
+    manifest = dict(schema_version=2, model_version=data['metadata']['model_version'], mutation_model='infinite_sites',
+                    sampling_distribution='learned_policy', posterior_calibration_established=False,
+                    environment_fingerprint=generator.env.dataset_fingerprint,
+                    haplotype_ids=list(generator.env.snp_data.haplotype_ids), num_variants=generator.env.num_variants,
+                    sequence_length=generator.env.sequence_length, seed=seed,
+                    summary=sample_summary(records), samples=records)
+    (output/'manifest.json').write_text(json.dumps(manifest, indent=2, allow_nan=False))
     return manifest
 
 
-def load_checkpoint(path, map_location=None):
-    try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
+def main(argv=None):
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--checkpoint', required=True)
+    parser.add_argument('--output-dir', required=True)
+    parser.add_argument('--num-args', type=int, default=16)
+    parser.add_argument('--batch-size', type=int, default=2)
+    parser.add_argument('--seed', type=int, default=100007)
+    parser.add_argument('--max-events', type=int, default=10000)
+    parser.add_argument('--device', default='auto')
+    args=vars(parser.parse_args(argv))
+    print(json.dumps(run_inference(**args)['summary'], indent=2))
 
 
-def resolve_device(device):
-    if device is None or device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    resolved = torch.device(device)
-    if resolved.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA was requested for inference but is not available.")
-    return resolved
-
-
-def validate_metadata(metadata):
-    if metadata.get("arg_prior") != "hudson":
-        raise ValueError("Only explicit Hudson ARG checkpoints are supported; start a fresh Hudson run")
-    policy = checkpoint_time_policy(metadata)
-    from policy.time_model import validate_continuous_time_head
-    validate_continuous_time_head(metadata.get('model', {}).get('continuous_time_head', 'exponential'), policy)
-    timing_keys = {"time_bin_scheme", "time_bins", "time_delta_bin_width"} if policy == "categorical" else set()
-    missing = sorted((REQUIRED_METADATA_KEYS | timing_keys) - set(metadata))
-    if missing:
-        raise ValueError(
-            "Checkpoint metadata is missing fields required for inference: "
-            + ", ".join(missing)
-        )
-    if policy == "categorical" and metadata["time_bin_scheme"] != DEFAULT_TIME_BIN_SCHEME:
-        raise ValueError(
-            "This inference path requires fixed-delta time-bin checkpoints "
-            f"({DEFAULT_TIME_BIN_SCHEME}), got {metadata['time_bin_scheme']!r}."
-        )
-    if metadata["model_version"] != MODEL_VERSION:
-        raise ValueError(
-            "Checkpoint model_version is incompatible with block-resolution partials: "
-            f"expected {MODEL_VERSION!r}, got {metadata['model_version']!r}."
-        )
-
-
-def environment_from_metadata(metadata, seed, device=None):
-    from env.workflow import require_neural_migration
-    require_neural_migration()
-    policy = checkpoint_time_policy(metadata)
-    population_size = float(metadata.get("effective_population_size", DEFAULT_NE))
-    sequence_length = int(metadata["sequence_length"])
-    rho = float(metadata["rho"])
-    env_kwargs = {
-        "time_policy": policy,
-        "arg_prior": metadata.get('arg_prior'),
-        "num_sequences": int(metadata["num_sequences"]),
-        "sequence_length": sequence_length,
-        "num_blocks": int(metadata["num_blocks"]),
-        "rho": rho,
-        "population_size": population_size,
-        # Legacy checkpoints stored only rho. Recover its per-base rate rather
-        # than reporting the constructor's unrelated default after restoration.
-        "recombination_rate": float(metadata.get(
-            "recombination_rate", rho / (4 * population_size * sequence_length)
-        )),
-        "mutation_rate": float(metadata.get("mutation_rate", DEFAULT_MU_PER_BP)),
-        "sequences": list(metadata["sequences"]),
-        "seed": seed,
-    }
-    if policy == "categorical":
-        env_kwargs.update(time_bins=int(metadata["time_bins"]),
-                          time_delta_bin_width=float(metadata["time_delta_bin_width"]))
-    if device is not None:
-        env_kwargs["device"] = device
-    return SimpleARGEnvironment(**env_kwargs)
-
-
-def run_batched_rollouts(
-    rollout_worker,
-    generator,
-    num_args,
-    batch_size,
-    random_spec,
-    verbose=False,
-):
-    states = []
-    trajectories = []
-    log_paths_pf_rows = []
-    log_paths_pb_rows = []
-
-    with torch.no_grad():
-        for start in range(0, num_args, batch_size):
-            chunk_size = min(batch_size, num_args - start)
-            end = start + chunk_size
-            if verbose:
-                print(
-                    f"Running ARG rollout chunk {start + 1}-{end} of {num_args} "
-                    f"(batch_size={chunk_size})",
-                    flush=True,
-                )
-            chunk_outputs, chunk_trajectories = rollout_worker.rollout(
-                generator,
-                episodes=chunk_size,
-                random_spec=random_spec,
-                return_states=True,
-            )
-            states.extend(chunk_outputs["states"])
-            trajectories.extend(chunk_trajectories)
-            log_paths_pf_rows.extend(
-                row.detach().cpu() for row in chunk_outputs["log_paths_pf"].unbind(0)
-            )
-            log_paths_pb_rows.extend(
-                row.detach().cpu() for row in chunk_outputs["log_paths_pb"].unbind(0)
-            )
-            del chunk_outputs, chunk_trajectories
-            if generator.device.type == "cuda":
-                torch.cuda.empty_cache()
-            if verbose:
-                print(
-                    f"Completed ARG rollout chunk {start + 1}-{end} of {num_args}",
-                    flush=True,
-                )
-
-    rollout_outputs = {
-        "states": states,
-        "log_paths_pf": _pad_log_path_rows(log_paths_pf_rows),
-        "log_paths_pb": _pad_log_path_rows(log_paths_pb_rows),
-    }
-    return rollout_outputs, trajectories
-
-
-def _pad_log_path_rows(rows):
-    if not rows:
-        return torch.empty(0, 0)
-    max_length = max(row.numel() for row in rows)
-    dtype = rows[0].dtype
-    padded = torch.zeros(len(rows), max_length, dtype=dtype)
-    for row_idx, row in enumerate(rows):
-        if row.numel() > 0:
-            padded[row_idx, : row.numel()] = row
-    return padded
-
-
-def build_random_spec(temperature=None):
-    if temperature is not None:
-        if not math.isfinite(temperature) or temperature <= 0:
-            raise ValueError("temperature must be finite and positive")
-        return {"T": float(temperature)}
-    return None
-
-
-def build_manifest(
-    checkpoint,
-    metadata,
-    seed,
-    random_spec,
-    output_dir,
-    env,
-    rollout_outputs,
-    trajectories,
-):
-    states = rollout_outputs["states"]
-    log_paths_pf = rollout_outputs["log_paths_pf"].detach().cpu()
-    log_paths_pb = rollout_outputs["log_paths_pb"].detach().cpu()
-
-    records = []
-    for idx, state in enumerate(states):
-        output_path = os.path.join(output_dir, f"arg_{idx + 1:06d}.trees")
-        tree_sequence = env.save_to_tree_sequence(state, output_path=output_path)
-        segments = env.get_arg_sequence_segments(state)
-        records.append(
-            {
-                "index": idx,
-                "output_file": output_path,
-                "log_reward": float(state.log_reward),
-                "accumulated_log_prior": float(state.accumulated_log_prior),
-                "log_path_pf": float(log_paths_pf[idx].sum().item()),
-                "log_path_pb": float(log_paths_pb[idx].sum().item()),
-                "trajectory_length": len(trajectories[idx]),
-                "breakpoints": segments["breakpoints"],
-                "segment_count": segments["num_segments"],
-                "num_recombination_events": len(segments["recombination_events"]),
-                "num_trees": int(tree_sequence.num_trees),
-                "num_edges": int(tree_sequence.num_edges),
-            }
-        )
-
-    return {
-        "checkpoint": os.path.abspath(checkpoint),
-        "checkpoint_epoch": int(metadata["epoch"]) if "epoch" in metadata else None,
-        "checkpoint_best_loss": (
-            float(metadata["best_loss"]) if "best_loss" in metadata else None
-        ),
-        "seed": int(seed),
-        "num_args": len(records),
-        "random_spec": random_spec,
-        "time": env.time_metadata,
-        "continuous_time_head": metadata.get('model', {}).get('continuous_time_head', 'exponential'),
-        "arg_prior": env.arg_prior,
-        "score_convention": "untempered policy; not the behavior density when T != 1",
-        "outputs": records,
-    }
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Infer ARGs from a saved ARG GFlowNet checkpoint.")
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--output-dir", default="inferred_args")
-    parser.add_argument(
-        "--num-args",
-        "--num-particles",
-        dest="num_args",
-        type=int,
-        default=1,
-        help="Total number of ARGs/particles to generate (default: 1).",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=1,
-        help="Number of ARG rollouts to process simultaneously on the GPU (default: 1).",
-    )
-    parser.add_argument("--seed", type=int)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    parser.add_argument("--temperature", type=float)
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
-
-    manifest = run_inference(
-        checkpoint=args.checkpoint,
-        output_dir=args.output_dir,
-        num_args=args.num_args,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        device=args.device,
-        temperature=args.temperature,
-        verbose=args.verbose,
-    )
-    print(f"Wrote {manifest['num_args']} ARG tree sequence(s) to {args.output_dir}")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

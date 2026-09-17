@@ -1,4 +1,4 @@
-## ancestry + JC69 mutations (modern msprime; replaces 1_msprime_sim + 2_msprimefinitesites)
+"""Simulate full ARG ancestry and infinite-sites mutations, with DNA exports."""
 
 import argparse
 import gzip
@@ -10,6 +10,7 @@ import urllib.request
 
 import msprime
 import numpy as np
+import tskit
 import yaml
 
 refdir = '../reference/'
@@ -23,6 +24,78 @@ HG38_START = 10_000_000
 _ACGT = frozenset('ACGT')
 VALIDATION_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = VALIDATION_DIR / 'config/simulate_config.yaml'
+
+
+def to_infinite_sites_nucleotides(ts, reference_sequence, seed, collision_policy='error'):
+    """Make an integer-position A/C/G/T export of binary infinite-sites data.
+
+    A site's ancestral allele is the reference base; its derived allele is a
+    uniformly chosen different base. Mutation nodes, times, and genotypes stay
+    unchanged. Flooring positions is safe only with integer ancestry boundaries.
+    Distinct continuous sites can occupy the same base: fail by default, or
+    explicitly retain the first site per base with collision_policy='drop'.
+    The latter is a lossy export, not the original infinite-sites realization.
+    """
+    if collision_policy not in ('error', 'drop'):
+        raise ValueError("export_collision_policy must be 'error' or 'drop'")
+    reference_sequence = reference_sequence.upper()
+    if (int(ts.sequence_length) != ts.sequence_length
+            or len(reference_sequence) != ts.sequence_length):
+        raise ValueError('reference_sequence must match the integer sequence length')
+    if set(reference_sequence) - _ACGT:
+        raise ValueError('infinite-sites export requires a reference window containing only A/C/G/T')
+    if any(position != int(position) for position in ts.breakpoints()):
+        raise ValueError('integer export requires integer ancestry breakpoints')
+
+    retained = []
+    seen = set()
+    dropped = 0
+    for site in ts.sites():
+        if (site.ancestral_state != '0' or len(site.mutations) != 1
+                or site.mutations[0].derived_state != '1'
+                or site.mutations[0].parent != tskit.NULL):
+            raise ValueError('expected exactly one binary 0-to-1 mutation per infinite site')
+        position = int(site.position)
+        if position in seen:
+            dropped += 1
+        else:
+            seen.add(position)
+            retained.append(site)
+    if dropped and collision_policy == 'error':
+        raise ValueError(
+            '{} mutations collide when continuous positions are mapped to integer bases. '
+            'Keep the continuous tree sequence, or set export_collision_policy: drop '
+            'only if a lossy VCF/FASTA export is acceptable.'
+            .format(dropped)
+        )
+
+    rng = np.random.default_rng(seed)
+    tables = ts.dump_tables()
+    tables.sites.clear()
+    tables.mutations.clear()
+    tables.reference_sequence.data = reference_sequence
+    for site in retained:
+        position = int(site.position)
+        ancestral = reference_sequence[position]
+        derived = str(rng.choice([base for base in 'ACGT' if base != ancestral]))
+        site_id = tables.sites.add_row(position=position, ancestral_state=ancestral,
+                                      metadata=site.metadata)
+        mutation = site.mutations[0]
+        tables.mutations.add_row(site=site_id, node=mutation.node, derived_state=derived,
+                                 time=mutation.time, metadata=mutation.metadata)
+    tables.provenances.add_row(record=json.dumps(tskit.provenance.get_provenance_dict(
+        parameters={
+            'command': 'to_infinite_sites_nucleotides',
+            'seed': int(seed),
+            'position_transform': 'floor',
+            'collision_policy': collision_policy,
+            'num_input_sites': ts.num_sites,
+            'num_dropped_sites': dropped,
+            'ancestral_alleles': 'reference_sequence',
+            'derived_alleles': 'uniform among the other three nucleotides',
+        }
+    )))
+    return tables.tree_sequence(), dropped
 
 
 def ensure_hg38_reference(reference_fasta=HG38_FASTA, reference_url=HG38_URL):
@@ -182,12 +255,13 @@ def write_haplotype_fasta(ts, fasta_path, site_mask=None, reference_sequence=Non
 def write_metadata(
     ts, metadata_path, *, dataset_name, replicate_index, contig_id,
     reference_fasta, reference_contig, reference_start, reference_sequence,
-    reference_url=None, site_mask=None,
+    reference_url=None, site_mask=None, full_ts=None, infinite_sites_ts=None,
+    export_collision_policy='error', num_dropped_sites=0,
 ):
     """Describe a replicate, its provenance, and the coordinate/export conventions.
 
     Breakpoints are boundaries between marginal trees. They do not count all
-    historical recombination events, which the default simulation does not record.
+    historical recombination events; those are retained in the full ancestry file.
     Simulation parameters come from the saved tree sequence's provenance.
     """
     metadata_path = Path(metadata_path)
@@ -202,7 +276,7 @@ def write_metadata(
     for record in provenance:
         parameters = dict(record.get('parameters', {}))
         command = parameters.pop('command', None)
-        if command in ('sim_ancestry', 'sim_mutations'):
+        if command in ('sim_ancestry', 'sim_mutations', 'to_infinite_sites_nucleotides'):
             parameters.pop('tree_sequence', None)
             simulation[command] = {
                 'software': record.get('software', {}),
@@ -213,6 +287,10 @@ def write_metadata(
     segregating_sites = 0
     exported_segregating_sites = 0
     reference_mismatches = []
+    original_sites = {}
+    if infinite_sites_ts is not None:
+        for original_site in infinite_sites_ts.sites():
+            original_sites.setdefault(int(original_site.position), original_site)
     for variant in ts.variants():
         site = variant.site
         position = int(site.position)
@@ -231,6 +309,10 @@ def write_metadata(
             'num_mutations': len(site.mutations),
             'is_segregating': segregating,
             'exported_to_vcf_and_fasta': exported,
+            'continuous_source_site_id': (original_sites[position].id
+                                          if position in original_sites else None),
+            'continuous_source_position_zero_based': (float(original_sites[position].position)
+                                                     if position in original_sites else None),
         })
     trees = []
     for tree in ts.trees():
@@ -245,7 +327,7 @@ def write_metadata(
         })
     breakpoints = [float(position) for position in ts.breakpoints()][1:-1]
     metadata = {
-        'schema_version': 1,
+        'schema_version': 2,
         'dataset_name': dataset_name,
         'replicate_index': int(replicate_index),
         'summary': {
@@ -266,10 +348,31 @@ def write_metadata(
             'time_units': ts.time_units,
         },
         'simulation': simulation,
+        'mutation_model': {
+            'name': 'infinite_sites',
+            'msprime_model': 'BinaryMutationModel',
+            'discrete_genome': False,
+            'recurrent_mutations': False,
+            'ancestral_allele_coding': '0',
+            'derived_allele_coding': '1',
+            'note': 'Nucleotide labels are an export recoding, not a JC69 mutation process.',
+        },
+        'integer_export': {
+            'position_transform': 'floor(continuous site position)',
+            'collision_policy': export_collision_policy,
+            'num_continuous_sites': (infinite_sites_ts.num_sites
+                                     if infinite_sites_ts is not None else ts.num_sites),
+            'num_dropped_collision_sites': int(num_dropped_sites),
+            'all_mutations_retained': num_dropped_sites == 0,
+            'note': ('Positions are discretized for VCF/FASTA. Dropping collisions changes '
+                     'the mutation count distribution; use the continuous truth for exact '
+                     'infinite-sites analyses.'),
+        },
         'coordinates': {
             'tree_sites_and_fasta_indices': 'Zero-based, local to the simulated window.',
             'vcf_positions': 'One-based, local to the simulated window: POS = tree site position + 1.',
             'tree_and_coalescence_intervals': 'Zero-based half-open [left, right).',
+            'continuous_truth_sites': 'Original floating-point, zero-based positions in .infinite_sites.trees.',
             'vcf_contig_id': str(contig_id),
         },
         'reference': {
@@ -278,8 +381,8 @@ def write_metadata(
             'contig': reference_contig,
             'start_zero_based': int(reference_start),
             'end_exclusive': int(reference_start + ts.sequence_length),
-            'usage': 'Background for nonvariant FASTA bases. JC69 site ancestral states are simulated independently of this reference.',
-            'vcf_ref_definition': 'Simulated ancestral allele; not necessarily the reference FASTA base.',
+            'usage': 'Ancestral nucleotide sequence for the entire window and nonvariant FASTA background.',
+            'vcf_ref_definition': 'Known ancestral allele, equal to the reference FASTA base.',
             'vcf_ref_mismatch_positions_zero_based': reference_mismatches,
         },
         'samples': [
@@ -301,11 +404,22 @@ def write_metadata(
             'vcf': dataset_name + '.vcf',
             'fasta': dataset_name + '.fa',
             'ground_truth_trees': dataset_name + '.trees',
+            'continuous_infinite_sites_trees': dataset_name + '.infinite_sites.trees',
+            'full_ancestry_trees': dataset_name + '.full.trees',
+            'full_ancestry_note': 'Full ARG ancestry without mutations; .trees is simplified and recoded for integer exports.',
             'pairwise_coalescence_directory': 'tcoalmap',
             'pairwise_coalescence_filename_pattern': dataset_name + '_spls{i}-{j}.tc',
             'file_paths_relative_to': 'The directory containing this metadata.json.',
         },
     }
+    if full_ts is not None:
+        metadata['full_ancestry'] = {
+            'num_nodes': full_ts.num_nodes,
+            'num_edges': full_ts.num_edges,
+            'num_mutations': full_ts.num_mutations,
+            'sample_nodes_in_haplotype_order': [int(node) for node in full_ts.samples()],
+            'record_full_arg': True,
+        }
     with metadata_path.open('w', encoding='utf-8') as handle:
         json.dump(metadata, handle, indent=2, allow_nan=False)
         handle.write('\n')
@@ -327,12 +441,17 @@ def simulate(
     reference_url=HG38_URL,
     reference_contig=HG38_CONTIG,
     reference_start=HG38_START,
+    export_collision_policy='error',
 ):
     """Write each replicate's files under output_dir/dataset_name/rep<i>/."""
     reference_sequence = read_reference_window(
         length, contig=reference_contig, start=reference_start,
         reference_fasta=reference_fasta, reference_url=reference_url,
     )
+    if set(reference_sequence) - _ACGT:
+        raise ValueError('choose a fully called reference window containing only A/C/G/T')
+    if export_collision_policy not in ('error', 'drop'):
+        raise ValueError("export_collision_policy must be 'error' or 'drop'")
     dataset_dir = Path(output_dir) / dataset_name
     for i in range(nrep):
         print('rep', i)
@@ -340,30 +459,52 @@ def simulate(
         coalescence_dir = rep_dir / 'tcoalmap'
         coalescence_dir.mkdir(parents=True, exist_ok=True)
         ancestry_seed = seed + i * 100_000
-        ancestry_ts = msprime.sim_ancestry(
+        full_ts = msprime.sim_ancestry(
             samples=n // 2,
             ploidy=2,
             population_size=Ne,
             sequence_length=length,
             recombination_rate=rec,
             discrete_genome=True,
+            record_full_arg=True,
             random_seed=ancestry_seed,
         )
-        ts = msprime.sim_mutations(
+        ancestry_ts = full_ts.simplify()
+        infinite_sites_ts = msprime.sim_mutations(
             ancestry_ts,
             rate=mu,
-            model=msprime.JC69(),
-            discrete_genome=True,
+            model=msprime.BinaryMutationModel(),
+            discrete_genome=False,
             keep=False,
             random_seed=ancestry_seed + 1,
         )
+        # Preserve exact truth before an integer export can fail on collisions.
+        full_ts.dump(rep_dir / (dataset_name + '.full.trees'))
+        continuous_path = rep_dir / (dataset_name + '.infinite_sites.trees')
+        infinite_sites_ts.dump(continuous_path)
+        try:
+            ts, n_dropped = to_infinite_sites_nucleotides(
+                infinite_sites_ts, reference_sequence, seed=ancestry_seed + 2,
+                collision_policy=export_collision_policy,
+            )
+        except ValueError as error:
+            raise ValueError('Replicate {}: {} Exact mutations saved to {}'.format(
+                i, error, continuous_path)) from None
+        # The original binary/fractional sites are not valid DNA VCF records.
         site_mask = vcf_site_mask(ts)
+        if any(site_mask):
+            raise ValueError('converted infinite-sites data contain invalid VCF/FASTA sites')
+        if n_dropped:
+            print('integer export dropped', n_dropped,
+                  'colliding sites; exact mutations are retained in .infinite_sites.trees')
         sample_ids = list(ts.samples())
         vcfpath = rep_dir / (dataset_name + '.vcf')
         write_vcf(ts, vcfpath, contig_id=contig_id, site_mask=site_mask)
         print('writing vcf to', vcfpath)
+
         tsfile = rep_dir / (dataset_name + '.trees')
         ts.dump(tsfile)
+
         print('writing trees to', tsfile)
         fastafile = rep_dir / (dataset_name + '.fa')
         write_haplotype_fasta(
@@ -387,12 +528,14 @@ def simulate(
             reference_contig=reference_contig, reference_start=reference_start,
             reference_sequence=reference_sequence, reference_url=reference_url,
             site_mask=site_mask,
+            full_ts=full_ts, infinite_sites_ts=infinite_sites_ts,
+            export_collision_policy=export_collision_policy, num_dropped_sites=n_dropped,
         )
         print('writing metadata to', metadata_path)
 
 
 _CONFIG_DEFAULTS = {
-    'dataset_name': 'sim_2k_super_easy_human',
+    'dataset_name': 'sim_2k_super_easy_human_infinite_sites',
     'num_replicates': 1,
     'num_samples': 8,
     'population_size': 10000,
@@ -406,6 +549,7 @@ _CONFIG_DEFAULTS = {
     'reference_url': HG38_URL,
     'reference_contig': HG38_CONTIG,
     'reference_start': HG38_START,
+    'export_collision_policy': 'error',
 }
 
 
@@ -429,8 +573,10 @@ def load_config(config_path):
             raise ValueError('{} must be an integer >= {}'.format(key, minimum))
     if config['num_samples'] % 2:
         raise ValueError('num_samples must be even (two haplotypes per diploid individual)')
-    if config['seed'] + (config['num_replicates'] - 1) * 100_000 + 1 >= 2**32:
+    if config['seed'] + (config['num_replicates'] - 1) * 100_000 + 2 >= 2**32:
         raise ValueError('seed and num_replicates exceed the msprime random seed range')
+    if config['export_collision_policy'] not in ('error', 'drop'):
+        raise ValueError("export_collision_policy must be 'error' or 'drop'")
     for key in ('population_size', 'mutation_rate', 'recombination_rate'):
         try:
             value = float(config[key])
@@ -465,7 +611,7 @@ def load_config(config_path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description='Simulate diploid ancestry and JC69 mutations from a YAML configuration.'
+        description='Simulate full diploid ARG ancestry and infinite-sites mutations from YAML.'
     )
     parser.add_argument(
         '--config', type=Path, default=DEFAULT_CONFIG,
@@ -486,6 +632,7 @@ def main(argv=None):
         reference_fasta=config['reference_fasta'],
         reference_url=config['reference_url'], reference_contig=config['reference_contig'],
         reference_start=config['reference_start'],
+        export_collision_policy=config['export_collision_policy'],
     )
 
 

@@ -1,112 +1,118 @@
-"""Explicit migrations for training checkpoints."""
-
-from copy import deepcopy
-
+"""Self-contained infinite-sites checkpoints; legacy schemas never migrate silently."""
+import random
+from pathlib import Path
+import numpy as np
 import torch
+from env.snp_data import SNPData
+from env.env import SimpleARGEnvironment
+from policy.observations import FEATURE_VERSION
 
-from env.time_env import checkpoint_time_policy
+SCHEMA_VERSION = 2
 
 
-def migrate_gamma_time_checkpoint(checkpoint, target):
-    """Add a zero log-shape head while preserving existing weights and Adam state.
+def seed_everything(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    The target must be the matching Gamma generator. Optimizer parameter indices
-    are remapped because the new shape parameters precede the event head. New
-    Adam state starts empty; every existing parameter retains its saved moments.
-    """
-    metadata = checkpoint.get("metadata", {})
-    if checkpoint_time_policy(metadata) != "cwr_exponential":
-        raise ValueError("Gamma migration requires continuous CwR timing")
-    saved_model = metadata.get("model", {})
-    if saved_model.get("continuous_time_head", "exponential") != "exponential":
-        raise ValueError("Gamma migration requires an exponential source checkpoint")
-    if target.arg_model.continuous_time_head != "gamma":
-        raise ValueError("Gamma migration requires a Gamma target generator")
-    if any(
-        target.model_kwargs.get(key) != value
-        for key, value in saved_model.items()
-        if key != "continuous_time_head"
-    ):
-        raise ValueError("Gamma migration cannot change other policy model settings")
-    if metadata.get("loss_type", "tb") != target.loss_type or (
-        target.loss_type == "subtb"
-        and metadata.get("flow_head_version") != target.flow_head_version
-    ):
-        raise ValueError("Gamma migration cannot change the objective or flow architecture")
-    if target.neural_source_flow:
-        raise ValueError(
-            "Legacy Gamma migration supports scalar-source checkpoints only; "
-            "version 5 starts fresh"
-        )
-    converted = deepcopy(checkpoint)
-    saved = converted["generator_state_dict"]
-    target_state = target.state_dict()
-    expected = {
-        prefix + ".shape_layer." + part
-        for prefix in ("arg_model.time_scorer", "time_model")
-        for part in ("weight", "bias")
-    }
-    if set(target_state) - set(saved) != expected or set(saved) - set(target_state):
-        raise ValueError("Unexpected state-dictionary difference during Gamma migration")
-    if any(saved[key].shape != target_state[key].shape for key in saved):
-        raise ValueError("Gamma migration cannot change existing parameter shapes")
-    device = saved["_Z"].device
-    for name in expected:
-        value = target_state[name]
-        if torch.count_nonzero(value):
-            raise ValueError("Gamma target log-shape head must be zero initialized")
-        saved[name] = value.detach().to(device).clone()
 
-    new_names = {
-        "arg_model.time_scorer.shape_layer.weight",
-        "arg_model.time_scorer.shape_layer.bias",
-    }
-    if "opt_state_dict" in converted:
-        old_opt = converted["opt_state_dict"]
-        target_opt = target.opt.state_dict()
-        if len(old_opt["param_groups"]) != len(target_opt["param_groups"]):
-            raise ValueError("Incompatible optimizer groups for Gamma migration")
-        names = {id(parameter): name for name, parameter in target.named_parameters()}
-        migrated = {"state": {}, "param_groups": []}
-        seen = set()
-        for old_group, new_group, live_group in zip(
-            old_opt["param_groups"],
-            target_opt["param_groups"],
-            target.opt.param_groups,
-        ):
-            group_names = [names[id(parameter)] for parameter in live_group["params"]]
-            existing = [
-                (name, index)
-                for name, index in zip(group_names, new_group["params"])
-                if name not in new_names
-            ]
-            if len(existing) != len(old_group["params"]):
-                raise ValueError("Incompatible optimizer parameter order for Gamma migration")
-            for old_index, (name, new_index) in zip(old_group["params"], existing):
-                seen.add(old_index)
-                if old_index in old_opt["state"]:
-                    entry = old_opt["state"][old_index]
-                    for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-                        if key in entry and entry[key].shape != saved[name].shape:
-                            raise ValueError(
-                                "Optimizer moments do not match the expected parameter order"
-                            )
-                    migrated["state"][new_index] = entry
-            migrated["param_groups"].append(
-                {**old_group, "params": list(new_group["params"])}
-            )
-        if set(old_opt["state"]) - seen:
-            raise ValueError("Unexpected optimizer state outside declared parameter groups")
-        converted["opt_state_dict"] = migrated
-    converted["metadata"]["model"] = {
-        **saved_model,
-        "continuous_time_head": "gamma",
-    }
-    converted["metadata"]["time_head_migration"] = {
-        "from_head": "exponential",
-        "to_head": "gamma",
-        "initial_log_shape": 0.0,
-        "preserved_existing_optimizer_state": True,
-        "new_parameters": sorted(new_names),
-    }
-    return converted
+def rng_state(env):
+    return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [], environment=env.rng.getstate())
+
+
+def restore_rng(env, data):
+    random.setstate(data['python']); np.random.set_state(data['numpy']); torch.set_rng_state(data['torch'].cpu())
+    if data['cuda'] and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(data['cuda'])
+    env.rng.setstate(data['environment'])
+
+
+def environment_metadata(env):
+    d = env.snp_data
+    return dict(mutation_model='infinite_sites', feature_version=FEATURE_VERSION,
+                environment_fingerprint=env.dataset_fingerprint,
+                observations=dict(genotypes=torch.tensor(d.genotypes.copy(), dtype=torch.uint8),
+                    positions=torch.tensor(d.positions.copy(), dtype=torch.float64), sequence_length=d.sequence_length,
+                    site_ids=d.site_ids, ancestral_states=d.ancestral_states, derived_states=d.derived_states,
+                    haplotype_ids=d.haplotype_ids, contig_id=d.contig_id),
+                environment=dict(population_size=env.population_size, mutation_rate=env.mutation_rate,
+                    recombination_rate=env.recombination_rate, reward_C=env.reward_fn.C,
+                    bp_per_blocks=1, time_policy='cwr_exponential', arg_prior='hudson'))
+
+
+def validate_metadata(metadata):
+    from generator import MODEL_VERSION, FLOW_VERSION
+    if (metadata.get('model_version') != MODEL_VERSION or metadata.get('mutation_model') != 'infinite_sites'
+            or metadata.get('feature_version') != FEATURE_VERSION or metadata.get('flow_head_version') != FLOW_VERSION):
+        raise ValueError('Incompatible checkpoint: a new infinite-sites shared-encoder checkpoint is required; JC69 is retired')
+    required = {'observations','environment','environment_fingerprint','model','generator_config'}
+    if not required <= metadata.keys():
+        raise ValueError('Incomplete infinite-sites checkpoint metadata')
+
+
+def environment_from_metadata(metadata, seed=7, device=None):
+    validate_metadata(metadata)
+    payload = dict(metadata['observations'])
+    for key in ('genotypes','positions'):
+        value = payload[key]
+        payload[key] = value.cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+    data = SNPData(**payload)
+    env = SimpleARGEnvironment(snp_data=data, seed=seed, **metadata['environment'])
+    if env.dataset_fingerprint != metadata['environment_fingerprint']:
+        raise ValueError('Checkpoint observation/environment fingerprint mismatch')
+    return env
+
+
+def save_checkpoint(path, generator, trainer=None, metadata=None):
+    from generator import MODEL_VERSION, FLOW_VERSION
+    meta = {**(metadata or {}), **environment_metadata(generator.env),
+            'model_version':MODEL_VERSION, 'flow_head_version':FLOW_VERSION,
+            'model':generator.model_kwargs,
+            'generator_config':dict(policy_lr=generator.policy_lr, flow_lr=generator.flow_lr,
+                                   grad_clip=generator.grad_clip, subtb_lambda=generator.subtb_lambda,
+                                   init_z_sample_count=generator.init_z_sample_count)}
+    data = dict(schema_version=SCHEMA_VERSION, metadata=meta, generator_state_dict=generator.state_dict(),
+                opt_state_dict=generator.opt.state_dict(), rng=rng_state(generator.env),
+                scheduler=generator.scheduler.state_dict() if generator.scheduler is not None else None,
+                trainer=trainer.state_dict() if trainer is not None else None)
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix+'.tmp')
+    torch.save(data, temporary); temporary.replace(path)
+    return data
+
+
+def load_checkpoint(path, map_location='cpu'):
+    data = torch.load(path, map_location=map_location, weights_only=False)
+    if not isinstance(data, dict) or data.get('schema_version') != SCHEMA_VERSION:
+        raise ValueError('Incompatible checkpoint schema; JC69 checkpoints cannot be migrated')
+    validate_metadata(data.get('metadata', {}))
+    return data
+
+
+def restore_generator(generator, data, load_optimizer=True):
+    if data.get('schema_version') != SCHEMA_VERSION:
+        raise ValueError('Incompatible checkpoint schema')
+    validate_metadata(data['metadata'])
+    metadata = data['metadata']
+    if metadata['environment_fingerprint'] != generator.env.dataset_fingerprint:
+        raise ValueError('Checkpoint observations or environment differ')
+    if metadata['model'] != generator.model_kwargs:
+        raise ValueError('Checkpoint neural architecture differs')
+    generator.load_state_dict(data['generator_state_dict'], strict=True)
+    if load_optimizer:
+        generator.opt.load_state_dict(data['opt_state_dict'])
+        if data['scheduler'] is not None:
+            generator.scheduler = torch.optim.lr_scheduler.ExponentialLR(generator.opt, gamma=data['scheduler']['gamma'])
+            generator.scheduler.load_state_dict(data['scheduler'])
+
+
+def generator_from_checkpoint(data, device='cpu', seed=7, optimizer=False, restore_random=False):
+    from generator import GFlowNetGenerator
+    env = environment_from_metadata(data['metadata'], seed)
+    generator = GFlowNetGenerator(env, device=device, model_kwargs=data['metadata']['model'],
+                 initialize_z_from_policy=False, **data['metadata']['generator_config'])
+    restore_generator(generator, data, optimizer)
+    if restore_random:
+        restore_rng(env, data['rng'])
+    return generator

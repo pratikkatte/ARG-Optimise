@@ -1,486 +1,121 @@
-from env.env import CoalescenceChoice, RecombinationChoice
-from breakpoint_model import BreakpointSplitPositionCNN, SparseMixtureBreakpointPolicy
-from policy.time_model import TimeModel, CwrExponentialTimeModel, CwrGammaTimeModel, validate_continuous_time_head
-from env.time_env import validate_time_policy
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical
-from dataclasses import dataclass
-from policy.encoding import encode_packed_lineages
-from policy.lineage_feature_cache import LineageFeatureCache
-from operator import index
+"""Infinite-sites action heads; the generator owns the shared state encoder."""
+from dataclasses import replace
 import math
+import torch
+from torch import nn
+from torch.distributions import Categorical
+from env.actions import CoalescenceChoice, RecombinationChoice
+from env.priors import total_event_rate
+from breakpoint_model import SparseMixtureBreakpointPolicy
+from .encoder import mlp
+from .time_model import CwrGammaTimeModel
 
 
-@dataclass(frozen=True)
-class PackedLineageFeatures:
-    """Real lineage sequences in batch order, with immutable row boundaries."""
-
-    tensor: torch.Tensor
-    row_offsets: tuple[int, ...]
-
-    def __post_init__(self):
-        offsets = tuple(index(value) for value in self.row_offsets)
-        object.__setattr__(self, "row_offsets", offsets)
-        if self.tensor.ndim != 3 or self.tensor.shape[-1] != 4:
-            raise ValueError("Packed sequence features must have shape (lineages, num_blocks, 4)")
-        if (len(offsets) < 2 or offsets[0] != 0
-                or offsets[-1] != self.tensor.shape[0]
-                or any(end <= start for start, end in zip(offsets, offsets[1:]))):
-            raise ValueError("Packed row offsets must delimit nonempty states and cover all lineages")
-
-    def get_lineage(self, batch_index, lineage_index):
-        """Return a sequence view; negative indices and padded rows are invalid."""
-        batch_index, lineage_index = index(batch_index), index(lineage_index)
-        if not 0 <= batch_index < len(self.row_offsets) - 1:
-            raise IndexError(f"Batch index {batch_index} out of bounds")
-        start, end = self.row_offsets[batch_index:batch_index + 2]
-        if not 0 <= lineage_index < end - start:
-            raise IndexError(f"Lineage index {lineage_index} out of bounds for batch {batch_index}")
-        return self.tensor[start + lineage_index]
-
-
-class TransformerMLP(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.0):
+class InfiniteSitesBreakpointHead(nn.Module):
+    def __init__(self, context_dim, hidden_size=128, components=4):
         super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim)
-        self.activation = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, dim)
-        self.dropout = nn.Dropout(dropout)
+        self.components = components
+        self.parameters_head = mlp(context_dim+3, hidden_size, 3*components)
+        output = self.parameters_head[-1]
+        nn.init.zeros_(output.weight); nn.init.zeros_(output.bias)
+        with torch.no_grad():
+            fractions = (torch.arange(components)+.5)/components
+            output.bias[components:2*components].copy_(torch.logit(fractions))
+            output.bias[2*components:].fill_(math.log(.1/.9))
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.activation(x)
-        x = self.fc2(x)
-        x = self.dropout(x)
-        return x
+    def parameters_for(self, choice, context, length):
+        a, z = SparseMixtureBreakpointPolicy.valid_span(choice, length)
+        span = context.new_tensor([a/length, z/length, (z-a+1)/max(length-1, 1)])
+        weights, centers, scales = self.parameters_head(torch.cat((context, span))).double().chunk(3)
+        return a, z, (weights.log_softmax(-1), a-.5+(z-a+1)*centers.sigmoid(),
+                      .1+(z-a+1)*scales.sigmoid())
 
-
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        num_heads,
-        attention_dropout=0.0,
-        projection_dropout=0.0,
-    ):
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(
-                f"embedding_size ({dim}) must be divisible by transformer_heads ({num_heads})"
-            )
-        self.num_heads = int(num_heads)
-        self.head_dim = dim // self.num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.attn_drop = nn.Dropout(attention_dropout)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(projection_dropout)
-
-    def forward(self, x, key_padding_mask=None):
-        batch_size, tokens, dim = x.shape
-        qkv = self.qkv(x).reshape(
-            batch_size,
-            tokens,
-            3,
-            self.num_heads,
-            self.head_dim,
-        )
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        if key_padding_mask is not None:
-            attn = attn.masked_fill(
-                key_padding_mask[:, None, None, :],
-                float("-inf"),
-            )
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(batch_size, tokens, dim)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class TransformerBlock(nn.Module):
-    def __init__(
-        self,
-        dim,
-        num_heads,
-        mlp_ratio=2.0,
-        dropout=0.0,
-        attention_dropout=0.0,
-    ):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = MultiHeadSelfAttention(
-            dim,
-            num_heads=num_heads,
-            attention_dropout=attention_dropout,
-            projection_dropout=dropout,
-        )
-        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
-        self.mlp = TransformerMLP(
-            dim,
-            hidden_dim=int(dim * mlp_ratio),
-            dropout=dropout,
-        )
-
-    def forward(self, x, key_padding_mask=None):
-        x = x + self.attn(self.norm1(x), key_padding_mask=key_padding_mask)
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class TransformerEncoder(nn.Module):
-    def __init__(
-        self,
-        dim,
-        depth,
-        num_heads,
-        mlp_ratio=2.0,
-        dropout=0.0,
-        attention_dropout=0.0,
-    ):
-        super().__init__()
-        self.blocks = nn.ModuleList(
-            TransformerBlock(
-                dim=dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                dropout=dropout,
-                attention_dropout=attention_dropout,
-            )
-            for _ in range(int(depth))
-        )
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
-        elif isinstance(module, nn.LayerNorm):
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
-            if module.weight is not None:
-                nn.init.constant_(module.weight, 1.0)
-
-    def forward(self, x, key_padding_mask=None):
-        for block in self.blocks:
-            x = block(x, key_padding_mask=key_padding_mask)
-        return self.norm(x)
+    def forward(self, choice, context, length, breakpoint=None):
+        a, z, parameters = self.parameters_for(choice, context, length)
+        if breakpoint is None:
+            breakpoint = SparseMixtureBreakpointPolicy.sample_gap(a, z, parameters)
+        if not isinstance(breakpoint, int) or not a <= breakpoint <= z:
+            raise ValueError('Breakpoint is outside the physical recombination span')
+        return breakpoint, SparseMixtureBreakpointPolicy.log_probabilities(breakpoint, a, z, parameters)
 
 
 class ARGModel(nn.Module):
-    """One-step ARG action policy.
+    event_policy = 'cwr_residual'
+    time_policy = 'cwr_exponential'
+    continuous_time_head = 'gamma'
 
-    The model scores candidate coalescent and recombination actions. When the
-    caller provides current ARG states, candidates are read from the environment
-    so material-mask constraints are respected.
-    """
-
-    def __init__(
-        self,
-        env,
-        embedding_size=32,
-        hidden_size=64,
-        dropout=0.0,
-        breakpoint_hidden_dim=128,
-        breakpoint_dropout=0.1,
-        transformer_depth=6,
-        transformer_heads=4,
-        transformer_mlp_ratio=2.0,
-        attention_dropout=0.0,
-        time_hidden_size=256,
-        time_layers=3,
-        time_dropout=0.0,
-        breakpoint_gap_hidden_size=256,
-        breakpoint_gap_layers=3,
-        breakpoint_gap_dropout=0.0,
-        breakpoint_use_position_features=True,
-        breakpoint_policy="cnn",
-        breakpoint_mixture_hidden_dim=128,
-        breakpoint_mixture_layers=4,
-        breakpoint_mixture_components=4,
-        event_policy="cwr",
-        time_policy=None,
-        continuous_time_head='exponential',
-        cache_lineage_features=False,
-    ):
+    def __init__(self, embedding_size=64, hidden_size=128, breakpoint_mixture_components=4):
         super().__init__()
-        if event_policy not in {"cwr", "cwr_residual"}:
-            raise ValueError(f"Unknown event_policy: {event_policy}")
-        self.event_policy = event_policy
-        self.time_policy = validate_time_policy(env.time_policy if time_policy is None else time_policy)
-        if self.time_policy != env.time_policy:
-            raise ValueError("Environment and model time_policy disagree")
-        self.continuous_time_head = validate_continuous_time_head(continuous_time_head, self.time_policy)
-        self.env = env
-        self.device = env.device
-        self.cache_lineage_features = bool(cache_lineage_features)
-        if self.cache_lineage_features:
-            self.lineage_feature_cache = LineageFeatureCache()
-        if int(embedding_size) % int(transformer_heads) != 0:
-            raise ValueError(
-                "embedding_size must be divisible by transformer_heads "
-                f"(got embedding_size={embedding_size}, transformer_heads={transformer_heads})"
-            )
-        input_size = int(env.num_blocks) * 4
+        self.event_head = mlp(embedding_size, hidden_size, 2)
+        self.action_head = mlp(4*embedding_size, hidden_size, 1)
+        self.breakpoint_head = InfiniteSitesBreakpointHead(4*embedding_size, hidden_size,
+                                                          breakpoint_mixture_components)
+        self.time_head = CwrGammaTimeModel(4*embedding_size+4, hidden_size, 0., layers=2)
+        for head in (self.event_head, self.action_head):
+            nn.init.zeros_(head[-1].weight); nn.init.zeros_(head[-1].bias)
 
-        self.seq_embedding = nn.Linear(input_size, embedding_size)
-        self.summary_token = nn.Parameter(torch.zeros(1, 1, embedding_size))
-        nn.init.trunc_normal_(self.summary_token, std=0.1)
-        self.encoder = TransformerEncoder(
-            dim=embedding_size,
-            depth=transformer_depth,
-            num_heads=transformer_heads,
-            mlp_ratio=transformer_mlp_ratio,
-            dropout=dropout,
-            attention_dropout=attention_dropout,
-        )
-        self.action_scorer = nn.Sequential(
-            nn.Linear(embedding_size * 4, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1),
-        )
-        breakpoint_kwargs = dict(
-            dropout=breakpoint_dropout,
-            action_context_dim=embedding_size * 4,
-            gap_hidden_dim=breakpoint_gap_hidden_size,
-            gap_layers=breakpoint_gap_layers,
-            gap_dropout=breakpoint_gap_dropout,
-        )
-        if breakpoint_policy == "cnn":
-            self.breakpoint_scorer = BreakpointSplitPositionCNN(
-                hidden_dim=breakpoint_hidden_dim,
-                use_position_features=breakpoint_use_position_features,
-                **breakpoint_kwargs,
-            ).to(self.device)
-        elif breakpoint_policy == "sparse_mixture":
-            self.breakpoint_scorer = SparseMixtureBreakpointPolicy(
-                source_alignment=env.block_seq_arrays,
-                hidden_dim=breakpoint_mixture_hidden_dim,
-                layers=breakpoint_mixture_layers,
-                components=breakpoint_mixture_components,
-                **breakpoint_kwargs,
-            ).to(self.device)
-        else:
-            raise ValueError(f"Unknown breakpoint_policy: {breakpoint_policy}")
+    def event_log_probs(self, batch, summary):
+        hazards = summary.new_tensor(batch.allowed_hazards, dtype=torch.float64)
+        available = hazards > 0
+        if not available.any(-1).all():
+            raise ValueError('Cannot sample an event from a terminal or dead-end state')
+        return (hazards.log()+self.event_head(summary).double()).masked_fill(~available, -torch.inf).log_softmax(-1)
 
-        if self.time_policy == "categorical":
-            self.time_scorer = TimeModel(
-                embedding_size * 4,
-                time_hidden_size,
-                time_dropout,
-                env.time_env.bins,
-                layers=time_layers,
-            )
-        else:
-            time_model_type = CwrGammaTimeModel if self.continuous_time_head == 'gamma' else CwrExponentialTimeModel
-            self.time_scorer = time_model_type(
-                embedding_size * 4 + 4, time_hidden_size, time_dropout, layers=time_layers,
-            )
-        self.logsoftmax = nn.LogSoftmax(dim=1)
-        if self.event_policy == "cwr_residual":
-            self.event_head = nn.Sequential(
-                nn.Linear(embedding_size + 3, hidden_size),
-                nn.SiLU(),
-                nn.Linear(hidden_size, 2),
-            )
-            nn.init.zeros_(self.event_head[-1].weight)
-            nn.init.zeros_(self.event_head[-1].bias)
+    @staticmethod
+    def contexts(choices, lineage, summary):
+        indices = torch.tensor([a.active_lineage_i for a in choices], device=lineage.device)
+        first = lineage[indices]
+        if isinstance(choices[0], CoalescenceChoice):
+            second = lineage[torch.tensor([a.active_lineage_j for a in choices], device=lineage.device)]
+            return torch.cat((first+second, (first-second).abs(), first*second,
+                              summary.expand(len(choices), -1)), -1)
+        return torch.cat((first, torch.zeros_like(first), torch.zeros_like(first),
+                          summary.expand(len(choices), -1)), -1)
 
-    def event_log_probs(self, states, summary_reps, event_actions, prior_probs):
-        """Untempered CwR-residual policy, ordered as (coal, recomb).
-
-        Terminal rows have no forward distribution and return two -infinities.
-        Take prior logs before casting so small positive priors do not underflow.
-        """
-        features = summary_reps.new_tensor([
-            [math.log1p(s.current_time), math.log1p(len(s.active_lineages)),
-             s.total_active_blocks / self.env.num_blocks] for s in states
-        ])
-        corrections = self.event_head(torch.cat((summary_reps, features), dim=-1))
-        prior_logs = corrections.new_tensor([
-            [math.log(p) if p > 0 else -math.inf for p in row] for row in prior_probs
-        ])
-        valid = torch.tensor([
-            [bool(actions) and p > 0 and not state.is_done
-             for actions, p in zip(candidates, probabilities)]
-            for state, candidates, probabilities in zip(states, event_actions, prior_probs)
-        ], dtype=torch.bool, device=corrections.device)
-        available = valid.any(dim=-1)
-        nonterminal = torch.tensor([not s.is_done for s in states], device=corrections.device)
-        if (nonterminal & ~available).any():
-            raise ValueError("Nonterminal state has no available event under the CwR prior")
-        logits = (prior_logs + corrections).masked_fill(~valid, -math.inf)
-        # Avoid undefined log-softmax/gradients on terminal rows.
-        logits = torch.where(available[:, None], logits, torch.zeros_like(logits))
-        return F.log_softmax(logits, dim=-1).masked_fill(~valid, -math.inf)
-
-    def _encode_lineage_features(self, lineage_seq_features, batch_active_lineage_counts):
-        """Project packed real sequences, then pad only the small embeddings."""
-        packed = lineage_seq_features.tensor
-        if tuple(packed.shape[1:]) != (int(self.env.num_blocks), 4):
-            raise ValueError(
-                f"Packed sequence features must have shape (lineages, {int(self.env.num_blocks)}, 4), "
-                f"got {tuple(packed.shape)}"
-            )
-        batch_active_lineage_counts = batch_active_lineage_counts.to(device=self.device, dtype=torch.long)
-        encoded, valid_mask = encode_packed_lineages(
-            lineage_seq_features, batch_active_lineage_counts,
-            self.seq_embedding, self.summary_token, self.encoder,
-        )
-        summary_reps = encoded[:, 0]
-        lineage_reps = encoded[:, 1:] * valid_mask.unsqueeze(-1)
-        return lineage_reps, summary_reps, lineage_seq_features, batch_active_lineage_counts
-
-    def _encode_states(self, states):
-        """Return lineage/summary embeddings, packed sequences, and active counts."""
-        if not states:
-            raise ValueError("ARGModel.forward requires at least one state")
-        active_counts = [len(state.active_lineages) for state in states]
-        offsets = [0]
-        for batch_index, count in enumerate(active_counts):
-            if count == 0:
-                raise ValueError(f"State {batch_index} has no active lineages")
-            offsets.append(offsets[-1] + count)
-        batch_active_lineage_counts = torch.tensor(active_counts, dtype=torch.long, device=self.device)
-        packed = torch.empty(
-            (offsets[-1], int(self.env.num_blocks), 4), device=self.device, dtype=torch.float32,
-        )
-        for batch_idx, state in enumerate(states):
-            for lineage_idx, lineage in enumerate(state.active_lineages):
-                if self.cache_lineage_features:
-                    feature = self.lineage_feature_cache.get(
-                        lineage, self.device, self.env.num_blocks,
-                        lambda: self._normalized_lineage_feature(lineage))
-                else:
-                    feature = self._normalized_lineage_feature(lineage)
-                packed[offsets[batch_idx] + lineage_idx] = feature
-        return self._encode_lineage_features(
-            PackedLineageFeatures(packed, tuple(offsets)), batch_active_lineage_counts,
-        )
-
-    def _normalized_lineage_feature(self, lineage):
-        feature = self._lineage_partials_tensor(lineage)
-        masked = self.env.evolution_model.mask_partials(feature, lineage.material_segments)
-        return self.env.evolution_model.normalize_partials(masked)
-
-    def _lineage_partials_tensor(self, lineage):
-        if lineage.partials is None:
-            raise ValueError(
-                f"Active ARG lineage {lineage.node_id} is missing partials; "
-                "state transitions must populate ARGLineage.partials"
-            )
-        partials = lineage.partials
-        if torch.is_tensor(partials):
-            partials = partials.to(device=self.device, dtype=torch.float32)
-        else:
-            partials = torch.as_tensor(partials, device=self.device, dtype=torch.float32)
-        expected_shape = (int(self.env.num_blocks), 4)
-        if tuple(partials.shape) != expected_shape:
-            raise ValueError(
-                f"Active ARG lineage {lineage.node_id} partials must have shape "
-                f"{expected_shape}, got {tuple(partials.shape)}"
-            )
-        return partials
-
-    def sample(self, logits, random_spec=None):
-        if random_spec is None:
-            return Categorical(logits=logits).sample()
-
-        temperature = random_spec["T"]
-        return Categorical(logits=logits / temperature).sample()
-
-
-    def compute_log_path_pf(self, logits, action_indices):
-        batch_idx = torch.arange(logits.shape[0], device=logits.device)
-        log_p = self.logsoftmax(logits)
-        return log_p[batch_idx, action_indices]
-
-    def _score_candidates(
-        self,
-        candidate_actions,
-        lineage_reps,
-        summary_reps
-        ):
-        """Build candidate features across states with one index transfer.
-
-        Group rows by event type for batched gathers, then scatter features
-        back to their original state/candidate positions before scoring.
-        """
-        batch_size = len(candidate_actions)
-        max_candidates = max(len(actions) for actions in candidate_actions)
-        embedding_size = lineage_reps.shape[-1]
-        feat_dim = self.seq_embedding.out_features * 4
-        features = lineage_reps.new_zeros(batch_size, max_candidates, feat_dim)
-
-        coal_rows, recomb_rows, other_rows = [], [], []
-        for batch_idx, actions in enumerate(candidate_actions):
-            for row_idx, action in enumerate(actions):
-                if isinstance(action, CoalescenceChoice):
-                    coal_rows.append((batch_idx, row_idx,
-                                      action.active_lineage_i, action.active_lineage_j))
-                elif isinstance(action, RecombinationChoice):
-                    recomb_rows.append((batch_idx, row_idx, action.active_lineage_i, 0))
-                else:
-                    # Preserve the summary-only features of unrecognized actions.
-                    other_rows.append((batch_idx, row_idx, 0, 0))
-
-        indices = torch.tensor(coal_rows + recomb_rows + other_rows,
-                               dtype=torch.long, device=lineage_reps.device).reshape(-1, 4)
-        coal_count = len(coal_rows)
-        recomb_end = coal_count + len(recomb_rows)
-        coal = indices[:coal_count]
-        recomb = indices[coal_count:recomb_end]
-        left = lineage_reps[coal[:, 0], coal[:, 2]]
-        right = lineage_reps[coal[:, 0], coal[:, 3]]
-        recombined = lineage_reps[recomb[:, 0], recomb[:, 2]]
-        other_zeros = lineage_reps.new_zeros(len(other_rows), embedding_size)
-        noncoal_zeros = lineage_reps.new_zeros(len(recomb_rows) + len(other_rows), embedding_size)
-        packed_features = torch.cat([
-            torch.cat([left + right, recombined, other_zeros], dim=0),
-            torch.cat([torch.abs(left - right), noncoal_zeros], dim=0),
-            torch.cat([left * right, noncoal_zeros], dim=0),
-            summary_reps[indices[:, 0]],
-        ], dim=-1)
-        batch_indices, candidate_indices = indices[:, 0], indices[:, 1]
-        features[batch_indices, candidate_indices] = packed_features
-        valid = torch.zeros(batch_size, max_candidates, dtype=torch.bool,
-                            device=lineage_reps.device)
-        valid[batch_indices, candidate_indices] = True
-        # Keep both axes even when every state has exactly one candidate.
-        # Squeezing [B, 1] into [B] makes the [B, 1] mask broadcast it to
-        # [B, B], mixing other states' scores into the action normalization.
-        logits = self.action_scorer(features.reshape(-1, feat_dim)).reshape(batch_size, max_candidates)
-
-        masked_logits = logits.masked_fill(~valid, float("-inf"))
-        return masked_logits, features
-
-    def forward(self, all_actions, lineage_reps, summary_reps, random_spec,
-                action_indices=None):
-        """Score and select candidates, returning untempered policy log probabilities."""
-        if any(len(actions) == 0 for actions in all_actions):
-            raise ValueError("ARGModel.forward received a batch item with no candidate actions.")
-
-        logits, action_features = self._score_candidates(all_actions, lineage_reps, summary_reps)
-        sampled_action_indices = (
-            self.sample(logits, random_spec) if action_indices is None
-            else torch.as_tensor(action_indices, device=logits.device, dtype=torch.long)
-        )
-        selected_action_indices = sampled_action_indices.detach().cpu().tolist()
-        chosen_actions = []
-        chosen_action_features = []
-        for batch_idx, action_idx in enumerate(selected_action_indices):
-            chosen_actions.append(all_actions[batch_idx][action_idx])
-            chosen_action_features.append(action_features[batch_idx, action_idx])
-
-        log_action_pf = self.compute_log_path_pf(logits, selected_action_indices)
-        return log_action_pf, selected_action_indices, chosen_actions, chosen_action_features
+    def forward(self, env, states, batch, lineages, summary, forced_actions=None):
+        event_logs = self.event_log_probs(batch, summary)
+        event_indices = (Categorical(logits=event_logs).sample().tolist() if forced_actions is None else
+                         [int(isinstance(a, RecombinationChoice)) for a in forced_actions])
+        actions, contexts, factors = [], [], []
+        for row, kind in enumerate(event_indices):
+            choices = batch.actions[row][kind]
+            if not choices:
+                raise ValueError('Forced action has no compatible support')
+            context = self.contexts(choices, lineages[row], summary[row])
+            baseline = context.new_tensor([a.breakpoint_count if kind else 1 for a in choices], dtype=torch.float64).log()
+            logits = baseline+self.action_head(context).squeeze(-1).double()
+            logs = logits.log_softmax(-1)
+            if forced_actions is None:
+                selected = int(Categorical(logits=logs).sample())
+            else:
+                forced = forced_actions[row]
+                canonical = replace(forced, delta_t=None, time_action=None,
+                                    **({'breakpoint': None} if kind else {}))
+                try:
+                    selected = choices.index(canonical)
+                except ValueError as exc:
+                    raise ValueError('Forced action is not a compatible physical candidate') from exc
+            action, chosen_context = choices[selected], context[selected]
+            breakpoint_log = logs.new_zeros(())
+            if kind:
+                bp, breakpoint_log = self.breakpoint_head(action, chosen_context, env.sequence_length,
+                                       None if forced_actions is None else forced_actions[row].breakpoint)
+                action = replace(action, breakpoint=bp)
+            actions.append(action); contexts.append(chosen_context)
+            factors.append(torch.stack((event_logs[row, kind], logs[selected], breakpoint_log)))
+        rates = [total_event_rate(r) for r in batch.physical_rates]
+        contexts = torch.stack(contexts)
+        timing = contexts.new_tensor([[math.log1p(s.current_time), math.log(rate),
+                    float(isinstance(a, RecombinationChoice)),
+                    a.breakpoint/env.sequence_length if isinstance(a, RecombinationChoice) else 0.]
+                    for s, a, rate in zip(states, actions, rates)])
+        rates = contexts.new_tensor(rates, dtype=torch.float64)
+        corrections = self.time_head(torch.cat((contexts, timing), -1))
+        waits = (self.time_head.sample(corrections, rates) if forced_actions is None else
+                 rates.new_tensor([a.delta_t for a in forced_actions]))
+        time_logs = self.time_head.compute_log_time_pf(corrections, waits, rates)
+        actions = [replace(a, delta_t=float(dt)) for a, dt in zip(actions, waits.tolist())]
+        factors = torch.cat((torch.stack(factors), time_logs[:, None]), -1)
+        if not torch.isfinite(factors).all():
+            raise FloatingPointError('Nonfinite policy factor')
+        return factors.sum(-1), actions, factors

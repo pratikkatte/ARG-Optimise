@@ -1,278 +1,109 @@
+"""Compatible policy sampling, forced replay, and bounded-memory score gradients."""
+import math
 import torch
-import numpy as np
-from env.env import SimpleTrajectory, CoalescenceChoice, RecombinationChoice
-from env.time_env import validate_temperature
+from torch.nn.utils.rnn import pad_sequence
+from env.env import SimpleTrajectory
+from utils import action_as_dict
+
+
+class RolloutFailure(RuntimeError):
+    def __init__(self, message, trajectories):
+        self.histories = [[action_as_dict(a) for a in t.actions] for t in trajectories]
+        super().__init__(message+'; all attempted action histories are available in .histories')
 
 
 class RolloutWorker:
-    """Policy-driven rollout orchestration for the ARG environment."""
+    def __init__(self, env, verbose=False, max_events=10000):
+        self.env, self.verbose = env, verbose
+        if max_events < 1:
+            raise ValueError('max_events must be positive')
+        self.max_events = int(max_events)
 
-    def __init__(self, env, verbose=False):
-        self.env = env
-        self.device = env.device
-        self.verbose = verbose
+    def _walk(self, generator, episodes, fixed=None, collect_flows=False):
+        states = [self.env.get_initial_state() for _ in range(episodes)]
+        paths = [SimpleTrajectory() for _ in states]
+        while True:
+            rows = [i for i, s in enumerate(states) if not s.is_done]
+            if not rows:
+                break
+            try:
+                if any(len(paths[i]) >= self.max_events for i in rows):
+                    raise ValueError('ARG event limit exceeded')
+                actions = None
+                if fixed is not None:
+                    if any(len(paths[i]) >= len(fixed[i]) for i in rows):
+                        raise ValueError('Replay ends before ancestry completes')
+                    actions = [fixed[i][len(paths[i])] for i in rows]
+                active = [states[i] for i in rows]
+                outputs = generator(active, forced_actions=actions, return_flows=collect_flows)
+                for k, (row, action) in enumerate(zip(rows, outputs['actions'])):
+                    previous = states[row]
+                    state = self.env.apply_action(previous, action)
+                    prior = self.env.compute_cwr_event_log_prior(previous, action)
+                    if generator.count_backward_parents(state) != 1:
+                        raise ValueError('Nonunique chronological predecessor')
+                    states[row] = state
+                    paths[row].update(action, log_prior=prior, log_reward=state.log_reward,
+                                      log_proposal=float(outputs['log_pf'][k].detach()))
+                    if state.is_done and not math.isfinite(state.log_reward):
+                        if state.log_reward == -math.inf:
+                            raise ValueError('Compatible policy reached an exact zero-likelihood ARG')
+                        raise FloatingPointError('Numerical failure in terminal reward')
+            except (ValueError, FloatingPointError, RuntimeError) as exc:
+                raise RolloutFailure(str(exc), paths) from exc
+            yield rows, outputs, states, paths
+        if fixed is not None and any(len(p) != len(a) for p, a in zip(paths, fixed)):
+            raise RolloutFailure('Replay has actions after termination', paths)
 
-    def _rollout_batch(
-        self,
-        generator,
-        episodes,
-        random_spec=None,
-        return_states=False,
-        collect_flows=False,
-        fixed_actions=None,
-        ):
-        
-        if collect_flows and generator.loss_type != "subtb":
-            raise ValueError("Flow collection requires loss_type=subtb")
-        continuous = self.env.time_policy == "cwr_exponential"
-        score_dtype = torch.float64 if continuous else torch.float32
-        if continuous:
-            validate_temperature(random_spec)
-        flows_by_traj = [[] for _ in range(episodes)] if collect_flows else None
-        corrections_by_traj = [[] for _ in range(episodes)] if collect_flows else None
-        states = [self.env.get_initial_state(track_likelihood=collect_flows) for _ in range(episodes)]
-        trajectories = [SimpleTrajectory() for _ in states]
-        
-        
-        log_paths_pf_by_traj = [[] for _ in range(episodes)]
-        backward_num_parents_by_traj = [[] for _ in range(episodes)]
-        
-        if self.verbose:
-            print(
-                f"Rolling out {episodes} trajectory/trajectories in batch "
-                f"({len([idx for idx, state in enumerate(states) if not state.is_done])} active)..."
-            )
-
-        unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
-
-        while unfinished:
-            active_states = [states[idx] for idx in unfinished]
-            forced = None
-            if fixed_actions is not None:
-                forced = []
-                for idx in unfinished:
-                    step = len(trajectories[idx])
-                    if step >= len(fixed_actions[idx]):
-                        raise ValueError("Replay trajectory ends before reaching a terminal state")
-                    action = fixed_actions[idx][step]
-                    if not isinstance(action, (CoalescenceChoice, RecombinationChoice)):
-                        raise ValueError("Invalid replay action")
-                    if isinstance(action, RecombinationChoice) and action.breakpoint is None:
-                        raise ValueError("Replay recombination is missing its breakpoint")
-                    if (continuous and action.delta_t is None) or (not continuous and action.time_action is None):
-                        raise ValueError("Replay action is missing its waiting time")
-                    forced.append(action)
-            
-            input_dict = self.env.prepare_state_rollout_inputs(
-                active_states,
-                random_spec=random_spec,
-                event_policy=generator.arg_model.event_policy,
-            )
-
-            if collect_flows:
-                total_log_pf, log_probs, choosen_actions, state_flows = generator(
-                    input_dict, return_flows=True, **({'forced_actions': forced} if forced is not None else {}))
-                for batch_idx, traj_idx in enumerate(unfinished):
-                    flows_by_traj[traj_idx].append(state_flows[batch_idx])
-                    corrections_by_traj[traj_idx].append(generator._last_flow_corrections[batch_idx])
-            else:
-                total_log_pf, log_probs, choosen_actions = generator(
-                    input_dict, **({'forced_actions': forced} if forced is not None else {}))
-
-            log_priors = [
-                self.env.compute_cwr_event_log_prior(state, self.env.enumerate_actions(state), action)
-                for state, action in zip(active_states, choosen_actions)
-            ]
-            next_states = self.env.apply_actions(active_states, choosen_actions, log_priors)
-            for batch_idx, traj_idx in enumerate(unfinished):
-                action = choosen_actions[batch_idx]
-                log_paths_pf_by_traj[traj_idx].append(total_log_pf[batch_idx])
-                log_prior = log_priors[batch_idx]
-                next_state = next_states[batch_idx]
-                states[traj_idx] = next_state
-                trajectories[traj_idx].update(
-                    action,
-                    log_prior=log_prior,
-                    log_reward=next_state.log_reward,
-                )
-
-                backward_num_parents_by_traj[traj_idx].append(
-                    generator.count_backward_parents(next_state)
-                    )
-            unfinished = [idx for idx, state in enumerate(states) if not state.is_done]
-
-        if fixed_actions is not None and any(len(traj) != len(actions) for traj, actions in zip(trajectories, fixed_actions)):
-            raise ValueError("Replay trajectory contains actions after its terminal state")
-
-        log_paths_pf = self._pad_log_path_lists(log_paths_pf_by_traj, score_dtype, self.device)
-
-        log_paths_pb = [
-            -torch.log(torch.tensor(num_parents, dtype=score_dtype, device=self.device))
-            for num_parents in backward_num_parents_by_traj
-            ]
-        
-        log_paths_pb = self._pad_log_path_vectors(log_paths_pb, score_dtype, self.device)
-
-        log_rewards = torch.tensor([state.log_reward for state in states], dtype=score_dtype, device=self.device)
-        if continuous and not all(bool(torch.isfinite(x).all()) for x in (
-            log_paths_pf, log_paths_pb, log_rewards, log_paths_pf.sum(-1), log_paths_pb.sum(-1)
-        )):
-            raise ValueError("non-finite continuous rollout scores")
-
-
-        data = {
-            "log_paths_pf": log_paths_pf,
-            "log_paths_pb": log_paths_pb,
-            "log_rewards": log_rewards,
-        }
+    def _run(self, generator, episodes, fixed=None, collect_flows=False, return_states=False):
+        if episodes < 1:
+            raise ValueError('episodes must be positive')
+        pf, flows, factors = ([[] for _ in range(episodes)] for _ in range(3))
+        for rows, output, states, paths in self._walk(generator, episodes, fixed, collect_flows):
+            for k, row in enumerate(rows):
+                pf[row].append(output['log_pf'][k])
+                factors[row].append(output['factors'][k])
+                if collect_flows:
+                    flows[row].append(output['flows'][k])
+        rewards = torch.tensor([s.log_reward for s in states], dtype=torch.float64, device=generator.device)
+        lengths = torch.tensor([len(p) for p in paths], dtype=torch.long, device=generator.device)
+        scores = pad_sequence([torch.stack(p) for p in pf], batch_first=True)
+        result = dict(log_paths_pf=scores, log_paths_pb=torch.zeros_like(scores), log_rewards=rewards,
+                      lengths=lengths, log_factors=pad_sequence([torch.stack(p) for p in factors], batch_first=True))
         if collect_flows:
-            # Keep terminal posterior precision; the legacy TB outputs stay float32.
-            data["log_rewards"] = torch.tensor([s.log_reward for s in states], dtype=torch.float64, device=self.device)
-            data["lengths"] = torch.tensor([len(p) for p in log_paths_pf_by_traj], dtype=torch.long, device=self.device)
-            for idx, values in enumerate(flows_by_traj):
-                values.append(data["log_rewards"][idx] if values else generator.compute_log_Z().double())
-            data["state_flows"] = self._pad_log_path_lists(flows_by_traj, torch.float64, self.device)
-            data["flow_corrections"] = self._pad_log_path_lists(corrections_by_traj, torch.float64, self.device)
+            result['state_flows'] = pad_sequence([torch.stack(f+[rewards[i]]) for i, f in enumerate(flows)], batch_first=True)
         if return_states:
-            data["states"] = states
+            result['states'] = states
+        return result, paths
 
-        return data, trajectories
-
-    def rollout(
-        self,
-        generator=None,
-        episodes=1,
-        random_spec=None,
-        return_states=False,
-        collect_flows=False,
-    ):
-        """Run one or more model-guided ARG rollouts."""
-        if generator is None:
-            raise ValueError("Generator is required for rollout")
-        return self._rollout_batch(
-            generator=generator,
-            episodes=episodes,
-            random_spec=random_spec,
-            return_states=return_states,
-            collect_flows=collect_flows,
-        )
+    def rollout(self, generator, episodes=1, random_spec=None, return_states=False, collect_flows=False):
+        if random_spec is not None and float(random_spec.get('T', 1.)) != 1.:
+            raise ValueError('Phase 2 uses temperature 1; tempered densities are not implemented')
+        return self._run(generator, episodes, collect_flows=collect_flows, return_states=return_states)
 
     def replay(self, generator, trajectories, collect_flows=True, return_states=False):
-        """Rescore fixed complete paths with the current policy and exact rewards.
+        actions = [t.actions if hasattr(t, 'actions') else t for t in trajectories]
+        return self._run(generator, len(actions), actions, collect_flows, return_states)
 
-        Only action records are reused; every PF, PB, and state flow is recomputed.
-        The caller controls eval mode/no_grad, just as for ordinary rollout.
+    def backward_scores(self, generator, trajectories, pf_weights, flow_weights, chunk_steps=16):
+        """Recompute scores in chunks with exact d(loss)/d(score) from a first pass.
+
+        No learned activation survives across chunks. Dropout is absent in this
+        architecture, so the score function is identical on both passes.
         """
-        if generator.arg_model.event_policy != 'cwr_residual':
-            raise ValueError('Replay currently requires event_policy=cwr_residual')
-        actions = [traj.actions if hasattr(traj, 'actions') else traj for traj in trajectories]
-        if not actions:
-            raise ValueError('Replay requires at least one trajectory')
-        return self._rollout_batch(generator, len(actions), collect_flows=collect_flows,
-                                   return_states=return_states, fixed_actions=actions)
-
-    def _states_to_padded_tree_features(self, states, device=None):
-        lineage_features = [
-            self._state_to_lineage_features(state, device=device)
-            for state in states
-        ]
-        max_active = max(features.shape[0] for features in lineage_features)
-        batch_size = len(lineage_features)
-        _, sequence_length, channels = lineage_features[0].shape
-        batch_features = lineage_features[0].new_zeros(
-            batch_size,
-            max_active,
-            sequence_length,
-            channels,
-        )
-        batch_nb_seq = torch.empty(batch_size, dtype=torch.long, device=batch_features.device)
-
-        for batch_idx, features in enumerate(lineage_features):
-            active_count = features.shape[0]
-            batch_features[batch_idx, :active_count] = features
-            batch_nb_seq[batch_idx] = active_count
-
-        return batch_features, batch_nb_seq
-
-    def _pad_log_path_lists(self, log_path_lists, dtype, device):
-        vectors = [
-            torch.stack(log_paths).to(dtype=dtype, device=device)
-            if log_paths
-            else torch.empty(0, dtype=dtype, device=device)
-            for log_paths in log_path_lists
-        ]
-        return self._pad_log_path_vectors(vectors, dtype, device)
-
-    def _pad_log_path_vectors(self, vectors, dtype, device):
-        max_length = max((vector.numel() for vector in vectors), default=0)
-        padded = torch.zeros(len(vectors), max_length, dtype=dtype, device=device)
-        for row_idx, vector in enumerate(vectors):
-            if vector.numel() > 0:
-                padded[row_idx, :vector.numel()] = vector.to(dtype=dtype, device=device)
-        return padded
-
-    def _log_path_dtype_device(self, log_path_lists):
-        for log_paths in log_path_lists:
-            if log_paths:
-                return log_paths[0].dtype, log_paths[0].device
-        seq_arrays = self.env.seq_arrays
-        device = seq_arrays.device if hasattr(seq_arrays, "device") else torch.device("cpu")
-        return torch.float32, device
-
-    def _state_to_lineage_features(self, state, device=None):
-        lineage_features = []
-
-        for lineage in state.active_lineages:
-            if lineage.partials is None:
-                raise ValueError(
-                    f"Active ARG lineage {lineage.node_id} is missing partials"
-                )
-            feature = lineage.partials
-            if not torch.is_tensor(feature):
-                feature = torch.as_tensor(feature, dtype=torch.float32)
-            feature = feature.float()
-            if device is not None:
-                feature = feature.to(device)
-            feature = self.env.evolution_model.mask_partials(
-                feature,
-                lineage.material_segments,
-            )
-            lineage_features.append(self.env.evolution_model.normalize_partials(feature))
-
-        if not lineage_features:
-            raise ValueError("Cannot prepare rollout features for a state with no active lineages.")
-        return torch.stack(lineage_features, dim=0)
-
-    def _state_to_tree_features(self, state):
-        return self._state_to_lineage_features(state).unsqueeze(0)
-
-    def _material_mask_to_site_mask(self, material_mask, device):
-        mask = torch.as_tensor(material_mask, dtype=torch.bool, device=device)
-        num_blocks = int(self.env.num_blocks)
-        if len(mask) == num_blocks:
-            return mask.to(dtype=torch.float32)
-        raise ValueError(
-            f"material mask must have length {num_blocks}, got {len(mask)}"
-        )
-
-    def _trajectory_record(self, step, action, log_prior, state, record_diagnostics):
-        record = {
-            "step": step,
-            "action": action,
-            "log_prior": log_prior,
-            "active_lineage_count": len(state.active_lineages),
-            "is_done": state.is_done,
-            "log_reward": state.log_reward,
-        }
-        if record_diagnostics:
-            record["active_counts"] = self.env.get_active_counts(state).tolist()
-        return record
-
-    def _generator_device(self, generator):
-        device = getattr(generator, "device", None)
-        if device is not None:
-            return torch.device(device)
-        try:
-            return next(generator.parameters()).device
-        except (AttributeError, StopIteration):
-            return self.env.seq_arrays.device
+        if chunk_steps < 1:
+            raise ValueError('chunk_steps must be positive')
+        actions = [t.actions for t in trajectories]
+        steps = [0]*len(actions)
+        terms = []
+        for rows, output, _, _ in self._walk(generator, len(actions), actions, True):
+            for k, row in enumerate(rows):
+                step = steps[row]
+                terms.append(pf_weights[row, step]*output['log_pf'][k]+
+                             flow_weights[row, step]*output['flows'][k])
+                steps[row] += 1
+            if len(terms) >= chunk_steps:
+                torch.stack(terms).sum().backward()
+                terms.clear()
+        if terms:
+            torch.stack(terms).sum().backward()

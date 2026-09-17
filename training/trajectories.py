@@ -25,12 +25,8 @@ def action_fingerprint(actions):
 
 def environment_fingerprint(env):
     """Return a stable identity for replay-relevant environment settings."""
-    fields = dict(sequences=env.sequences, num_blocks=env.num_blocks,
-                  sequence_length=env.sequence_length, mutation_rate=env.mutation_rate,
-                  recombination_rate=env.recombination_rate, population_size=env.population_size,
-                  arg_prior=env.arg_prior, rho=env.rho, time_policy=env.time_policy,
-                  reward_C=env.reward_fn.C)
-    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+    return env.dataset_fingerprint
+
 
 
 @dataclass(frozen=True)
@@ -42,6 +38,8 @@ class ReplayEntry:
     topology: tuple
     source: str
     added_step: int
+    log_prior: float
+    log_proposal: object = None
 
     def actions(self):
         """Deserialize the stored action sequence."""
@@ -54,7 +52,7 @@ class DiverseTrajectoryBuffer:
     Half the capacity is a reservoir over fresh insertions. The other half
     retains high-reward entries with a quota per canonical grid topology.
     """
-    schema_version = 1
+    schema_version = 2
 
     def __init__(self, env, capacity=2048, grid_size=16, per_topology=4, seed=7,
                  forbidden_actions=()):
@@ -94,7 +92,7 @@ class DiverseTrajectoryBuffer:
 
     def add(self, env, trajectory, state, source, step):
         """Validate and conditionally retain a newly generated trajectory."""
-        if source not in ('policy', 'prior'):
+        if source not in ('policy', 'compatible_proposal'):
             raise ValueError('Only newly generated training trajectories may enter replay')
         if environment_fingerprint(env) != self.environment_sha256:
             raise ValueError('Replay environment changed')
@@ -102,6 +100,9 @@ class DiverseTrajectoryBuffer:
             raise ValueError('Replay requires a finite exact terminal reward')
         if abs(float(trajectory.log_reward) - float(state.log_reward)) > 1e-8:
             raise ValueError('Trajectory and terminal-state rewards disagree')
+        if source == 'compatible_proposal' and (len(trajectory.log_proposals) != len(trajectory.actions)
+                or any(p is None or not math.isfinite(p) for p in trajectory.log_proposals)):
+            raise ValueError('Compatible exploration requires its actual proposal log densities')
         text = action_text(trajectory.actions)
         key = hashlib.sha256(text.encode()).hexdigest()
         if key in self.forbidden:
@@ -113,7 +114,9 @@ class DiverseTrajectoryBuffer:
                 raise ValueError('The same replay trajectory has changed reward')
             return False
         entry = ReplayEntry(key, text, float(trajectory.log_reward), self._topology(env, state),
-                            source, int(step))
+                            source, int(step), float(state.accumulated_log_prior),
+                            sum(trajectory.log_proposals) if trajectory.log_proposals and
+                            all(p is not None for p in trajectory.log_proposals) else None)
         self._admit(entry)
         return key in self.reservoir or key in self.elite
 
@@ -176,7 +179,7 @@ class DiverseTrajectoryBuffer:
             replay_buffer_modal_local_frequency_mean=float(np.mean([max(c.values()) / len(entries) for c in local])),
             replay_buffer_log_reward_mean=float(np.mean([e.log_reward for e in entries])),
             replay_buffer_log_reward_max=max(e.log_reward for e in entries),
-            replay_buffer_prior_fraction=sum(e.source == 'prior' for e in entries) / len(entries))
+            replay_buffer_compatible_proposal_fraction=sum(e.source == 'compatible_proposal' for e in entries) / len(entries))
         if len(entries) > 1:
             result['replay_buffer_pairwise_local_rf_mean'] = float(np.mean([
                 mean_pairwise_rf([entry.topology[i] for entry in entries], self.sample_count)
@@ -195,7 +198,7 @@ class DiverseTrajectoryBuffer:
                     reservoir=list(self.reservoir), elite=list(self.elite))
 
     def load_state_dict(self, state):
-        """Restore and validate a schema-version-1 replay checkpoint."""
+        """Restore and validate a schema-version-2 replay checkpoint."""
         for key in ('schema_version', 'capacity', 'grid_size', 'per_topology',
                     'environment_sha256', 'sample_count'):
             if state[key] != getattr(self, key):
@@ -208,9 +211,12 @@ class DiverseTrajectoryBuffer:
         for key, entry in entries.items():
             if entry.key != key or hashlib.sha256(entry.actions_json.encode()).hexdigest() != key:
                 raise ValueError('Replay trajectory fingerprint mismatch')
-            if key in self.forbidden or not math.isfinite(entry.log_reward):
+            if (key in self.forbidden or not math.isfinite(entry.log_reward)
+                    or not math.isfinite(entry.log_prior)
+                    or (entry.log_proposal is not None and not math.isfinite(entry.log_proposal))
+                    or (entry.source == 'compatible_proposal' and entry.log_proposal is None)):
                 raise ValueError('Invalid replay entry')
-            if entry.source not in ('policy', 'prior') or len(entry.topology) != self.grid_size or entry.added_step < 1:
+            if entry.source not in ('policy', 'compatible_proposal') or len(entry.topology) != self.grid_size or entry.added_step < 1:
                 raise ValueError('Invalid replay entry provenance or topology')
         reservoir = {key: entries[key] for key in state['reservoir']}
         elite = {key: entries[key] for key in state['elite']}

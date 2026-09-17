@@ -1,6 +1,6 @@
 # Infinite-sites ARG environment (Phase 1)
 
-The environment now uses polarized, fully observed SNP data and exact single-mutation messages. Neural policy encoding, GFlowNet training, checkpoint inference, and trained-model evaluation are deferred to Phase 2. Their entrypoints fail explicitly; FASTA/JC69 environment inputs and old checkpoints are not supported.
+The environment uses polarized, fully observed SNP data and exact single-mutation messages. Neural training and checkpoint inference are now available through the [Phase 2 shared-encoder workflow](INFINITE_SITES_TRAINING.md). FASTA/JC69 inputs and old checkpoints remain unsupported.
 
 ## Use the environment
 
@@ -81,4 +81,4 @@ python3 -m pytest validation/tests/test_snp_data.py \
   validation/tests/test_infinite_sites_environment.py -q
 ```
 
-Tests cover independent analytical scores, exhaustive small topologies, two-interval reachability, invariant material, local-MRCA stems, prior/mask separation, reconstruction, neural entrypoint guards, the 25-event rep0 full-ancestry replay, and fixed-seed generated candidates. The truth replay is a test fixture only and is not part of diagnostic sampling. These checks establish environment correctness, not posterior calibration or a training speedup.
+Tests cover independent analytical scores, exhaustive small topologies, two-interval reachability, invariant material, local-MRCA stems, prior/mask separation, reconstruction, legacy-input rejection, the 25-event rep0 full-ancestry replay, and fixed-seed generated candidates. The truth replay is a test fixture only and is not part of diagnostic sampling. These checks establish environment correctness, not posterior calibration or a training speedup.

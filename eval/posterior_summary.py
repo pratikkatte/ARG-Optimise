@@ -447,53 +447,32 @@ class TerminalSamplingEvaluator:
 
     @classmethod
     def from_dataset(cls, dataset_path, env, grid_size=100, tmrca_method='grid'):
+        from env.snp_data import load_snp_dataset
         dataset_path = Path(dataset_path)
-        metadata_path = dataset_path.parent/'metadata.json'
-        metadata = json.loads(metadata_path.read_text())
-        truth_path = dataset_path.parent/metadata['files']['ground_truth_trees']
+        metadata = json.loads((dataset_path/'metadata.json').read_text())
+        observed = load_snp_dataset(dataset_path)
+        if (observed.haplotype_ids != env.snp_data.haplotype_ids
+                or not np.array_equal(observed.positions, env.snp_data.positions)
+                or not np.array_equal(observed.genotypes, env.snp_data.genotypes)
+                or observed.sequence_length != env.sequence_length):
+            raise ValueError('Evaluation observations differ from the model environment')
+        truth_path = dataset_path/metadata['files']['ground_truth_trees']
         truth = tskit.load(truth_path)
-        headers = [line[1:].split()[0] for line in dataset_path.read_text().splitlines() if line.startswith('>')]
-        records = read_fasta(str(dataset_path))
-        if len(headers) != len(records) or len(set(headers)) != len(headers):
-            raise ValueError('Duplicate or malformed FASTA sample identities')
-        sequences = load_sequences(str(dataset_path))
-        if sequences != list(env.sequences) or len(headers) != env.num_sequences:
-            raise ValueError('FASTA order/sequences differ from the model environment')
-        by_name = {s['fasta_header']: s for s in metadata['samples']}
-        if set(headers) != set(by_name) or len(by_name) != len(metadata['samples']):
-            raise ValueError('FASTA identities differ from simulation metadata')
-        truth_samples = [int(by_name[name]['tree_node_id']) for name in headers]
-        for name, node in zip(headers, truth_samples):
-            if truth.node(node).individual != by_name[name]['individual_id']:
-                raise ValueError('Truth sample individual does not match simulation metadata')
-        if truth.sequence_length != env.sequence_length or metadata['summary']['time_units'] != 'generations':
-            raise ValueError('Truth sequence length or time units do not match the dataset')
-        ancestry = metadata['simulation']['sim_ancestry']['parameters']
-        mutation = metadata['simulation']['sim_mutations']['parameters']
-        if (ancestry['population_size'] != env.population_size or
-                ancestry['recombination_rate'] != env.recombination_rate or mutation['rate'] != env.mutation_rate):
-            raise ValueError('Evaluation simulation parameters differ from training')
-        exported = {s['site_id'] for s in metadata['sites'] if s['exported_to_vcf_and_fasta']}
-        checked = 0
-        for variant in truth.variants(samples=truth_samples):
-            if variant.site.id in exported:
-                position = int(variant.site.position)
-                if position != variant.site.position:
-                    raise ValueError('Expected discrete genomic coordinates')
-                for sequence, genotype in zip(sequences, variant.genotypes):
-                    if genotype < 0 or sequence[position] != variant.alleles[genotype]:
-                        raise ValueError('FASTA alleles do not match the mapped truth sample identities')
-                checked += 1
-        if checked != len(exported):
-            raise ValueError('Exported truth sites were not all verified')
-        return cls(truth, truth_samples, headers, env.population_size, grid_size, dict(
-            dataset_sha256=hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
-            truth_sha256=hashlib.sha256(truth_path.read_bytes()).hexdigest(),
-            metadata_sha256=hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
-            verified_exported_sites=checked, mutation_rate=env.mutation_rate,
-            recombination_rate=env.recombination_rate, effective_population_size=env.population_size,
-            **({'arg_prior': env.arg_prior} if tmrca_method == 'point_accuracy' else {})),
-            tmrca_method=tmrca_method)
+        samples = metadata['sample_nodes_in_haplotype_order']
+        if len(samples) != env.num_sequences or truth.sequence_length != env.sequence_length:
+            raise ValueError('Truth dimensions differ from observations')
+        variants = {v.site.id: (v.site.position, v.site.ancestral_state, v.genotypes.copy(), tuple(v.alleles))
+                    for v in truth.variants(samples=samples)}
+        for j, site_id in enumerate(observed.site_ids):
+            position, ancestral, genotypes, alleles = variants[site_id]
+            if (position != observed.positions[j] or ancestral != observed.ancestral_states[j]
+                    or not np.array_equal(genotypes, observed.genotypes[:, j])
+                    or alleles[1] != observed.derived_states[j]):
+                raise ValueError('Truth sample mapping does not reproduce observed SNPs')
+        return cls(truth, samples, observed.haplotype_ids, env.population_size, grid_size,
+                   dict(environment_fingerprint=env.dataset_fingerprint,
+                        truth_sha256=hashlib.sha256(truth_path.read_bytes()).hexdigest(),
+                        verified_exported_sites=observed.num_variants), tmrca_method=tmrca_method)
 
     def pair_times(self, ts, samples):
         return np.array([[tree.tmrca(samples[a], samples[b])/self.scale for a, b in self.pairs]
@@ -595,7 +574,7 @@ class TerminalSamplingEvaluator:
                     raise ValueError('Incomplete marginal tree')
                 trees.append(ts); valid_indices.append(index)
             except (ValueError, tskit.LibraryError) as exc:
-                invalid[str(exc)] += 1
+                raise ValueError('Invalid evaluation draw; no samples may be discarded') from exc
         metrics, details = self.summarize_trees(trees)
         recombinations = [sum(a.event_type=='recomb' for a in traj.actions) for traj in trajectories]
         rewards = outputs['log_rewards'].detach().cpu().numpy()
