@@ -2,7 +2,8 @@
 import copy
 import json
 from pathlib import Path
-from types import SimpleNamespace
+from importlib.machinery import ModuleSpec
+from types import ModuleType
 from unittest.mock import patch
 import numpy as np
 import pytest
@@ -90,7 +91,8 @@ def test_accumulation_same_update_on_fixed_histories():
         w=RolloutWorker(g.env); cursor=[0]
         def rollout(generator,episodes,**kwargs):
             selected=paths[cursor[0]:cursor[0]+episodes];cursor[0]+=episodes
-            return None,selected
+            return w.replay(generator, selected, collect_flows=kwargs.get('collect_flows', False),
+                            return_states=kwargs.get('return_states', False))
         w.rollout=rollout
         return w
     a=Trainer(first,fixed_worker(first),TrajectoryMixConfig(replay_fraction=0.))
@@ -146,38 +148,68 @@ def fixture_dataset(tmp_path):
     return path,environment().snp_data
 
 
-def test_full_cli_training_eval_wandb_and_resume(tmp_path):
+def test_full_cli_training_eval_wandb_and_resume(tmp_path, capsys):
     path,data=fixture_dataset(tmp_path)
     options=dict(dataset_path=str(path),output_path=str(tmp_path/'run'),epochs=2,batch_size=4,
         model_kwargs=dict(embedding_size=16,hidden_size=32,transformer_depth=1,transformer_heads=2),
-        init_z_sample_count=2,eval_episodes=4,eval_every=1,checkpoint_every=1,grad_accum_steps=2,
+        init_z_sample_count=2,init_z_batch_size=1,eval_episodes=4,eval_every=2,checkpoint_every=1,grad_accum_steps=2,
         replay_capacity=8,replay_grid_size=3,replay_per_topology=1,replay_min_size=2,
-        lr_schedule='cosine',lr_schedule_steps=4,wandb=True,wandb_mode='offline',verbose=False)
+        lr_schedule='cosine',lr_schedule_steps=4,wandb=True,wandb_mode='offline',verbose=True)
     class Run:
         id='test-run'
         def __init__(self): self.logged=[];self.finished=False;self.summary={}
         def log(self,info,step): self.logged.append((step,info))
         def finish(self): self.finished=True
     run=Run()
-    with patch('train.load_snp_dataset',return_value=data),patch('wandb.init',return_value=run):
+    wandb=ModuleType('wandb')
+    wandb.__spec__=ModuleSpec('wandb',loader=None)
+    wandb.init=lambda **kwargs:run
+    with patch('train.load_snp_dataset',return_value=data),patch.dict(
+            'sys.modules', wandb=wandb):
         g,t=train(**options)
+    lines=capsys.readouterr().out.splitlines()
+    initialization=[line for line in lines if line.startswith(('Initializing flow', 'Initialization complete'))]
+    assert len(initialization)==2
+    assert initialization[0]=='Initializing flow (2 trajectories)...'
+    assert initialization[1].startswith('Initialization complete (') and initialization[1].endswith('s)')
+    batches=[line for line in lines if line.startswith('Z init ')]
+    assert len(batches)==2
+    for index,line in enumerate(batches,1):
+        assert line.startswith(f'Z init {index}/2 | events/ARG=') and line.endswith('s')
+    epochs=[line for line in lines if line.startswith('Epoch ')]
+    assert len(epochs)==2
+    assert epochs[0].startswith('Epoch 1/2  subtb_loss=') and 'eval_subtb_loss=' not in epochs[0]
+    assert epochs[1].startswith('Epoch 2/2  subtb_loss=') and 'eval_subtb_loss=' in epochs[1]
+    assert all('  time=' in line for line in epochs)
     assert run.finished and len(run.logged)==2
-    assert run.summary['progress']['phase']=='training_complete'
-    progress=[json.loads(s) for s in (tmp_path/'run/progress.jsonl').read_text().splitlines()]
-    assert progress[0]['phase']=='ready' and progress[-1]['phase']=='training_complete'
-    assert any(row['phase']=='flow_initialization' and row['initialized']==0 for row in progress)
+    assert 'grad_norm' in run.logged[0][1] and 'eval_subtb_loss' in run.logged[1][1]
+    training=[json.loads(s) for s in (tmp_path/'run/training.jsonl').read_text().splitlines()]
+    for line,info in zip(epochs,training):
+        assert f'subtb_loss={info["loss"]:.4f}' in line
+        assert 'grad_norm' in info
+    assert lines==initialization[:1]+batches+initialization[1:]+epochs and 'progress' not in run.summary
+    assert not (tmp_path/'run/progress.jsonl').exists()
     resolved=yaml.safe_load((tmp_path/'run/resolved_config.yaml').read_text())
     assert resolved['effective_population_size']==10 and resolved['lr_schedule_steps']==4
     assert t.buffer.grid_size==3 and t.buffer.per_topology==1
     assert (tmp_path/'run/checkpoints/best_eval.pt').exists()
     reports=[json.loads(s) for s in (tmp_path/'run/evaluation.jsonl').read_text().splitlines()]
-    assert len(reports)==2 and all(x['eval_independent_checked']==4 for x in reports)
+    assert len(reports)==1 and reports[0]['eval_independent_checked']==4
+    assert f'eval_subtb_loss={reports[0]["eval_subtb_loss"]:.4f}' in epochs[1]
     checkpoint=tmp_path/'run/checkpoints/checkpoint_0002.pt'
+    # Older checkpoints may contain the retired logging settings.
+    saved=load_checkpoint(checkpoint)
+    saved['metadata']['resolved_config'].update(debug_progress=True,progress_every_seconds=15.)
+    torch.save(saved,checkpoint)
     # No original observation directory is needed for resume without truth evaluation.
     with patch('train.load_snp_dataset',side_effect=AssertionError('dataset should be embedded')):
         resumed,trainer=train(output_path=str(tmp_path/'resume'),resume_checkpoint=str(checkpoint),
                               epochs=3,wandb=False,verbose=False)
     assert trainer.completed_updates==3 and resumed.scheduler.completed_updates==3
+    assert capsys.readouterr().out==''
+    assert not (tmp_path/'resume/progress.jsonl').exists()
+    resumed_config=yaml.safe_load((tmp_path/'resume/resolved_config.yaml').read_text())
+    assert 'debug_progress' not in resumed_config and 'progress_every_seconds' not in resumed_config
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA hardware unavailable')

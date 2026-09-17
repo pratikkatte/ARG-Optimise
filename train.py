@@ -1,6 +1,7 @@
 """Train an infinite-sites shared-encoder GFlowNet from an explicit YAML configuration."""
 import json
 from pathlib import Path
+import time
 import torch
 import yaml
 from env.snp_data import load_snp_dataset
@@ -13,7 +14,6 @@ from training.configuration import (parse_train_args, resolve_config, config_not
                                     temperature_config, mix_config)
 from training.schedules import WarmupCosineScheduler
 from training.evaluation import evaluate_generator
-from training.progress import ProgressReporter
 
 
 def _json(path, value):
@@ -46,6 +46,8 @@ def train(dataset_path=None, output_path=None, device='cpu', **options):
                                   ('mutation_rate','mutation_rate'),('recombination_rate','recombination_rate'),
                                   ('reward_C','reward_C')):
                 saved[target] = checkpoint['metadata']['environment'][source]
+        # Discard retired logging settings from older checkpoints.
+        saved = {k:v for k,v in saved.items() if k not in ('debug_progress','progress_every_seconds')}
         c = resolve_config({**saved,**requested})
         previous = resolve_config(saved)
         mutable = {'dataset_path','output_path','device','epochs_num','resume_checkpoint','cpu_threads',
@@ -53,7 +55,7 @@ def train(dataset_path=None, output_path=None, device='cpu', **options):
                    'checkpoint_every','eval_every','eval_episodes','eval_batch_size','eval_seed',
                    'eval_density_slope','eval_independent_likelihood','terminal_eval',
                    'terminal_eval_grid_size','terminal_eval_repeats','terminal_eval_repeat_every',
-                   'tmrca_method','evaluation','max_events','progress_every_seconds'}
+                   'tmrca_method','evaluation','max_events','init_z_batch_size','chunk_steps'}
         for key in c.keys()-mutable:
             if c[key] != previous[key]:
                 raise ValueError('Cannot change '+key+' when resuming; use a fresh run')
@@ -108,19 +110,9 @@ def train(dataset_path=None, output_path=None, device='cpu', **options):
     notes = config_notes(c)
     (output/'resolved_config.yaml').write_text(yaml.safe_dump(c,sort_keys=False))
     _json(output/'configuration_notes.json',notes)
-    if c['verbose']:
-        print(f'Configuration: {output/"resolved_config.yaml"}\n'
-              f'Configuration notes: {output/"configuration_notes.json"}', flush=True)
-    progress = ProgressReporter(output/'progress.jsonl', verbose=c['verbose'],
-                                every_seconds=c['progress_every_seconds'])
-    g.progress_reporter = progress
-    progress.begin('ready', neural_device=str(g.device), environment_device=g.env.device,
-                   haplotypes=g.env.num_sequences, snps=g.env.num_variants,
-                   initialization_args=0 if checkpoint else c['init_z_sample_count'], batch_size=c['batch_size'])
     wandb_id = checkpoint['metadata'].get('wandb_id') if checkpoint else None
     try:
         if c['wandb']:
-            progress.begin('wandb_initialization')
             try:
                 import wandb
             except ImportError as exc:
@@ -129,24 +121,25 @@ def train(dataset_path=None, output_path=None, device='cpu', **options):
                 name=c['wandb_name'] or output.name,mode=c['wandb_mode'],dir=str(output),
                 config=c,id=wandb_id,resume='allow' if wandb_id else None)
             wandb_id = run.id if run is not None else None
-            progress.summary = getattr(run, 'summary', None)
-            progress.update(force=True, status='connected')
         if checkpoint:
-            progress.begin('checkpoint_restore')
             trainer.load_state_dict(checkpoint['trainer']); restore_rng(g.env,checkpoint['rng'])
         else:
-            g.initialize_flow_center()
+            initialization_started = time.perf_counter()
+            if c['verbose']:
+                print(f'Initializing flow ({c["init_z_sample_count"]} trajectories)...', flush=True)
+            g.initialize_flow_center(batch_size=c['init_z_batch_size'], verbose=c['verbose'])
+            if c['verbose']:
+                print(f'Initialization complete ({time.perf_counter()-initialization_started:.1f}s)', flush=True)
         for step in range(trainer.completed_updates+1,c['epochs_num']+1):
+            epoch_started = time.perf_counter()
             info = trainer.train_epoch(batch_size=c['batch_size'],grad_accum_steps=c['grad_accum_steps'])
             _append(output/'training.jsonl',info)
-            if c['verbose']:
-                print(json.dumps(info,allow_nan=False),flush=True)
             logged = dict(info)
             improved = False
+            eval_text = ''
             due = c['eval_episodes'] and (step%c['eval_every']==0 or step==c['epochs_num'])
             repeated = c['terminal_eval'] and step%c['terminal_eval_repeat_every']==0
             if due or (c['eval_episodes'] and repeated):
-                progress.begin('evaluation_setup', step=step, trajectories=c['eval_episodes'])
                 evaluator = None
                 if c['terminal_eval']:
                     if not c['dataset_path']:
@@ -164,6 +157,7 @@ def train(dataset_path=None, output_path=None, device='cpu', **options):
                     _append(output/'evaluation.jsonl',dict(step=step,repeat=repeat,**metrics))
                     _json(output/'evaluation'/f'step_{step:06d}_repeat_{repeat:02d}.json',dict(metrics=metrics,details=details))
                 mean_loss = sum(r['eval_subtb_loss'] for r in reports)/len(reports)
+                eval_text = f'  eval_subtb_loss={mean_loss:.4f}'
                 if best_eval is None or mean_loss<best_eval:
                     best_eval,improved = mean_loss,True
                 if run is not None:
@@ -171,28 +165,25 @@ def train(dataset_path=None, output_path=None, device='cpu', **options):
                                if isinstance(v,(int,float)) and all(r[k] is not None for r in reports)}
                     logged.update(numeric)
             if run is not None:
-                progress.begin('wandb_logging', step=step)
                 run.log(logged,step=step)
             metadata = dict(resolved_config=c,configuration_notes=notes,rate_overrides=rate_overrides,
                 run_config={k:c[k] for k in ('batch_size','max_events','chunk_steps','seed','dataset_path')},
                 step=step,best_eval_loss=best_eval,wandb_id=wandb_id)
             if step%c['checkpoint_every']==0 or step==c['epochs_num']:
-                progress.begin('checkpoint_save', step=step, path=str(output/'checkpoints'/f'checkpoint_{step:04d}.pt'))
                 g.save(output/'checkpoints'/f'checkpoint_{step:04d}.pt',trainer=trainer,metadata=metadata)
             if improved:
-                progress.begin('best_checkpoint_save', step=step)
                 g.save(output/'checkpoints'/'best_eval.pt',trainer=trainer,metadata=metadata)
-        progress.begin('training_complete', completed_updates=trainer.completed_updates)
+            if c['verbose']:
+                print(f'Epoch {step}/{c["epochs_num"]}  subtb_loss={info["loss"]:.4f}'
+                      f'  time={time.perf_counter()-epoch_started:.1f}s{eval_text}', flush=True)
         return g,trainer
     except Exception as exc:
         payload = dict(error=str(exc),completed_updates=trainer.completed_updates)
         if isinstance(exc,RolloutFailure):
             payload['histories'] = exc.histories
         _json(output/'failure.json',payload)
-        progress.begin('failed', completed_updates=trainer.completed_updates, error=str(exc))
         raise
     finally:
-        g.progress_reporter = None
         if run is not None:
             run.finish()
 

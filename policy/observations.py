@@ -12,6 +12,95 @@ LINEAGE_DIM = 7
 STATE_DIM = 12
 
 
+@dataclass(frozen=True)
+class _DatasetFeatures:
+    geometry: np.ndarray
+    observed: np.ndarray
+    bit_shifts: np.ndarray
+
+
+# SNPData has identity equality and immutable arrays. Values must not retain the
+# key: constants disappear when their dataset does, independently of raw rows.
+_DATASET_FEATURES = weakref.WeakKeyDictionary()
+
+
+def _dataset_features(data):
+    features = _DATASET_FEATURES.get(data)
+    if features is None:
+        positions, length = data.positions, int(data.sequence_length)
+        left = positions - np.r_[0., positions[:-1]] if len(positions) else positions
+        right = np.r_[positions[1:], length] - positions if len(positions) else positions
+        geometry = np.column_stack((positions/length, left/length, right/length)).astype(np.float32)
+        observed = np.array(data.genotypes.T, dtype=np.float32, order='C')
+        shifts = np.arange(min(data.num_haplotypes, 64), dtype=np.uint64)
+        for array in (geometry, observed, shifts):
+            array.setflags(write=False)
+        features = _DatasetFeatures(geometry, observed, shifts)
+        _DATASET_FEATURES[data] = features
+    return features
+
+
+def _descendant_bits(masks, n, shifts):
+    # Truncate only the decoded columns, just as the original range(n) did.
+    sample_mask = (1 << n)-1
+    if n <= 64:
+        values = np.fromiter((mask & sample_mask for mask in masks), dtype=np.uint64, count=len(masks))
+        return ((values[:, None] >> shifts) & np.uint64(1)).astype(np.float32)
+    width = (n+7)//8
+    raw = b''.join((mask & sample_mask).to_bytes(width, 'little') for mask in masks)
+    octets = np.frombuffer(raw, dtype=np.uint8).reshape(len(masks), width)
+    return np.unpackbits(octets, axis=1, bitorder='little')[:, :n].astype(np.float32)
+
+
+def _static_features(env, node, constants):
+    n, length = env.num_sequences, env.sequence_length
+    segments = node.descendants.segments
+    masks = tuple(segment[2] for segment in segments)
+    decoded = _descendant_bits(masks, n, constants.bit_shifts)
+    complete = np.fromiter((mask == env.all_samples for mask in masks),
+                           dtype=np.float32, count=len(masks))
+    left = np.fromiter((s[0] for s in segments), dtype=np.float64, count=len(segments))
+    right = np.fromiter((s[1] for s in segments), dtype=np.float64, count=len(segments))
+    material = np.empty((len(segments), 4+n), dtype=np.float32)
+    if length <= 2**53:
+        material[:, 0] = left/length
+        material[:, 1] = right/length
+        material[:, 2] = (right-left)/length
+    else:
+        # Preserve Python integer subtraction/division even for huge coordinates.
+        material[:, :3] = np.asarray([(l/length, r/length, (r-l)/length)
+                                      for l, r, _ in segments], dtype=np.float32).reshape(-1, 3)
+    material[:, 3] = complete
+    material[:, 4:] = decoded
+
+    indices = node.snp_indices
+    sites = np.empty((len(indices), 7+2*n), dtype=np.float32)
+    sites[:, :2] = node.messages[:, :2]
+    # Keep libm's scalar rounding and domain behavior; vectorize row assembly.
+    sites[:, 2] = np.fromiter(map(math.log1p, node.messages[:, 2]),
+                              dtype=np.float64, count=len(indices))
+    sites[:, 3:6] = constants.geometry[indices]
+    sites[:, 7:7+n] = constants.observed[indices]
+    sites[:, 6] = 0
+    sites[:, 7+n:] = 0
+    if len(segments) and len(indices):
+        positions = env.snp_data.positions[indices]
+        segment_indices = np.searchsorted(left, positions, side='right')-1
+        covered = (segment_indices >= 0) & (positions < right[segment_indices])
+        if length > 2**53:
+            # Integer/float boundary comparisons must agree with at(float(x)).
+            segment_indices = np.fromiter(
+                (next((i for i, (l, r, _) in enumerate(segments) if l <= float(x) < r), -1)
+                 for x in positions), dtype=np.intp, count=len(positions))
+            covered = segment_indices >= 0
+        selected = segment_indices[covered]
+        sites[covered, 6] = complete[selected]
+        sites[covered, 7+n:] = decoded[selected]
+    for array in (sites, material):
+        array.setflags(write=False)
+    return sites, material
+
+
 class RawObservationCache:
     """Bounded cache tied to immutable message arrays, never learned tensors."""
     def __init__(self, max_bytes=64*1024*1024):
@@ -76,14 +165,10 @@ def pack_states(env, states, device='cpu', cache=None):
     if not states:
         raise ValueError('At least one ARG state is required')
     n, length = env.num_sequences, env.sequence_length
-    positions = env.snp_data.positions
-    left_gaps = positions - np.r_[0., positions[:-1]] if len(positions) else positions
-    right_gaps = np.r_[positions[1:], length] - positions if len(positions) else positions
+    constants = _dataset_features(env.snp_data)
     snps, intervals, lineage_rows, state_rows = [], [], [], []
     snp_lengths, interval_lengths, offsets = [], [], [0]
     actions, rates, hazards = [], [], []
-    def bits(mask):
-        return [(int(mask) >> k) & 1 for k in range(n)]
     for state in states:
         env._check_state(state)
         choices = env.enumerate_policy_actions(state)
@@ -108,21 +193,7 @@ def pack_states(env, states, device='cpu', cache=None):
             snp_lengths.append(len(node.snp_indices))
             interval_lengths.append(len(node.descendants.segments))
             def static_features():
-                site_rows, material_rows = [], []
-                for index, (a, d, m) in zip(node.snp_indices, node.messages):
-                    descendants = node.descendants.at(float(positions[index]))
-                    site_rows.append([a, d, math.log1p(m), positions[index]/length,
-                                      left_gaps[index]/length, right_gaps[index]/length,
-                                      float(descendants == env.all_samples)] +
-                                     bits(env.derived_sets[index]) + bits(descendants))
-                for left, right, descendants in node.descendants.segments:
-                    material_rows.append([left/length, right/length, (right-left)/length,
-                                          float(descendants == env.all_samples)] + bits(descendants))
-                result = (np.asarray(site_rows, dtype=np.float32).reshape(-1,7+2*n),
-                          np.asarray(material_rows, dtype=np.float32).reshape(-1,4+n))
-                for value in result:
-                    value.setflags(write=False)
-                return result
+                return _static_features(env, node, constants)
             site_rows, material_rows = (static_features() if cache is None else cache.get(env,node,static_features))
             snps.append(site_rows); intervals.append(material_rows)
             material = node.material_segments
@@ -133,7 +204,10 @@ def pack_states(env, states, device='cpu', cache=None):
                                  math.log1p(len(node.snp_indices)), float(bool(len(node.snp_indices)))])
         offsets.append(len(lineage_rows))
     def tensor(rows, width):
-        value = torch.tensor(rows, dtype=torch.float32, device=device).reshape(-1, width)
+        # Concatenation (or conversion of scalar lists) owns a fresh batch buffer;
+        # no tensor aliases immutable cache entries or reusable scratch storage.
+        array = np.asarray(rows, dtype=np.float32).reshape(-1, width)
+        value = torch.from_numpy(array).to(device=device)
         if not torch.isfinite(value).all():
             raise FloatingPointError('Nonfinite neural observation; restore or diagnose the state')
         return value

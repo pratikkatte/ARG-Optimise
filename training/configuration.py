@@ -10,11 +10,11 @@ from .trainer import TrajectoryMixConfig
 DEFAULTS = dict(
     dataset_path=None, output_path=None, device='cpu', epochs_num=20, batch_size=2, seed=7,
     effective_population_size=None, mutation_rate=None, recombination_rate=None, reward_C=3000.,
-    policy_lr=1e-4, flow_lr=1e-3, grad_clip=10., subtb_lambda=.9, init_z_sample_count=8,
+    policy_lr=1e-4, flow_lr=1e-3, grad_clip=10., subtb_lambda=.9, init_z_sample_count=8, init_z_batch_size=32,
     replay_fraction=.25, replay_min_size=8, replay_capacity=2048, replay_grid_size=16,
     replay_per_topology=4, exploration_fraction=0., max_events=10000, chunk_steps=16,
     checkpoint_every=10, resume_checkpoint=None, cpu_threads=1, grad_accum_steps=1,
-    verbose=True, progress_every_seconds=15., wandb=False, wandb_project='ARG-Optimise', wandb_entity=None,
+    verbose=True, wandb=False, wandb_project='ARG-Optimise', wandb_entity=None,
     wandb_name=None, wandb_mode='online',
     lr_schedule='constant', lr_schedule_steps=0, lr_warmup_steps=0,
     lr_warmup_start_factor=.1, lr_min_factor=.1,
@@ -92,7 +92,7 @@ def resolve_config(options):
         problems.append(str(exc))
     if problems:
         raise ValueError('Infinite-sites configuration needs updating:\n- '+'\n- '.join(problems))
-    for key in ('epochs_num','batch_size','cpu_threads','checkpoint_every','init_z_sample_count',
+    for key in ('epochs_num','batch_size','cpu_threads','checkpoint_every','init_z_sample_count','init_z_batch_size',
                 'max_events','chunk_steps','grad_accum_steps','eval_batch_size','terminal_eval_grid_size',
                 'terminal_eval_repeats','terminal_eval_repeat_every','time_bins','flow_warmup_episodes',
                 'breakpoint_hidden_dim'):
@@ -110,7 +110,7 @@ def resolve_config(options):
     for key in ('verbose','wandb','eval_density_slope','eval_independent_likelihood','terminal_eval'):
         if not isinstance(c[key],bool):
             raise ValueError(key+' must be a YAML boolean')
-    for key in ('policy_lr','flow_lr','grad_clip','time_delta_bin_width','progress_every_seconds'):
+    for key in ('policy_lr','flow_lr','grad_clip','time_delta_bin_width'):
         if not math.isfinite(c[key]) or c[key]<=0:
             raise ValueError(key+' must be positive and finite')
     if not math.isfinite(c['reward_C']) or not math.isfinite(c['subtb_lambda']) or c['subtb_lambda']<0:
@@ -128,7 +128,9 @@ def resolve_config(options):
 
 
 def config_notes(c):
-    return dict(time_bins='Inactive: continuous waiting times have no bins.',
+    return dict(chunk_steps='Inactive: training uses direct SubTB backpropagation per microbatch without score recomputation.',
+                init_z_batch_size='Concurrent initialization ARGs; all init_z_sample_count samples are retained. Changing this changes RNG interleaving.',
+                time_bins='Inactive: continuous waiting times have no bins.',
                 time_delta_bin_width='Inactive: continuous waiting times have no bin width.',
                 breakpoint_hidden_dim='Inactive: width of the retired nucleotide CNN. Use breakpoint_mixture_hidden_dim.',
                 flow_warmup_episodes='Inactive while flow_warmup_steps=0; frozen-encoder warm-up is retired.',

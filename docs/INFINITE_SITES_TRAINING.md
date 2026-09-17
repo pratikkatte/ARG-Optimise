@@ -14,6 +14,10 @@ The supplied config runs 20 updates on `validation/datasets/sim_5k_mr20/rep0`: b
 
 Outputs include `training.jsonl` and numbered checkpoints. The default is CPU with one PyTorch thread. Environment state always stays on CPU in float64; neural execution may use CUDA. MPS is unsupported because scoring requires float64.
 
+At sampling temperature one, training retains the fresh trajectories' neural activations and uses their policy scores and flows directly in the full SubTB loss. Each microbatch calls `loss.backward()` once, with no score recomputation for gradients. Compatible-proposal and replay-buffer paths are scored once under the current policy. Higher-temperature samples are generated without gradients, then scored under the temperature-one policy. Activations are released after each microbatch; gradients accumulate until one clip and optimizer/scheduler step per update. These graphs are not stored in checkpoints.
+
+Console output shows initialization start and completion, plus one concise `Z init` line per initialization batch with the completed trajectory count, mean events per ARG, and batch elapsed time. With `init_z_batch_size: 1`, this prints after every initialization trajectory. Training then prints one line per epoch with SubTB loss and elapsed time, including evaluation SubTB loss when evaluation runs (averaged across repeats). Detailed metrics remain in JSONL files and W&B. Use `--no-verbose` to suppress training console output.
+
 Resume to a new total update count:
 
 ```bash
@@ -23,7 +27,7 @@ python3 train.py \
   --epochs 40
 ```
 
-Resume restores observations, model and optimizer weights, scheduler state when present, replay storage, RNG states, and the completed update count. The saved run determines batch size, score-chunk size, architecture, rates, replay configuration, and learning-rate schedule. Runtime settings such as the event limit and evaluation cadence may be overridden. The original dataset directory is optional. If supplied, its observations must match. Scientific rates and architecture cannot change on resume.
+Resume restores observations, model and optimizer weights, scheduler state when present, replay storage, RNG states, and the completed update count. The saved run determines batch size, architecture, rates, replay configuration, and learning-rate schedule. Runtime settings such as the event limit and evaluation cadence may be overridden. The original dataset directory is optional. If supplied, its observations must match. Scientific rates and architecture cannot change on resume.
 
 ## Sample and evaluate
 
@@ -73,11 +77,12 @@ All declared YAML keys also have CLI overrides, except the nested `evaluation` m
 | Controls | Meaning |
 | --- | --- |
 | `epochs`, `batch_size` | Total optimizer updates and total trajectories per update. |
-| `grad_accum_steps`, `chunk_steps` | Split each update into microbatches; replay each microbatch's score gradients in bounded chunks. Clip and step once per full update. |
+| `grad_accum_steps` | Split each update into microbatches; backpropagate the full SubTB loss directly for each microbatch. Clip and step once per full update. |
+| `chunk_steps` | Inactive legacy setting, accepted for existing configs and checkpoints. |
 | `replay_fraction`, `replay_capacity`, `replay_grid_size`, `replay_per_topology`, `replay_min_size` | Topology-diverse replay: reservoir plus topology-capped elite storage. The topology quota applies to the elite half. |
 | `exploration_fraction` | Fraction from the compatible diagnostic proposal; actual proposal and physical prior densities remain distinct. |
 | `lr_schedule`, `lr_schedule_steps`, `lr_warmup_steps`, `lr_warmup_start_factor`, `lr_min_factor` | Constant or warm-up/cosine schedule, applied to policy/shared and flow-head rates. Scheduler progress and base rates resume exactly. |
-| `policy_temperature_schedule`, `policy_temperature_start`, `policy_temperature_anneal_steps` | Constant temperature one, or discrete linear annealing toward one. Annealing currently requires replay and compatible exploration fractions zero. Timing and rewards remain untempered. Current-policy SubTB scores are recomputed at temperature one. |
+| `policy_temperature_schedule`, `policy_temperature_start`, `policy_temperature_anneal_steps` | Constant temperature one, or discrete linear annealing toward one. Annealing currently requires replay and compatible exploration fractions zero. Timing and rewards remain untempered. Higher-temperature samples are rescored at temperature one; fresh temperature-one scores are reused. |
 | `embedding_size`, `hidden_size`, `transformer_depth`, `transformer_heads`, `transformer_mlp_ratio` | Shared encoder, pooling projections, lineage Transformer, and head dimensions. |
 | `breakpoint_mixture_hidden_dim`, `breakpoint_mixture_layers`, `breakpoint_mixture_components` | Hidden width, hidden MLP-layer count, and logistic-mixture count on the shared action/span representation. No nucleotide CNN is used. |
 | `breakpoint_gap_hidden_size`, `breakpoint_gap_layers` | Width and number of additional hidden layers before mixture parameter outputs. |
@@ -138,7 +143,7 @@ w(s) = (total_carried_length / physical_length - 1) / (sample_count - 1)
 
 `Phi` is the Phase 1 closed-edge potential. `B0` is the mean initial-policy `log R - log PF`; `sigma` is the corresponding standard deviation, bounded below by one for scaling the flow output. These are fixed initialization buffers, not exact estimates of the evidence. The source flow is learned with the shared network and has no separate scalar log-Z parameter. The terminal boundary equals the exact log reward. The potential is not a likelihood marginalized over future completions.
 
-Training retains the exact all-segment SubTB loss. To bound memory on long histories, it first computes loss derivatives with respect to numerical forward scores and flows, then replays neural scores in short chunks to accumulate their parameter gradients. The chain rule gives the same gradient as a direct full-trajectory graph; tests compare the two. The architecture has no dropout, and parameters stay unchanged between passes. Frozen-feature flow warm-up is rejected.
+Training differentiates the exact all-segment SubTB loss directly through the full trajectory graphs in each microbatch. There is no SubTB window or chunked score recomputation. This removes a neural scoring pass at the cost of retaining activations for all events in that microbatch. Increase `grad_accum_steps` to reduce concurrent trajectories if needed; a single long trajectory must still fit in memory. Legacy `chunk_steps` values have no effect, including on resume. Tests compare direct gradients with the former chunked calculation. The architecture has no dropout. Frozen-feature flow warm-up is rejected.
 
 ## Checkpoints and verification
 

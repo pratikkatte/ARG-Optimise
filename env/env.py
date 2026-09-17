@@ -193,8 +193,28 @@ class SimpleARGEnvironment:
 
     def enumerate_policy_actions(self, state):
         coal, recomb = self.enumerate_actions(state)
-        return ([a for a in coal if not self.incompatible_sites(state, a)],
-                recomb if self.recombination_rate > 0 else [])
+        if coal and self.num_variants:
+            # Decode each lineage once, rather than walking its intervals at
+            # every SNP for every candidate pair. Python integers retain exact
+            # bitsets for datasets with more than 64 haplotypes.
+            dtype = np.uint64 if self.num_sequences <= 64 else object
+            descendants = np.zeros((len(state.active_lineages), self.num_variants), dtype=dtype)
+            for row, node in enumerate(state.active_lineages):
+                for left, right, bits in node.descendants.segments:
+                    start, end = np.searchsorted(self.snp_data.positions, [left, right])
+                    descendants[row, start:end] = bits
+            targets = np.asarray(self.derived_sets, dtype=dtype)
+            allowed = []
+            for start in range(0, len(coal), 256):
+                choices = coal[start:start+256]
+                left = descendants[[a.active_lineage_i for a in choices]]
+                right = descendants[[a.active_lineage_j for a in choices]]
+                union = left | right
+                conflicts = ((left != 0) & (right != 0) & ((union & targets) != 0)
+                             & ((union & ~targets) != 0) & ((targets & ~union) != 0))
+                allowed.extend(a for a, bad in zip(choices, conflicts.any(axis=1)) if not bad)
+            coal = allowed
+        return coal, recomb if self.recombination_rate > 0 else []
 
     def compute_coalescence_actions(self, state):
         return self.enumerate_actions(state)[0]
@@ -251,6 +271,17 @@ class SimpleARGEnvironment:
                     self.compute_event_rates(physical), time_env=self.time_env, time_policy=self.time_policy)
 
     def apply_action(self, state, action, log_prior=None):
+        return self._apply_action(state, action, log_prior, inplace=False)[0]
+
+    def step_owned_state(self, state, action):
+        """Advance a rollout-owned state, returning its exact event prior.
+
+        The caller must not retain earlier versions of this state. Public
+        apply_action remains nonmutating for branching and external callers.
+        """
+        return self._apply_action(state, action, None, inplace=True)
+
+    def _apply_action(self, state, action, log_prior, *, inplace):
         self._validate_physical_action(state, action)
         if isinstance(action, CoalescenceChoice):
             conflicts = self.incompatible_sites(state, action)
@@ -260,7 +291,7 @@ class SimpleARGEnvironment:
         if log_prior is not None and (not math.isfinite(log_prior)
                                      or not math.isclose(log_prior, actual_prior, rel_tol=0, abs_tol=1e-10)):
             raise ValueError('supplied log_prior disagrees with the unmasked Hudson prior')
-        result = state.clone()
+        result = state if inplace else state.clone()
         event_time = self.time_env.event_time(state.current_time, action.delta_t)
         indices = ([action.active_lineage_i, action.active_lineage_j]
                    if isinstance(action, CoalescenceChoice) else [action.active_lineage_i])
@@ -293,7 +324,7 @@ class SimpleARGEnvironment:
         if not math.isfinite(result.accumulated_log_prior):
             raise FloatingPointError('accumulated prior overflowed float64')
         result.log_reward = self.compute_terminal_log_reward(result) if result.is_done else None
-        return result
+        return result, actual_prior
 
     def apply_coalescence(self, state, action, log_prior=None):
         if not isinstance(action, CoalescenceChoice):

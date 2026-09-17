@@ -1,5 +1,6 @@
 """Shared-encoder infinite-sites GFlowNet. All scientific state lives in env."""
 import math
+import time
 import numpy as np
 import torch
 from torch import nn
@@ -86,7 +87,7 @@ class GFlowNetGenerator(nn.Module):
         self._observation_cache = RawObservationCache()
         self.max_events = 10000
         if initialize_z_from_policy:
-            self.initialize_flow_center()
+            self.initialize_flow_center(verbose=verbose)
 
     def encode(self, states):
         batch = pack_states(self.env, states, self.device, cache=self._observation_cache)
@@ -124,30 +125,31 @@ class GFlowNetGenerator(nn.Module):
         return dict(zip(('coal','recomb'), values))
 
     @torch.no_grad()
-    def initialize_flow_center(self):
+    def initialize_flow_center(self, batch_size=32, *, verbose=False):
+        """Estimate the center from every sampled ARG in bounded batches.
+
+        Batch size changes RNG interleaving, but not the proposal distribution
+        or the per-trajectory reward-minus-log-proposal estimator.
+        """
         from gfn.rollout import RolloutWorker
         if self.init_z_sample_count < 1:
             raise ValueError('Flow initialization requires at least one trajectory')
-        progress = getattr(self, 'progress_reporter', None)
-        if progress is not None:
-            progress.begin('flow_initialization', initialized=0, initialization_total=self.init_z_sample_count,
-                           neural_device=str(self.device), environment_device=self.env.device)
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError('Initialization batch_size must be a positive integer')
         targets = []
-        for index in range(self.init_z_sample_count):
-            if progress is not None:
-                progress.update(current_arg=index+1, events_max=0, batch_completed=0, batch_total=1)
-            outputs, paths = RolloutWorker(self.env, max_events=self.max_events).rollout(self)
-            targets.append(outputs['log_rewards'][0]-outputs['log_paths_pf'][0].sum())
-            if progress is not None:
-                completed = index+1
-                progress.update(initialized=completed, events_max=len(paths[0]), batch_completed=1,
-                                active_lineages_max=0,
-                                force=completed == 1 or completed % 10 == 0 or completed == self.init_z_sample_count)
-        values = torch.stack(targets)
+        worker = RolloutWorker(self.env, max_events=self.max_events)
+        for index in range(0, self.init_z_sample_count, batch_size):
+            started = time.perf_counter()
+            count = min(batch_size, self.init_z_sample_count-index)
+            outputs, _ = worker.rollout(self, episodes=count)
+            targets.append(outputs['log_rewards']-outputs['log_paths_pf'].sum(-1))
+            if verbose:
+                mean_events = outputs['lengths'].double().mean().item()
+                print(f'Z init {index+count}/{self.init_z_sample_count} | '
+                      f'events/ARG={mean_events:.1f} | {time.perf_counter()-started:.1f}s', flush=True)
+        values = torch.cat(targets)
         self.flow_init_offset.copy_(values.mean())
         self.flow_output_scale.copy_(values.std(unbiased=False).clamp_min(1.))
-        if progress is not None:
-            progress.update(force=True, status='complete', initialized=self.init_z_sample_count)
 
     def get_loss_from_rollout_outputs(self, outputs):
         return geometric_subtb_loss(outputs['log_paths_pf'], outputs['log_paths_pb'],

@@ -99,14 +99,24 @@ class ARGModel(nn.Module):
         event_logs = self.event_log_probs(batch, summary, temperature)
         event_indices = (Categorical(logits=event_logs).sample().tolist() if forced_actions is None else
                          [int(isinstance(a, RecombinationChoice)) for a in forced_actions])
+        choices_by_row = [batch.actions[row][kind] for row, kind in enumerate(event_indices)]
+        if any(not choices for choices in choices_by_row):
+            raise ValueError('Forced action has no compatible support')
+        candidate_contexts = [self.contexts(choices, lineages[row], summary[row])
+                              for row, choices in enumerate(choices_by_row)]
+        # Score every candidate in one neural call; normalization stays per ARG.
+        hidden = self.action_head[:-1](torch.cat(candidate_contexts))
+        # The final scalar bias cancels in every candidate softmax. Omit it
+        # here to avoid Adam amplifying roundoff in its mathematically zero
+        # gradient when the candidate batch size changes. Keep the parameter
+        # in the module so existing checkpoint layouts remain compatible.
+        residuals = torch.nn.functional.linear(hidden, self.action_head[-1].weight).squeeze(-1).double().split(
+            [len(choices) for choices in choices_by_row])
         actions, contexts, factors = [], [], []
         for row, kind in enumerate(event_indices):
-            choices = batch.actions[row][kind]
-            if not choices:
-                raise ValueError('Forced action has no compatible support')
-            context = self.contexts(choices, lineages[row], summary[row])
+            choices, context = choices_by_row[row], candidate_contexts[row]
             baseline = context.new_tensor([a.breakpoint_count if kind else 1 for a in choices], dtype=torch.float64).log()
-            logits = baseline+self.action_head(context).squeeze(-1).double()
+            logits = baseline+residuals[row]
             logs = (logits/temperature).log_softmax(-1)
             if forced_actions is None:
                 selected = int(Categorical(logits=logs).sample())

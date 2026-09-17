@@ -22,10 +22,6 @@ class RolloutWorker:
     def _walk(self, generator, episodes, fixed=None, collect_flows=False, temperature=1.0):
         states = [self.env.get_initial_state() for _ in range(episodes)]
         paths = [SimpleTrajectory() for _ in states]
-        progress = getattr(generator, 'progress_reporter', None)
-        if progress is not None:
-            progress.update(batch_completed=0, batch_total=episodes, events_max=0,
-                            active_lineages_max=self.env.num_sequences)
         while True:
             rows = [i for i, s in enumerate(states) if not s.is_done]
             if not rows:
@@ -40,26 +36,20 @@ class RolloutWorker:
                     actions = [fixed[i][len(paths[i])] for i in rows]
                 active = [states[i] for i in rows]
                 outputs = generator(active, forced_actions=actions, return_flows=collect_flows, temperature=temperature)
+                proposal_scores = outputs['log_pf'].detach().tolist()
                 for k, (row, action) in enumerate(zip(rows, outputs['actions'])):
-                    previous = states[row]
-                    state = self.env.apply_action(previous, action)
-                    prior = self.env.compute_cwr_event_log_prior(previous, action)
+                    state, prior = self.env.step_owned_state(states[row], action)
                     if generator.count_backward_parents(state) != 1:
                         raise ValueError('Nonunique chronological predecessor')
                     states[row] = state
                     paths[row].update(action, log_prior=prior, log_reward=state.log_reward,
-                                      log_proposal=float(outputs['log_pf'][k].detach()))
+                                      log_proposal=proposal_scores[k])
                     if state.is_done and not math.isfinite(state.log_reward):
                         if state.log_reward == -math.inf:
                             raise ValueError('Compatible policy reached an exact zero-likelihood ARG')
                         raise FloatingPointError('Numerical failure in terminal reward')
             except (ValueError, FloatingPointError, RuntimeError) as exc:
                 raise RolloutFailure(str(exc), paths) from exc
-            if progress is not None and progress.due():
-                progress.update(force=True, batch_completed=sum(s.is_done for s in states),
-                                batch_total=episodes, events_max=max(len(p) for p in paths),
-                                active_lineages_max=max(len(s.active_lineages) for s in states if not s.is_done)
-                                if any(not s.is_done for s in states) else 0)
             yield rows, outputs, states, paths
         if fixed is not None and any(len(p) != len(a) for p, a in zip(paths, fixed)):
             raise RolloutFailure('Replay has actions after termination', paths)
