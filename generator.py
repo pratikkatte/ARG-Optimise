@@ -44,6 +44,8 @@ class GFlowNetGenerator(TBMixin, SubTBMixin, torch.nn.Module):
         log_loss=None,
     ):
         super().__init__()
+        from env.workflow import require_neural_migration
+        require_neural_migration()
         resolved_policy_lr = arg_model_lr if policy_lr is None else policy_lr
         self.flow_lr = float(resolved_policy_lr if flow_lr is None else flow_lr)
         self.loss_type = loss_type

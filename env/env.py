@@ -1,41 +1,52 @@
+"""Infinite-sites Hudson ARG environment; CPU float64 reference implementation."""
+import hashlib
 import math
 import random
-from typing import Any, Optional, Sequence
-import torch
+from dataclasses import dataclass, replace
+from numbers import Integral
+
 import numpy as np
 
 from . import priors
-from .evo import EvolutionModelTorch
-from env.time_env import TimeEnvCwrExponential
 from .actions import CoalescenceChoice, PriorActionOptions, RecombinationChoice
+from .infinite_sites import evaluate_infinite_sites
+from .infinite_sites_tracker import InfiniteSitesTracker
+from .snp_data import SNPData
 from .states import ARGLineage, ARGState, MaterialSegments
+from .time_env import TimeEnvCwrExponential
 
 
-CHARACTERS_MAPS = {
-    'DNA_WITH_GAP': {
-        'A': [1., 0., 0., 0.],
-        'C': [0., 1., 0., 0.],
-        'G': [0., 0., 1., 0.],
-        'T': [0., 0., 0., 1.],
-        '-': [1., 1., 1., 1.],
-        'N': [1., 1., 1., 1.]
-    }
-}
+class IncompatibleActionError(ValueError):
+    def __init__(self, site_ids):
+        self.site_ids = tuple(site_ids)
+        super().__init__(f'Coalescence contradicts infinite sites at SNP IDs {self.site_ids}')
+
+
+class ARGReward:
+    def __init__(self, C=3000):
+        self.C = float(C)
+        if not math.isfinite(self.C):
+            raise ValueError('reward offset must be finite')
+
+    def __call__(self, log_likelihood, accumulated_log_prior):
+        if math.isnan(log_likelihood) or log_likelihood == math.inf or not math.isfinite(accumulated_log_prior):
+            raise FloatingPointError('invalid likelihood or prior')
+        score = float(self.C + log_likelihood + accumulated_log_prior)
+        if log_likelihood != -math.inf and not math.isfinite(score):
+            raise FloatingPointError('reward overflowed float64')
+        return score
+
 
 class SimpleTrajectory:
-    """Compact trajectory history used when cloned ARG states are not needed."""
-
     def __init__(self):
-        self.actions = []
-        self.log_priors = []
-        self.records = []
+        self.actions, self.log_priors, self.log_proposals, self.records = [], [], [], []
         self.log_reward = None
 
-    def update(self, action, log_prior=None, log_reward=None, record=None, active_lineages=None):
-        if not isinstance(action, (CoalescenceChoice, RecombinationChoice)):
-            raise ValueError("Trajectory actions must be action dataclasses")
+    def update(self, action, log_prior=None, log_reward=None, record=None, active_lineages=None,
+               log_proposal=None):
         self.actions.append(action)
         self.log_priors.append(log_prior)
+        self.log_proposals.append(log_proposal)
         self.log_reward = log_reward
         if record is not None:
             self.records.append(record)
@@ -43,802 +54,401 @@ class SimpleTrajectory:
     def __len__(self):
         return len(self.actions)
 
-class ARGReward:
-    """
-    Terminal reward helpers for constructed ARG states.
-    """
-    def __init__(self, C=3000):
-        self.C = C
 
-    def __call__(self, log_likelihood, accumulated_log_prior):
-        return float(self.C + log_likelihood + accumulated_log_prior)
+@dataclass(frozen=True)
+class CompatibleStep:
+    action: object
+    log_proposal: float
+    log_prior: float
+
 
 class SimpleARGEnvironment:
-    """Hudson ARG environment with discrete genomic links and continuous waits.
+    """Discrete genomic links, continuous 2Ne waits, and polarized SNP observations.
 
-    Terminal rewards combine the Hudson prior with the JC69 sequence likelihood.
+    Physical action enumeration and prior rates never depend on compatibility.
+    Resolved material is retained until every physical position has one ancestor.
     """
+    mutation_model = 'infinite_sites'
 
-    def __init__(
-        self,
-        num_sequences: Optional[int] = None,
-        sequence_length: Optional[int] = None,
-        num_blocks: Optional[int] = None,
-        population_size: float = 10000.0,
-        effective_population_size: Optional[float] = None,
-        mutation_rate: float = 2e-8,
-        recombination_rate: float = 2e-8,
-        rho: Optional[float] = None,
-        sequences: Optional[Sequence[Any]] = None,
-        seed: Optional[int] = 7,
-        bp_per_blocks: int = 1,
-        device: Optional[torch.device] = 'cpu',
-        time_bins: Optional[int] = None,
-        time_delta_bin_width: Optional[float] = None,
-        time_policy: str = "cwr_exponential",
-        arg_prior: str = "hudson",
-    ):
-        if arg_prior != 'hudson':
-            raise ValueError("Only the Hudson ARG prior is supported; start a fresh Hudson run")
-        if time_policy != 'cwr_exponential':
-            raise ValueError('Hudson requires continuous waiting times')
-        self.arg_prior = arg_prior
-        self.sequences = list(sequences) if sequences is not None else None
-        self.chars_dict = CHARACTERS_MAPS['DNA_WITH_GAP']
-        self.event_types = ["coal", "recomb"]
-        self.device = torch.device(device)
-        self.flow_likelihood = None
-
-        if self.sequences is not None:
-            num_sequences = len(self.sequences)
-            sequence_length = len(self.sequences[0])
-            if any(len(sequence) != sequence_length for sequence in self.sequences):
-                raise ValueError("all sequences must have length sequence_length")
-
-
-        self.num_sequences = int(num_sequences)
-        self.sequence_length = int(sequence_length)
-        if num_blocks is None:
-            self.num_blocks = int(sequence_length // bp_per_blocks)
-        else:
-            self.num_blocks = int(num_blocks)
-        if self.num_blocks <= 0:
-            raise ValueError("num_blocks must be positive")
-
-        ## Important parameters
-        self.recombination_rate = float(recombination_rate)
-        if effective_population_size is not None:
-            population_size = effective_population_size
-        self.population_size = float(population_size)
-        self.mutation_rate = float(mutation_rate) ## where are we using this?
-
-        self.rho = (
-            float(rho)
-            if rho is not None
-            else 4 * self.population_size * self.recombination_rate * self.sequence_length
-        )
-
-        ## Time environment
-        self.time_policy = time_policy
-        self.time_env = TimeEnvCwrExponential()
-
+    def __init__(self, *, snp_data=None, population_size=10000.0, effective_population_size=None,
+                 mutation_rate=2e-8, recombination_rate=2e-8, seed=7, reward_C=3000,
+                 bp_per_blocks=1, device='cpu', arg_prior='hudson', time_policy='cwr_exponential',
+                 sequences=None, num_sequences=None, sequence_length=None, num_blocks=None, rho=None):
+        if sequences is not None:
+            raise ValueError('FASTA/JC69 inputs are retired; pass snp_data=SNPData')
+        if not isinstance(snp_data, SNPData):
+            raise ValueError('snp_data must be SNPData from load_snp_dataset')
+        if str(device) != 'cpu':
+            raise ValueError('Phase 1 infinite-sites environment requires CPU float64')
+        if arg_prior != 'hudson' or time_policy != 'cwr_exponential':
+            raise ValueError('Infinite-sites environment requires Hudson with continuous 2Ne waits')
+        if bp_per_blocks != 1 or not float(snp_data.sequence_length).is_integer():
+            raise ValueError('Phase 1 requires an integer physical length and one-base blocks')
+        self.snp_data = snp_data
+        self.num_sequences, self.num_variants = snp_data.genotypes.shape
+        self.sequence_length = self.num_blocks = int(snp_data.sequence_length)
+        for supplied, expected in ((num_sequences, self.num_sequences),
+                                   (sequence_length, self.sequence_length), (num_blocks, self.num_blocks)):
+            if supplied is not None and supplied != expected:
+                raise ValueError('dimensions must match SNPData and one-base physical blocks')
+        self.population_size = self._rate(population_size if effective_population_size is None
+                                          else effective_population_size, 'population_size', positive=True)
+        self.mutation_rate = self._rate(mutation_rate, 'mutation_rate')
+        self.recombination_rate = self._rate(recombination_rate, 'recombination_rate')
+        self.kappa = 2 * self.population_size * self.mutation_rate
+        self.rho = 4 * self.population_size * self.recombination_rate * self.sequence_length
+        if not math.isfinite(self.kappa) or not math.isfinite(self.rho):
+            raise ValueError('scaled rates overflow float64')
+        if rho is not None and not math.isclose(float(rho), self.rho, rel_tol=1e-12, abs_tol=0):
+            raise ValueError('rho must equal 4Ne*r*physical sequence length')
+        if self.num_variants and self.kappa == 0:
+            raise ValueError('observed SNPs have zero support at zero mutation rate')
+        self.arg_prior, self.time_policy, self.device = arg_prior, time_policy, 'cpu'
+        self.time_env, self.reward_fn = TimeEnvCwrExponential(), ARGReward(reward_C)
         self.rng = random.Random(seed)
+        self.all_samples = (1 << self.num_sequences) - 1
+        self.derived_sets = tuple(sum(1 << int(i) for i in np.flatnonzero(snp_data.genotypes[:, j]))
+                                  for j in range(self.num_variants))
+        h = hashlib.sha256()
+        h.update(snp_data.genotypes.tobytes())
+        h.update(snp_data.positions.tobytes())
+        h.update(repr((snp_data.haplotype_ids, snp_data.site_ids, self.sequence_length,
+                       self.population_size, self.mutation_rate, self.recombination_rate,
+                       self.reward_fn.C)).encode())
+        self.dataset_fingerprint = h.hexdigest()
+        self._validate_observation_support()
+        self.likelihood_tracker = InfiniteSitesTracker(self)
 
-        ## Sequence arrays
-        seq_arrays = np.array([self.seq2array(seq) for seq in self.sequences], dtype=np.float32)
+    @staticmethod
+    def _rate(value, name, positive=False):
+        value = float(value)
+        if not math.isfinite(value) or value < 0 or (positive and value == 0):
+            raise ValueError(f'{name} must be finite and {"positive" if positive else "nonnegative"}')
+        return value
 
-        block_seq_arrays = np.empty(
-            (self.num_sequences, self.num_blocks, seq_arrays.shape[-1]),
-            dtype=np.float32,
-        )
-        for block_idx in range(self.num_blocks):
-            site_start = int(round(block_idx * self.sequence_length / self.num_blocks))
-            site_end = int(round((block_idx + 1) * self.sequence_length / self.num_blocks))
-            if site_end <= site_start:
-                raise ValueError(
-                    "num_blocks must not create empty block intervals for sequence_length"
-                )
-            block_seq_arrays[:, block_idx, :] = seq_arrays[:, site_start:site_end, :].mean(axis=1)
-
-        self.seq_arrays = torch.nn.Parameter(
-            torch.tensor(seq_arrays, dtype=torch.float32, device=self.device),
-            requires_grad=False,
-        )
-        self.block_seq_arrays = torch.nn.Parameter(
-            torch.tensor(block_seq_arrays, dtype=torch.float32, device=self.device),
-            requires_grad=False,
-        )
-        
-        ## Evolution model
-        self.evolution_model = EvolutionModelTorch(self)
-
-        ## Reward function 
-        self.reward_fn = ARGReward()
+    def _validate_observation_support(self):
+        groups = {}
+        for i, x in enumerate(self.snp_data.positions):
+            groups.setdefault(int(x) if self.recombination_rate > 0 else 0, []).append(i)
+        for indices in groups.values():
+            for offset, i in enumerate(indices):
+                a = self.derived_sets[i]
+                for j in indices[offset + 1:]:
+                    b = self.derived_sets[j]
+                    if a & b and a & ~b and b & ~a:
+                        raise ValueError('No compatible ancestry within inseparable material: '
+                                         f'SNP IDs {self.snp_data.site_ids[i]}, {self.snp_data.site_ids[j]}')
 
     @property
     def time_metadata(self):
         return self.time_env.metadata
 
-    def seq2array(self, seq):
-        seq = [self.chars_dict[x] for x in seq]
-        data = np.array(seq)
-        return data
+    def _check_state(self, state):
+        if state.dataset_fingerprint != self.dataset_fingerprint:
+            raise ValueError('state belongs to different observations or environment parameters')
 
-    def _validate_timing(self, action):
-        if action.time_action is not None or action.delta_t is None:
-            raise ValueError("cwr_exponential actions require only delta_t timing")
-        self.time_env.positive(action.delta_t, "wait")
-
-    def resolve_event_time(self, state, action, rates):
-        """Validate the pre-action rate and resolve the continuous wait."""
-        self._validate_timing(action)
-        priors.total_event_rate(rates)
-        return self.time_env.event_time(state.current_time, action.delta_t)
-
-    def timing_for_delta(self, delta_t, rates):
-        return {"delta_t": self.time_env.positive(delta_t, "reconstructed wait")}
-
-    def get_initial_state(self, track_likelihood=True):
-        active_lineages = []
-        all_nodes = {}
-        material_segments = MaterialSegments.full(self.num_blocks)
-        material_segments_list = [material_segments] * self.num_sequences
-        partials_list = self._initial_lineages_partials_batch(material_segments_list)
-
-        for node_id in range(self.num_sequences):
-            # Here, each lineage starts at time 0.0
-            lineage = ARGLineage(
-                node_id=node_id,
-                children=[],
-                parents=[],
-                material_segments=material_segments,
-                num_blocks=self.num_blocks,
-                partials=partials_list[node_id],
-                sequences_indices=[node_id],
-                time=0.0,
-            )
-            active_lineages.append(lineage)
-            all_nodes[node_id] = lineage
-     
-
-        state = ARGState(
-            active_lineages=active_lineages,
-            all_nodes=all_nodes,
-            max_node_idx=self.num_sequences - 1,
-            log_reward=None,
-            accumulated_log_prior=0.0,
-            is_done=False,
-            total_active_blocks=self.num_sequences * self.num_blocks,
-            current_time=0.0,
-        )
-        state.is_done = self.is_terminal(state)
-        if track_likelihood and self.flow_likelihood is not None:
-            self.flow_likelihood.initialize(state)
-        if state.is_done:
-            state.log_reward = self.compute_terminal_log_reward(state)
-        return state
-
-    def _initial_lineage_partials(self, node_id, material_segments):
-        partials = self.block_seq_arrays[int(node_id)].detach().clone().float()
-        return self.evolution_model.mask_partials(partials, material_segments)
-
-    def _initial_lineages_partials_batch(self, material_segments_list):
-        """Initialize each sequence's tip partials with its material mask."""
-        num_lineages = len(material_segments_list)
-        if num_lineages != self.num_sequences:
-            raise ValueError(
-                f"Expected {self.num_sequences} material segment sets, got {num_lineages}"
-            )
-
-        return [
-            self._initial_lineage_partials(node_id, material_segments)
-            for node_id, material_segments in enumerate(material_segments_list)
-        ]
-
-    def _require_lineage_partials(self, lineage):
-        if lineage.partials is None:
-            raise ValueError(f"ARG lineage {lineage.node_id} is missing partials")
-        return self.evolution_model._as_partials_tensor(lineage.partials)
-
-    def _transition_lineage_partials(self, lineage, parent_time):
-        edge_time = float(parent_time) - float(lineage.time)
-        if edge_time <= 0:
-            raise ValueError(
-                f"ARG node times must increase from child to parent: "
-                f"parent_time={parent_time}, child={lineage.node_id} time={lineage.time}"
-            )
-        partials = self._require_lineage_partials(lineage)
-        return self.evolution_model.transition_partials(partials, edge_time)
-
-    def _coalesced_parent_partials(self, child_i, child_j, parent_segments, parent_time):
-        reference = self._require_lineage_partials(child_i)
-        combined = torch.ones_like(reference)
-        has_material = torch.zeros(
-            reference.shape[0],
-            1,
-            dtype=torch.bool,
-            device=reference.device,
-        )
-
-        for child in (child_i, child_j):
-            transitioned = self._transition_lineage_partials(child, parent_time)
-            transitioned = self.evolution_model.normalize_partials(transitioned)
-            weights = self.evolution_model.material_site_weights(
-                child.material_segments,
-                device=transitioned.device,
-                dtype=transitioned.dtype,
-            )
-            child_has_material = weights[:, None] > 0
-            child_partials = transitioned * weights[:, None]
-            combined = torch.where(child_has_material, combined * child_partials, combined)
-            has_material = has_material | child_has_material
-
-        combined = torch.where(has_material, combined, torch.zeros_like(combined))
-        combined = self.evolution_model.mask_partials(combined, parent_segments)
-        return self.evolution_model.normalize_partials(combined)
-
-    def _recombined_parent_partials(self, transitioned, parent_segments):
-        """Mask transitioned child partials for one recombination parent."""
-        masked = self.evolution_model.mask_partials(transitioned, parent_segments)
-        return self.evolution_model.normalize_partials(masked)
-
-    def _parent_partials_batch(self, specs):
-        """Calculate block features for independent (time, material, children)."""
-        results = [None] * len(specs)
-        evo = self.evolution_model
-
-        def normalize(partials):
-            sums = partials.sum(-1, keepdim=True)
-            return torch.where(sums > 0, partials / sums.clamp_min(1e-12),
-                               torch.zeros_like(partials))
-
-        for child_count in (1, 2):
-            indices = [i for i, (_, _, children) in enumerate(specs) if len(children) == child_count]
-            if not indices:
-                continue
-            group = [specs[i] for i in indices]
-            combined = None
-            for slot in range(child_count):
-                children = [children[slot] for _, _, children in group]
-                times = [float(time) - float(child.time)
-                         for (time, _, _), child in zip(group, children)]
-                if any(time <= 0 for time in times):
-                    raise ValueError("ARG node times must increase from child to parent")
-                partials = torch.stack([self._require_lineage_partials(child) for child in children])
-                transitioned = evo.transition_partials_batch(partials, times)
-                if child_count == 1:
-                    combined = transitioned
-                else:
-                    transitioned = normalize(transitioned)
-                    mask = evo.material_masks_batch([child.material_segments for child in children])
-                    child_partials = transitioned * mask[:, :, None]
-                    if combined is None:
-                        combined = torch.ones_like(transitioned)
-                    combined = torch.where(mask[:, :, None], combined * child_partials, combined)
-            mask = evo.material_masks_batch([material for _, material, _ in group])
-            parent_partials = normalize(combined * mask[:, :, None])
-            for index, value in zip(indices, parent_partials.unbind()):
-                results[index] = value
-        return results
+    def get_initial_state(self):
+        nodes = {}
+        for i in range(self.num_sequences):
+            node = ARGLineage(i, MaterialSegments.full(self.num_blocks), self.num_blocks)
+            self.likelihood_tracker.initialize_leaf(node)
+            nodes[i] = node
+        return ARGState(list(nodes.values()), nodes, self.num_sequences - 1,
+                        np.full(self.num_variants, np.nan), self.dataset_fingerprint,
+                        total_active_blocks=self.num_sequences * self.num_blocks)
 
     def get_active_counts(self, state):
-        if not state.active_lineages:
-            return np.zeros(self.num_blocks, dtype=int)
-        counts = np.zeros(self.num_blocks, dtype=int)
-        for lineage in state.active_lineages:
-            for start, end in lineage.material_segments.segments:
-                counts[start:end] += 1
-        return counts
-
-    def get_arg_sequence_segments(self, state):
-        return self.evolution_model.get_arg_sequence_segments(state)
-
-    def _iter_arg_edge_intervals(self, state):
-        for parent_id in sorted(state.all_nodes):
-            parent = state.all_nodes[parent_id]
-            for child_id in parent.children:
-                if child_id not in state.all_nodes:
-                    raise ValueError(f"ARG node {parent_id} references missing child {child_id}")
-                child = state.all_nodes[child_id]
-                material_segments = parent.material_segments.intersection(child.material_segments)
-                for left_block, right_block in material_segments.segments:
-                    yield parent_id, child_id, left_block, right_block
-
-    def _arg_edge_breakpoints(self, state):
-        num_blocks = int(self.num_blocks)
-        breakpoints = set()
-        for _, _, left_block, right_block in self._iter_arg_edge_intervals(state):
-            if 0 < left_block < num_blocks:
-                breakpoints.add(int(left_block))
-            if 0 < right_block < num_blocks:
-                breakpoints.add(int(right_block))
-        return breakpoints
-
-    def _arg_recombination_events(self, state, breakpoints=None):
-        num_blocks = int(self.num_blocks)
-        if breakpoints is None:
-            breakpoints = set()
-        recomb_by_event = {}
-
-        for node_id, lineage in state.all_nodes.items():
-            if (
-                lineage.event_type != "recomb"
-                or lineage.breakpoint is None
-                or not lineage.children
-            ):
-                continue
-
-            breakpoint = int(lineage.breakpoint)
-            if 0 < breakpoint < num_blocks:
-                breakpoints.add(breakpoint)
-
-            key = (int(lineage.children[0]), breakpoint)
-            grouped = recomb_by_event.setdefault(
-                key,
-                {"left": None, "right": None, "other": []},
-            )
-            if lineage.recombination_side == "left":
-                grouped["left"] = int(node_id)
-            elif lineage.recombination_side == "right":
-                grouped["right"] = int(node_id)
-            else:
-                grouped["other"].append(int(node_id))
-
-        recombination_events = []
-        for (child_id, breakpoint), grouped in sorted(
-            recomb_by_event.items(),
-            key=lambda item: (item[0][1], item[0][0]),
-        ):
-            parent_ids = []
-            if grouped["left"] is not None:
-                parent_ids.append(grouped["left"])
-            if grouped["right"] is not None:
-                parent_ids.append(grouped["right"])
-            parent_ids.extend(sorted(grouped["other"]))
-            recombination_events.append(
-                {
-                    "child_id": child_id,
-                    "breakpoint": breakpoint,
-                    "parent_ids": parent_ids,
-                }
-            )
-        return recombination_events
-
-    def save_to_tree_sequence(self, state, output_path=None):
-        """Convert a terminal ARG state to a tskit TreeSequence.
-
-        The exported topology contains ancestry edges only. Stored ARG node
-        times are internal t/(2Ne) values and are exported in generations to
-        match msprime tree sequences.
-        """
-        if not self.is_terminal(state):
-            raise ValueError("terminal_state_to_tree_sequence requires a terminal ARGState")
-        if self.num_blocks <= 0 or self.sequence_length <= 0:
-            raise ValueError("sequence_length and num_blocks must be positive")
-
-        try:
-            import tskit
-        except ImportError as exc:
-            raise ImportError(
-                "tskit is required to export ARG states to .trees files. "
-                "Install it with `pip install tskit`."
-            ) from exc
-
-        node_times = self._tskit_node_times(state)
-        tables = tskit.TableCollection(sequence_length=float(self.sequence_length))
-        tables.time_units = "generations"
-        sample_node_ids = set(range(self.num_sequences))
-        tskit_node_ids = {}
-
-        for node_id in sorted(state.all_nodes):
-            flags = tskit.NODE_IS_SAMPLE if node_id in sample_node_ids else 0
-            tskit_node_ids[node_id] = tables.nodes.add_row(
-                flags=flags,
-                time=node_times[node_id],
-            )
-
-        for parent_id, child_id, left_block, right_block in self._iter_arg_edge_intervals(state):
-            left = self._block_to_sequence_coordinate(left_block)
-            right = self._block_to_sequence_coordinate(right_block)
-            if left < right:
-                tables.edges.add_row(
-                    left=left,
-                    right=right,
-                    parent=tskit_node_ids[parent_id],
-                    child=tskit_node_ids[child_id],
-                )
-
-        tables.sort()
-        tree_sequence = tables.tree_sequence()
-        if output_path is not None:
-            tree_sequence.dump(output_path)
-        return tree_sequence
-
-    def _tskit_node_times(self, state): 
-        time_scale = 2.0 * self.population_size
-        node_times = {
-            node_id: float(node.time) * time_scale
-            for node_id, node in state.all_nodes.items()
-        }
-        for parent_id, parent in state.all_nodes.items():
-            for child_id in parent.children:
-                if node_times[parent_id] <= node_times[child_id]:
-                    raise ValueError(
-                        f"learned ARG node times must satisfy parent > child: "
-                        f"parent={parent_id} child={child_id}"
-                    )
-        return node_times
-
-    def _block_to_sequence_coordinate(self, block_index):
-        return float(block_index) * float(self.sequence_length) / float(self.num_blocks)
-
-    def compute_terminal_log_reward(self, state, log_likelihood=None):
-        """Return the posterior target, reusing a tracked terminal likelihood.
-
-        Untracked states still use independent marginal-tree pruning. At zero
-        mutation, impossible observations activate normalization-dependent
-        probability floors; retain that independent reward convention there.
-        An explicit likelihood remains available for independent validation.
-        """
-        if not self.is_terminal(state):
-            raise ValueError("terminal reward requires a terminal ARGState")
-        if log_likelihood is None:
-            tracked = state.partial_log_likelihood
-            if (tracked is not None and math.isfinite(tracked)
-                    and self.evolution_model._branch_length_scale > 0):
-                log_likelihood = tracked
-            else:
-                log_likelihood = self.evolution_model.compute_arg_log_likelihood(state)
-        log_reward = self.reward_fn(log_likelihood, state.accumulated_log_prior)
-        return log_reward
-
-    def compute_coalescence_actions(self, state):
-        return list(CoalescenceChoice.enumerate_from_active_lineages(
-            state.active_lineages))
-
-    def compute_recombination_actions(self, state):
-        return list(RecombinationChoice.enumerate_from_active_lineages(state.active_lineages))
-
-    def enumerate_prior_options(self, state):
-        coal_actions, recomb_actions = self.enumerate_actions(state)
-        rates = self.compute_event_rates((coal_actions, recomb_actions))
-        state.rates = rates
-        prior_options = PriorActionOptions(
-            coal_actions=tuple(coal_actions),
-            recomb_choices=tuple(recomb_actions),
-            rates=rates,
-        )
-        state.prior_options = prior_options
-        return prior_options
-
-    def action_options_from_prior_options(self, prior_options):
-        actions = []
-        if prior_options.rates["lambda_coal"] > 0:
-            actions.extend(prior_options.coal_actions)
-        if prior_options.rates["lambda_recomb"] > 0:
-            actions.extend(choice for choice in prior_options.recomb_choices if choice.breakpoint_count > 0)
-        return actions
-
+        changes = np.zeros(self.num_blocks + 1, dtype=np.int64)
+        for node in state.active_lineages:
+            for l, r in node.material_segments.segments:
+                changes[l] += 1
+                changes[r] -= 1
+        return changes.cumsum()[:-1]
 
     def is_terminal(self, state):
-        if state.total_active_blocks is None:
-            raise ValueError("total_active_blocks is required for terminal check")
-        else:
-            result = int(state.total_active_blocks) == self.num_blocks
-            # bool(np.all(self.get_active_counts(state) == 1)) ## another way, realtime compute. 
-            return result
-
-    def _finalize_transition_state(self, next_state, log_prior):
-        if log_prior is not None:
-            next_state.accumulated_log_prior += log_prior
-        next_state.is_done = self.is_terminal(next_state)
-        if next_state.is_done:
-            next_state.log_reward = self.compute_terminal_log_reward(next_state)
-        else:
-            next_state.log_reward = None
-        if (
-            not math.isfinite(next_state.accumulated_log_prior)
-            or (next_state.log_reward is not None and not math.isfinite(next_state.log_reward))
-        ):
-            raise ValueError("non-finite continuous accumulated prior or reward")
-        return next_state
-
-    def apply_coalescence(self, state, action, log_prior=None, *, _prepared=None):
-
-        rates = self._get_state_rates(state)
-
-        next_state = state.clone(copy_partials=False)
-        i = action.active_lineage_i
-        j = action.active_lineage_j
-
-        child_i = next_state.active_lineages[i].clone(copy_partials=False, copy_mask=False)
-        child_j = next_state.active_lineages[j].clone(copy_partials=False, copy_mask=False)
-
-        parent_id = next_state.max_node_idx + 1
-        parent_segments = child_i.material_segments.union(child_j.material_segments)
-        overlap_count = child_i.material_segments.intersection_count(child_j.material_segments)
-        parent_time = self.resolve_event_time(state, action, rates) if _prepared is None else _prepared[0]
-        next_state.current_time = parent_time
-        parent_partials = self._coalesced_parent_partials(
-            child_i,
-            child_j,
-            parent_segments,
-            parent_time,
-        ) if _prepared is None else _prepared[1][0]
-        parent = ARGLineage(
-            node_id=parent_id,
-            children=[child_i.node_id, child_j.node_id],
-            parents=[],
-            material_segments=parent_segments,
-            num_blocks=self.num_blocks,
-            partials=parent_partials,
-            sequences_indices=sorted(set(child_i.sequences_indices + child_j.sequences_indices)),
-            event_type="coal",
-            time=parent_time,
-        )
-
-        child_i.parents.append(parent.node_id)
-        child_j.parents.append(parent.node_id)
-        if self.flow_likelihood is not None and next_state.partial_log_likelihood is not None:
-            if _prepared is None:
-                increment = self.flow_likelihood.parent(parent, [child_i, child_j])
-            else:
-                parent.likelihood_partials, increment = _prepared[2][0]
-                parent.likelihood_log_increment = increment
-            next_state.partial_log_likelihood += increment
-        child_i.partials = None
-        child_j.partials = None
-        child_i.likelihood_partials = child_j.likelihood_partials = None
-        next_state.active_lineages[i] = child_i
-        next_state.active_lineages[j] = child_j
-        next_state.all_nodes[child_i.node_id] = child_i
-        next_state.all_nodes[child_j.node_id] = child_j
-        next_state.all_nodes[parent.node_id] = parent
-        next_state.active_lineages = [
-            lineage for idx, lineage in enumerate(next_state.active_lineages) if idx not in (i, j)
-        ]
-        next_state.active_lineages.append(parent)
-        next_state.max_node_idx = parent.node_id
-        if next_state.total_active_blocks is not None:
-            next_state.total_active_blocks = int(next_state.total_active_blocks) - overlap_count
-        return self._finalize_transition_state(next_state, log_prior)
-
-    def apply_recombination(self, state, action, log_prior=None, *, _prepared=None):
-        rates = self._get_state_rates(state)
-
-        next_state = state.clone(copy_partials=False)
-        current_lineage_idx = action.active_lineage_i
-        breakpoint = action.breakpoint
-        child = next_state.active_lineages[current_lineage_idx].clone(copy_partials=False, copy_mask=False)
-        left_segments, right_segments = child.material_segments.split(breakpoint)
-
-        left_parent_id = next_state.max_node_idx + 1
-        right_parent_id = next_state.max_node_idx + 2
-        event_time = self.resolve_event_time(state, action, rates) if _prepared is None else _prepared[0]
-        next_state.current_time = event_time
-        if _prepared is None:
-            transitioned = self._transition_lineage_partials(child, event_time)
-            left_partials = self._recombined_parent_partials(transitioned, left_segments)
-            right_partials = self._recombined_parent_partials(transitioned, right_segments)
-        else:
-            left_partials, right_partials = _prepared[1]
-        left_parent = ARGLineage(
-            node_id=left_parent_id,
-            children=[child.node_id],
-            parents=[],
-            material_segments=left_segments,
-            num_blocks=self.num_blocks,
-            partials=left_partials,
-            sequences_indices=list(child.sequences_indices),
-            event_type="recomb",
-            breakpoint=breakpoint,
-            recombination_side="left",
-            time=event_time,
-        )
-        right_parent = ARGLineage(
-            node_id=right_parent_id,
-            children=[child.node_id],
-            parents=[],
-            material_segments=right_segments,
-            num_blocks=self.num_blocks,
-            partials=right_partials,
-            sequences_indices=list(child.sequences_indices),
-            event_type="recomb",
-            breakpoint=breakpoint,
-            recombination_side="right",
-            time=event_time,
-        )
-
-        child.parents = [left_parent.node_id, right_parent.node_id]
-        if self.flow_likelihood is not None and next_state.partial_log_likelihood is not None:
-            for index, parent in enumerate((left_parent, right_parent)):
-                if _prepared is None:
-                    increment = self.flow_likelihood.parent(parent, [child])
-                else:
-                    parent.likelihood_partials, increment = _prepared[2][index]
-                    parent.likelihood_log_increment = increment
-                next_state.partial_log_likelihood += increment
-        child.partials = None
-        child.likelihood_partials = None
-        next_state.all_nodes[child.node_id] = child
-        next_state.all_nodes[left_parent.node_id] = left_parent
-        next_state.all_nodes[right_parent.node_id] = right_parent
-        next_state.active_lineages = [
-            lineage for idx, lineage in enumerate(next_state.active_lineages) if idx != current_lineage_idx
-        ]
-        next_state.active_lineages.extend([left_parent, right_parent])
-        next_state.max_node_idx = right_parent.node_id
-        return self._finalize_transition_state(next_state, log_prior)
-
-    def apply_action(self, state, action, log_prior=None):
-        if isinstance(action, RecombinationChoice):
-            return self.apply_recombination(
-                state,
-                action,
-                log_prior
-            )
-        elif isinstance(action, CoalescenceChoice):
-            return self.apply_coalescence(
-                state,
-                action,
-                log_prior
-            )
-        else:
-            raise ValueError(f"Unknown action event_type: {action}")
-
-    def apply_actions(self, states, actions, log_priors=None):
-        """Apply one action per state, batching independent tensor calculations.
-
-        The scalar transition methods still assemble topology and compute exact
-        terminal rewards. Prepared tensors belong only to this call; no mutable
-        state or learned values are cached across rollout steps.
-        """
-        if log_priors is None:
-            log_priors = [None] * len(states)
-        if len(states) != len(actions) or len(states) != len(log_priors):
-            raise ValueError("Expected one action and log prior per state")
-        specs, spans, tracked_indices = [], [], []
-        for state, action in zip(states, actions):
-            time = self.resolve_event_time(state, action, self._get_state_rates(state))
-            start = len(specs)
-            if isinstance(action, CoalescenceChoice):
-                children = [state.active_lineages[action.active_lineage_i],
-                            state.active_lineages[action.active_lineage_j]]
-                material = children[0].material_segments.union(children[1].material_segments)
-                specs.append((time, material, children))
-            elif isinstance(action, RecombinationChoice):
-                child = state.active_lineages[action.active_lineage_i]
-                for material in child.material_segments.split(action.breakpoint):
-                    specs.append((time, material, [child]))
-            else:
-                raise ValueError(f"Unknown action event_type: {action}")
-            spans.append((time, start, len(specs)))
-            if self.flow_likelihood is not None and state.partial_log_likelihood is not None:
-                tracked_indices.extend(range(start, len(specs)))
-        partials = self._parent_partials_batch(specs)
-        likelihoods = [None] * len(specs)
-        if tracked_indices:
-            values = self.flow_likelihood.parent_values_batch([specs[i] for i in tracked_indices])
-            for index, value in zip(tracked_indices, values):
-                likelihoods[index] = value
-        results = []
-        for state, action, prior, (time, start, end) in zip(states, actions, log_priors, spans):
-            apply = self.apply_coalescence if isinstance(action, CoalescenceChoice) else self.apply_recombination
-            results.append(apply(state, action, prior,
-                                 _prepared=(time, partials[start:end], likelihoods[start:end])))
-        return results
-
-    def _get_state_rates(self, state, actions=None):
-        """Compute and cache rates when the state has none."""
-        if state.rates is None:
-            if actions is None:
-                actions = self.enumerate_actions(state)
-            state.rates = self.compute_event_rates(actions)
-        return state.rates
-
-    def compute_event_rates(self, actions):
-        return priors.compute_event_rates(
-            actions, rho=self.rho, num_blocks=self.num_blocks)
-
-    def compute_event_probabilities(self, state, actions=None):
-        if actions is None:
-            actions = self.enumerate_actions(state)
-        rates = self.compute_event_rates(actions)
-        state.rates = rates
-        return priors.compute_event_probabilities(rates)
+        # Total length alone cannot detect holes offset by multiply covered intervals.
+        return bool(np.all(self.get_active_counts(state) == 1) and all(
+            node.descendants is not None and all(bits == self.all_samples
+                for _, _, bits in node.descendants.segments)
+            for node in state.active_lineages))
 
     def enumerate_actions(self, state):
-        coal_actions = self.compute_coalescence_actions(state)
-        recomb_actions = self.compute_recombination_actions(state)
-        return coal_actions, recomb_actions
+        self._check_state(state)
+        if state.is_done:
+            return [], []
+        return (list(CoalescenceChoice.enumerate_from_active_lineages(state.active_lineages)),
+                list(RecombinationChoice.enumerate_from_active_lineages(state.active_lineages)))
 
-    def sample_prior_step(self, state):
-        """Sample a timed prior action using the shared prior implementation."""
-        actions = self.enumerate_actions(state)
-        rates = self.compute_event_rates(actions)
-        state.rates = rates
-        return priors.sample_prior_step(
-            state.active_lineages, actions, rates,
-            time_env=self.time_env, time_policy=self.time_policy,
-            rng=self.rng, event_rng=np.random)
+    def incompatible_sites(self, state, action):
+        left, right = (state.active_lineages[i] for i in
+                       (action.active_lineage_i, action.active_lineage_j))
+        common = np.intersect1d(left.snp_indices, right.snp_indices, assume_unique=True)
+        bad = []
+        for i in common:
+            x, target = self.snp_data.positions[i], self.derived_sets[i]
+            bits = left.descendants.at(x) | right.descendants.at(x)
+            if bits & target and bits & ~target and target & ~bits:
+                bad.append(self.snp_data.site_ids[i])
+        return tuple(bad)
 
-    def sample_log_rewards(self, num_trajs, verbose=True):
-        """Sample prior rollouts sequentially and return terminal log rewards."""
-        log_rewards = []
-        for traj_idx in range(num_trajs):
-            if verbose:
-                print(
-                    f"Sampling prior trajectory {traj_idx + 1}/{num_trajs} for log Z init..."
-                )
-            state = self.get_initial_state()
-            while not state.is_done:
-                action, log_prior = self.sample_prior_step(state)
-                state = self.apply_action(state, action, log_prior=log_prior)
-            log_rewards.append(state.log_reward)
-        return log_rewards
+    def enumerate_policy_actions(self, state):
+        coal, recomb = self.enumerate_actions(state)
+        return ([a for a in coal if not self.incompatible_sites(state, a)],
+                recomb if self.recombination_rate > 0 else [])
+
+    def compute_coalescence_actions(self, state):
+        return self.enumerate_actions(state)[0]
+
+    def compute_recombination_actions(self, state):
+        return self.enumerate_actions(state)[1]
+
+    def compute_event_rates(self, actions):
+        return priors.compute_event_rates(actions, rho=self.rho, num_blocks=self.num_blocks)
+
+    def enumerate_prior_options(self, state):
+        coal, recomb = self.enumerate_actions(state)
+        rates = self.compute_event_rates((coal, recomb))
+        return PriorActionOptions(tuple(coal), tuple(recomb), rates)
+
+    def compute_event_probabilities(self, state, actions=None):
+        # Deliberately ignore caller-provided filtered action lists.
+        return priors.compute_event_probabilities(self.enumerate_prior_options(state).rates)
+
+    def _validate_physical_action(self, state, action):
+        self._check_state(state)
+        if state.is_done:
+            raise ValueError('terminal states have no forward actions')
+        if not isinstance(action, (CoalescenceChoice, RecombinationChoice)):
+            raise ValueError('expected a coalescence or recombination action')
+        indices = [action.active_lineage_i]
+        if isinstance(action, CoalescenceChoice):
+            indices.append(action.active_lineage_j)
+        if any(isinstance(i, (bool, np.bool_)) or not isinstance(i, Integral)
+               or not 0 <= i < len(state.active_lineages) for i in indices):
+            raise ValueError('invalid active lineage index')
+        if len(indices) == 2 and indices[0] == indices[1]:
+            raise ValueError('coalescence requires distinct lineages')
+        if action.time_action is not None:
+            raise ValueError('use continuous delta_t, not time_action')
+        self.time_env.event_time(state.current_time, action.delta_t)
+        if isinstance(action, RecombinationChoice):
+            choice = next((a for a in self.compute_recombination_actions(state)
+                           if a.active_lineage_i == action.active_lineage_i), None)
+            if (self.recombination_rate == 0 or choice is None
+                    or isinstance(action.breakpoint, (bool, np.bool_))
+                    or not isinstance(action.breakpoint, Integral)
+                    or not choice.span_start < action.breakpoint <= choice.span_end
+                    or replace(action, breakpoint=None, delta_t=None) != choice):
+                raise ValueError('invalid recombination span, integer breakpoint, or zero recombination rate')
 
     def compute_cwr_event_log_prior(self, state, combined_actions, action=None, rates=None):
-        """Validate timing and resolve state rates before scoring in priors."""
+        """Always recompute the physical prior; filtered lists/cached rates cannot alter it."""
         if action is None:
             action = combined_actions
-            combined_actions = self.enumerate_actions(state)
-        if not isinstance(action, (CoalescenceChoice, RecombinationChoice)):
-            raise ValueError("Invalid ARG action")
-        self._validate_timing(action)
+        self._validate_physical_action(state, action)
+        physical = self.enumerate_actions(state)
+        return priors.compute_cwr_event_log_prior(state.active_lineages, physical, action,
+                    self.compute_event_rates(physical), time_env=self.time_env, time_policy=self.time_policy)
 
-        if rates is None:
-            rates = self._get_state_rates(state, combined_actions)
-        state.rates = rates
-        
-        return priors.compute_cwr_event_log_prior(
-            state.active_lineages, combined_actions, action, rates,
-            time_env=self.time_env, time_policy=self.time_policy)
+    def apply_action(self, state, action, log_prior=None):
+        self._validate_physical_action(state, action)
+        if isinstance(action, CoalescenceChoice):
+            conflicts = self.incompatible_sites(state, action)
+            if conflicts:
+                raise IncompatibleActionError(conflicts)
+        actual_prior = self.compute_cwr_event_log_prior(state, action)
+        if log_prior is not None and (not math.isfinite(log_prior)
+                                     or not math.isclose(log_prior, actual_prior, rel_tol=0, abs_tol=1e-10)):
+            raise ValueError('supplied log_prior disagrees with the unmasked Hudson prior')
+        result = state.clone()
+        event_time = self.time_env.event_time(state.current_time, action.delta_t)
+        indices = ([action.active_lineage_i, action.active_lineage_j]
+                   if isinstance(action, CoalescenceChoice) else [action.active_lineage_i])
+        children = [result.active_lineages[i] for i in indices]
+        if len(children) == 2:
+            material = children[0].material_segments.union(children[1].material_segments)
+            parents = [ARGLineage(result.max_node_idx + 1, material, self.num_blocks,
+                                 children=[c.node_id for c in children], event_type='coal', time=event_time)]
+        else:
+            materials = children[0].material_segments.split(action.breakpoint)
+            parents = [ARGLineage(result.max_node_idx + offset + 1, material, self.num_blocks,
+                                 children=[children[0].node_id], event_type='recomb', time=event_time,
+                                 breakpoint=int(action.breakpoint), recombination_side=side)
+                       for offset, (side, material) in enumerate(zip(('left', 'right'), materials))]
+        for parent in parents:
+            self.likelihood_tracker.parent(parent, children)
+            self.likelihood_tracker.record(result, parent)
+            result.all_nodes[parent.node_id] = parent
+        for child in children:
+            child.parents = [p.node_id for p in parents]
+            child.messages = child.snp_indices = None
+        result.active_lineages = [n for i, n in enumerate(result.active_lineages) if i not in indices] + parents
+        result.max_node_idx = parents[-1].node_id
+        result.current_time = event_time
+        result.actions += (action,)
+        result.accumulated_log_prior += actual_prior
+        result.total_active_blocks = sum(n.material_count for n in result.active_lineages)
+        result.partial_log_likelihood = self.likelihood_tracker.potential(result)
+        result.is_done = self.is_terminal(result)
+        if not math.isfinite(result.accumulated_log_prior):
+            raise FloatingPointError('accumulated prior overflowed float64')
+        result.log_reward = self.compute_terminal_log_reward(result) if result.is_done else None
+        return result
 
-    def prepare_state_rollout_inputs(
-        self,
-        states,
-        random_spec=None,
-        event_policy="cwr",
-    ):
-        batch_size = len(states)
-        if batch_size == 0:
-            raise ValueError("states must contain at least one ARGState")
+    def apply_coalescence(self, state, action, log_prior=None):
+        if not isinstance(action, CoalescenceChoice):
+            raise ValueError('expected coalescence')
+        return self.apply_action(state, action, log_prior)
 
-        if event_policy == "cwr_residual":
-            event_actions = [self.enumerate_actions(state) for state in states]
-            prior_probs = [
-                self.compute_event_probabilities(state, actions)
-                for state, actions in zip(states, event_actions)
-            ]
-            return {
-                "states": states,
-                "event_actions": event_actions,
-                "event_prior_probs": [[p[e] for e in self.event_types] for p in prior_probs],
-                "random_spec": random_spec,
-            }
-        if event_policy != "cwr":
-            raise ValueError(f"Unknown event_policy: {event_policy}")
+    def apply_recombination(self, state, action, log_prior=None):
+        if not isinstance(action, RecombinationChoice):
+            raise ValueError('expected recombination')
+        return self.apply_action(state, action, log_prior)
 
-        event = {}
-        input_actions = []
-        for idx, state in enumerate(states):
-            coal_actions, recomb_actions = self.enumerate_actions(state)
-            event_probs = self.compute_event_probabilities(state, (coal_actions, recomb_actions))
-            chosen_event_type = priors.sample_event_type(event_probs, rng=np.random)
-            if chosen_event_type == "coal":
-                input_actions.append(coal_actions)
+    def apply_actions(self, states, actions, log_priors=None):
+        log_priors = [None] * len(states) if log_priors is None else log_priors
+        if len(states) != len(actions) or len(states) != len(log_priors):
+            raise ValueError('expected one action and prior per state')
+        return [self.apply_action(s, a, p) for s, a, p in zip(states, actions, log_priors)]
+
+    def compute_terminal_log_reward(self, state, log_likelihood=None):
+        self._check_state(state)
+        if not self.is_terminal(state):
+            raise ValueError('terminal reward requires complete ancestry across the genome')
+        if log_likelihood is None:
+            if np.isnan(state.completed_site_lengths).any():
+                raise ValueError('terminal state has unresolved SNP likelihoods; restore its caches')
+            log_likelihood = self.likelihood_tracker.potential(state)
+        return self.reward_fn(log_likelihood, state.accumulated_log_prior)
+
+    def sample_compatible_step(self, state):
+        physical = self.enumerate_prior_options(state)
+        total = priors.total_event_rate(physical.rates)
+        coal, recomb = self.enumerate_policy_actions(state)
+        link_hazard = self.rho / (2 * self.num_blocks)
+        recomb_weight = link_hazard * sum(a.breakpoint_count for a in recomb)
+        allowed = len(coal) + recomb_weight
+        if allowed <= 0:
+            raise RuntimeError('no compatible action: cannot silently discard this state')
+        if self.rng.random() * allowed < len(coal):
+            action = self.rng.choice(coal)
+            log_discrete = -math.log(allowed)
+        else:
+            action = priors.sample_recombination_prior_action(recomb, rng=self.rng)
+            log_discrete = math.log(link_hazard) - math.log(allowed)
+        action = replace(action, delta_t=self.time_env.sample_from_prior(total, self.rng))
+        return CompatibleStep(action, log_discrete + self.time_env.log_density(action.delta_t, total),
+                              self.compute_cwr_event_log_prior(state, action))
+
+    def sample_prior_step(self, state):
+        """Unconditioned physical proposal; apply_action may reject its coalescence."""
+        physical = self.enumerate_prior_options(state)
+        total = priors.total_event_rate(physical.rates)
+        if self.rng.random() * total < physical.rates['lambda_coal']:
+            action = self.rng.choice(physical.coal_actions)
+        else:
+            action = priors.sample_recombination_prior_action(physical.recomb_choices, rng=self.rng)
+        action = replace(action, delta_t=self.time_env.sample_from_prior(total, self.rng))
+        return action, self.compute_cwr_event_log_prior(state, action)
+
+    def sample_compatible_trajectory(self, max_events=10000):
+        if not isinstance(max_events, Integral) or max_events < 1:
+            raise ValueError('max_events must be a positive integer')
+        state, trajectory = self.get_initial_state(), SimpleTrajectory()
+        for _ in range(max_events):
+            step = self.sample_compatible_step(state)
+            state = self.apply_action(state, step.action, step.log_prior)
+            trajectory.update(step.action, step.log_prior, state.log_reward, log_proposal=step.log_proposal)
+            if state.is_done:
+                return state, trajectory
+        raise RuntimeError(f'compatible rollout exceeded {max_events} events; no trajectory was discarded or retried')
+
+    def replay(self, actions):
+        state = self.get_initial_state()
+        for action in actions:
+            state = self.apply_action(state, action)
+        return state
+
+    def restore_state(self, state):
+        self._check_state(state)
+        result = state.clone()
+        self.likelihood_tracker.restore(result)
+        self._restore_history_and_prior(result)
+        result.total_active_blocks = sum(n.material_count for n in result.active_lineages)
+        result.is_done = self.is_terminal(result)
+        result.log_reward = self.compute_terminal_log_reward(result) if result.is_done else None
+        return result
+
+    def _restore_history_and_prior(self, state):
+        """Recover chronological events from stored ancestry, not cached action/prior fields."""
+        from collections import defaultdict
+        events = defaultdict(list)
+        for node in state.all_nodes.values():
+            if node.children:
+                events[node.time].append(node)
+        cursor = self.get_initial_state()
+        history, scores = [], []
+        for event_time, parents in sorted(events.items()):
+            active = {n.node_id: i for i, n in enumerate(cursor.active_lineages)}
+            dt = event_time - cursor.current_time
+            if len(parents) == 1 and parents[0].event_type == 'coal' and len(parents[0].children) == 2:
+                child_ids = parents[0].children
+                i, j = sorted(active[c] for c in child_ids)
+                action = CoalescenceChoice(i, j, delta_t=dt)
+            elif len(parents) == 2 and all(p.event_type == 'recomb' for p in parents):
+                parents = sorted(parents, key=lambda p: p.recombination_side)
+                left, right = parents
+                if (left.recombination_side != 'left' or right.recombination_side != 'right'
+                        or left.children != right.children or len(left.children) != 1
+                        or left.breakpoint != right.breakpoint):
+                    raise ValueError('invalid paired recombination nodes')
+                child_ids = left.children
+                child = cursor.active_lineages[active[child_ids[0]]]
+                if child.material_segments.split(left.breakpoint) != (left.material_segments, right.material_segments):
+                    raise ValueError('recombination parents must partition child material')
+                choice = next(a for a in self.enumerate_actions(cursor)[1]
+                              if a.active_lineage_i == active[child_ids[0]])
+                action = replace(choice, breakpoint=left.breakpoint, delta_t=dt)
             else:
-                input_actions.append(recomb_actions)
+                raise ValueError('stored graph must contain distinct timed coalescence or paired recombination events')
+            scores.append(self.compute_cwr_event_log_prior(cursor, action))
+            history.append(action)
+            cursor.active_lineages = [n for n in cursor.active_lineages if n.node_id not in child_ids] + parents
+            cursor.current_time = event_time
+            cursor.is_done = self.is_terminal(cursor)
+        if {n.node_id for n in cursor.active_lineages} != {n.node_id for n in state.active_lineages}:
+            raise ValueError('stored active lineages disagree with ancestry events')
+        state.actions = tuple(history)
+        state.current_time = cursor.current_time
+        # Chronological accumulation; recovered waits can differ by float64 roundoff.
+        state.accumulated_log_prior = sum(scores)
 
-            event[idx] = {}
-            event[idx]["event_type"] = chosen_event_type
-            event[idx]["probability"] = event_probs[chosen_event_type]
+    def _iter_arg_edge_intervals(self, state):
+        for parent in state.all_nodes.values():
+            for child_id in parent.children:
+                child = state.all_nodes[child_id]
+                for l, r in parent.material_segments.intersection(child.material_segments).segments:
+                    yield parent.node_id, child_id, l, r
 
-        input_dict = {
-            "states": states,
-            "event": event,
-            "input_actions": input_actions,
-            "random_spec": random_spec,
-        }
+    def save_to_tree_sequence(self, state, output_path=None):
+        import tskit
+        self._check_state(state)
+        if not self.is_terminal(state):
+            raise ValueError('tree sequence export requires complete ancestry across the genome')
+        tables = tskit.TableCollection(self.sequence_length)
+        tables.time_units = 'generations'
+        mapping = {}
+        for key, node in sorted(state.all_nodes.items()):
+            mapping[key] = tables.nodes.add_row(time=node.time * (2 * self.population_size),
+                                flags=tskit.NODE_IS_SAMPLE if key < self.num_sequences else 0)
+        for parent, child, left, right in self._iter_arg_edge_intervals(state):
+            tables.edges.add_row(left, right, mapping[parent], mapping[child])
+        tables.sort()
+        ts = tables.tree_sequence()
+        if output_path is not None:
+            ts.dump(output_path)
+        return ts
 
-        return input_dict
+    def evaluate_terminal(self, state):
+        return evaluate_infinite_sites(self.save_to_tree_sequence(state), self.snp_data,
+                                       mutation_rate=self.mutation_rate)

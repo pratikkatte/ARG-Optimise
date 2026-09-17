@@ -1,9 +1,8 @@
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
 
 from .actions import PriorActionOptions
 
@@ -129,68 +128,76 @@ class MaterialSegments:
         return any(seg_start <= start and end <= seg_end for seg_start, seg_end in self.segments)
 
 
-class ARGLineage:
-    def __init__(
-        self,
-        node_id: int,
-        children: Optional[Sequence[int]] = None,
-        parents: Optional[Sequence[int]] = None,
-        material_mask: Optional[np.ndarray] = None,
-        material_segments: Optional[MaterialSegments] = None,
-        num_blocks: Optional[int] = None,
-        partials: Optional[Any] = None,
-        sequences_indices: Optional[Sequence[int]] = None,
-        event_type: Optional[str] = None,
-        breakpoint: Optional[int] = None,
-        recombination_side: Optional[str] = None,
-        time: float = 0.0,
-        likelihood_partials=None,
-        likelihood_log_increment: float = 0.0,
-    ):
-        self.node_id = int(node_id)
-        self.children = list(children or [])
-        self.parents = list(parents or [])
-        self.partials = partials
-        self.sequences_indices = list(sequences_indices or [])
-        self.event_type = event_type
-        self.breakpoint = breakpoint
-        self.recombination_side = recombination_side
-        self.time = float(time)
-        self.likelihood_partials = likelihood_partials
-        self.likelihood_log_increment = float(likelihood_log_increment)
-        self._material_mask = None
+@dataclass(frozen=True)
+class DescendantSegments:
+    """Disjoint physical intervals annotated with exact local sample bitsets."""
+    segments: tuple = ()
 
-        if material_segments is None:
-            self.material_mask = [] if material_mask is None else material_mask
-            if num_blocks is not None:
-                self.num_blocks = int(num_blocks)
-        else:
-            self.material_segments = MaterialSegments.from_segments(material_segments)
-            self.num_blocks = int(
-                num_blocks
-                if num_blocks is not None
-                else max((end for _, end in self.material_segments.segments), default=0)
-            )
-            if material_mask is not None:
-                self._cache_material_mask(material_mask)
+    def __post_init__(self):
+        result = []
+        for left, right, bits in self.segments:
+            if any(isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, np.integer))
+                   for x in (left, right, bits)) or left < 0 or right <= left or bits <= 0:
+                raise ValueError("descendant intervals require integer 0 <= left < right and positive bitsets")
+            left, right, bits = int(left), int(right), int(bits)
+            if result and left < result[-1][1]:
+                raise ValueError("descendant intervals must be sorted and disjoint")
+            if result and left == result[-1][1] and bits == result[-1][2]:
+                result[-1] = (result[-1][0], right, bits)
+            else:
+                result.append((left, right, bits))
+        object.__setattr__(self, 'segments', tuple(result))
+
+    @property
+    def material(self):
+        return MaterialSegments(tuple((l, r) for l, r, _ in self.segments))
+
+    def at(self, position):
+        return next((b for l, r, b in self.segments if l <= position < r), 0)
+
+    def restrict(self, material):
+        return DescendantSegments(tuple(
+            (max(l, a), min(r, z), b)
+            for l, r, b in self.segments for a, z in material.segments
+            if max(l, a) < min(r, z)))
+
+    def merge(self, other):
+        bounds = sorted({x for obj in (self, other) for l, r, _ in obj.segments for x in (l, r)})
+        merged = []
+        i = j = 0
+        for l, r in zip(bounds, bounds[1:]):
+            while i < len(self.segments) and self.segments[i][1] <= l:
+                i += 1
+            while j < len(other.segments) and other.segments[j][1] <= l:
+                j += 1
+            a = self.segments[i][2] if i < len(self.segments) and self.segments[i][0] <= l else 0
+            b = other.segments[j][2] if j < len(other.segments) and other.segments[j][0] <= l else 0
+            if a & b:
+                raise ValueError("active local descendant sets must be disjoint")
+            if a | b:
+                merged.append((l, r, a | b))
+        return DescendantSegments(tuple(merged))
+
+
+@dataclass
+class ARGLineage:
+    node_id: int
+    material_segments: MaterialSegments
+    num_blocks: int
+    descendants: Optional[DescendantSegments] = None
+    children: list = field(default_factory=list)
+    parents: list = field(default_factory=list)
+    event_type: Optional[str] = None
+    breakpoint: Optional[int] = None
+    recombination_side: Optional[str] = None
+    time: float = 0.0
+    snp_indices: Optional[np.ndarray] = None
+    messages: Optional[np.ndarray] = None
+    exposure_increment: float = 0.0
 
     @property
     def material_mask(self):
-        if self._material_mask is None:
-            self._material_mask = self.material_segments.to_mask(self.num_blocks)
-        return self._material_mask
-
-    @material_mask.setter
-    def material_mask(self, value):
-        if value is None:
-            self._material_mask = None
-            return
-        self._cache_material_mask(value)
-        self.material_segments = MaterialSegments.from_mask(self._material_mask)
-
-    def _cache_material_mask(self, value):
-        self._material_mask = np.asarray(value, dtype=bool).copy()
-        self.num_blocks = int(self._material_mask.size)
+        return self.material_segments.to_mask(self.num_blocks)
 
     @property
     def material_count(self):
@@ -198,71 +205,47 @@ class ARGLineage:
 
     @property
     def material_span(self):
-        if self.material_segments.count < 2:
+        if self.material_count < 2:
             return None
-        return (
-            self.material_segments.span_start,
-            self.material_segments.span_end,
-            self.material_segments.count,
-        )
+        return (self.material_segments.span_start, self.material_segments.span_end, self.material_count)
 
     def clone(self, copy_partials=True, copy_mask=True):
-        if not copy_partials:
-            partials = self.partials
-        elif torch.is_tensor(self.partials):
-            partials = self.partials.clone()
-        else:
-            partials = copy.deepcopy(self.partials)
+        result = copy.copy(self)
+        result.children, result.parents = list(self.children), list(self.parents)
+        # Shared arrays are immutable. Rebuilt caches always replace them.
+        if copy_partials:
+            for name in ('snp_indices', 'messages'):
+                value = getattr(self, name)
+                if value is not None:
+                    value = value.copy()
+                    value.setflags(write=False)
+                    setattr(result, name, value)
+        return result
 
-        clone = ARGLineage(
-            node_id=self.node_id,
-            children=self.children,
-            parents=self.parents,
-            material_segments=self.material_segments,
-            num_blocks=self.num_blocks,
-            partials=partials,
-            sequences_indices=self.sequences_indices,
-            event_type=self.event_type,
-            breakpoint=self.breakpoint,
-            recombination_side=self.recombination_side,
-            time=float(self.time),
-            likelihood_partials=(self.likelihood_partials.clone()
-                                 if copy_partials and self.likelihood_partials is not None
-                                 else self.likelihood_partials),
-            likelihood_log_increment=self.likelihood_log_increment,
-        )
-        if copy_mask and self._material_mask is not None:
-            clone._material_mask = self._material_mask.copy()
-        return clone
 
 @dataclass
 class ARGState:
     active_lineages: List[ARGLineage]
     all_nodes: Dict[int, ARGLineage]
     max_node_idx: int
+    completed_site_lengths: np.ndarray
+    dataset_fingerprint: str
     log_reward: Optional[float] = None
     accumulated_log_prior: float = 0.0
     is_done: bool = False
     rates: Optional[Dict[str, float]] = None
     prior_options: Optional[PriorActionOptions] = None
-    total_active_blocks: Optional[int] = None
+    total_active_blocks: int = 0
     current_time: float = 0.0
-    partial_log_likelihood: Optional[float] = None
+    partial_log_likelihood: float = 0.0
+    exposure: float = 0.0  # internal 2Ne-time * bp, closed edges only
+    actions: tuple = ()
 
     def clone(self, copy_partials=False):
-        all_nodes = {
-            node_id: lineage.clone(copy_partials=copy_partials)
-            for node_id, lineage in self.all_nodes.items()
-        }
-        active_lineages = [all_nodes[lineage.node_id] for lineage in self.active_lineages]
-        return ARGState(
-            active_lineages=active_lineages,
-            all_nodes=all_nodes,
-            max_node_idx=self.max_node_idx,
-            log_reward=self.log_reward,
-            accumulated_log_prior=self.accumulated_log_prior,
-            is_done=self.is_done,
-            total_active_blocks=self.total_active_blocks,
-            current_time=float(self.current_time),
-            partial_log_likelihood=self.partial_log_likelihood,
-        )
+        nodes = {key: node.clone(copy_partials=copy_partials) for key, node in self.all_nodes.items()}
+        result = copy.copy(self)
+        result.all_nodes = nodes
+        result.active_lineages = [nodes[node.node_id] for node in self.active_lineages]
+        result.completed_site_lengths = self.completed_site_lengths.copy()
+        result.rates = result.prior_options = None
+        return result

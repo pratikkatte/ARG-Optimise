@@ -40,6 +40,8 @@ def run_inference(
     temperature=None,
     verbose=False,
 ):
+    from env.workflow import require_neural_migration
+    require_neural_migration()
     if num_args < 1:
         raise ValueError("num_args must be at least 1")
     if batch_size < 1:
@@ -143,6 +145,8 @@ def validate_metadata(metadata):
 
 
 def environment_from_metadata(metadata, seed, device=None):
+    from env.workflow import require_neural_migration
+    require_neural_migration()
     policy = checkpoint_time_policy(metadata)
     population_size = float(metadata.get("effective_population_size", DEFAULT_NE))
     sequence_length = int(metadata["sequence_length"])

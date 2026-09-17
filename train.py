@@ -352,7 +352,9 @@ def train(
     eval_density_slope=False,
     log_loss=None,
 ):
-    """Train a GFlowNet from a sequence dataset and write run artifacts."""
+    """Neural training is unavailable until the infinite-sites encoder migration."""
+    from env.workflow import require_neural_migration
+    require_neural_migration()
     from dataclasses import asdict
     mix_config = TrajectoryMixConfig(exploration_fraction, replay_fraction, replay_capacity,
                                      replay_grid_size, replay_per_topology, replay_min_size)

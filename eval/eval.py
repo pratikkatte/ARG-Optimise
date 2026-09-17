@@ -157,6 +157,8 @@ def preserve_global_rng():
 
 
 def load_model(path, options):
+    from env.workflow import require_neural_migration
+    require_neural_migration()
     checkpoint = load_checkpoint(str(path), map_location='cpu')
     metadata = checkpoint.get('metadata', {})
     validate_metadata(metadata)
@@ -530,7 +532,9 @@ def write_report(folder, result, fixed_rows, fresh_rows):
 
 
 def run_evaluation(options):
-    """Callable runner; all global and model sampling state is restored on exit."""
+    """Callable runner; requires the Phase 2 neural migration."""
+    from env.workflow import require_neural_migration
+    require_neural_migration()
     with preserve_global_rng():
         return _run_evaluation(options)
 
