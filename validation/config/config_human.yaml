@@ -1,0 +1,22 @@
+# Standalone infinite-sites simulation. No reference genome or FASTA is needed.
+# Human mutation and recombination rates match human_simulate.yaml.
+# Run from the repository root:
+#   python3 validation/scripts/simulate_infinite_sites.py --config validation/config/config_human.yaml
+# Relative output_dir paths resolve from this YAML file.
+dataset_name: sim_100k_human_rates
+num_replicates: 1
+num_samples: 10                 # Haplotypes: 16 = eight diploid individuals.
+population_size: 10000        # Diploid effective population size.
+mutation_rate: 1e-8          # Mutations per base per generation.
+recombination_rate: 1e-8    # Recombination rate per base per generation.
+sequence_length: 100000
+seed: 42                      # Replicate i: ancestry seed+100000*i; mutations +1.
+contig_id: "1"
+output_dir: ../datasets
+record_full_arg: true          # Also save unmutated full ancestry as .full.trees.
+
+# Outputs per replicate: .trees, .vcf, .positions.tsv, metadata.json, tcoalmap/.
+# .trees preserves exact continuous SNP positions. VCF uses the original scripts'
+# legacy integer conversion, which rounds and advances collisions without dropping
+# SNPs. Use the position map or .trees for exact genomic coordinates/distances.
+# Rerunning the same dataset name overwrites matching output files.

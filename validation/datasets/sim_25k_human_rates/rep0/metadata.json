@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "dataset_name": "sim_25k_human_rates",
+  "replicate_index": 0,
+  "parameters": {
+    "dataset_name": "sim_25k_human_rates",
+    "num_replicates": 1,
+    "num_samples": 16,
+    "population_size": 10000.0,
+    "mutation_rate": 1.29e-08,
+    "recombination_rate": 1.253e-08,
+    "sequence_length": 25000,
+    "seed": 42,
+    "contig_id": "1",
+    "output_dir": "/private/home/pkatte/aim3/iclr2017/temp/ARG-Optimise/validation/datasets",
+    "record_full_arg": true
+  },
+  "ancestry_seed": 42,
+  "mutation_seed": 43,
+  "mutation_model": "infinite_sites",
+  "mutation_alphabet": "ACGT",
+  "mutation_positions": "continuous",
+  "num_mutations": 34,
+  "num_sites": 34,
+  "num_haplotypes": 16,
+  "num_trees": 27,
+  "time_units": "generations",
+  "vcf_positions": "legacy: round, then advance ties/zero to positive distinct integers",
+  "vcf_positions_advanced_beyond_rounding": 0,
+  "coordinate_note": "VCF positions are approximate and can cross ancestry breakpoints or exceed the simulated length. Use .trees or .positions.tsv for exact mutation positions and genomic distances.",
+  "vcf_ref": "known simulated ancestral allele; no external reference genome",
+  "full_ancestry": "unmutated .full.trees when record_full_arg is true",
+  "sample_nodes_in_haplotype_order": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "software": {
+    "msprime": "1.4.0"
+  },
+  "simulation": {
+    "sim_ancestry": {
+      "software": {
+        "name": "msprime",
+        "version": "1.4.0"
+      },
+      "parameters": {
+        "samples": 8,
+        "demography": null,
+        "sequence_length": 25000,
+        "discrete_genome": true,
+        "recombination_rate": 1.253e-08,
+        "gene_conversion_rate": null,
+        "gene_conversion_tract_length": null,
+        "population_size": 10000.0,
+        "ploidy": 2,
+        "model": null,
+        "initial_state": null,
+        "start_time": null,
+        "end_time": null,
+        "record_migrations": null,
+        "record_full_arg": true,
+        "additional_nodes": null,
+        "coalescing_segments_only": null,
+        "num_labels": null,
+        "random_seed": 42,
+        "stop_at_local_mrca": null,
+        "replicate_index": 0
+      }
+    },
+    "sim_mutations": {
+      "software": {
+        "name": "msprime",
+        "version": "1.4.0"
+      },
+      "parameters": {
+        "rate": 1.29e-08,
+        "model": {
+          "alphabet": 1,
+          "__class__": "msprime.mutations.InfiniteSites"
+        },
+        "start_time": null,
+        "end_time": null,
+        "discrete_genome": false,
+        "keep": false,
+        "random_seed": 43
+      }
+    }
+  },
+  "summary": {
+    "sequence_length_bp": 25000,
+    "num_haplotypes": 16,
+    "num_individuals": 8,
+    "num_sites": 34,
+    "num_mutations": 34
+  },
+  "files": {
+    "vcf": "sim_25k_human_rates.vcf",
+    "ground_truth_trees": "sim_25k_human_rates.trees",
+    "position_map": "sim_25k_human_rates.positions.tsv",
+    "pairwise_coalescence_directory": "tcoalmap"
+  }
+}
