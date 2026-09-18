@@ -8,6 +8,7 @@ from numbers import Integral
 import numpy as np
 
 from . import priors
+from .action_context import ActionContext, update_compatibility
 from .actions import CoalescenceChoice, PriorActionOptions, RecombinationChoice
 from .infinite_sites import evaluate_infinite_sites
 from .infinite_sites_tracker import InfiniteSitesTracker
@@ -172,12 +173,23 @@ class SimpleARGEnvironment:
                 for _, _, bits in node.descendants.segments)
             for node in state.active_lineages))
 
-    def enumerate_actions(self, state):
+    def _get_action_context(self, state):
         self._check_state(state)
-        if state.is_done:
-            return [], []
-        return (list(CoalescenceChoice.enumerate_from_active_lineages(state.active_lineages)),
-                list(RecombinationChoice.enumerate_from_active_lineages(state.active_lineages)))
+        # Active indices can shift or be reordered by public callers. Retain the
+        # immutable geometry/descendants in the signature so replacements also
+        # invalidate the cache, even when action count and lineage IDs agree.
+        lineages = tuple((n.node_id, n.material_segments, n.descendants) for n in state.active_lineages)
+        signature = (self.dataset_fingerprint, state.is_done, self.rho, self.num_blocks, lineages)
+        context = state._action_context
+        if context is None or context.signature != signature:
+            context = ActionContext.build(state, signature, self.compute_event_rates)
+            state._action_context = context
+        return context
+
+    def enumerate_actions(self, state):
+        context = self._get_action_context(state)
+        # Public lists remain independently mutable; cached choices are frozen.
+        return list(context.coal_actions), list(context.recomb_choices)
 
     def incompatible_sites(self, state, action):
         left, right = (state.active_lineages[i] for i in
@@ -192,43 +204,29 @@ class SimpleARGEnvironment:
         return tuple(bad)
 
     def enumerate_policy_actions(self, state):
-        coal, recomb = self.enumerate_actions(state)
+        context = self._get_action_context(state)
+        coal = context.coal_actions
         if coal and self.num_variants:
-            # Decode each lineage once, rather than walking its intervals at
-            # every SNP for every candidate pair. Python integers retain exact
-            # bitsets for datasets with more than 64 haplotypes.
-            dtype = np.uint64 if self.num_sequences <= 64 else object
-            descendants = np.zeros((len(state.active_lineages), self.num_variants), dtype=dtype)
-            for row, node in enumerate(state.active_lineages):
-                for left, right, bits in node.descendants.segments:
-                    start, end = np.searchsorted(self.snp_data.positions, [left, right])
-                    descendants[row, start:end] = bits
-            targets = np.asarray(self.derived_sets, dtype=dtype)
-            allowed = []
-            for start in range(0, len(coal), 256):
-                choices = coal[start:start+256]
-                left = descendants[[a.active_lineage_i for a in choices]]
-                right = descendants[[a.active_lineage_j for a in choices]]
-                union = left | right
-                conflicts = ((left != 0) & (right != 0) & ((union & targets) != 0)
-                             & ((union & ~targets) != 0) & ((targets & ~union) != 0))
-                allowed.extend(a for a, bad in zip(choices, conflicts.any(axis=1)) if not bad)
-            coal = allowed
-        return coal, recomb if self.recombination_rate > 0 else []
+            cached = state._compatibility
+            if (cached is None or cached.dataset_fingerprint != self.dataset_fingerprint
+                    or cached.lineages != context.signature[-1]):
+                cached = update_compatibility(self, context, cached)
+                state._compatibility = cached
+            coal = cached.coal_actions
+        return list(coal), list(context.recomb_choices) if self.recombination_rate > 0 else []
 
     def compute_coalescence_actions(self, state):
-        return self.enumerate_actions(state)[0]
+        return list(self._get_action_context(state).coal_actions)
 
     def compute_recombination_actions(self, state):
-        return self.enumerate_actions(state)[1]
+        return list(self._get_action_context(state).recomb_choices)
 
     def compute_event_rates(self, actions):
         return priors.compute_event_rates(actions, rho=self.rho, num_blocks=self.num_blocks)
 
     def enumerate_prior_options(self, state):
-        coal, recomb = self.enumerate_actions(state)
-        rates = self.compute_event_rates((coal, recomb))
-        return PriorActionOptions(tuple(coal), tuple(recomb), rates)
+        context = self._get_action_context(state)
+        return PriorActionOptions(context.coal_actions, context.recomb_choices, context.rates.copy())
 
     def compute_event_probabilities(self, state, actions=None):
         # Deliberately ignore caller-provided filtered action lists.
@@ -252,8 +250,7 @@ class SimpleARGEnvironment:
             raise ValueError('use continuous delta_t, not time_action')
         self.time_env.event_time(state.current_time, action.delta_t)
         if isinstance(action, RecombinationChoice):
-            choice = next((a for a in self.compute_recombination_actions(state)
-                           if a.active_lineage_i == action.active_lineage_i), None)
+            choice = self._get_action_context(state).recomb_by_lineage[action.active_lineage_i]
             if (self.recombination_rate == 0 or choice is None
                     or isinstance(action.breakpoint, (bool, np.bool_))
                     or not isinstance(action.breakpoint, Integral)
@@ -262,13 +259,14 @@ class SimpleARGEnvironment:
                 raise ValueError('invalid recombination span, integer breakpoint, or zero recombination rate')
 
     def compute_cwr_event_log_prior(self, state, combined_actions, action=None, rates=None):
-        """Always recompute the physical prior; filtered lists/cached rates cannot alter it."""
+        """Score from the environment's physical context, ignoring caller lists/rates."""
         if action is None:
             action = combined_actions
         self._validate_physical_action(state, action)
-        physical = self.enumerate_actions(state)
+        context = self._get_action_context(state)
+        physical = (context.coal_actions, context.recomb_choices)
         return priors.compute_cwr_event_log_prior(state.active_lineages, physical, action,
-                    self.compute_event_rates(physical), time_env=self.time_env, time_policy=self.time_policy)
+                    context.rates, time_env=self.time_env, time_policy=self.time_policy)
 
     def apply_action(self, state, action, log_prior=None):
         return self._apply_action(state, action, log_prior, inplace=False)[0]
@@ -321,6 +319,9 @@ class SimpleARGEnvironment:
         result.total_active_blocks = sum(n.material_count for n in result.active_lineages)
         result.partial_log_likelihood = self.likelihood_tracker.potential(result)
         result.is_done = self.is_terminal(result)
+        result._action_context = None
+        if result.is_done:
+            result._compatibility = None
         if not math.isfinite(result.accumulated_log_prior):
             raise FloatingPointError('accumulated prior overflowed float64')
         result.log_reward = self.compute_terminal_log_reward(result) if result.is_done else None
@@ -403,6 +404,7 @@ class SimpleARGEnvironment:
     def restore_state(self, state):
         self._check_state(state)
         result = state.clone()
+        result._compatibility = None
         self.likelihood_tracker.restore(result)
         self._restore_history_and_prior(result)
         result.total_active_blocks = sum(n.material_count for n in result.active_lineages)

@@ -1,10 +1,13 @@
 import copy
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .actions import PriorActionOptions
+
+if TYPE_CHECKING:
+    from .action_context import ActionContext, CompatibilityCache
 
 
 @dataclass(frozen=True)
@@ -240,6 +243,8 @@ class ARGState:
     partial_log_likelihood: float = 0.0
     exposure: float = 0.0  # internal 2Ne-time * bp, closed edges only
     actions: tuple = ()
+    _action_context: Optional['ActionContext'] = field(default=None, init=False, repr=False, compare=False)
+    _compatibility: Optional['CompatibilityCache'] = field(default=None, init=False, repr=False, compare=False)
 
     def clone(self, copy_partials=False):
         nodes = {key: node.clone(copy_partials=copy_partials) for key, node in self.all_nodes.items()}
@@ -248,4 +253,7 @@ class ARGState:
         result.active_lineages = [nodes[node.node_id] for node in self.active_lineages]
         result.completed_site_lengths = self.completed_site_lengths.copy()
         result.rates = result.prior_options = None
+        result._action_context = None
+        # The compatibility snapshot is immutable and can be reused by either
+        # branch. Updating it replaces the snapshot, never its shared arrays.
         return result
