@@ -1,6 +1,6 @@
 """Lineage Transformer blocks shared by the infinite-sites encoder."""
-import torch
 from torch import nn
+from torch.nn import functional as F
 
 class TransformerMLP(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.0):
@@ -51,16 +51,24 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        # SDPA uses True for allowed keys; our padding mask uses True for padding.
+        attn_mask = None
         if key_padding_mask is not None:
-            attn = attn.masked_fill(
-                key_padding_mask[:, None, None, :],
-                float("-inf"),
+            attn_mask = ~key_padding_mask[:, None, None, :]
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        if dropout_p == 1.0:
+            # Fused CUDA SDPA can return NaNs at p=1; preserve zero gradients too.
+            x = v * 0.0
+        else:
+            # Keep the projection dtype (FP32 in the policy) and auto-select the backend.
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                scale=self.scale,
             )
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(batch_size, tokens, dim)
+        x = x.transpose(1, 2).reshape(batch_size, tokens, dim)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -135,5 +143,3 @@ class TransformerEncoder(nn.Module):
         for block in self.blocks:
             x = block(x, key_padding_mask=key_padding_mask)
         return self.norm(x)
-
-
