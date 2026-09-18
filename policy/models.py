@@ -53,6 +53,50 @@ class InfiniteSitesBreakpointHead(nn.Module):
             score = score/temperature-normalizer
         return breakpoint, score
 
+    def forward_batch(self, spans, contexts, length, breakpoints=None):
+        """T=1 physical-link distributions; all results stay on the device.
+
+        spans is [rows, 2] with inclusive integer endpoints. The scalar API
+        above also serves the existing, exactly normalized tempered path.
+        """
+        if spans.ndim != 2 or spans.shape != (len(contexts), 2) or spans.dtype != torch.long:
+            raise ValueError('Breakpoint spans must be an integer [rows, 2] tensor')
+        a, z = spans.unbind(-1)
+        lower, upper = spans.double().unbind(-1)
+        n = z-a+1
+        features = torch.stack((lower/length, upper/length,
+                                n.double()/max(length-1, 1)), -1).to(contexts.dtype)
+        raw = self.parameters_head(torch.cat((contexts, features), -1)).double()
+        weights, centers, scales = raw.chunk(3, -1)
+        weights = weights.log_softmax(-1)
+        locations = lower[:, None]-.5+n[:, None]*centers.sigmoid()
+        scales = .1+n[:, None]*scales.sigmoid()
+        # Check the whole batch before feeding any invalid value to a sampler.
+        valid = ((a >= 1) & (a <= z) & (z < length)).all()
+        valid = valid & torch.isfinite(raw).all() & torch.isfinite(locations).all() & torch.isfinite(scales).all()
+        if not valid:
+            raise ValueError('Invalid breakpoint spans or nonfinite mixture parameters')
+        if breakpoints is None:
+            with torch.no_grad():
+                component = torch.multinomial(weights.detach().exp(), 1)
+                loc = locations.detach().gather(1, component).squeeze(-1)
+                scale = scales.detach().gather(1, component).squeeze(-1)
+                low = torch.sigmoid((lower-.5-loc)/scale)
+                high = torch.sigmoid((upper+.5-loc)/scale)
+                probability = low+torch.rand_like(low)*(high-low)
+                eps = torch.finfo(torch.float64).eps
+                draw = loc+scale*torch.logit(probability.clamp(eps, 1-eps))
+                breakpoints = torch.minimum(torch.maximum(torch.floor(draw+.5).long(), a), z)
+        elif breakpoints.dtype != torch.long or breakpoints.shape != a.shape:
+            raise ValueError('Breakpoints must be an integer tensor matching the batch')
+        elif not ((breakpoints >= a) & (breakpoints <= z)).all():
+            raise ValueError('Breakpoint is outside the physical recombination span')
+        mass = SparseMixtureBreakpointPolicy._log_interval_mass
+        gaps = breakpoints.double()[:, None]
+        logs = torch.logsumexp(weights+mass(gaps-.5, gaps+.5, locations, scales)
+                               -mass(lower[:, None]-.5, upper[:, None]+.5, locations, scales), -1)
+        return breakpoints, torch.where(a == z, logs*0., logs)
+
 
 class ARGModel(nn.Module):
     event_policy = 'cwr_residual'
@@ -76,10 +120,11 @@ class ARGModel(nn.Module):
             nn.init.zeros_(head[-1].weight); nn.init.zeros_(head[-1].bias)
 
     def event_log_probs(self, batch, summary, temperature=1.0):
+        if any(any(not math.isfinite(h) or h < 0 for h in row) or not any(h > 0 for h in row)
+               for row in batch.allowed_hazards):
+            raise ValueError('Cannot sample an event from a terminal or dead-end state with invalid hazards')
         hazards = summary.new_tensor(batch.allowed_hazards, dtype=torch.float64)
         available = hazards > 0
-        if not available.any(-1).all():
-            raise ValueError('Cannot sample an event from a terminal or dead-end state')
         return ((hazards.log()+self.event_head(summary).double())/temperature).masked_fill(~available, -torch.inf).log_softmax(-1)
 
     @staticmethod
@@ -96,6 +141,118 @@ class ARGModel(nn.Module):
     def forward(self, env, states, batch, lineages, summary, forced_actions=None, temperature=1.0):
         if not math.isfinite(temperature) or temperature < 1:
             raise ValueError('Policy temperature must be finite and >= 1')
+        if temperature != 1.:
+            return self._forward_tempered(env, states, batch, lineages, summary, forced_actions, temperature)
+        if forced_actions is not None and len(forced_actions) != len(states):
+            raise ValueError('Forced actions must match the state batch')
+        event_logs = self.event_log_probs(batch, summary)
+        kinds = (self._sample_logs(event_logs).tolist() if forced_actions is None else
+                 [int(isinstance(a, RecombinationChoice)) for a in forced_actions])
+        choices_by_row = [batch.actions[row][kind] for row, kind in enumerate(kinds)]
+        if any(not choices for choices in choices_by_row):
+            raise ValueError('Forced action has no compatible support')
+        selected_cpu = []
+        if forced_actions is not None:
+            for choices, action, kind in zip(choices_by_row, forced_actions, kinds):
+                canonical = replace(action, delta_t=None, time_action=None,
+                                    **({'breakpoint': None} if kind else {}))
+                try:
+                    selected_cpu.append(choices.index(canonical))
+                except ValueError as exc:
+                    raise ValueError('Forced action is not a compatible physical candidate') from exc
+                if kind:
+                    a, z = SparseMixtureBreakpointPolicy.valid_span(action, env.sequence_length)
+                    if not isinstance(action.breakpoint, int) or not a <= action.breakpoint <= z:
+                        raise ValueError('Breakpoint is outside the physical recombination span')
+
+        # Two context batches, with no embedding padding and no GPU work in
+        # the CPU metadata loop. Each record stores row/i/j/column/a/z/weight.
+        records, groups = [], []
+        width = max(map(len, choices_by_row))
+        lookup = [[0]*width for _ in states]
+        for kind in (0, 1):
+            start = len(records)
+            for row, choices in enumerate(choices_by_row):
+                if kinds[row] != kind:
+                    continue
+                for column, action in enumerate(choices):
+                    a, z = SparseMixtureBreakpointPolicy.valid_span(action, env.sequence_length) if kind else (0, 0)
+                    lookup[row][column] = len(records)
+                    records.append((row, action.active_lineage_i, action.active_lineage_i if kind else action.active_lineage_j,
+                                    column, a, z, action.breakpoint_count if kind else 1))
+            groups.append((start, len(records)))
+        metadata = torch.tensor(records, device=lineages.device, dtype=torch.long)
+        packed = []
+        for kind, (start, end) in enumerate(groups):
+            if start == end:
+                continue
+            row, i, j = metadata[start:end, :3].unbind(-1)
+            first = lineages[row, i]
+            if kind:
+                context = torch.cat((first, torch.zeros_like(first), torch.zeros_like(first), summary[row]), -1)
+            else:
+                second = lineages[row, j]
+                context = torch.cat((first+second, (first-second).abs(), first*second, summary[row]), -1)
+            packed.append(context)
+        contexts = torch.cat(packed)
+        hidden = self.action_head[:-1](contexts)
+        # The scalar bias cancels in the softmax; preserve checkpoint layout
+        # without training that mathematically zero-gradient parameter.
+        residuals = torch.nn.functional.linear(hidden, self.action_head[-1].weight).squeeze(-1).double()
+        logits = residuals.new_full((len(states), width), -torch.inf)
+        logits = logits.index_put((metadata[:, 0], metadata[:, 3]), residuals+metadata[:, 6].double().log())
+        logs = logits.log_softmax(-1)
+        selected = (self._sample_logs(logs) if forced_actions is None else
+                    torch.tensor(selected_cpu, device=lineages.device, dtype=torch.long))
+        selected_groups = torch.tensor(lookup, device=lineages.device).gather(1, selected[:, None]).squeeze(-1)
+        contexts = contexts[selected_groups]
+        selected_spans = metadata[selected_groups, 4:6]
+        recomb_rows = [row for row, kind in enumerate(kinds) if kind]
+        gaps = torch.zeros(len(states), dtype=torch.long, device=lineages.device)
+        breakpoint_logs = logs.new_zeros(len(states))
+        if recomb_rows:
+            rows = torch.tensor(recomb_rows, device=lineages.device)
+            forced_gaps = (None if forced_actions is None else
+                           torch.tensor([forced_actions[row].breakpoint for row in recomb_rows], device=lineages.device))
+            drawn, scores = self.breakpoint_head.forward_batch(selected_spans[rows], contexts[rows],
+                                                              env.sequence_length, forced_gaps)
+            gaps = gaps.index_copy(0, rows, drawn)
+            breakpoint_logs = breakpoint_logs.index_copy(0, rows, scores)
+        rates = [total_event_rate(r) for r in batch.physical_rates]
+        timing = contexts.new_tensor([[math.log1p(s.current_time), math.log(rate), float(kind), rate]
+                                      for s, rate, kind in zip(states, rates, kinds)], dtype=torch.float64)
+        time_features = torch.cat((contexts, timing[:, :3].to(contexts.dtype),
+                                   (gaps.double()/env.sequence_length).to(contexts.dtype)[:, None]), -1)
+        corrections = self.time_head(time_features)
+        if forced_actions is None:
+            waits, time_logs = self.time_head.sample_and_log_time_pf(corrections, timing[:, 3])
+        else:
+            waits = timing.new_tensor([a.delta_t for a in forced_actions])
+            time_logs = self.time_head.compute_log_time_pf(corrections, waits, timing[:, 3])
+        event_index = torch.tensor(kinds, device=lineages.device)[:, None]
+        factors = torch.stack((event_logs.gather(1, event_index).squeeze(-1),
+                               logs.gather(1, selected[:, None]).squeeze(-1), breakpoint_logs, time_logs), -1)
+        if not torch.isfinite(factors).all():
+            raise FloatingPointError('Nonfinite policy factor')
+        if forced_actions is None:
+            # Keep integers separate from float64 waits (coordinates need not
+            # fit in float64's exact integer range). No per-row device reads.
+            decisions = torch.stack((selected, gaps), -1).tolist()
+            actions = [replace(choices[index], delta_t=dt, **({'breakpoint': bp} if kind else {}))
+                       for choices, kind, (index, bp), dt in zip(choices_by_row, kinds, decisions, waits.tolist())]
+        else:
+            actions = [replace(a, time_action=None, delta_t=float(a.delta_t)) for a in forced_actions]
+        return factors.sum(-1), actions, factors
+
+    @staticmethod
+    @torch.no_grad()
+    def _sample_logs(logs):
+        probabilities = logs.detach().exp()
+        if not torch.isfinite(probabilities).all():
+            raise FloatingPointError('Nonfinite policy distribution')
+        return torch.multinomial(probabilities, 1).squeeze(-1)
+
+    def _forward_tempered(self, env, states, batch, lineages, summary, forced_actions, temperature):
         event_logs = self.event_log_probs(batch, summary, temperature)
         event_indices = (Categorical(logits=event_logs).sample().tolist() if forced_actions is None else
                          [int(isinstance(a, RecombinationChoice)) for a in forced_actions])

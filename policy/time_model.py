@@ -63,33 +63,91 @@ class CwrExponentialTimeModel(TimeModel):
             raise ValueError(f"continuous {name} must be finite and positive")
 
     def rates(self, corrections, baseline_rates):
+        log_rates, rates, checks = self._rate_values(corrections, baseline_rates)
+        self._check_status(checks)
+        return log_rates, rates
+
+    @staticmethod
+    def _valid_positive(values):
+        return (torch.isfinite(values) & (values > 0)).all()
+
+    @staticmethod
+    def _check_status(checks, extra=()):
+        """One host transfer for all validation results at a sampling boundary."""
+        values = torch.stack([value for value, _ in checks] + list(extra)).tolist()
+        for valid, (_, message) in zip(values, checks):
+            if not valid:
+                raise ValueError(message)
+        return values[len(checks):]
+
+    def _rate_values(self, corrections, baseline_rates):
         g = corrections.squeeze(-1).double()
         baseline_rates = torch.as_tensor(baseline_rates, device=g.device, dtype=torch.float64)
-        self._positive(baseline_rates, "baseline rates")
-        if not bool(torch.isfinite(g).all()):
-            raise ValueError("non-finite continuous rate correction")
         rates = baseline_rates * g.exp()
-        self._positive(rates, "policy rates")
-        return baseline_rates.log() + g, rates
+        checks = [(self._valid_positive(baseline_rates), 'continuous baseline rates must be finite and positive'),
+                  (torch.isfinite(g).all(), 'non-finite continuous rate correction'),
+                  (self._valid_positive(rates), 'continuous policy rates must be finite and positive')]
+        return baseline_rates.log() + g, rates, checks
+
+    def _distribution_parameters(self, corrections, baseline_rates):
+        log_rates, rates, checks = self._rate_values(corrections, baseline_rates)
+        return None, log_rates, rates, checks
+
+    def _prepare_distribution(self, corrections, baseline_rates, temperature=None):
+        shape, log_rates, rates, checks = self._distribution_parameters(corrections, baseline_rates)
+        behavior_rates, exponential = None, shape is None
+        if temperature is not None:
+            behavior_rates = rates / temperature
+            checks.append((self._valid_positive(behavior_rates),
+                           'continuous behavior rates must be finite and positive'))
+        extra = ((shape == 1).all(),) if shape is not None and temperature is not None else ()
+        flags = self._check_status(checks, extra)
+        if flags:
+            exponential = flags[0]
+        return shape, log_rates, rates, behavior_rates, exponential
+
+    @staticmethod
+    @torch.no_grad()
+    def _draw(shape, behavior_rates, exponential):
+        # Parameters have already been checked together. Do not repeat the
+        # distribution constructors' synchronous CUDA argument validation.
+        # The shape-one flag retains the exponential stream at migration.
+        if exponential:
+            return torch.distributions.Exponential(behavior_rates.detach(), validate_args=False).sample()
+        return torch.distributions.Gamma(shape.detach(), behavior_rates.detach(), validate_args=False).sample()
+
+    @staticmethod
+    def _log_density(shape, log_rates, rates, waits):
+        if shape is None:
+            return log_rates - rates * waits
+        return shape*log_rates-torch.lgamma(shape)+(shape-1)*waits.log()-rates*waits
+
+    def _score_parameters(self, shape, log_rates, rates, waits):
+        waits = torch.as_tensor(waits, device=rates.device, dtype=torch.float64).detach()
+        scores = self._log_density(shape, log_rates, rates, waits)
+        self._check_status([(self._valid_positive(waits), 'continuous waits must be finite and positive'),
+                            (torch.isfinite(scores).all(), 'non-finite continuous policy log density')])
+        return scores
 
     def sample(self, corrections, baseline_rates, random_spec=None):
         temperature = validate_temperature(random_spec, time_component=True)
         with torch.no_grad():
-            _, rates = self.rates(corrections, baseline_rates)
-            behavior_rates = rates / temperature
-            self._positive(behavior_rates, "behavior rates")
-            waits = torch.distributions.Exponential(behavior_rates).sample()
+            shape, _, _, behavior, exponential = self._prepare_distribution(corrections, baseline_rates, temperature)
+            waits = self._draw(shape, behavior, exponential)
             self._positive(waits, "sampled waits")
         return waits
 
+    def sample_and_log_time_pf(self, corrections, baseline_rates, random_spec=None):
+        """Share differentiable parameters; sampled waits remain fixed actions."""
+        temperature = validate_temperature(random_spec, time_component=True)
+        shape, log_rates, rates, behavior, exponential = self._prepare_distribution(
+            corrections, baseline_rates, temperature)
+        waits = self._draw(shape, behavior, exponential)
+        return waits, self._score_parameters(shape, log_rates, rates, waits)
+
     def compute_log_time_pf(self, corrections, waits, baseline_rates):
-        log_rates, rates = self.rates(corrections, baseline_rates)
-        waits = torch.as_tensor(waits, device=rates.device, dtype=torch.float64).detach()
-        self._positive(waits, "waits")
-        scores = log_rates - rates * waits
-        if not bool(torch.isfinite(scores).all()):
-            raise ValueError("non-finite continuous policy log density")
-        return scores
+        shape, log_rates, rates, _, _ = self._prepare_distribution(corrections, baseline_rates)
+        return self._score_parameters(shape, log_rates, rates, waits)
 
 
 def validate_continuous_time_head(head, time_policy):
@@ -120,37 +178,16 @@ class CwrGammaTimeModel(CwrExponentialTimeModel):
         return torch.cat((self.output_layer(action_features), self.shape_layer(action_features)), dim=-1)
 
     def gamma_parameters(self, corrections, baseline_rates):
+        shape, log_rates, rates, _, _ = self._prepare_distribution(corrections, baseline_rates)
+        return shape, log_rates, rates
+
+    def _distribution_parameters(self, corrections, baseline_rates):
         if corrections.ndim != 2 or corrections.shape[-1] != 2:
             raise ValueError('Gamma timing requires mean-rate and log-shape corrections')
-        log_mean_rates, mean_rates = super().rates(corrections[:, :1], baseline_rates)
+        log_mean_rates, mean_rates, checks = self._rate_values(corrections[:, :1], baseline_rates)
         log_shape = corrections[:, 1].double()
         shape = log_shape.exp()
-        self._positive(shape, 'gamma shapes')
         rates = mean_rates*shape
-        self._positive(rates, 'gamma rates')
-        return shape, log_mean_rates+log_shape, rates
-
-    def sample(self, corrections, baseline_rates, random_spec=None):
-        temperature = validate_temperature(random_spec, time_component=True)
-        with torch.no_grad():
-            shape, _, rates = self.gamma_parameters(corrections, baseline_rates)
-            behavior_rates = rates/temperature
-            self._positive(behavior_rates, 'behavior rates')
-            # Preserve the exact old sampling stream at checkpoint migration.
-            # General gamma exploration scales the mean by T; scores remain
-            # those of the untempered policy, as for the exponential head.
-            if bool((shape == 1).all()):
-                waits = torch.distributions.Exponential(behavior_rates).sample()
-            else:
-                waits = torch.distributions.Gamma(shape, behavior_rates).sample()
-            self._positive(waits, 'sampled waits')
-            return waits
-
-    def compute_log_time_pf(self, corrections, waits, baseline_rates):
-        shape, log_rates, rates = self.gamma_parameters(corrections, baseline_rates)
-        waits = torch.as_tensor(waits, device=rates.device, dtype=torch.float64).detach()
-        self._positive(waits, 'waits')
-        scores = shape*log_rates-torch.lgamma(shape)+(shape-1)*waits.log()-rates*waits
-        if not bool(torch.isfinite(scores).all()):
-            raise ValueError('non-finite continuous gamma policy log density')
-        return scores
+        checks.extend([(self._valid_positive(shape), 'continuous gamma shapes must be finite and positive'),
+                       (self._valid_positive(rates), 'continuous gamma rates must be finite and positive')])
+        return shape, log_mean_rates+log_shape, rates, checks

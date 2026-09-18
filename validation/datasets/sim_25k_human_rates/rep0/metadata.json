@@ -5,10 +5,10 @@
   "parameters": {
     "dataset_name": "sim_25k_human_rates",
     "num_replicates": 1,
-    "num_samples": 16,
+    "num_samples": 10,
     "population_size": 10000.0,
-    "mutation_rate": 1.29e-08,
-    "recombination_rate": 1.253e-08,
+    "mutation_rate": 1e-08,
+    "recombination_rate": 1e-08,
     "sequence_length": 25000,
     "seed": 42,
     "contig_id": "1",
@@ -20,10 +20,10 @@
   "mutation_model": "infinite_sites",
   "mutation_alphabet": "ACGT",
   "mutation_positions": "continuous",
-  "num_mutations": 34,
-  "num_sites": 34,
-  "num_haplotypes": 16,
-  "num_trees": 27,
+  "num_mutations": 23,
+  "num_sites": 23,
+  "num_haplotypes": 10,
+  "num_trees": 15,
   "time_units": "generations",
   "vcf_positions": "legacy: round, then advance ties/zero to positive distinct integers",
   "vcf_positions_advanced_beyond_rounding": 0,
@@ -40,13 +40,7 @@
     6,
     7,
     8,
-    9,
-    10,
-    11,
-    12,
-    13,
-    14,
-    15
+    9
   ],
   "software": {
     "msprime": "1.4.0"
@@ -58,11 +52,11 @@
         "version": "1.4.0"
       },
       "parameters": {
-        "samples": 8,
+        "samples": 5,
         "demography": null,
         "sequence_length": 25000,
         "discrete_genome": true,
-        "recombination_rate": 1.253e-08,
+        "recombination_rate": 1e-08,
         "gene_conversion_rate": null,
         "gene_conversion_tract_length": null,
         "population_size": 10000.0,
@@ -87,7 +81,7 @@
         "version": "1.4.0"
       },
       "parameters": {
-        "rate": 1.29e-08,
+        "rate": 1e-08,
         "model": {
           "alphabet": 1,
           "__class__": "msprime.mutations.InfiniteSites"
@@ -102,10 +96,10 @@
   },
   "summary": {
     "sequence_length_bp": 25000,
-    "num_haplotypes": 16,
-    "num_individuals": 8,
-    "num_sites": 34,
-    "num_mutations": 34
+    "num_haplotypes": 10,
+    "num_individuals": 5,
+    "num_sites": 23,
+    "num_mutations": 23
   },
   "files": {
     "vcf": "sim_25k_human_rates.vcf",

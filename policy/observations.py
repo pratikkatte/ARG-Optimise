@@ -207,10 +207,9 @@ def pack_states(env, states, device='cpu', cache=None):
         # Concatenation (or conversion of scalar lists) owns a fresh batch buffer;
         # no tensor aliases immutable cache entries or reusable scratch storage.
         array = np.asarray(rows, dtype=np.float32).reshape(-1, width)
-        value = torch.from_numpy(array).to(device=device)
-        if not torch.isfinite(value).all():
+        if not np.isfinite(array).all():
             raise FloatingPointError('Nonfinite neural observation; restore or diagnose the state')
-        return value
+        return torch.from_numpy(array).to(device=device)
     packed = PackedObservations(tensor(np.concatenate(snps), 7+2*n), tensor(np.concatenate(intervals), 4+n),
                                 tuple(snp_lengths), tuple(interval_lengths),
                                 tensor(lineage_rows, LINEAGE_DIM), tensor(state_rows, STATE_DIM), tuple(offsets))
