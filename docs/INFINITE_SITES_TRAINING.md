@@ -86,7 +86,8 @@ All declared YAML keys also have CLI overrides, except the nested `evaluation` m
 | `embedding_size`, `hidden_size`, `transformer_depth`, `transformer_heads`, `transformer_mlp_ratio` | Shared encoder, pooling projections, lineage Transformer, and head dimensions. |
 | `breakpoint_mixture_hidden_dim`, `breakpoint_mixture_layers`, `breakpoint_mixture_components` | Hidden width, hidden MLP-layer count, and logistic-mixture count on the shared action/span representation. No nucleotide CNN is used. |
 | `breakpoint_gap_hidden_size`, `breakpoint_gap_layers` | Width and number of additional hidden layers before mixture parameter outputs. |
-| `continuous_time_head`, `time_hidden_dim`, `time_layers` | Gamma or exponential head, hidden width and hidden-layer count. The full physical Hudson rate remains the baseline. |
+| `continuous_time_head`, `time_hidden_dim`, `time_layers` | Gamma, Gamma-mixture, or exponential head, hidden width and hidden-layer count. The full physical Hudson rate remains the baseline. |
+| `time_mixture_components` | Number of components when `continuous_time_head: gamma_mixture`. Each component learns its mean and shape. Policy scores marginalize component identity with logsumexp; components are not additional ARG actions. Existing Gamma/exponential heads are unchanged. |
 | `policy_lr`, `flow_lr`, `subtb_lambda`, `grad_clip` | Shared/policy and flow-head learning rates, all-segment SubTB weighting, and global clipping threshold. Per-component unclipped norms are logged. |
 | `init_z_sample_count` | Number of initial-policy trajectories defining fixed flow-centering/scaling buffers. There is no separate scalar Z. |
 | `effective_population_size`, `mutation_rate`, `recombination_rate`, `reward_C` | Explicit scientific overrides and reward offset. Omitted rates come from the dataset metadata. |
