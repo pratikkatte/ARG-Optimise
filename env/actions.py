@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import ClassVar, Dict, Optional, Tuple
 
 
@@ -54,8 +55,16 @@ class CoalescenceChoice:
 
     @classmethod
     def enumerate_from_active_lineages(cls, active_lineages):
-        return tuple(cls(i, j) for i in range(len(active_lineages))
-                     for j in range(i + 1, len(active_lineages)))
+        count = len(active_lineages)
+        # Choices contain only active indices and are immutable. Bound both the
+        # number and size of cached templates; large states use transient tuples.
+        return (cls._cached_pairs(count) if count <= 64 else
+                tuple(cls(i, j) for i in range(count) for j in range(i + 1, count)))
+
+    @classmethod
+    @lru_cache(maxsize=32)
+    def _cached_pairs(cls, count):
+        return tuple(cls(i, j) for i in range(count) for j in range(i + 1, count))
 
 
 @dataclass(frozen=True)

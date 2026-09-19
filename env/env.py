@@ -168,10 +168,11 @@ class SimpleARGEnvironment:
 
     def is_terminal(self, state):
         # Total length alone cannot detect holes offset by multiply covered intervals.
-        return bool(np.all(self.get_active_counts(state) == 1) and all(
+        # Reject incomplete descendants before allocating/scanning genome coverage.
+        return bool(all(
             node.descendants is not None and all(bits == self.all_samples
                 for _, _, bits in node.descendants.segments)
-            for node in state.active_lineages))
+            for node in state.active_lineages) and np.all(self.get_active_counts(state) == 1))
 
     def _get_action_context(self, state):
         self._check_state(state)

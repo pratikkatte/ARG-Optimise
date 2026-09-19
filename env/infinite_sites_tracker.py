@@ -50,12 +50,20 @@ class InfiniteSitesTracker:
             dt = node.time - child.time
             if not math.isfinite(dt) or dt <= 0:
                 raise ValueError('parent times must strictly exceed child times')
-            relevant = child.descendants.restrict(node.material_segments)
+            # A coalescent parent contains all of each child. A recombination
+            # parent's descendants are already the required restricted child.
+            relevant = child.descendants if len(children) == 2 else node.descendants
             exposures.append(dt * sum(r - l for l, r, bits in relevant.segments
                                       if bits != self.env.all_samples))
-            common, parent_rows, child_rows = np.intersect1d(
-                indices, child.snp_indices, assume_unique=True, return_indices=True)
-            if len(common):
+            # Sorted SNP indices have known subset relationships. Keep exactly
+            # the original row/child order without concatenate/sort/intersect.
+            if len(children) == 2:
+                child_rows = np.arange(len(child.snp_indices))
+                parent_rows = np.searchsorted(indices, child.snp_indices)
+            else:
+                parent_rows = np.arange(len(indices))
+                child_rows = np.searchsorted(child.snp_indices, indices)
+            if len(parent_rows):
                 a, d, m = child.messages[child_rows].T
                 propagated = m + dt * d
                 old = combined[parent_rows].copy()

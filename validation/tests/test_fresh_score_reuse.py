@@ -88,7 +88,7 @@ def assert_nested_close(first, second):
         assert first == second
 
 
-@pytest.mark.parametrize('head', ['gamma', 'exponential'])
+@pytest.mark.parametrize('head', ['gamma', 'exponential', 'gamma_mixture'])
 @pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason='CUDA hardware unavailable'))])
 @pytest.mark.parametrize('batch,accum,exploration,replay', [
@@ -172,7 +172,7 @@ def test_tempered_sampling_falls_back_until_exactly_one():
     assert all(c['collect_flows'] and c['return_states'] for c in worker.sampling_options)
 
 
-@pytest.mark.parametrize('head', ['gamma', 'exponential'])
+@pytest.mark.parametrize('head', ['gamma', 'exponential', 'gamma_mixture'])
 def test_flow_collection_preserves_sampling_and_rng(head):
     torch.set_num_threads(1)
     seed_everything(27)

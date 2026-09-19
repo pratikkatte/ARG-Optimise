@@ -8,7 +8,7 @@ from env.actions import CoalescenceChoice, RecombinationChoice
 from env.priors import total_event_rate
 from breakpoint_model import SparseMixtureBreakpointPolicy
 from .encoder import mlp
-from .time_model import CwrGammaTimeModel, CwrExponentialTimeModel
+from .time_model import CwrGammaTimeModel, CwrExponentialTimeModel, CwrGammaMixtureTimeModel
 
 
 class InfiniteSitesBreakpointHead(nn.Module):
@@ -106,7 +106,8 @@ class ARGModel(nn.Module):
     def __init__(self, embedding_size=64, hidden_size=128, breakpoint_mixture_components=4,
                  breakpoint_mixture_hidden_dim=None, breakpoint_mixture_layers=1,
                  breakpoint_gap_hidden_size=64, breakpoint_gap_layers=0,
-                 continuous_time_head='gamma', time_hidden_dim=None, time_layers=2):
+                 continuous_time_head='gamma', time_hidden_dim=None, time_layers=2,
+                 time_mixture_components=4):
         super().__init__()
         self.event_head = mlp(embedding_size, hidden_size, 2)
         self.action_head = mlp(4*embedding_size, hidden_size, 1)
@@ -114,8 +115,13 @@ class ARGModel(nn.Module):
                     breakpoint_mixture_components, breakpoint_mixture_layers,
                     breakpoint_gap_hidden_size, breakpoint_gap_layers)
         self.continuous_time_head = continuous_time_head
-        head = CwrGammaTimeModel if continuous_time_head == 'gamma' else CwrExponentialTimeModel
-        self.time_head = head(4*embedding_size+4, time_hidden_dim or hidden_size, 0., layers=time_layers)
+        heads = {'gamma': CwrGammaTimeModel, 'exponential': CwrExponentialTimeModel,
+                 'gamma_mixture': CwrGammaMixtureTimeModel}
+        if continuous_time_head not in heads:
+            raise ValueError('Unknown continuous time head')
+        extra = {'components': time_mixture_components} if continuous_time_head == 'gamma_mixture' else {}
+        self.time_head = heads[continuous_time_head](4*embedding_size+4,
+            time_hidden_dim or hidden_size, 0., layers=time_layers, **extra)
         for head in (self.event_head, self.action_head):
             nn.init.zeros_(head[-1].weight); nn.init.zeros_(head[-1].bias)
 

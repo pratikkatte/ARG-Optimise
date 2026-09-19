@@ -16,12 +16,13 @@ DEFAULT_MODEL = dict(embedding_size=64, hidden_size=128, transformer_depth=6,
                      transformer_mlp_ratio=2.0, dropout=0.0, attention_dropout=0.0,
                      breakpoint_mixture_hidden_dim=None, breakpoint_mixture_layers=1,
                      breakpoint_gap_hidden_size=64, breakpoint_gap_layers=0, breakpoint_dropout=0.0,
-                     continuous_time_head='gamma', time_hidden_dim=None, time_layers=2)
+                     continuous_time_head='gamma', time_hidden_dim=None, time_layers=2,
+                     time_mixture_components=4)
 
 
 def validate_model_config(cfg):
     for key in ('embedding_size','hidden_size','transformer_depth','transformer_heads',
-                'breakpoint_mixture_components','breakpoint_gap_hidden_size'):
+                'breakpoint_mixture_components','breakpoint_gap_hidden_size','time_mixture_components'):
         if isinstance(cfg[key], bool) or not isinstance(cfg[key], int) or cfg[key] < 1:
             raise ValueError(key+' must be a positive integer')
     for key in ('breakpoint_mixture_hidden_dim','time_hidden_dim'):
@@ -33,8 +34,8 @@ def validate_model_config(cfg):
     for key in ('dropout','attention_dropout','breakpoint_dropout'):
         if cfg[key] != 0:
             raise ValueError(key+' must be 0: exact policy replay and chunked gradients require deterministic scores')
-    if cfg['continuous_time_head'] not in ('gamma','exponential'):
-        raise ValueError('continuous_time_head must be gamma or exponential')
+    if cfg['continuous_time_head'] not in ('gamma','exponential','gamma_mixture'):
+        raise ValueError('continuous_time_head must be gamma, exponential or gamma_mixture')
     if not math.isfinite(cfg['transformer_mlp_ratio']) or cfg['transformer_mlp_ratio'] <= 0:
         raise ValueError('transformer_mlp_ratio must be positive and finite')
     if cfg['embedding_size'] % cfg['transformer_heads']:
@@ -74,7 +75,7 @@ class GFlowNetGenerator(nn.Module):
                                  ('embedding_size','hidden_size','breakpoint_mixture_components',
                                   'breakpoint_mixture_hidden_dim','breakpoint_mixture_layers',
                                   'breakpoint_gap_hidden_size','breakpoint_gap_layers',
-                                  'continuous_time_head','time_hidden_dim','time_layers')})
+                                  'continuous_time_head','time_hidden_dim','time_layers','time_mixture_components')})
         self.flow_head = mlp(cfg['embedding_size']+STATE_DIM, cfg['hidden_size'], 1)
         nn.init.zeros_(self.flow_head[-1].weight); nn.init.zeros_(self.flow_head[-1].bias)
         self.register_buffer('flow_init_offset', torch.tensor(env.reward_fn.C, dtype=torch.float64))
@@ -90,11 +91,13 @@ class GFlowNetGenerator(nn.Module):
             self.initialize_flow_center(verbose=verbose)
 
     def encode(self, states, *, pooled_cache=None):
-        batch = pack_states(self.env, states, self.device, cache=self._observation_cache)
+        nodes = [node for state in states for node in state.active_lineages] if pooled_cache is not None else None
+        plan = pooled_cache.prepare(nodes) if pooled_cache is not None else None
+        batch = pack_states(self.env, states, self.device, cache=self._observation_cache,
+                            static_rows=None if plan is None else plan.missing)
         pooled = None
         if pooled_cache is not None:
-            nodes = [node for state in states for node in state.active_lineages]
-            pooled = pooled_cache.get(self.state_encoder, batch.observations, nodes)
+            pooled = pooled_cache.get(self.state_encoder, batch.observations, nodes, plan=plan)
         lineage, summary = self.state_encoder(batch.observations, pooled_embeddings=pooled)
         return batch, lineage, summary
 

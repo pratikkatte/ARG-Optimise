@@ -1,4 +1,5 @@
 """One trainable SNP/material encoder used by policy and state flow."""
+from dataclasses import dataclass
 import torch
 from torch import nn
 from .observations import LINEAGE_DIM, STATE_DIM
@@ -7,6 +8,14 @@ from .transformer import TransformerEncoder
 
 def mlp(inputs, hidden, outputs):
     return nn.Sequential(nn.Linear(inputs, hidden), nn.SiLU(), nn.Linear(hidden, outputs))
+
+
+@dataclass(frozen=True)
+class _PoolPlan:
+    sources: tuple
+    keys: tuple
+    positions: dict
+    missing: tuple
 
 
 class PooledLineageCache:
@@ -34,13 +43,16 @@ class PooledLineageCache:
         index = torch.tensor(indices, dtype=torch.long, device=values.device)
         return values.index_select(0, index), tuple(lengths[i] for i in rows)
 
-    def get(self, encoder, observations, lineages):
+    def prepare(self, lineages):
+        """Find new static rows before observation assembly/device transfer."""
         sources = tuple((node.messages, node.snp_indices) for node in lineages)
+        if any(messages is None or indices is None for messages, indices in sources):
+            raise ValueError('Active lineage is missing infinite-sites messages')
         # Messages/indices are immutable in the environment. Replacements and
         # different descendant material must miss, including zero-SNP lineages.
-        keys = [(id(messages), id(indices), node.descendants.segments)
+        keys = tuple((id(messages), id(indices), node.descendants.segments)
                 if not messages.flags.writeable and not indices.flags.writeable else object()
-                for node, (messages, indices) in zip(lineages, sources)]
+                for node, (messages, indices) in zip(lineages, sources))
         positions = dict(self.positions)
         start = 0 if self.pooled is None else len(self.pooled)
         missing = []
@@ -48,6 +60,11 @@ class PooledLineageCache:
             if key not in positions:
                 positions[key] = start + len(missing)
                 missing.append(i)
+        return _PoolPlan(sources, keys, positions, tuple(missing))
+
+    def get(self, encoder, observations, lineages, *, plan=None):
+        plan = self.prepare(lineages) if plan is None else plan
+        sources, keys, positions, missing = plan.sources, plan.keys, plan.positions, plan.missing
         if missing:
             snps, snp_lengths = self._select_rows(observations.snps, observations.snp_lengths, missing)
             intervals, interval_lengths = self._select_rows(

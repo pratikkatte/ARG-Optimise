@@ -18,16 +18,27 @@ from env.snp_data import load_snp_dataset
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--replicate-dir", required=True, type=Path,
+    parser.add_argument('--generate-poc', action='store_true',
+                        help='Create the fixed tiny posterior benchmark, then score its reference candidate')
+    parser.add_argument('--config', type=Path,
+                        help='POC YAML, required with --generate-poc')
+    parser.add_argument("--replicate-dir", type=Path,
                         help="Directory containing simulator metadata.json, VCF, and position map")
-    parser.add_argument("--trees", required=True, type=Path,
+    parser.add_argument("--trees", type=Path,
                         help="Explicit candidate ancestry; mutation records are ignored")
-    parser.add_argument("--mutation-rate", required=True, type=float,
+    parser.add_argument("--mutation-rate", type=float,
                         help="Mutations per bp per generation")
     parser.add_argument("--sample-nodes", type=int, nargs="+",
                         help="Candidate sample node IDs in genotype-row order (default: ts.samples())")
     args = parser.parse_args(argv)
     try:
+        if args.generate_poc:
+            if args.config is None or any(x is not None for x in (args.replicate_dir, args.trees, args.mutation_rate)):
+                parser.error('--generate-poc requires --config and supplies dataset, trees and rate')
+            from validation.poc_dataset import generate_poc, load_poc_config
+            args.replicate_dir, args.trees, args.mutation_rate = generate_poc(load_poc_config(args.config))
+        elif args.config is not None or any(x is None for x in (args.replicate_dir, args.trees, args.mutation_rate)):
+            parser.error('Scoring requires --replicate-dir, --trees and --mutation-rate')
         data = load_snp_dataset(args.replicate_dir)
         ts = tskit.load(args.trees)
         result = evaluate_infinite_sites(ts, data, mutation_rate=args.mutation_rate,
@@ -51,6 +62,8 @@ def main(argv=None):
             "likelihood_convention": "polarized mutation-pattern density; fixed data-only factors omitted",
         }
         output = json.dumps(report, indent=2, allow_nan=False)
+        if args.generate_poc:
+            (args.replicate_dir / 'candidate_score.json').write_text(output+'\n')
     except (OSError, ValueError, tskit.FileFormatError, tskit.LibraryError) as exc:
         parser.error(str(exc))
     print(output)

@@ -161,11 +161,18 @@ class PolicyBatch:
     allowed_hazards: tuple
 
 
-def pack_states(env, states, device='cpu', cache=None):
+def pack_states(env, states, device='cpu', cache=None, *, static_rows=None):
+    """Pack full observations, or only static rows missing from a pooled cache.
+
+    With static_rows, skipped lineages have zero raw-token lengths. All dynamic
+    features and lineage ordering stay intact; the encoder must receive the
+    corresponding cached pooled embeddings. Ordinary callers get full rows.
+    """
     if not states:
         raise ValueError('At least one ARG state is required')
     n, length = env.num_sequences, env.sequence_length
     constants = _dataset_features(env.snp_data)
+    static_rows = None if static_rows is None else frozenset(static_rows)
     snps, intervals, lineage_rows, state_rows = [], [], [], []
     snp_lengths, interval_lengths, offsets = [], [], [0]
     actions, rates, hazards = [], [], []
@@ -190,12 +197,16 @@ def pack_states(env, states, device='cpu', cache=None):
         for node in state.active_lineages:
             if node.messages is None or node.snp_indices is None:
                 raise ValueError('Active lineage is missing infinite-sites messages')
-            snp_lengths.append(len(node.snp_indices))
-            interval_lengths.append(len(node.descendants.segments))
-            def static_features():
-                return _static_features(env, node, constants)
-            site_rows, material_rows = (static_features() if cache is None else cache.get(env,node,static_features))
-            snps.append(site_rows); intervals.append(material_rows)
+            if static_rows is None or len(lineage_rows) in static_rows:
+                snp_lengths.append(len(node.snp_indices))
+                interval_lengths.append(len(node.descendants.segments))
+                def static_features():
+                    return _static_features(env, node, constants)
+                site_rows, material_rows = (static_features() if cache is None else cache.get(env,node,static_features))
+                snps.append(site_rows); intervals.append(material_rows)
+            else:
+                snp_lengths.append(0)
+                interval_lengths.append(0)
             material = node.material_segments
             lineage_rows.append([math.log1p(node.time), math.log1p(state.current_time-node.time),
                                  material.count/length,
@@ -210,7 +221,8 @@ def pack_states(env, states, device='cpu', cache=None):
         if not np.isfinite(array).all():
             raise FloatingPointError('Nonfinite neural observation; restore or diagnose the state')
         return torch.from_numpy(array).to(device=device)
-    packed = PackedObservations(tensor(np.concatenate(snps), 7+2*n), tensor(np.concatenate(intervals), 4+n),
+    packed = PackedObservations(tensor(np.concatenate(snps) if snps else [], 7+2*n),
+                                tensor(np.concatenate(intervals) if intervals else [], 4+n),
                                 tuple(snp_lengths), tuple(interval_lengths),
                                 tensor(lineage_rows, LINEAGE_DIM), tensor(state_rows, STATE_DIM), tuple(offsets))
     return PolicyBatch(packed, tuple(actions), tuple(rates), tuple(hazards))

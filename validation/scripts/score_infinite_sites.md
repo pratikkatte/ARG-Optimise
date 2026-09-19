@@ -1,5 +1,18 @@
 # Independent infinite-sites SNP scorer
 
+To create and score the fixed two-base posterior benchmark:
+
+```sh
+python validation/scripts/score_infinite_sites.py --generate-poc --config validation/config/poc.yaml
+```
+
+This optional mode writes the deliberately constructed two-haplotype SNP
+bundle and one reference candidate under `suplemental/poc/dataset/rep0`, then
+prints and saves the candidate's independent likelihood. It is separate from
+random msprime simulation and requires the POC reference dependencies. See
+[the experiment protocol](../../suplemental/poc/README.md) for training and
+full-history posterior evaluation.
+
 From the repository root:
 
 ```sh
@@ -18,7 +31,7 @@ the simulation parameters automatically.
 The observation loader reads only the VCF, exact-position map, and metadata.
 It never reads ground-truth ancestry. Candidate ancestry is a separate input,
 and its site and mutation records are ignored. The CLI needs NumPy and tskit;
-it does not import PyTorch, msprime, or the training code.
+ordinary scoring does not import PyTorch, msprime, or the training code.
 
 ## Python interfaces
 

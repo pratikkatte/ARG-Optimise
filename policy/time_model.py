@@ -151,9 +151,9 @@ class CwrExponentialTimeModel(TimeModel):
 
 
 def validate_continuous_time_head(head, time_policy):
-    if head not in ('exponential', 'gamma'):
+    if head not in ('exponential', 'gamma', 'gamma_mixture'):
         raise ValueError(f'Unknown continuous_time_head: {head!r}')
-    if head == 'gamma' and time_policy != 'cwr_exponential':
+    if head in ('gamma', 'gamma_mixture') and time_policy != 'cwr_exponential':
         raise ValueError('The gamma head requires continuous CwR timing')
     return head
 
@@ -191,3 +191,79 @@ class CwrGammaTimeModel(CwrExponentialTimeModel):
         checks.extend([(self._valid_positive(shape), 'continuous gamma shapes must be finite and positive'),
                        (self._valid_positive(rates), 'continuous gamma rates must be finite and positive')])
         return shape, log_mean_rates+log_shape, rates, checks
+
+
+class CwrGammaMixtureTimeModel(TimeModel):
+    """Conditional Gamma mixture with an exactly evaluated marginal density.
+
+    Component selection is an internal sampling operation, not an ARG action.
+    Replay and SubTB therefore score logsumexp over every component. The
+    physical Hudson waiting-time prior is unchanged. Distinct initial shapes
+    break mixture symmetry while keeping all component means at the prior mean.
+    """
+
+    def __init__(self, input_dim, hidden_dim, dropout, layers=3, components=4):
+        if isinstance(components, bool) or not isinstance(components, int) or components < 1:
+            raise ValueError('time mixture components must be a positive integer')
+        super().__init__(input_dim, hidden_dim, dropout, 3 * components, layers)
+        self.components = components
+        nn.init.zeros_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
+        with torch.no_grad():
+            self.output_layer.bias[2 * components:].copy_(
+                torch.arange(1, components + 1, dtype=self.output_layer.bias.dtype).log())
+
+    def mixture_parameters(self, corrections, baseline_rates):
+        if corrections.ndim != 2 or corrections.shape[-1] != 3 * self.components:
+            raise ValueError('Gamma mixture requires logits, mean-rate and log-shape corrections')
+        logits, mean_corrections, log_shapes = corrections.double().chunk(3, dim=-1)
+        baseline = torch.as_tensor(baseline_rates, device=corrections.device, dtype=torch.float64)
+        if baseline.shape != (len(corrections),):
+            raise ValueError('one physical baseline rate is required per time distribution')
+        CwrExponentialTimeModel._positive(baseline, 'baseline rates')
+        log_rates = baseline.log()[:, None] + mean_corrections + log_shapes
+        shapes, rates = log_shapes.exp(), log_rates.exp()
+        CwrExponentialTimeModel._check_status([
+            (torch.isfinite(corrections).all(), 'non-finite mixture corrections'),
+            (CwrExponentialTimeModel._valid_positive(shapes), 'invalid mixture shapes'),
+            (CwrExponentialTimeModel._valid_positive(rates), 'invalid mixture rates')])
+        return logits.log_softmax(-1), shapes, log_rates, rates
+
+    @staticmethod
+    def _score(parameters, waits):
+        log_weights, shapes, log_rates, rates = parameters
+        waits = torch.as_tensor(waits, device=rates.device, dtype=torch.float64).detach()
+        if waits.shape != (len(rates),):
+            raise ValueError('one waiting time is required per mixture')
+        CwrExponentialTimeModel._positive(waits, 'waits')
+        component_scores = CwrExponentialTimeModel._log_density(
+            shapes, log_rates, rates, waits[:, None])
+        scores = torch.logsumexp(log_weights + component_scores, dim=-1)
+        if not bool(torch.isfinite(scores).all()):
+            raise ValueError('non-finite mixture time density')
+        return scores
+
+    @staticmethod
+    @torch.no_grad()
+    def _draw(parameters, temperature):
+        log_weights, shapes, _, rates = parameters
+        selected = torch.distributions.Categorical(logits=log_weights).sample()[:, None]
+        shape = shapes.gather(1, selected).squeeze(1)
+        rate = rates.gather(1, selected).squeeze(1) / temperature
+        waits = torch.distributions.Gamma(shape, rate).sample()
+        CwrExponentialTimeModel._positive(waits, 'sampled waits')
+        return waits
+
+    def sample(self, corrections, baseline_rates, random_spec=None):
+        temperature = validate_temperature(random_spec, time_component=True)
+        with torch.no_grad():
+            return self._draw(self.mixture_parameters(corrections, baseline_rates), temperature)
+
+    def sample_and_log_time_pf(self, corrections, baseline_rates, random_spec=None):
+        temperature = validate_temperature(random_spec, time_component=True)
+        parameters = self.mixture_parameters(corrections, baseline_rates)
+        waits = self._draw(parameters, temperature)
+        return waits, self._score(parameters, waits)
+
+    def compute_log_time_pf(self, corrections, waits, baseline_rates):
+        return self._score(self.mixture_parameters(corrections, baseline_rates), waits)

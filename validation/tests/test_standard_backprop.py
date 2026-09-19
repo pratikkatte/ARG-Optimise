@@ -14,7 +14,7 @@ from training.trainer import Trainer, TrajectoryMixConfig
 from validation.tests.test_fresh_score_reuse import make_model, assert_nested_close
 
 
-@pytest.mark.parametrize('head', ['gamma', 'exponential'])
+@pytest.mark.parametrize('head', ['gamma', 'exponential', 'gamma_mixture'])
 @pytest.mark.parametrize('accum', [1, 3])
 @pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason='CUDA unavailable'))])

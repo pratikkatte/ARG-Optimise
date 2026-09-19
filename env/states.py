@@ -159,10 +159,21 @@ class DescendantSegments:
         return next((b for l, r, b in self.segments if l <= position < r), 0)
 
     def restrict(self, material):
-        return DescendantSegments(tuple(
-            (max(l, a), min(r, z), b)
-            for l, r, b in self.segments for a, z in material.segments
-            if max(l, a) < min(r, z)))
+        # Both inputs are sorted and disjoint: visit each interval once instead
+        # of comparing every descendant interval with every material interval.
+        result = []
+        i = j = 0
+        while i < len(self.segments) and j < len(material.segments):
+            l, r, bits = self.segments[i]
+            a, z = material.segments[j]
+            left, right = max(l, a), min(r, z)
+            if left < right:
+                result.append((left, right, bits))
+            if r <= z:
+                i += 1
+            else:
+                j += 1
+        return DescendantSegments(tuple(result))
 
     def merge(self, other):
         bounds = sorted({x for obj in (self, other) for l, r, _ in obj.segments for x in (l, r)})
