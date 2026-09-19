@@ -1,0 +1,107 @@
+# Human-rate infinite-sites rep0: full cosine/replay configuration.
+# Scientific observations and rates match sim_5k_human_rates/rep0.
+# CUDA is for neural execution; the environment remains CPU float64.
+# Run from repository root:
+# python train.py --config config/config_infinite_sites_human_rep0_cosine_replay.yaml
+dataset_path: validation/datasets/paper_datasets/r2/rep0
+output_path: runs/paper_datasets/r2/
+device: cuda
+cpu_threads: 8
+max_events: 10000
+epochs: 10000
+batch_size: 32
+seed: 7
+verbose: true
+wandb: true
+
+# Hudson prior, Gamma-mixture timing, and SubTB training.
+event_policy: cwr_residual
+loss_type: subtb
+subtb_lambda: 2.0
+flow_head_version: 6
+flow_lr: 0.001
+policy_lr: 0.0001
+flow_warmup_steps: 0 #Legacy setting
+flow_warmup_episodes: 128 # Legacy warm-up trajectory count.
+grad_clip: 10.0
+grad_accum_steps: 1 
+init_z_sample_count: 1
+init_z_batch_size: 1  # Concurrent ARGs during flow initialization
+
+# No LR warm-up in the primary factorial comparison, to isolate cosine decay.
+# Final policy/flow rates: 1e-5 / 1e-4 after 10,000 updates.
+lr_schedule: cosine
+lr_schedule_steps: 3000
+lr_warmup_steps: 0
+lr_warmup_start_factor: 0.1
+lr_min_factor: 0.1
+
+# 192 fresh + 64 replay histories per update once the buffer is ready.
+exploration_fraction: 0.0
+replay_fraction: 0.25
+replay_capacity: 2048
+replay_grid_size: 16
+replay_per_topology: 4
+replay_min_size: 128
+# Temperature annealing is currently incompatible with replay in the trainer.
+policy_temperature_schedule: constant
+policy_temperature_start: 1.0
+policy_temperature_anneal_steps: 0
+
+# Frequent progress checks; larger, separate posterior evaluations below.
+eval_episodes: 256
+eval_batch_size: 16
+eval_seed: 100007
+eval_independent_likelihood: true  # Evaluation only; never the training reward
+eval_every: 50
+checkpoint_every: 250
+eval_density_slope: true
+terminal_eval: true
+terminal_eval_grid_size: 100
+terminal_eval_repeats: 3
+terminal_eval_repeat_every: 50
+tmrca_method: point_accuracy
+
+# Match sim_5k_human_rates/rep0 metadata.
+arg_prior: hudson
+bp_per_blocks: 1
+effective_population_size: 10000
+mutation_rate: 1e-08
+recombination_rate: 5e-9
+time_policy: cwr_exponential
+continuous_time_head: gamma_mixture
+time_mixture_components: 4
+time_bins: 32  # Accepted legacy field; inactive for continuous timing
+time_delta_bin_width: 0.001  # Inactive for continuous timing
+
+embedding_size: 64
+hidden_size: 128
+dropout: 0.0
+breakpoint_hidden_dim: 64  # Accepted legacy CNN field; inactive
+breakpoint_policy: sparse_mixture
+breakpoint_mixture_hidden_dim: 128
+breakpoint_mixture_layers: 4  # Hidden MLP layers on shared action/span features
+breakpoint_mixture_components: 4
+breakpoint_dropout: 0.0  # Required for deterministic policy scoring and replay
+breakpoint_gap_hidden_size: 64
+breakpoint_gap_layers: 1
+transformer_depth: 6
+transformer_heads: 4
+transformer_mlp_ratio: 2.0
+attention_dropout: 0.0
+
+# Used by: python eval/eval.py --config <this file>
+# Training records this mapping; eval_* above controls periodic evaluation.
+# Pass explicit numbered checkpoints for convergence curves (see plan).
+evaluation:
+  checkpoint: best_eval
+  metrics: [density_fit, ess, posterior_summary]
+  num_samples: 1024
+  repeats: 5
+  batch_size: 32
+  seed: 100007
+  device: auto
+  grid_size: 100
+  rank_bins: 20
+  bank_per_stratum: 64
+  bank_candidates: 768
