@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=arg-gfn
-#SBATCH --account=bbpa-delta-gpu
-#SBATCH --partition=gpuA100x4
+#SBATCH --account=standard
+#SBATCH --partition=gpu
 #SBATCH --array=1,2,4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --gpus-per-node=1
+#SBATCH --gres=gpu:A100:1
 #SBATCH --mem=100G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/train-%A_%a.out
@@ -18,11 +18,17 @@ set -euo pipefail
 # Repository
 # ============================================================
 
-cd /u/pratikkatte7/ARG-Optimise
+# cd /u/pratikkatte7/ARG-Optimise
 
 # Use Python directly from the existing "args" environment.
 # This avoids Conda initialization problems inside sbatch.
-PYTHON="/u/pratikkatte7/.conda/envs/args/bin/python"
+# PYTHON="/u/pratikkatte7/.conda/envs/args/bin/python"
+
+cd "$HOME/aim3/iclr2017/temp/ARG-Optimise"
+
+# Use the Python from your Phoenix conda environment
+# PYTHON="$HOME/.conda/envs/phylogfn_orig/bin/python"
+PYTHON="/private/home/pkatte/anaconda3/envs/phylogfn_orig/bin/python"
 
 export PYTHONNOUSERSITE=1
 
