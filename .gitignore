@@ -2,5 +2,6 @@ __pycache__/
 *.py[cod]
 wandb/
 checkpoints/
-train.sbatch
+*.sbatch
+*.sbatch
 pg.ipynb
