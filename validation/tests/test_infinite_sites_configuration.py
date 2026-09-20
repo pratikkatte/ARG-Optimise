@@ -17,6 +17,7 @@ from training.configuration import resolve_config, parse_train_args, DEFAULTS
 from training.schedules import LearningRateConfig, WarmupCosineScheduler, PolicyTemperatureConfig
 from training.trainer import Trainer, TrajectoryMixConfig
 from training.evaluation import evaluate_generator
+from training.reporting import open_json
 from train import train
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -265,3 +266,10 @@ def test_truth_evaluation_repeats_and_rank_bins(tmp_path):
     assert factory.call_count==2
     rows=[json.loads(s) for s in (tmp_path/'truth_run/evaluation.jsonl').read_text().splitlines()]
     assert len(rows)==4 and [r['repeat'] for r in rows]==[0,0,1,2]
+    reports=sorted((tmp_path/'truth_run/evaluation').glob('*.json.gz'))
+    assert len(reports)==4
+    for row,path in zip(rows,reports):
+        with open_json(path) as handle:
+            report=json.load(handle)
+        assert report['metrics']=={k:v for k,v in row.items() if k not in ('step','repeat')}
+        assert 'pair_tmrca_exact' in report['details']['truth']

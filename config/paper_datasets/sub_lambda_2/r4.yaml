@@ -4,7 +4,7 @@
 # Run from repository root:
 # python train.py --config config/config_infinite_sites_human_rep0_cosine_replay.yaml
 dataset_path: validation/datasets/paper_datasets/r4/rep0
-output_path: runs/paper_datasets/r4/
+output_path: /projects/bbpa/runs/paper_datasets/retake/sub_lambda_2/r4/
 device: cuda
 cpu_threads: 8
 max_events: 10000
@@ -17,7 +17,7 @@ wandb: true
 # Hudson prior, Gamma-mixture timing, and SubTB training.
 event_policy: cwr_residual
 loss_type: subtb
-subtb_lambda: 1.0
+subtb_lambda: 2.0
 flow_head_version: 6
 flow_lr: 0.001
 policy_lr: 0.0001

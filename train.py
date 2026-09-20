@@ -14,13 +14,7 @@ from training.configuration import (parse_train_args, resolve_config, config_not
                                     temperature_config, mix_config)
 from training.schedules import WarmupCosineScheduler
 from training.evaluation import evaluate_generator
-
-
-def _json(path, value):
-    path = Path(path); path.parent.mkdir(parents=True,exist_ok=True)
-    temporary = path.with_suffix(path.suffix+'.tmp')
-    temporary.write_text(json.dumps(value,indent=2,allow_nan=False,default=lambda x:x.tolist()))
-    temporary.replace(path)
+from training.reporting import write_json as _json
 
 
 def _append(path,value):
@@ -155,7 +149,7 @@ def train(dataset_path=None, output_path=None, device='cpu', **options):
                         terminal_evaluator=evaluator)
                     reports.append(metrics)
                     _append(output/'evaluation.jsonl',dict(step=step,repeat=repeat,**metrics))
-                    _json(output/'evaluation'/f'step_{step:06d}_repeat_{repeat:02d}.json',dict(metrics=metrics,details=details))
+                    _json(output/'evaluation'/f'step_{step:06d}_repeat_{repeat:02d}.json.gz',dict(metrics=metrics,details=details))
                 mean_loss = sum(r['eval_subtb_loss'] for r in reports)/len(reports)
                 eval_text = f'  eval_subtb_loss={mean_loss:.4f}'
                 if best_eval is None or mean_loss<best_eval:
