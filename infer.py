@@ -11,6 +11,20 @@ from training.checkpoints import (load_checkpoint, generator_from_checkpoint, se
 from utils import action_as_dict
 
 
+class TerminalValidationError(AssertionError):
+    """A reproducible independent-likelihood discrepancy, never silently skipped."""
+    def __init__(self, message, env, state, reference):
+        super().__init__(message)
+        def number(value):
+            return float(value) if math.isfinite(value) else str(value)
+        self.details = dict(log_likelihood=number(state.partial_log_likelihood),
+            reference_log_likelihood=number(reference.log_likelihood),
+            exposure=number(state.exposure*2*env.population_size), reference_exposure=number(reference.exposure),
+            compatible_branch_lengths=[number(x) for x in state.completed_site_lengths*2*env.population_size],
+            reference_branch_lengths=[number(x) for x in reference.compatible_branch_lengths],
+            current_time=state.current_time, actions=[action_as_dict(a) for a in state.actions])
+
+
 def resolve_device(device='auto'):
     device = ('cuda' if torch.cuda.is_available() else 'cpu') if device in (None,'auto') else device
     if str(device) == 'mps':
@@ -24,11 +38,14 @@ def validate_terminal(env, state):
     if not state.is_done or not math.isfinite(state.log_reward):
         raise ValueError('Inference requires a completed ARG with positive finite likelihood')
     reference = env.evaluate_terminal(state)
-    if abs(reference.log_likelihood-state.partial_log_likelihood) > 1e-9:
-        raise AssertionError('Independent terminal likelihood disagrees')
-    np.testing.assert_allclose(reference.exposure, state.exposure*2*env.population_size, rtol=1e-12, atol=1e-8)
-    np.testing.assert_allclose(reference.compatible_branch_lengths,
-                               state.completed_site_lengths*2*env.population_size, rtol=1e-12, atol=1e-8)
+    try:
+        if not math.isfinite(reference.log_likelihood) or abs(reference.log_likelihood-state.partial_log_likelihood) > 1e-9:
+            raise AssertionError('Independent terminal likelihood disagrees')
+        np.testing.assert_allclose(reference.exposure, state.exposure*2*env.population_size, rtol=1e-12, atol=1e-8)
+        np.testing.assert_allclose(reference.compatible_branch_lengths,
+                                   state.completed_site_lengths*2*env.population_size, rtol=1e-12, atol=1e-8)
+    except AssertionError as exc:
+        raise TerminalValidationError(str(exc),env,state,reference) from exc
     return reference
 
 

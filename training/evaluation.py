@@ -27,14 +27,16 @@ def evaluate_generator(generator, episodes, batch_size=2, seed=100007, max_event
                        density=True, independent=True, terminal_evaluator=None):
     if episodes < 1 or batch_size < 1:
         raise ValueError('Evaluation counts must be positive')
-    records, trees, loss_sum = [], [], 0.
+    records, trees = [], []
+    losses = dict(subtb=0., tb=0., total=0.)
     with preserve_sampling(generator):
         seed_everything(seed); generator.env.rng.seed(seed)
         worker = RolloutWorker(generator.env,max_events=max_events)
         for start in range(0,episodes,batch_size):
             count = min(batch_size,episodes-start)
             outputs, paths = worker.rollout(generator,count,collect_flows=True,return_states=True)
-            loss_sum += float(generator.get_loss_from_rollout_outputs(outputs))*count
+            for name,value in generator.loss_components(outputs).items():
+                losses[name] += float(value)*count
             for i,state in enumerate(outputs['states']):
                 reference = validate_terminal(generator.env,state) if independent else None
                 pf = float(outputs['log_paths_pf'][i].sum())
@@ -47,7 +49,8 @@ def evaluate_generator(generator, episodes, batch_size=2, seed=100007, max_event
                     trees.append(generator.env.save_to_tree_sequence(state))
         importance = importance_stats([r['log_reward']-r['log_policy_density'] for r in records],
                                      reward_constant=generator.env.reward_fn.C)
-        metrics = dict(eval_subtb_loss=loss_sum/episodes,
+        metrics = dict(eval_subtb_loss=losses['subtb']/episodes,
+                    eval_tb_loss=losses['tb']/episodes,eval_objective=losses['total']/episodes,
                     eval_source='fresh_untempered_policy',
                     **{'eval_'+k:v for k,v in importance.items()},
                     eval_mean_events=float(np.mean([r['event_count'] for r in records])),

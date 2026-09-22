@@ -26,8 +26,13 @@ class InfiniteSitesResult:
         return self.log_likelihood == -math.inf
 
 
-def evaluate_infinite_sites(tree_sequence, data: SNPData, *, mutation_rate, sample_nodes=None) -> InfiniteSitesResult:
-    """Score observed SNPs on ancestry whose node times are in generations.
+def evaluate_infinite_sites(tree_sequence, data: SNPData, *, mutation_rate, sample_nodes=None,
+                            time_scale=None) -> InfiniteSitesResult:
+    """Score observed SNPs, returning exposure/branch lengths in generations.
+
+    A tree sequence with time_units='2Ne' requires time_scale=2*Ne. Branch
+    differences are computed before scaling to preserve very short branches.
+    Mutation rates always have units per generation, regardless of input units.
 
     ``sample_nodes[i]`` identifies genotype row i; the default is ts.samples()
     order. An explicit mapping must be a permutation of exactly those samples.
@@ -40,8 +45,12 @@ def evaluate_infinite_sites(tree_sequence, data: SNPData, *, mutation_rate, samp
     if not isinstance(tree_sequence, tskit.TreeSequence) or not isinstance(data, SNPData):
         raise ValueError("expected a tskit.TreeSequence and SNPData")
     ts = tree_sequence
-    if ts.time_units != "generations":
-        raise ValueError("candidate ancestry must have time_units='generations'; convert explicitly before scoring")
+    if ts.time_units == 'generations' and time_scale is None:
+        time_scale = 1.
+    elif ts.time_units != '2Ne' or time_scale is None:
+        raise ValueError("candidate ancestry requires time_units='generations', or '2Ne' with explicit time_scale")
+    if isinstance(time_scale, bool) or not math.isfinite(float(time_scale)) or time_scale <= 0:
+        raise ValueError('time_scale must be finite and positive')
     if ts.sequence_length != data.sequence_length:
         raise ValueError("candidate and observations must have the same physical sequence_length")
     try:
@@ -81,7 +90,9 @@ def evaluate_infinite_sites(tree_sequence, data: SNPData, *, mutation_rate, samp
             descendants[node] = bits
             # A full-sample descendant set identifies stems above the local MRCA.
             if tree.parent(node) != tskit.NULL and bits not in (0, all_samples):
-                branch = float(tree.branch_length(node))
+                # Subtract in the original units BEFORE scaling. Scaling two
+                # absolute float64 timestamps first loses short branches.
+                branch = float(tree.branch_length(node)) * time_scale
                 if not math.isfinite(branch) or branch <= 0:
                     raise ValueError("candidate branches must have finite positive durations")
                 proper_branches.append(branch)

@@ -272,13 +272,13 @@ class SimpleARGEnvironment:
     def apply_action(self, state, action, log_prior=None):
         return self._apply_action(state, action, log_prior, inplace=False)[0]
 
-    def step_owned_state(self, state, action):
+    def step_owned_state(self, state, action, log_prior=None):
         """Advance a rollout-owned state, returning its exact event prior.
 
         The caller must not retain earlier versions of this state. Public
         apply_action remains nonmutating for branching and external callers.
         """
-        return self._apply_action(state, action, None, inplace=True)
+        return self._apply_action(state, action, log_prior, inplace=True)
 
     def _apply_action(self, state, action, log_prior, *, inplace):
         self._validate_physical_action(state, action)
@@ -464,16 +464,19 @@ class SimpleARGEnvironment:
                 for l, r in parent.material_segments.intersection(child.material_segments).segments:
                     yield parent.node_id, child_id, l, r
 
-    def save_to_tree_sequence(self, state, output_path=None):
+    def save_to_tree_sequence(self, state, output_path=None, *, time_units='generations'):
         import tskit
         self._check_state(state)
         if not self.is_terminal(state):
             raise ValueError('tree sequence export requires complete ancestry across the genome')
         tables = tskit.TableCollection(self.sequence_length)
-        tables.time_units = 'generations'
+        if time_units not in ('generations', '2Ne'):
+            raise ValueError('tree sequence time_units must be generations or 2Ne')
+        tables.time_units = time_units
+        scale = 2 * self.population_size if time_units == 'generations' else 1.
         mapping = {}
         for key, node in sorted(state.all_nodes.items()):
-            mapping[key] = tables.nodes.add_row(time=node.time * (2 * self.population_size),
+            mapping[key] = tables.nodes.add_row(time=node.time * scale,
                                 flags=tskit.NODE_IS_SAMPLE if key < self.num_sequences else 0)
         for parent, child, left, right in self._iter_arg_edge_intervals(state):
             tables.edges.add_row(left, right, mapping[parent], mapping[child])
@@ -484,5 +487,5 @@ class SimpleARGEnvironment:
         return ts
 
     def evaluate_terminal(self, state):
-        return evaluate_infinite_sites(self.save_to_tree_sequence(state), self.snp_data,
-                                       mutation_rate=self.mutation_rate)
+        return evaluate_infinite_sites(self.save_to_tree_sequence(state, time_units='2Ne'), self.snp_data,
+                                       mutation_rate=self.mutation_rate, time_scale=2*self.population_size)

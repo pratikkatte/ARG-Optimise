@@ -348,10 +348,21 @@ def topology_signature(tree, samples):
     """Rooted nontrivial clade bitsets; suppress unary nodes and ignore times/IDs."""
     indices = {int(node): i for i, node in enumerate(samples)}
     clades = set()
-    for node in tree.nodes():
-        leaves = list(tree.samples(node))
-        if 1 < len(leaves) < len(samples):
-            clades.add(sum(1 << indices[int(leaf)] for leaf in leaves))
+    if set(indices) != set(map(int, tree.tree_sequence.samples())):
+        # Preserve the existing behavior for callers supplying a partial list.
+        for node in tree.nodes():
+            leaves = list(tree.samples(node))
+            if 1 < len(leaves) < len(samples):
+                clades.add(sum(1 << indices[int(leaf)] for leaf in leaves))
+        return tuple(sorted(clades))
+    descendants = {}
+    for node in tree.nodes(order='postorder'):
+        bits = (1 << indices[node]) if tree.is_sample(node) else 0
+        for child in tree.children(node):
+            bits |= descendants[child]
+        descendants[node] = bits
+        if 1 < bits.bit_count() < len(samples):
+            clades.add(bits)
     return tuple(sorted(clades))
 
 

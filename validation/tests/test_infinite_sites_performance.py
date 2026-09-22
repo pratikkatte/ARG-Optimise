@@ -52,9 +52,10 @@ def test_owned_steps_match_nonmutating_steps_and_exact_priors():
     assert owned.log_reward == reference.log_reward
 
 
-def test_initialization_batches_keep_every_target_including_partial_batch():
+@pytest.mark.parametrize('flow_scale_mode', ['fixed', 'empirical'])
+def test_initialization_batches_keep_every_target_including_partial_batch(flow_scale_mode):
     torch.set_num_threads(1)
-    g = model(environment(recombination_rate=.01))
+    g = model(environment(recombination_rate=.01), flow_scale_mode=flow_scale_mode)
     g.init_z_sample_count = 5
     worker = RolloutWorker(g.env)
     seed_everything(19)
@@ -70,7 +71,8 @@ def test_initialization_batches_keep_every_target_including_partial_batch():
         g.initialize_flow_center(batch_size=2)
     assert [call.kwargs['episodes'] for call in rollout.call_args_list] == [2, 2, 1]
     torch.testing.assert_close(g.flow_init_offset, targets.mean(), atol=0, rtol=0)
-    torch.testing.assert_close(g.flow_output_scale, targets.std(unbiased=False).clamp_min(1), atol=0, rtol=0)
+    expected_scale = targets.std(unbiased=False).clamp_min(1) if flow_scale_mode == 'empirical' else targets.new_tensor(1.)
+    torch.testing.assert_close(g.flow_output_scale, expected_scale, atol=0, rtol=0)
     assert resolve_config(parse_train_args(['--init-z-batch-size', '7']))['init_z_batch_size'] == 7
     with pytest.raises(ValueError, match='init_z_batch_size'):
         resolve_config(dict(init_z_batch_size=0))

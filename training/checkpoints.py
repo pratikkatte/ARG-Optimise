@@ -71,7 +71,11 @@ def save_checkpoint(path, generator, trainer=None, metadata=None):
             'model':generator.model_kwargs,
             'generator_config':dict(policy_lr=generator.policy_lr, flow_lr=generator.flow_lr,
                                    grad_clip=generator.grad_clip, subtb_lambda=generator.subtb_lambda,
-                                   init_z_sample_count=generator.init_z_sample_count)}
+                                   init_z_sample_count=generator.init_z_sample_count,
+                                   encoder_lr=generator.encoder_lr,
+                                   flow_encoder_grad_scale=generator.flow_encoder_grad_scale,
+                                   tb_loss_weight=generator.tb_loss_weight,
+                                   flow_scale_mode=generator.flow_scale_mode)}
     data = dict(schema_version=SCHEMA_VERSION, metadata=meta, generator_state_dict=generator.state_dict(),
                 opt_state_dict=generator.opt.state_dict(), rng=rng_state(generator.env),
                 scheduler=generator.scheduler.state_dict() if generator.scheduler is not None else None,
@@ -97,8 +101,8 @@ def restore_generator(generator, data, load_optimizer=True):
     metadata = data['metadata']
     if metadata['environment_fingerprint'] != generator.env.dataset_fingerprint:
         raise ValueError('Checkpoint observations or environment differ')
-    from generator import DEFAULT_MODEL
-    if {**DEFAULT_MODEL, **metadata['model']} != generator.model_kwargs:
+    from generator import checkpoint_model_config
+    if checkpoint_model_config(metadata['model']) != generator.model_kwargs:
         raise ValueError('Checkpoint neural architecture differs')
     generator.load_state_dict(data['generator_state_dict'], strict=True)
     if load_optimizer:
@@ -113,10 +117,11 @@ def restore_generator(generator, data, load_optimizer=True):
 
 
 def generator_from_checkpoint(data, device='cpu', seed=7, optimizer=False, restore_random=False):
-    from generator import GFlowNetGenerator
+    from generator import GFlowNetGenerator, checkpoint_model_config
     env = environment_from_metadata(data['metadata'], seed)
-    generator = GFlowNetGenerator(env, device=device, model_kwargs=data['metadata']['model'],
-                 initialize_z_from_policy=False, **data['metadata']['generator_config'])
+    generator = GFlowNetGenerator(env, device=device, model_kwargs=checkpoint_model_config(data['metadata']['model']),
+                 initialize_z_from_policy=False, **{'flow_scale_mode':'empirical',
+                                                   **data['metadata']['generator_config']})
     restore_generator(generator, data, optimizer)
     if restore_random:
         restore_rng(env, data['rng'])

@@ -39,9 +39,10 @@ def environment(n=3, snps=True, recombination=0., length=2):
                                  recombination_rate=recombination)
 
 
-def model(env=None, **kwargs):
+def model(env=None, *, time_parameterization='bounded_v1', **kwargs):
     return GFlowNetGenerator(env or environment(),init_z_sample_count=2,
-             model_kwargs=dict(embedding_size=16,hidden_size=32,transformer_depth=1,transformer_heads=2),
+             model_kwargs=dict(embedding_size=16,hidden_size=32,transformer_depth=1,transformer_heads=2,
+                               time_parameterization=time_parameterization),
              initialize_z_from_policy=False, **kwargs)
 
 
@@ -89,7 +90,7 @@ def test_shared_encoder_and_lineage_equivariance():
 
 
 def test_mask_prior_and_factor_normalization():
-    env=environment();g=model(env);state=env.get_initial_state()
+    env=environment();g=model(env,time_parameterization='legacy');state=env.get_initial_state()
     output=g([state],forced_actions=[CoalescenceChoice(1,2,delta_t=.25)])
     assert output['factors'][0,0]==0 and output['factors'][0,2]==0
     assert float(output['log_pf'].detach())==pytest.approx(-3*.25,abs=1e-10)
@@ -246,7 +247,7 @@ def test_rep0_truth_mapping_and_reference_replay():
 def test_allowed_coal_normalization_retains_physical_wait_rate():
     from validation.tests.test_infinite_sites_environment import environment as fixture_env
     env=fixture_env(recombination_rate=0)
-    state=env.get_initial_state();g=model(env)
+    state=env.get_initial_state();g=model(env,time_parameterization='legacy')
     action=CoalescenceChoice(0,1,delta_t=.3)
     output=g([state],forced_actions=[action])
     assert output['factors'][0,:3].tolist()==[0.,0.,0.]

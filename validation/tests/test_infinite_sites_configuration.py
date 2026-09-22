@@ -160,7 +160,7 @@ def test_full_cli_training_eval_wandb_and_resume(tmp_path, capsys):
         id='test-run'
         def __init__(self): self.logged=[];self.finished=False;self.summary={}
         def log(self,info,step): self.logged.append((step,info))
-        def finish(self): self.finished=True
+        def finish(self, exit_code=0): self.finished=True;self.exit_code=exit_code
     run=Run()
     wandb=ModuleType('wandb')
     wandb.__spec__=ModuleSpec('wandb',loader=None)
@@ -182,7 +182,7 @@ def test_full_cli_training_eval_wandb_and_resume(tmp_path, capsys):
     assert epochs[0].startswith('Epoch 1/2  subtb_loss=') and 'eval_subtb_loss=' not in epochs[0]
     assert epochs[1].startswith('Epoch 2/2  subtb_loss=') and 'eval_subtb_loss=' in epochs[1]
     assert all('  time=' in line for line in epochs)
-    assert run.finished and len(run.logged)==2
+    assert run.finished and run.exit_code==0 and len(run.logged)==2
     assert 'grad_norm' in run.logged[0][1] and 'eval_subtb_loss' in run.logged[1][1]
     training=[json.loads(s) for s in (tmp_path/'run/training.jsonl').read_text().splitlines()]
     for line,info in zip(epochs,training):

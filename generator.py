@@ -1,6 +1,7 @@
 """Shared-encoder infinite-sites GFlowNet. All scientific state lives in env."""
 import math
 import time
+from dataclasses import replace
 import numpy as np
 import torch
 from torch import nn
@@ -17,10 +18,23 @@ DEFAULT_MODEL = dict(embedding_size=64, hidden_size=128, transformer_depth=6,
                      breakpoint_mixture_hidden_dim=None, breakpoint_mixture_layers=1,
                      breakpoint_gap_hidden_size=64, breakpoint_gap_layers=0, breakpoint_dropout=0.0,
                      continuous_time_head='gamma', time_hidden_dim=None, time_layers=2,
-                     time_mixture_components=4)
+                     time_mixture_components=4, time_parameterization='bounded_v1',
+                     state_feature_transform='signed_log', initial_recombination_bias=0.)
+
+
+def checkpoint_model_config(saved):
+    """Missing versioned transforms mean the original checkpoint semantics."""
+    return {**DEFAULT_MODEL, 'time_parameterization':'legacy',
+            'state_feature_transform':'identity', **saved}
 
 
 def validate_model_config(cfg):
+    if cfg['time_parameterization'] not in ('legacy', 'bounded_v1'):
+        raise ValueError('Unknown time_parameterization')
+    if cfg['state_feature_transform'] not in ('identity', 'signed_log'):
+        raise ValueError('Unknown state_feature_transform')
+    if not math.isfinite(cfg['initial_recombination_bias']):
+        raise ValueError('initial_recombination_bias must be finite')
     for key in ('embedding_size','hidden_size','transformer_depth','transformer_heads',
                 'breakpoint_mixture_components','breakpoint_gap_hidden_size','time_mixture_components'):
         if isinstance(cfg[key], bool) or not isinstance(cfg[key], int) or cfg[key] < 1:
@@ -46,7 +60,8 @@ class GFlowNetGenerator(nn.Module):
     def __init__(self, env, init_z_sample_count=8, *, device='cpu', model_kwargs=None,
                  policy_lr=1e-4, flow_lr=1e-3, grad_clip=10., subtb_lambda=.9,
                  initialize_z_from_policy=True, loss_type='subtb', flow_head_version=FLOW_VERSION,
-                 flow_warmup_steps=0, verbose=False):
+                 flow_warmup_steps=0, verbose=False, encoder_lr=None,
+                 flow_encoder_grad_scale=1., tb_loss_weight=0., flow_scale_mode='fixed'):
         super().__init__()
         if loss_type != 'subtb' or flow_head_version != FLOW_VERSION or flow_warmup_steps != 0:
             raise ValueError('Infinite sites requires shared-encoder SubTB v6 without cached flow warm-up')
@@ -61,6 +76,18 @@ class GFlowNetGenerator(nn.Module):
         self.neural_source_flow = True
         self.subtb_lambda, self.grad_clip = float(subtb_lambda), float(grad_clip)
         self.policy_lr, self.flow_lr = float(policy_lr), float(flow_lr)
+        if encoder_lr is not None and (not math.isfinite(encoder_lr) or encoder_lr <= 0):
+            raise ValueError('encoder_lr must be positive and finite')
+        if not math.isfinite(flow_encoder_grad_scale) or not 0 <= flow_encoder_grad_scale <= 1:
+            raise ValueError('flow_encoder_grad_scale must be in [0,1]')
+        if not math.isfinite(tb_loss_weight) or tb_loss_weight < 0:
+            raise ValueError('tb_loss_weight must be finite and nonnegative')
+        if flow_scale_mode not in ('fixed','empirical'):
+            raise ValueError('flow_scale_mode must be fixed or empirical')
+        self.encoder_lr = encoder_lr
+        self.flow_encoder_grad_scale = float(flow_encoder_grad_scale)
+        self.tb_loss_weight = float(tb_loss_weight)
+        self.flow_scale_mode = flow_scale_mode
         self.init_z_sample_count = int(init_z_sample_count)
         self.model_kwargs = {**DEFAULT_MODEL, **(model_kwargs or {})}
         unknown = self.model_kwargs.keys()-DEFAULT_MODEL.keys()
@@ -75,15 +102,24 @@ class GFlowNetGenerator(nn.Module):
                                  ('embedding_size','hidden_size','breakpoint_mixture_components',
                                   'breakpoint_mixture_hidden_dim','breakpoint_mixture_layers',
                                   'breakpoint_gap_hidden_size','breakpoint_gap_layers',
-                                  'continuous_time_head','time_hidden_dim','time_layers','time_mixture_components')})
+                                  'continuous_time_head','time_hidden_dim','time_layers','time_mixture_components',
+                                  'time_parameterization')})
+        # Initialization only; the normalized residual policy retains full
+        # compatible support and the physical target prior is never modified.
+        with torch.no_grad():
+            self.arg_model.event_head[-1].bias[1] = cfg['initial_recombination_bias']
         self.flow_head = mlp(cfg['embedding_size']+STATE_DIM, cfg['hidden_size'], 1)
         nn.init.zeros_(self.flow_head[-1].weight); nn.init.zeros_(self.flow_head[-1].bias)
         self.register_buffer('flow_init_offset', torch.tensor(env.reward_fn.C, dtype=torch.float64))
         self.register_buffer('flow_output_scale', torch.tensor(1., dtype=torch.float64))
         self.to(self.device)
-        self.opt = torch.optim.Adam([
-            {'params': list(self.state_encoder.parameters())+list(self.arg_model.parameters()), 'lr':policy_lr},
-            {'params': self.flow_head.parameters(), 'lr':flow_lr}])
+        groups = [
+            {'params': (list(self.state_encoder.parameters()) if encoder_lr is None else [])+
+                       list(self.arg_model.parameters()), 'lr':policy_lr},
+            {'params': self.flow_head.parameters(), 'lr':flow_lr}]
+        if encoder_lr is not None:
+            groups.append({'params': self.state_encoder.parameters(), 'lr':encoder_lr})
+        self.opt = torch.optim.Adam(groups)
         self.scheduler = None
         self._observation_cache = RawObservationCache()
         self.max_events = 10000
@@ -95,6 +131,14 @@ class GFlowNetGenerator(nn.Module):
         plan = pooled_cache.prepare(nodes) if pooled_cache is not None else None
         batch = pack_states(self.env, states, self.device, cache=self._observation_cache,
                             static_rows=None if plan is None else plan.missing)
+        if self.model_kwargs['state_feature_transform'] == 'signed_log':
+            scalars = batch.observations.state_scalars
+            # These two potentially unbounded inputs previously overwhelmed
+            # the summary/time networks on rare long histories. No scientific
+            # likelihood, prior, target, or state is transformed.
+            stable = torch.cat((scalars[:, :5],
+                scalars[:, 5:7].sign()*scalars[:, 5:7].abs().log1p(), scalars[:, 7:]), -1)
+            batch = replace(batch, observations=replace(batch.observations, state_scalars=stable))
         pooled = None
         if pooled_cache is not None:
             pooled = pooled_cache.get(self.state_encoder, batch.observations, nodes, plan=plan)
@@ -102,6 +146,7 @@ class GFlowNetGenerator(nn.Module):
         return batch, lineage, summary
 
     def state_flows(self, states, summary, observations):
+        summary = summary.detach()+self.flow_encoder_grad_scale*(summary-summary.detach())
         residual = self.flow_head(torch.cat((summary, observations.state_scalars), -1)).squeeze(-1).double()
         prior = residual.new_tensor([s.accumulated_log_prior for s in states])
         potential = residual.new_tensor([s.partial_log_likelihood for s in states])
@@ -156,11 +201,21 @@ class GFlowNetGenerator(nn.Module):
                       f'events/ARG={mean_events:.1f} | {time.perf_counter()-started:.1f}s', flush=True)
         values = torch.cat(targets)
         self.flow_init_offset.copy_(values.mean())
-        self.flow_output_scale.copy_(values.std(unbiased=False).clamp_min(1.))
+        self.flow_output_scale.copy_(values.std(unbiased=False).clamp_min(1.)
+                                    if self.flow_scale_mode == 'empirical' else values.new_tensor(1.))
+
+    def loss_components(self, outputs):
+        subtb = geometric_subtb_loss(outputs['log_paths_pf'], outputs['log_paths_pb'],
+                    outputs['state_flows'], outputs['lengths'], outputs['log_rewards'], self.subtb_lambda)
+        mask = torch.arange(outputs['log_paths_pf'].shape[1],device=self.device)[None,:]<outputs['lengths'][:,None]
+        forward = torch.where(mask,outputs['log_paths_pf'],0.).sum(-1)
+        backward = torch.where(mask,outputs['log_paths_pb'],0.).sum(-1)
+        residual = outputs['state_flows'][:, 0]+forward-backward-outputs['log_rewards']
+        tb = residual.square().mean()
+        return dict(subtb=subtb,tb=tb,total=subtb+self.tb_loss_weight*tb)
 
     def get_loss_from_rollout_outputs(self, outputs):
-        return geometric_subtb_loss(outputs['log_paths_pf'], outputs['log_paths_pb'],
-                    outputs['state_flows'], outputs['lengths'], outputs['log_rewards'], self.subtb_lambda)
+        return self.loss_components(outputs)['total']
 
     def count_backward_parents(self, state):
         if not state.actions:

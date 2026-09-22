@@ -107,7 +107,7 @@ class ARGModel(nn.Module):
                  breakpoint_mixture_hidden_dim=None, breakpoint_mixture_layers=1,
                  breakpoint_gap_hidden_size=64, breakpoint_gap_layers=0,
                  continuous_time_head='gamma', time_hidden_dim=None, time_layers=2,
-                 time_mixture_components=4):
+                 time_mixture_components=4, time_parameterization='legacy'):
         super().__init__()
         self.event_head = mlp(embedding_size, hidden_size, 2)
         self.action_head = mlp(4*embedding_size, hidden_size, 1)
@@ -121,7 +121,8 @@ class ARGModel(nn.Module):
             raise ValueError('Unknown continuous time head')
         extra = {'components': time_mixture_components} if continuous_time_head == 'gamma_mixture' else {}
         self.time_head = heads[continuous_time_head](4*embedding_size+4,
-            time_hidden_dim or hidden_size, 0., layers=time_layers, **extra)
+            time_hidden_dim or hidden_size, 0., layers=time_layers,
+            parameterization=time_parameterization, **extra)
         for head in (self.event_head, self.action_head):
             nn.init.zeros_(head[-1].weight); nn.init.zeros_(head[-1].bias)
 

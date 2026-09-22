@@ -11,6 +11,7 @@ DEFAULTS = dict(
     dataset_path=None, output_path=None, device='cpu', epochs_num=20, batch_size=2, seed=7,
     effective_population_size=None, mutation_rate=None, recombination_rate=None, reward_C=3000.,
     policy_lr=1e-4, flow_lr=1e-3, grad_clip=10., subtb_lambda=.9, init_z_sample_count=8, init_z_batch_size=32,
+    encoder_lr=None, flow_encoder_grad_scale=1., tb_loss_weight=0., flow_scale_mode='fixed',
     replay_fraction=.25, replay_min_size=8, replay_capacity=2048, replay_grid_size=16,
     replay_per_topology=4, exploration_fraction=0., max_events=10000, chunk_steps=16,
     checkpoint_every=10, resume_checkpoint=None, cpu_threads=1, grad_accum_steps=1,
@@ -20,6 +21,8 @@ DEFAULTS = dict(
     lr_warmup_start_factor=.1, lr_min_factor=.1,
     policy_temperature_schedule='constant', policy_temperature_start=1., policy_temperature_anneal_steps=0,
     eval_episodes=0, eval_every=50, eval_batch_size=2, eval_seed=100007,
+    eval_async=False, eval_async_device='cpu', eval_async_shutdown_seconds=1800.,
+    eval_initial=False, best_checkpoint_metric='eval_log_weight_std', max_wall_seconds=0.,
     eval_density_slope=True, eval_independent_likelihood=True,
     terminal_eval=False, terminal_eval_grid_size=100, terminal_eval_repeats=1,
     terminal_eval_repeat_every=250, tmrca_method='point_accuracy',
@@ -107,12 +110,32 @@ def resolve_config(options):
         raise ValueError('eval_episodes requires eval_every > 0')
     if c['terminal_eval'] and not c['eval_episodes']:
         raise ValueError('terminal_eval requires eval_episodes > 0')
-    for key in ('verbose','wandb','eval_density_slope','eval_independent_likelihood','terminal_eval'):
+    for key in ('verbose','wandb','eval_density_slope','eval_independent_likelihood','terminal_eval','eval_initial','eval_async'):
         if not isinstance(c[key],bool):
             raise ValueError(key+' must be a YAML boolean')
+    if c['eval_async'] and not c['eval_episodes']:
+        raise ValueError('eval_async requires eval_episodes > 0')
+    if c['eval_async_device'] != 'cpu' and c['eval_async_device'] != 'cuda' and not (
+            isinstance(c['eval_async_device'], str) and c['eval_async_device'].startswith('cuda:')
+            and c['eval_async_device'][5:].isdigit()):
+        raise ValueError('eval_async_device must be cpu, cuda or cuda:N')
+    if not math.isfinite(c['eval_async_shutdown_seconds']) or c['eval_async_shutdown_seconds'] < 0:
+        raise ValueError('eval_async_shutdown_seconds must be finite and nonnegative')
+    if c['best_checkpoint_metric'] not in ('eval_subtb_loss','eval_log_weight_std'):
+        raise ValueError('best_checkpoint_metric must be eval_subtb_loss or eval_log_weight_std')
+    if not math.isfinite(c['max_wall_seconds']) or c['max_wall_seconds'] < 0:
+        raise ValueError('max_wall_seconds must be finite and nonnegative')
     for key in ('policy_lr','flow_lr','grad_clip','time_delta_bin_width'):
         if not math.isfinite(c[key]) or c[key]<=0:
             raise ValueError(key+' must be positive and finite')
+    if c['encoder_lr'] is not None and (not math.isfinite(c['encoder_lr']) or c['encoder_lr'] <= 0):
+        raise ValueError('encoder_lr must be positive and finite')
+    if not math.isfinite(c['flow_encoder_grad_scale']) or not 0 <= c['flow_encoder_grad_scale'] <= 1:
+        raise ValueError('flow_encoder_grad_scale must be in [0,1]')
+    if not math.isfinite(c['tb_loss_weight']) or c['tb_loss_weight'] < 0:
+        raise ValueError('tb_loss_weight must be finite and nonnegative')
+    if c['flow_scale_mode'] not in ('fixed','empirical'):
+        raise ValueError('flow_scale_mode must be fixed or empirical')
     if not math.isfinite(c['reward_C']) or not math.isfinite(c['subtb_lambda']) or c['subtb_lambda']<0:
         raise ValueError('Invalid reward offset or SubTB lambda')
     if c['tmrca_method'] not in ('grid','point_accuracy'):
@@ -152,7 +175,7 @@ def parse_train_args(argv=None):
         else:
             kind = type(default) if default is not None else (int if key in
                     ('breakpoint_mixture_hidden_dim','time_hidden_dim') else float if key in
-                    ('effective_population_size','mutation_rate','recombination_rate') else str)
+                    ('effective_population_size','mutation_rate','recombination_rate','encoder_lr') else str)
             parser.add_argument(flag,type=kind,default=None)
     parser.add_argument('--epochs',type=int)
     args = vars(parser.parse_args(argv)); path = args.pop('config')

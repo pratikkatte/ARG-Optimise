@@ -1,0 +1,73 @@
+#!/bin/bash
+#SBATCH --job-name=r2-l09-b64-tb025
+#SBATCH --account=bbpa-delta-gpu
+#SBATCH --partition=gpuA100x4
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gpus-per-node=1
+#SBATCH --mem=100G
+#SBATCH --time=48:00:00
+#SBATCH --signal=USR1@1800
+#SBATCH --no-requeue
+#SBATCH --output=logs/r2-resume-%j.out
+#SBATCH --error=logs/r2-resume-%j.err
+
+set -euo pipefail
+
+# Submit from the repository root after: mkdir -p logs
+# Initial launch: sbatch train_r2_resume.sbatch.blp
+# Later allocation: sbatch train_r2_resume.sbatch.blp --resume
+ARG_REPO="${ARG_REPO:-/u/pratikkatte7/ARG-Optimise}"
+ARG_PYTHON="${ARG_PYTHON:-/u/pratikkatte7/.conda/envs/args/bin/python}"
+cd "$ARG_REPO"
+
+ARG_CONFIG="$ARG_REPO/config/paper_datasets/blp_r2_resume/config.yaml"
+ARG_BUNDLE="$ARG_REPO/runs/paper_datasets_stable/long48h_r2_from_f0700"
+ARG_RUN="$ARG_REPO/runs/paper_datasets_stable/blp_r2_lambda09_batch64_from0700"
+# This is the selected full checkpoint at update 700, not a fresh initialization.
+ARG_CHECKPOINT="$ARG_BUNDLE/start.pt"
+
+if [[ $# -eq 1 && "$1" == --resume ]]; then
+    ARG_CHECKPOINT="$ARG_RUN/checkpoints/latest.pt"
+elif [[ $# -ne 0 ]]; then
+    echo 'Usage: sbatch train_r2_resume.sbatch.blp [--resume]' >&2
+    exit 2
+fi
+
+test -x "$ARG_PYTHON" || { echo "Python not executable: $ARG_PYTHON" >&2; exit 1; }
+test -f "$ARG_CONFIG" || { echo "Missing config: $ARG_CONFIG" >&2; exit 1; }
+test -f "$ARG_CHECKPOINT" || { echo "Missing resume checkpoint: $ARG_CHECKPOINT" >&2; exit 1; }
+test -f "$ARG_BUNDLE/source/training/async_evaluation.py" || {
+    echo "Copy the updated frozen source directory to $ARG_BUNDLE/source" >&2; exit 1;
+}
+
+mkdir -p "$ARG_RUN"
+exec 9> "$ARG_RUN/run.lock"
+flock -n 9 || { echo 'Another job owns this output directory' >&2; exit 1; }
+if [[ $# -eq 0 && ( -f "$ARG_RUN/checkpoints/latest.pt" || -f "$ARG_RUN/training.jsonl" ) ]]; then
+    echo 'Existing training output found; use --resume to continue it' >&2
+    exit 1
+fi
+
+export PYTHONNOUSERSITE=1
+# Execute the tested frozen runtime; the evaluator imports the same source.
+export PYTHONPATH="$ARG_BUNDLE/source"
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
+echo "Job: ${SLURM_JOB_ID:-local}"
+echo "Repository: $ARG_REPO"
+echo "Python: $ARG_PYTHON"
+echo "Config: $ARG_CONFIG"
+echo "Resume checkpoint: $ARG_CHECKPOINT"
+echo "New checkpoints: $ARG_RUN/checkpoints"
+echo 'r2: batch 64, SubTB lambda 0.9, auxiliary TB weight 0.25'
+"$ARG_PYTHON" --version
+nvidia-smi
+
+srun --unbuffered "$ARG_PYTHON" -u "$ARG_BUNDLE/source/train.py" \
+    --config "$ARG_CONFIG" \
+    --resume-checkpoint "$ARG_CHECKPOINT" \
+    --dataset-path "$ARG_REPO/validation/datasets/paper_datasets/r2/rep0" \
+    --output-path "$ARG_RUN"

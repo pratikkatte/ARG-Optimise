@@ -16,6 +16,15 @@ Replicate `i` uses ancestry seed `base + 100000*i` and mutation seed
 do not reuse the earlier development schedule starting at 42. Changing the
 seeds changes the realized SNP counts; there is no SNP-count cap or filtering.
 
+Increasing this ratio lowers recombination while keeping mutation fixed; it does
+not increase the expected number of SNPs. With these constant-size diploid
+coalescent settings, the expected segregating-site count across replicates is
+`4 * Ne * mu * L * H_(n-1)`, approximately 28.29 for each configuration. Individual
+replicates vary because both ancestry and mutation placement are random. The
+saved r1/r2/r4 replicates contain 16/45/31 SNPs, respectively; their ordering is
+not an error or an expected ordering by ratio. These are three different
+observed datasets, not a controlled comparison holding the genealogy fixed.
+
 ## Generate data
 
 Run from the repository root in an environment with the simulator dependencies:

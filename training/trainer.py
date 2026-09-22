@@ -39,7 +39,9 @@ def sample_compatible_trajectories(env, episodes, max_events=10000):
                 if len(path) >= max_events:
                     raise ValueError('Compatible proposal exceeded ARG event limit')
                 step = env.sample_compatible_step(state)
-                state = env.apply_action(state, step.action, step.log_prior)
+                # This path retains actions and scalar scores, not past states.
+                # Keep the supplied-prior check without cloning the whole ARG.
+                state, _ = env.step_owned_state(state, step.action, step.log_prior)
                 path.update(step.action, log_prior=step.log_prior, log_proposal=step.log_proposal,
                             log_reward=state.log_reward)
             except (ValueError, RuntimeError, FloatingPointError) as exc:
@@ -127,6 +129,7 @@ class Trainer:
         # One clip, optimizer update, and scheduler step follow all microbatches.
         g.opt.zero_grad(set_to_none=True)
         loss_value, rewards, lengths, retained = 0., [], [], []
+        component_values = dict(subtb_loss=0.,tb_loss=0.)
         for start in range(0,batch_size,micro_size):
             sampled = None
             if start < fresh:
@@ -151,14 +154,18 @@ class Trainer:
             subset = paths[start:start+micro_size]
             outputs, rescored = self._score_subset(subset, sampled)
             del sampled
-            loss = g.get_loss_from_rollout_outputs(outputs)*(len(subset)/batch_size)
+            components = g.loss_components(outputs)
+            weight = len(subset)/batch_size
+            loss = components['total']*weight
+            for name in ('subtb','tb'):
+                component_values[name+'_loss'] += float(components[name].detach())*weight
             if not torch.isfinite(loss):
                 raise FloatingPointError('Nonfinite SubTB loss')
             loss.backward()
             loss_value += float(loss.detach())
             rewards.extend(outputs['log_rewards'].tolist()); lengths.extend(outputs['lengths'].tolist())
             retained.extend(zip(sources[start:start+micro_size], subset, rescored, outputs['states']))
-            del outputs, loss, rescored
+            del outputs, loss, rescored, components
         group_norms = {}
         for name, parameters in (('encoder',g.state_encoder.parameters()),
                                  ('policy',g.arg_model.parameters()),('flow',g.flow_head.parameters())):
@@ -176,10 +183,12 @@ class Trainer:
                     self.buffer.add(g.env, path, state, source, step)
         self.completed_updates = step
         return dict(step=step, loss=loss_value, grad_norm=float(norm), fresh=fresh,
+                    **component_values,gradient_clip_factor=min(1.,g.grad_clip/(float(norm)+1e-6)),
                     compatible_proposal=exploration, replay=replay,
                     policy_temperature=temperature, grad_accum_steps=grad_accum_steps,
                     policy_lr=used_lrs[0], flow_lr=used_lrs[1],
                     next_policy_lr=g.opt.param_groups[0]['lr'], next_flow_lr=g.opt.param_groups[1]['lr'],
+                    encoder_lr=used_lrs[2] if len(used_lrs)>2 else used_lrs[0],
                     gradient_clipped=bool(norm>g.grad_clip), **group_norms,
                     log_reward_mean=float(torch.tensor(rewards,dtype=torch.float64).mean()),
                     mean_events=float(torch.tensor(lengths,dtype=torch.float32).mean()),
