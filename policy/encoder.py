@@ -1,4 +1,4 @@
-"""One trainable SNP/material encoder used by policy and state flow."""
+"""SNP/material encoding and branch-local pooling for infinite-sites states."""
 from dataclasses import dataclass
 import torch
 from torch import nn
@@ -24,7 +24,7 @@ class PooledLineageCache:
     Retain only the preceding call's lookup. Surviving immutable sources reuse
     their pools; new parents are encoded afresh. The caller must discard this
     cache before another backward graph or parameter update. It is deliberately
-    not module/checkpoint state and must not be shared between rollouts.
+    not module/checkpoint state and must not be shared between rollouts or encoders.
     """
     def __init__(self):
         self.clear()

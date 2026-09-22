@@ -1,13 +1,13 @@
-# R1: fresh training with lambda 0.9, batch 128, and auxiliary TB weight 0.25.
+# R1: batch 128, lambda 0.9, auxiliary TB weight 0.25, and a fixed flow encoder.
 # Cluster root matches the R2/R4 configs.
 # python train.py --config config/paper_datasets/blp_r1_batch128/config.yaml
 dataset_path: validation/datasets/paper_datasets/r1/rep0
 resume_checkpoint: null
-output_path: runs/paper_datasets_stable/blp_r1_lambda09_batch128
+output_path: runs/paper_datasets_stable/blp_r1_lambda09_batch128_frozen_initial
 device: cuda
 cpu_threads: 8
 max_events: 10000
-epochs: 10000  # Fresh updates 1 through 6000, matching R1's cosine schedule.
+epochs: 10000  # Cosine decay through update 6000, then retain the minimum LR.
 max_wall_seconds: 169200
 batch_size: 128
 grad_accum_steps: 1  # One full batch of 128.
@@ -15,7 +15,7 @@ seed: 7
 verbose: true
 wandb: true
 wandb_project: ARG-Optimise
-wandb_name: blp_r1_lambda09_batch128
+wandb_name: blp_r1_lambda09_batch128_frozen_initial
 wandb_mode: online
 
 # SubTB + 0.25 * TB; retain R1's flow scaling and learning rates.
@@ -28,7 +28,9 @@ flow_scale_mode: empirical
 flow_lr: 0.001
 policy_lr: 0.0001
 encoder_lr: null
-flow_encoder_grad_scale: 1.0
+# The flow head always uses a frozen copy of the complete initial encoder.
+# Policy encoder and flow head learn from update 1; the copy never changes.
+flow_encoder_mode: frozen_initial
 grad_clip: 10.0
 flow_warmup_steps: 0
 flow_warmup_episodes: 128

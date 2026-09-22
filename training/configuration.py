@@ -12,6 +12,7 @@ DEFAULTS = dict(
     effective_population_size=None, mutation_rate=None, recombination_rate=None, reward_C=3000.,
     policy_lr=1e-4, flow_lr=1e-3, grad_clip=10., subtb_lambda=.9, init_z_sample_count=8, init_z_batch_size=32,
     encoder_lr=None, flow_encoder_grad_scale=1., tb_loss_weight=0., flow_scale_mode='fixed',
+    flow_encoder_mode='shared',
     replay_fraction=.25, replay_min_size=8, replay_capacity=2048, replay_grid_size=16,
     replay_per_topology=4, exploration_fraction=0., max_events=10000, chunk_steps=16,
     checkpoint_every=10, resume_checkpoint=None, cpu_threads=1, grad_accum_steps=1,
@@ -132,6 +133,8 @@ def resolve_config(options):
         raise ValueError('encoder_lr must be positive and finite')
     if not math.isfinite(c['flow_encoder_grad_scale']) or not 0 <= c['flow_encoder_grad_scale'] <= 1:
         raise ValueError('flow_encoder_grad_scale must be in [0,1]')
+    if c['flow_encoder_mode'] not in ('shared', 'frozen_initial'):
+        raise ValueError('flow_encoder_mode must be shared or frozen_initial')
     if not math.isfinite(c['tb_loss_weight']) or c['tb_loss_weight'] < 0:
         raise ValueError('tb_loss_weight must be finite and nonnegative')
     if c['flow_scale_mode'] not in ('fixed','empirical'):
@@ -156,14 +159,17 @@ def config_notes(c):
                 time_bins='Inactive: continuous waiting times have no bins.',
                 time_delta_bin_width='Inactive: continuous waiting times have no bin width.',
                 breakpoint_hidden_dim='Inactive: width of the retired nucleotide CNN. Use breakpoint_mixture_hidden_dim.',
-                flow_warmup_episodes='Inactive while flow_warmup_steps=0; frozen-encoder warm-up is retired.',
+                flow_warmup_episodes='Inactive: head-only flow prefit is unsupported; flow_warmup_steps must be 0.',
+                flow_encoder_mode='shared trains one encoder; frozen_initial gives the flow head a permanently fixed copy of the initial encoder.',
+                flow_encoder_grad_scale=('Inactive with frozen_initial: flow gradients never reach the policy encoder.'
+                    if c['flow_encoder_mode'] == 'frozen_initial' else 'Static multiplier on flow-to-shared-encoder gradients only.'),
                 evaluation='Reserved for eval/eval.py --config; periodic training evaluation uses eval_* and terminal_eval_*.',
                 breakpoint_mixture_layers='Number of hidden MLP layers on shared action/span features; no nucleotide CNN.',
                 breakpoint_gap_layers='Additional parameter-head hidden layers, using breakpoint_gap_hidden_size.')
 
 
 def parse_train_args(argv=None):
-    parser = argparse.ArgumentParser(description='Train the infinite-sites shared-encoder GFlowNet')
+    parser = argparse.ArgumentParser(description='Train the infinite-sites GFlowNet')
     parser.add_argument('--config')
     for key,default in {**DEFAULTS,**DEFAULT_MODEL}.items():
         if key in ('evaluation','epochs_num'):

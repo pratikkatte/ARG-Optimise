@@ -1,4 +1,4 @@
-"""Train an infinite-sites shared-encoder GFlowNet from an explicit YAML configuration."""
+"""Train an infinite-sites GFlowNet from an explicit YAML configuration."""
 import json
 from pathlib import Path
 import time
@@ -97,7 +97,7 @@ def train(dataset_path=None, output_path=None, device=None, **options):
         g = GFlowNetGenerator(env,device=c['device'],model_kwargs=c['model_kwargs'],
                 initialize_z_from_policy=False,**{k:c[k] for k in ('init_z_sample_count','policy_lr',
                      'flow_lr','grad_clip','subtb_lambda','loss_type','flow_head_version','flow_warmup_steps',
-                     'encoder_lr','flow_encoder_grad_scale','tb_loss_weight','flow_scale_mode')})
+                     'encoder_lr','flow_encoder_grad_scale','tb_loss_weight','flow_scale_mode','flow_encoder_mode')})
         if c['lr_schedule']=='cosine':
             g.scheduler = WarmupCosineScheduler(g.opt,lr_config(c))
     # Persist actual scientific rates, not just optional overrides or metadata paths.

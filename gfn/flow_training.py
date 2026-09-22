@@ -1,9 +1,9 @@
-"""The shared encoder is trained jointly; frozen-feature warm-up is retired."""
+"""Policy and flow head train jointly from the first update; no head-only prefit."""
 
 
 def warmup_flow(generator, steps, episodes=32, seed=100019):
     if steps != 0:
-        raise ValueError('Cached-feature flow warm-up is incompatible with the shared trainable encoder')
+        raise ValueError('Head-only flow prefit is unsupported in shared and frozen modes; train policy and flow head jointly')
     return {}
 
 

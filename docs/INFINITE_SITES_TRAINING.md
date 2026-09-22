@@ -1,6 +1,6 @@
 # Infinite-sites neural training (Phase 2)
 
-The policy and state flow now use **one shared trainable encoder**. This supports fresh SubTB training, compatible exploration, topology-diverse replay, self-contained checkpoints, resumed training, inference, and optional truth evaluation. These workflows accept a simulator replicate directory containing VCF, exact position map, and metadata. FASTA inputs and JC69 checkpoints are rejected.
+The policy and state flow use **one shared trainable encoder by default**. Set `flow_encoder_mode: frozen_initial` to give the flow head a permanently frozen copy of the complete initial encoder. Both modes support fresh SubTB training, compatible exploration, topology-diverse replay, self-contained checkpoints, resumed training, inference, and optional truth evaluation. These workflows accept a simulator replicate directory containing VCF, exact position map, and metadata. FASTA inputs and JC69 checkpoints are rejected.
 
 ## Start a run
 
@@ -89,6 +89,8 @@ All declared YAML keys also have CLI overrides, except the nested `evaluation` m
 | `continuous_time_head`, `time_hidden_dim`, `time_layers` | Gamma, Gamma-mixture, or exponential head, hidden width and hidden-layer count. The full physical Hudson rate remains the baseline. |
 | `time_mixture_components` | Number of components when `continuous_time_head: gamma_mixture`. Each component learns its mean and shape. Policy scores marginalize component identity with logsumexp; components are not additional ARG actions. Existing Gamma/exponential heads are unchanged. |
 | `policy_lr`, `flow_lr`, `subtb_lambda`, `grad_clip` | Shared/policy and flow-head learning rates, all-segment SubTB weighting, and global clipping threshold. Per-component unclipped norms are logged. |
+| `flow_encoder_mode` | `shared` (default) or `frozen_initial`. The latter copies the entire initial encoder without consuming additional initialization randomness, freezes it permanently, and trains the policy and flow head from the first optimizer update. |
+| `flow_encoder_grad_scale`, `encoder_lr` | Static flow-to-encoder gradient multiplier in shared mode only; inactive in frozen mode. Optional separate learning rate for the trainable policy encoder. |
 | `init_z_sample_count` | Number of initial-policy trajectories defining fixed flow-centering/scaling buffers. There is no separate scalar Z. |
 | `effective_population_size`, `mutation_rate`, `recombination_rate`, `reward_C` | Explicit scientific overrides and reward offset. Omitted rates come from the dataset metadata. |
 | `wandb`, `wandb_project`, `wandb_entity`, `wandb_name`, `wandb_mode`, `verbose` | Optional W&B logging and console output. Offline mode is supported. JSONL output is always written. |
@@ -99,7 +101,7 @@ All declared YAML keys also have CLI overrides, except the nested `evaluation` m
 The older file cannot be used unchanged: its FASTA path, `flow_head_version: 5`, and `breakpoint_dropout: 0.1` need replacement. The new file makes these changes explicitly.
 
 - `dataset_path` must identify an infinite-sites replicate directory. The selected legacy file's 2 kb rates must not be mistaken for the 5 kb rep0 rates.
-- `flow_head_version` must be **6**; version 5 identifies the retired flow architecture. `flow_warmup_steps` must be zero because frozen-feature warm-up is incompatible with a shared trainable encoder.
+- `flow_head_version` must be **6**; version 5 identifies the retired flow architecture. `flow_warmup_steps` must be zero: neither encoder mode supports a head-only prefit phase.
 - `dropout`, `attention_dropout`, and `breakpoint_dropout` must be zero. Stochastic masks would make sampled, replayed, and gradient-recomputed policy scores inconsistent. Nonzero values are rejected rather than quietly disabled.
 - `time_bins` and `time_delta_bin_width` are accepted legacy fields, explicitly recorded as **inactive** under continuous timing.
 - `breakpoint_hidden_dim` is accepted and recorded as **inactive**: it controlled the retired nucleotide CNN. Use the mixture/gap widths for the current head.
@@ -128,7 +130,11 @@ python3 eval/eval.py --config config/config_infinite_sites_rep0_cosine_replay.ya
 
 Separate two-layer MLPs pool SNPs by mean and maximum, and material intervals by length-weighted mean and maximum. Empty SNP pools are zero with an explicit `has_snps` scalar; their material is still encoded. Time, lineage age, material length, span, interval count, and SNP count accompany the pools. Messages remain defined at their stored node time. Network widths depend on sample count, not the number of SNPs or physical bases; models remain specific to one observed dataset.
 
-The projected lineage embeddings and a summary token enter the lineage Transformer. A shared state representation then feeds separate action and flow heads. The encoder is registered once and receives gradients from both. Its parameters use the policy learning rate; the flow head has its own optimizer group. An optional internal cache retains only immutable numerical input features, with weak references and a bounded byte budget. Age and state statistics are refreshed, and learned embeddings are always recomputed.
+The projected lineage embeddings and a summary token enter the lineage Transformer. In `shared` mode, one state representation feeds separate action and flow heads; both branches can update the encoder. Its parameters use the policy learning rate unless `encoder_lr` is specified; the flow head has its own optimizer group.
+
+In `frozen_initial` mode, the flow branch deep-copies the entire initial `InfiniteSitesEncoder`: SNP and material encoders, projections, summary token, and Transformer. This copy has independent storage, remains in evaluation mode even after `generator.train()`, and runs under `no_grad`. It is never synchronized with the policy encoder or unfrozen, and its parameters are excluded from the optimizer. Source and intermediate flows use its frozen summary plus current state features in the unchanged trainable flow head. Policy gradients update the live encoder; flow gradients update the flow head. Both trainable branches use the existing objective from update one, with the same initialization, learning rates, and global gradient clipping. Policy-only sampling skips the frozen encoder entirely.
+
+The raw observation cache contains only immutable numerical inputs, with weak references and a bounded byte budget, and can be shared between branches. Each encoder has a separate pooled-embedding cache scoped to one rollout/microbatch graph. Each branch assembles its missing raw observations against its own cache; frozen features never reuse policy embeddings. Age and state statistics are refreshed at every state, and both pooled caches are discarded before a new microbatch or parameter update.
 
 The policy factors into event, pair/lineage, breakpoint, and waiting-time terms. Event logits use **allowed** hazard totals plus learned residuals. Coalescence choices are compatible pairs; recombination lineage baselines are their physical link counts. The breakpoint head is a four-component mixture of truncated discretized logistics over the entire integer span, including trapped gaps and SNP-free intervals. The Gamma timing head (or the configurable exponential head) uses the **unmasked physical** Hudson rate as its baseline. All four factors are normalized and accumulated in float64. The environment independently scores the physical prior, with no compatibility adjustment.
 
@@ -138,17 +144,21 @@ For unfinished states:
 
 ```
 log F(s) = C + accumulated_log_prior + Phi(s)
-           + w(s) * (B0 - C) + sigma * flow_head(shared_features)
+           + w(s) * (B0 - C) + sigma * flow_head(flow_summary, state_features)
 w(s) = (total_carried_length / physical_length - 1) / (sample_count - 1)
 ```
 
-`Phi` is the Phase 1 closed-edge potential. `B0` is the mean initial-policy `log R - log PF`; `sigma` is the corresponding standard deviation, bounded below by one for scaling the flow output. These are fixed initialization buffers, not exact estimates of the evidence. The source flow is learned with the shared network and has no separate scalar log-Z parameter. The terminal boundary equals the exact log reward. The potential is not a likelihood marginalized over future completions.
+`Phi` is the Phase 1 closed-edge potential. `B0` is the mean initial-policy `log R - log PF`; `sigma` is one in `flow_scale_mode: fixed`, or the corresponding standard deviation bounded below by one in `empirical` mode. These are fixed initialization buffers, not exact estimates of the evidence. The source flow uses the same selected encoder branch and flow head as intermediate states, with no separate scalar log-Z parameter. The terminal boundary equals the exact log reward. The potential is not a likelihood marginalized over future completions.
 
-Training differentiates the exact all-segment SubTB loss directly through the full trajectory graphs in each microbatch. There is no SubTB window or chunked score recomputation. This removes a neural scoring pass at the cost of retaining activations for all events in that microbatch. Increase `grad_accum_steps` to reduce concurrent trajectories if needed; a single long trajectory must still fit in memory. Legacy `chunk_steps` values have no effect, including on resume. Tests compare direct gradients with the former chunked calculation. The architecture has no dropout. Frozen-feature flow warm-up is rejected.
+Training differentiates the exact all-segment SubTB loss directly through the full trajectory graphs in each microbatch. There is no SubTB window or chunked score recomputation. This removes a neural scoring pass at the cost of retaining activations for all events in that microbatch. Increase `grad_accum_steps` to reduce concurrent trajectories if needed; a single long trajectory must still fit in memory. Legacy `chunk_steps` values have no effect, including on resume. Tests compare direct gradients with the former chunked calculation. The architecture has no dropout. Head-only prefit is rejected in both encoder modes. The discarded gradient warm-up/ramp options (`flow_encoder_warmup_steps`, `flow_encoder_ramp_steps`) are no longer supported.
 
 ## Checkpoints and verification
 
 Checkpoints store the observed binary matrix, float64 positions, haplotype order, allele labels, physical length, rates, fingerprint, model/feature/flow versions, weights, optimizer, scheduler, replay, and RNG states. They contain no ground-truth ancestry. Replay schema 2 stores timed actions, exact prior and reward, proposal provenance and density, and topology signatures; current neural scores are always recomputed.
+
+Checkpoint schema 2 and flow-head version 6 are unchanged. `generator_config.flow_encoder_mode` explicitly records the encoder mode; a missing field means legacy shared behavior. Frozen checkpoints include the complete frozen encoder weights, restored directly on resume rather than copied from the trained policy encoder. Loading or resuming across modes is rejected. Checkpoints containing the discarded flow-gradient warm-up schedule are rejected, including for evaluation/inference; start a fresh run instead of silently converting them.
+
+The R1 experiment at `config/paper_datasets/blp_r1_batch128/config.yaml` selects `frozen_initial`, batch 128, SubTB lambda 0.9, and auxiliary TB weight 0.25, with no resume or prefit. See its adjacent README for full and reduced CPU run commands. The extra encoder requires another forward pass when flows are requested and extra parameter/checkpoint storage; no training activations are retained for that frozen branch.
 
 Fast scientific and neural checks:
 

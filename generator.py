@@ -1,4 +1,4 @@
-"""Shared-encoder infinite-sites GFlowNet. All scientific state lives in env."""
+"""Infinite-sites GFlowNet with shared or permanently frozen flow encoding."""
 import math
 import time
 from dataclasses import replace
@@ -9,6 +9,7 @@ from policy.encoder import InfiniteSitesEncoder, mlp
 from policy.models import ARGModel
 from policy.observations import pack_states, STATE_DIM, FEATURE_VERSION, RawObservationCache
 from gfn.subtb import geometric_subtb_loss
+from gfn.flow_encoder import FrozenFlowEncoder
 
 MODEL_VERSION = 'infinite-sites-shared-v1'
 FLOW_VERSION = 6
@@ -61,10 +62,14 @@ class GFlowNetGenerator(nn.Module):
                  policy_lr=1e-4, flow_lr=1e-3, grad_clip=10., subtb_lambda=.9,
                  initialize_z_from_policy=True, loss_type='subtb', flow_head_version=FLOW_VERSION,
                  flow_warmup_steps=0, verbose=False, encoder_lr=None,
-                 flow_encoder_grad_scale=1., tb_loss_weight=0., flow_scale_mode='fixed'):
+                 flow_encoder_grad_scale=1., tb_loss_weight=0., flow_scale_mode='fixed',
+                 flow_encoder_mode='shared'):
         super().__init__()
         if loss_type != 'subtb' or flow_head_version != FLOW_VERSION or flow_warmup_steps != 0:
-            raise ValueError('Infinite sites requires shared-encoder SubTB v6 without cached flow warm-up')
+            raise ValueError('Infinite sites requires SubTB v6 without head-only flow prefit')
+        if flow_encoder_mode not in ('shared', 'frozen_initial'):
+            raise ValueError('flow_encoder_mode must be shared or frozen_initial')
+        self.flow_encoder_mode = flow_encoder_mode
         self.device = torch.device(device)
         if self.device.type not in ('cpu', 'cuda'):
             raise ValueError('Float64 scoring requires CPU or CUDA; MPS is unsupported')
@@ -98,6 +103,8 @@ class GFlowNetGenerator(nn.Module):
         self.state_encoder = InfiniteSitesEncoder(env.num_sequences, **{k:cfg[k] for k in
                                 ('embedding_size','hidden_size','transformer_depth','transformer_heads',
                                  'transformer_mlp_ratio','dropout','attention_dropout')})
+        self.flow_encoder = (FrozenFlowEncoder(self.state_encoder)
+                             if flow_encoder_mode == 'frozen_initial' else None)
         self.arg_model = ARGModel(**{k:cfg[k] for k in
                                  ('embedding_size','hidden_size','breakpoint_mixture_components',
                                   'breakpoint_mixture_hidden_dim','breakpoint_mixture_layers',
@@ -127,6 +134,11 @@ class GFlowNetGenerator(nn.Module):
             self.initialize_flow_center(verbose=verbose)
 
     def encode(self, states, *, pooled_cache=None):
+        return self._encode(states, self.state_encoder, pooled_cache=pooled_cache)
+
+    def _encode(self, states, encoder, *, pooled_cache=None):
+        # Each branch prepares missing raw rows against its own learned cache.
+        # Only the nonlearned raw observation cache is shared between branches.
         nodes = [node for state in states for node in state.active_lineages] if pooled_cache is not None else None
         plan = pooled_cache.prepare(nodes) if pooled_cache is not None else None
         batch = pack_states(self.env, states, self.device, cache=self._observation_cache,
@@ -141,12 +153,20 @@ class GFlowNetGenerator(nn.Module):
             batch = replace(batch, observations=replace(batch.observations, state_scalars=stable))
         pooled = None
         if pooled_cache is not None:
-            pooled = pooled_cache.get(self.state_encoder, batch.observations, nodes, plan=plan)
-        lineage, summary = self.state_encoder(batch.observations, pooled_embeddings=pooled)
+            pooled = pooled_cache.get(encoder, batch.observations, nodes, plan=plan)
+        lineage, summary = encoder(batch.observations, pooled_embeddings=pooled)
         return batch, lineage, summary
 
-    def state_flows(self, states, summary, observations):
-        summary = summary.detach()+self.flow_encoder_grad_scale*(summary-summary.detach())
+    def state_flows(self, states, summary=None, observations=None, *, flow_pooled_cache=None):
+        if self.flow_encoder is not None:
+            batch, _, summary = self._encode(states, self.flow_encoder, pooled_cache=flow_pooled_cache)
+            observations = batch.observations
+        else:
+            if summary is None or observations is None:
+                batch, _, summary = self.encode(states)
+                observations = batch.observations
+            # This control applies only to the shared trainable encoder.
+            summary = summary.detach()+self.flow_encoder_grad_scale*(summary-summary.detach())
         residual = self.flow_head(torch.cat((summary, observations.state_scalars), -1)).squeeze(-1).double()
         prior = residual.new_tensor([s.accumulated_log_prior for s in states])
         potential = residual.new_tensor([s.partial_log_likelihood for s in states])
@@ -158,16 +178,19 @@ class GFlowNetGenerator(nn.Module):
         reward = value.new_tensor([s.log_reward if s.is_done else 0. for s in states])
         return torch.where(terminal, reward, value)
 
-    def forward(self, states, *, forced_actions=None, return_flows=False, temperature=1.0, pooled_cache=None):
+    def forward(self, states, *, forced_actions=None, return_flows=False, temperature=1.0,
+                pooled_cache=None, flow_pooled_cache=None):
+        if pooled_cache is not None and flow_pooled_cache is pooled_cache:
+            raise ValueError('Policy and flow encoders require separate pooled caches')
         batch, lineages, summary = self.encode(states, pooled_cache=pooled_cache)
         log_pf, actions, factors = self.arg_model(self.env, states, batch, lineages, summary, forced_actions, temperature)
-        flow = self.state_flows(states, summary, batch.observations) if return_flows else None
+        flow = self.state_flows(states, summary, batch.observations,
+                               flow_pooled_cache=flow_pooled_cache) if return_flows else None
         return dict(log_pf=log_pf, actions=actions, factors=factors, flows=flow)
 
     def compute_log_Z(self):
         states = [self.env.get_initial_state()]
-        batch, _, summary = self.encode(states)
-        return self.state_flows(states, summary, batch.observations)[0]
+        return self.state_flows(states)[0]
 
     def compute_event_probabilities(self, state):
         if state.is_done:

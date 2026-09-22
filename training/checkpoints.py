@@ -45,10 +45,29 @@ def validate_metadata(metadata):
     from generator import MODEL_VERSION, FLOW_VERSION
     if (metadata.get('model_version') != MODEL_VERSION or metadata.get('mutation_model') != 'infinite_sites'
             or metadata.get('feature_version') != FEATURE_VERSION or metadata.get('flow_head_version') != FLOW_VERSION):
-        raise ValueError('Incompatible checkpoint: a new infinite-sites shared-encoder checkpoint is required; JC69 is retired')
+        raise ValueError('Incompatible checkpoint: an infinite-sites v6 checkpoint is required; JC69 is retired')
     required = {'observations','environment','environment_fingerprint','model','generator_config'}
     if not required <= metadata.keys():
         raise ValueError('Incomplete infinite-sites checkpoint metadata')
+    mode = metadata['generator_config'].get('flow_encoder_mode', 'shared')
+    if mode not in ('shared', 'frozen_initial'):
+        raise ValueError('Checkpoint flow_encoder_mode must be shared or frozen_initial')
+    retired = {'flow_encoder_warmup_steps', 'flow_encoder_ramp_steps'}
+    for key in ('generator_config', 'resolved_config', 'run_config'):
+        config = metadata.get(key) or {}
+        if retired.intersection(config):
+            raise ValueError('Discarded flow-gradient warm-up checkpoint cannot be loaded; start a fresh run')
+    resolved = metadata.get('resolved_config')
+    if resolved is not None and resolved.get('flow_encoder_mode', 'shared') != mode:
+        raise ValueError('Checkpoint encoder mode disagrees with resolved configuration')
+
+
+def validate_checkpoint(data):
+    if not isinstance(data, dict) or data.get('schema_version') != SCHEMA_VERSION:
+        raise ValueError('Incompatible checkpoint schema; JC69 checkpoints cannot be migrated')
+    validate_metadata(data.get('metadata', {}))
+    if 'flow_encoder_gradient' in (data.get('trainer') or {}):
+        raise ValueError('Discarded flow-gradient warm-up checkpoint cannot be loaded; start a fresh run')
 
 
 def environment_from_metadata(metadata, seed=7, device=None):
@@ -73,6 +92,7 @@ def save_checkpoint(path, generator, trainer=None, metadata=None):
                                    grad_clip=generator.grad_clip, subtb_lambda=generator.subtb_lambda,
                                    init_z_sample_count=generator.init_z_sample_count,
                                    encoder_lr=generator.encoder_lr,
+                                   flow_encoder_mode=generator.flow_encoder_mode,
                                    flow_encoder_grad_scale=generator.flow_encoder_grad_scale,
                                    tb_loss_weight=generator.tb_loss_weight,
                                    flow_scale_mode=generator.flow_scale_mode)}
@@ -80,6 +100,7 @@ def save_checkpoint(path, generator, trainer=None, metadata=None):
                 opt_state_dict=generator.opt.state_dict(), rng=rng_state(generator.env),
                 scheduler=generator.scheduler.state_dict() if generator.scheduler is not None else None,
                 trainer=trainer.state_dict() if trainer is not None else None)
+    validate_checkpoint(data)
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix+'.tmp')
     torch.save(data, temporary); temporary.replace(path)
@@ -88,17 +109,15 @@ def save_checkpoint(path, generator, trainer=None, metadata=None):
 
 def load_checkpoint(path, map_location='cpu'):
     data = torch.load(path, map_location=map_location, weights_only=False)
-    if not isinstance(data, dict) or data.get('schema_version') != SCHEMA_VERSION:
-        raise ValueError('Incompatible checkpoint schema; JC69 checkpoints cannot be migrated')
-    validate_metadata(data.get('metadata', {}))
+    validate_checkpoint(data)
     return data
 
 
 def restore_generator(generator, data, load_optimizer=True):
-    if data.get('schema_version') != SCHEMA_VERSION:
-        raise ValueError('Incompatible checkpoint schema')
-    validate_metadata(data['metadata'])
+    validate_checkpoint(data)
     metadata = data['metadata']
+    if metadata['generator_config'].get('flow_encoder_mode', 'shared') != generator.flow_encoder_mode:
+        raise ValueError('Checkpoint flow_encoder_mode differs; cross-mode loading is unsupported')
     if metadata['environment_fingerprint'] != generator.env.dataset_fingerprint:
         raise ValueError('Checkpoint observations or environment differ')
     from generator import checkpoint_model_config
@@ -118,6 +137,7 @@ def restore_generator(generator, data, load_optimizer=True):
 
 def generator_from_checkpoint(data, device='cpu', seed=7, optimizer=False, restore_random=False):
     from generator import GFlowNetGenerator, checkpoint_model_config
+    validate_checkpoint(data)
     env = environment_from_metadata(data['metadata'], seed)
     generator = GFlowNetGenerator(env, device=device, model_kwargs=checkpoint_model_config(data['metadata']['model']),
                  initialize_z_from_policy=False, **{'flow_scale_mode':'empirical',

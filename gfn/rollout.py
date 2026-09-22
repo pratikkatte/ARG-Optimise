@@ -21,7 +21,8 @@ class RolloutWorker:
             raise ValueError('max_events must be positive')
         self.max_events = int(max_events)
 
-    def _walk(self, generator, episodes, fixed=None, collect_flows=False, temperature=1.0, *, pooled_cache=None):
+    def _walk(self, generator, episodes, fixed=None, collect_flows=False, temperature=1.0, *,
+              pooled_cache=None, flow_pooled_cache=None):
         states = [self.env.get_initial_state() for _ in range(episodes)]
         paths = [SimpleTrajectory() for _ in states]
         while True:
@@ -38,7 +39,8 @@ class RolloutWorker:
                     actions = [fixed[i][len(paths[i])] for i in rows]
                 active = [states[i] for i in rows]
                 outputs = generator(active, forced_actions=actions, return_flows=collect_flows,
-                                    temperature=temperature, pooled_cache=pooled_cache)
+                                    temperature=temperature, pooled_cache=pooled_cache,
+                                    flow_pooled_cache=flow_pooled_cache)
                 proposal_scores = outputs['log_pf'].detach().tolist()
                 for k, (row, action) in enumerate(zip(rows, outputs['actions'])):
                     state, prior = self.env.step_owned_state(states[row], action)
@@ -64,9 +66,12 @@ class RolloutWorker:
         # One _run belongs to one microbatch backward graph. No cache escapes
         # into the next microbatch, a tempered rescore, or an optimizer update.
         cache = PooledLineageCache() if self.cache_pooled_embeddings else None
+        flow_cache = (PooledLineageCache() if self.cache_pooled_embeddings and collect_flows
+                      and generator.flow_encoder_mode == 'frozen_initial' else None)
         try:
             for rows, output, states, paths in self._walk(
-                    generator, episodes, fixed, collect_flows, temperature, pooled_cache=cache):
+                    generator, episodes, fixed, collect_flows, temperature,
+                    pooled_cache=cache, flow_pooled_cache=flow_cache):
                 for k, row in enumerate(rows):
                     pf[row].append(output['log_pf'][k])
                     factors[row].append(output['factors'][k])
@@ -75,6 +80,8 @@ class RolloutWorker:
         finally:
             if cache is not None:
                 cache.clear()
+            if flow_cache is not None:
+                flow_cache.clear()
         rewards = torch.tensor([s.log_reward for s in states], dtype=torch.float64, device=generator.device)
         lengths = torch.tensor([len(p) for p in paths], dtype=torch.long, device=generator.device)
         scores = pad_sequence([torch.stack(p) for p in pf], batch_first=True)

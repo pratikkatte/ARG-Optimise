@@ -202,6 +202,8 @@ class Trainer:
                     replay=self.buffer.state_dict() if self.buffer is not None else None)
 
     def load_state_dict(self, data):
+        if 'flow_encoder_gradient' in data:
+            raise ValueError('Discarded flow-gradient warm-up checkpoint cannot be resumed; start a fresh run')
         if data.get('schema_version') != self.schema_version or data['config'] != asdict(self.config):
             raise ValueError('Incompatible infinite-sites trainer checkpoint')
         self.completed_updates = int(data['completed_updates'])
