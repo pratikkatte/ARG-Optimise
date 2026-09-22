@@ -1,13 +1,13 @@
 # R1: fresh training with lambda 0.9, batch 128, and auxiliary TB weight 0.25.
 # Cluster root matches the R2/R4 configs.
 # python train.py --config config/paper_datasets/blp_r1_batch128/config.yaml
-dataset_path: /u/pratikkatte7/ARG-Optimise/validation/datasets/paper_datasets/r1/rep0
+dataset_path: validation/datasets/paper_datasets/r1/rep0
 resume_checkpoint: null
-output_path: /u/pratikkatte7/ARG-Optimise/runs/paper_datasets_stable/blp_r1_lambda09_batch128_tb025_fresh
+output_path: runs/paper_datasets_stable/blp_r1_lambda09_batch128
 device: cuda
-cpu_threads: 1
+cpu_threads: 8
 max_events: 10000
-epochs: 6000  # Fresh updates 1 through 6000, matching R1's cosine schedule.
+epochs: 10000  # Fresh updates 1 through 6000, matching R1's cosine schedule.
 max_wall_seconds: 169200
 batch_size: 128
 grad_accum_steps: 1  # One full batch of 128.
@@ -15,7 +15,7 @@ seed: 7
 verbose: true
 wandb: true
 wandb_project: ARG-Optimise
-wandb_name: blp_r1_lambda09_batch128_tb025_fresh
+wandb_name: blp_r1_lambda09_batch128
 wandb_mode: online
 
 # SubTB + 0.25 * TB; retain R1's flow scaling and learning rates.
@@ -83,7 +83,7 @@ reward_C: 3000.0
 time_policy: cwr_exponential
 continuous_time_head: gamma_mixture
 time_mixture_components: 4
-time_layers: 2
+time_layers: 4
 time_parameterization: legacy
 
 # Preserve R1's six-layer architecture and feature representation.
