@@ -97,7 +97,7 @@ def evaluate_infinite_sites(tree_sequence, data: SNPData, *, mutation_rate, samp
                     raise ValueError("candidate branches must have finite positive durations")
                 proper_branches.append(branch)
                 by_pattern.setdefault(bits, []).append(branch)
-        interval_exposures.append(tree.span * math.fsum(proper_branches))
+        interval_exposures.append(data.observed_span(*tree.interval) * math.fsum(proper_branches))
         start, end = np.searchsorted(data.positions, [tree.interval.left, tree.interval.right], side="left")
         for index in range(int(start), int(end)):
             lengths[index] = math.fsum(by_pattern.get(targets[index], ()))

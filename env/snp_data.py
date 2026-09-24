@@ -1,4 +1,4 @@
-"""Lossless observations from the standalone infinite-sites simulator.
+"""Lossless polarized observations from simulation or explicit real-data bundles.
 
 Physical coordinates and observation indices are deliberately independent.
 This module reads no ancestry, mutation placements, or ground-truth trees.
@@ -6,6 +6,7 @@ This module reads no ancestry, mutation placements, or ground-truth trees.
 from __future__ import annotations
 
 import csv
+from bisect import bisect_right
 import json
 import math
 from dataclasses import dataclass
@@ -16,10 +17,11 @@ import numpy as np
 
 @dataclass(frozen=True, eq=False)
 class SNPData:
-    """Polarized, fully observed SNPs; rows are haplotypes, columns are sites.
+    """Complete polarized SNP calls; rows are haplotypes, columns are sites.
 
     Arrays are copied and made read-only on construction. Nucleotide labels
     are retained for provenance; likelihood calculations use the 0/1 patterns.
+    Optional observation intervals mask mutation exposure, never physical space.
     """
 
     genotypes: np.ndarray
@@ -30,6 +32,7 @@ class SNPData:
     derived_states: tuple[str, ...]
     haplotype_ids: tuple[str, ...]
     contig_id: str = "1"
+    observation_intervals: tuple[tuple[float, float], ...] | None = None
 
     def __post_init__(self):
         try:
@@ -73,6 +76,34 @@ class SNPData:
             raise ValueError("haplotype_ids must be unique nonempty strings, one per row")
         if not isinstance(self.contig_id, str) or not self.contig_id:
             raise ValueError("contig_id must be a nonempty string")
+        intervals = None
+        if self.observation_intervals is not None:
+            try:
+                intervals = tuple(tuple(map(float, interval)) for interval in self.observation_intervals)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("invalid observation_intervals") from None
+            previous = 0.
+            for interval in intervals:
+                if (len(interval) != 2 or not all(math.isfinite(x) for x in interval)
+                        or not 0 <= interval[0] < interval[1] <= length or interval[0] < previous):
+                    raise ValueError("observation_intervals must be sorted disjoint intervals within the sequence")
+                previous = interval[1]
+            if intervals == ((0., length),):
+                intervals = None
+        object.__setattr__(self, "observation_intervals", intervals)
+        spans = intervals if intervals is not None else ((0., length),)
+        starts, cumulative, total = [], [], 0.
+        for left, right in spans:
+            starts.append(left)
+            cumulative.append(total)
+            total += right - left
+        object.__setattr__(self, "_observation_starts", tuple(starts))
+        object.__setattr__(self, "_observation_cumulative", tuple(cumulative))
+        if intervals is not None:
+            for position in positions:
+                i = bisect_right(starts, position) - 1
+                if i < 0 or position >= intervals[i][1]:
+                    raise ValueError("every recorded SNP must lie in an observation interval")
         genotypes.setflags(write=False)
         positions.setflags(write=False)
         for name, value in (("genotypes", genotypes), ("positions", positions),
@@ -88,6 +119,18 @@ class SNPData:
     @property
     def num_variants(self):
         return self.genotypes.shape[1]
+
+    def observed_span(self, left, right):
+        """Observed bp in [left, right); physical ancestry/recombination is unchanged."""
+        if self.observation_intervals is None:
+            return right - left
+        def prefix(x):
+            i = bisect_right(self._observation_starts, x) - 1
+            if i < 0:
+                return 0.
+            a, b = self.observation_intervals[i]
+            return self._observation_cumulative[i] + min(x - a, b - a)
+        return prefix(right) - prefix(left)
 
 
 def _integer(value, description, minimum=0):
@@ -187,15 +230,19 @@ def _read_vcf(path, contig_id, mapping):
 
 
 def load_snp_dataset(replicate_dir) -> SNPData:
-    """Read a schema-v1 simulator bundle, without opening its ground-truth files.
+    """Read a simulator bundle or a schema-v2 observed-data bundle, without truth.
 
     REF is ancestral only because the simulator explicitly guarantees it.
-    General VCFs, missing observations and unknown polarization are unsupported.
+    Schema-v2 real data require explicit ancestral annotations and observation
+    intervals. Arbitrary VCFs, missing SNP calls and unknown polarization are unsupported.
     VCF POS and contig length are export coordinates, never physical geometry.
     """
     directory = Path(replicate_dir).expanduser()
     with (directory / "metadata.json").open() as handle:
         metadata = json.load(handle)
+    if isinstance(metadata, dict) and metadata.get("dataset_type") == "observed_human_variation":
+        from .real_data import load_real_snp_dataset
+        return load_real_snp_dataset(directory, metadata)
     if not isinstance(metadata, dict) or type(metadata.get("schema_version")) is not int or metadata["schema_version"] != 1:
         raise ValueError("expected simulator metadata schema_version 1")
     if (metadata.get("mutation_model") != "infinite_sites"

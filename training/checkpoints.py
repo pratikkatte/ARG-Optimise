@@ -35,7 +35,8 @@ def environment_metadata(env):
                 observations=dict(genotypes=torch.tensor(d.genotypes.copy(), dtype=torch.uint8),
                     positions=torch.tensor(d.positions.copy(), dtype=torch.float64), sequence_length=d.sequence_length,
                     site_ids=d.site_ids, ancestral_states=d.ancestral_states, derived_states=d.derived_states,
-                    haplotype_ids=d.haplotype_ids, contig_id=d.contig_id),
+                    haplotype_ids=d.haplotype_ids, contig_id=d.contig_id,
+                    observation_intervals=d.observation_intervals),
                 environment=dict(population_size=env.population_size, mutation_rate=env.mutation_rate,
                     recombination_rate=env.recombination_rate, reward_C=env.reward_fn.C,
                     bp_per_blocks=1, time_policy='cwr_exponential', arg_prior='hudson'))

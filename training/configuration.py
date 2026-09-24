@@ -22,7 +22,7 @@ DEFAULTS = dict(
     lr_warmup_start_factor=.1, lr_min_factor=.1,
     policy_temperature_schedule='constant', policy_temperature_start=1., policy_temperature_anneal_steps=0,
     eval_episodes=0, eval_every=50, eval_batch_size=2, eval_seed=100007,
-    eval_async=False, eval_async_device='cpu', eval_async_shutdown_seconds=1800.,
+    eval_async=False, eval_async_device='cuda', eval_async_shutdown_seconds=1800.,
     eval_initial=False, best_checkpoint_metric='eval_log_weight_std', max_wall_seconds=0.,
     eval_density_slope=True, eval_independent_likelihood=True,
     terminal_eval=False, terminal_eval_grid_size=100, terminal_eval_repeats=1,

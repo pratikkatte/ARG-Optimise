@@ -53,7 +53,7 @@ class InfiniteSitesTracker:
             # A coalescent parent contains all of each child. A recombination
             # parent's descendants are already the required restricted child.
             relevant = child.descendants if len(children) == 2 else node.descendants
-            exposures.append(dt * sum(r - l for l, r, bits in relevant.segments
+            exposures.append(dt * sum(self.env.snp_data.observed_span(l, r) for l, r, bits in relevant.segments
                                       if bits != self.env.all_samples))
             # Sorted SNP indices have known subset relationships. Keep exactly
             # the original row/child order without concatenate/sort/intersect.

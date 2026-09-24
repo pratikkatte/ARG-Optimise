@@ -116,6 +116,11 @@ class SimpleARGEnvironment:
         h.update(repr((snp_data.haplotype_ids, snp_data.site_ids, self.sequence_length,
                        self.population_size, self.mutation_rate, self.recombination_rate,
                        self.reward_fn.C)).encode())
+        # Preserve existing fully observed checkpoint identities. Masks alter
+        # the likelihood, so masked datasets must have distinct identities.
+        if snp_data.observation_intervals is not None:
+            h.update(b'observation_intervals_v1')
+            h.update(repr(snp_data.observation_intervals).encode())
         self.dataset_fingerprint = h.hexdigest()
         self._validate_observation_support()
         self.likelihood_tracker = InfiniteSitesTracker(self)
