@@ -11,6 +11,7 @@ from env.actions import CoalescenceChoice
 from env.env import SimpleARGEnvironment
 from env.infinite_sites import evaluate_infinite_sites
 from env.snp_data import SNPData
+from env.time_env import TimeEnvCwrExponential
 from infer import validate_terminal, TerminalValidationError
 from policy.time_model import CwrGammaMixtureTimeModel
 from training.checkpoints import load_checkpoint, generator_from_checkpoint
@@ -23,6 +24,44 @@ from train import train
 @pytest.fixture(autouse=True)
 def single_thread():
     torch.set_num_threads(1)
+
+
+@pytest.mark.parametrize('current,wait', [(1., 1e-300), (1., math.ulp(1.) / 2), (1e20, 1.)])
+def test_positive_wait_below_timestamp_precision(current, wait):
+    assert current + wait == current
+    assert TimeEnvCwrExponential().event_time(current, wait) == math.nextafter(current, math.inf)
+
+
+@pytest.mark.parametrize('current,wait', [
+    (math.inf, 1.), (math.nan, 1.), (-1., 1.), (1e308, 1e308),
+    (float.fromhex('0x1.fffffffffffffp+1023'), 1.),
+    (1., 0.), (1., -1.), (1., math.inf), (1., math.nan),
+])
+def test_invalid_event_times_still_fail(current, wait):
+    with pytest.raises(ValueError):
+        TimeEnvCwrExponential().event_time(current, wait)
+
+
+def test_tiny_wait_rollout_preserves_sampled_density_and_replay():
+    g = model(time_parameterization='legacy')
+    worker = RolloutWorker(g.env)
+    # First event establishes a nonzero clock; the next positive wait rounds away.
+    with patch.object(g.arg_model.time_head, '_draw', side_effect=[
+        torch.tensor([1.], dtype=torch.float64),
+        torch.tensor([1e-300], dtype=torch.float64),
+    ]), torch.no_grad():
+        sampled, paths = worker.rollout(g, return_states=True)
+    state = sampled['states'][0]
+    assert state.current_time == math.nextafter(1., math.inf)
+    assert paths[0].actions[-1].delta_t == 1e-300
+    assert state.actions[-1].delta_t == 1e-300
+    assert g.count_backward_parents(state) == 1
+    validate_terminal(g.env, state)
+    with torch.no_grad():
+        replayed, _ = worker.replay(g, paths, collect_flows=False, return_states=True)
+    for key in ('log_paths_pf', 'log_rewards', 'log_factors'):
+        torch.testing.assert_close(replayed[key], sampled[key], rtol=0, atol=0)
+    assert replayed['states'][0].current_time == state.current_time
 
 
 def test_short_branch_roundoff_and_real_mismatch():

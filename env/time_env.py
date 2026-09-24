@@ -67,6 +67,10 @@ class TimeEnvCwrExponential:
         delta_t = self.positive(delta_t, "wait")
         current_time = float(current_time)
         event_time = current_time + delta_t
+        if event_time == current_time:
+            # A positive wait can round away at the current clock's precision.
+            # Advance the stored timestamp by one ULP; retain delta_t for scoring.
+            event_time = math.nextafter(current_time, math.inf)
         if not math.isfinite(current_time) or current_time < 0 or not math.isfinite(event_time) or event_time <= current_time:
             raise ValueError("continuous event time must be finite and strictly increasing in float64")
         return event_time
