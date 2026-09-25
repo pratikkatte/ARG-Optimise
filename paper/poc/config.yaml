@@ -1,0 +1,54 @@
+# Reproduce from repository root with the args environment:
+# python validation/scripts/score_infinite_sites.py --generate-poc --config paper/poc/config.yaml
+# python paper/poc/run_poc.py --config paper/poc/config.yaml
+# Hand-constructed observations, not a selected favorable simulation replicate.
+output_dir: suplemental/poc
+dataset:
+  name: two_locus_two_haplotype
+  num_samples: 2
+  sequence_length: 2
+  positions: [0.5, 1.5]
+  genotypes: [[1, 0], [0, 1]]
+  population_size: 10
+  mutation_rate: 0.025
+  recombination_rate: 0.025
+  seed: 42
+training:
+  seeds: [7, 17, 27]
+  steps: 3000
+  checkpoint_every: 100
+  batch_size: 128
+  device: cuda
+  cpu_threads: 1
+  policy_lr: 0.0005
+  flow_lr: 0.001
+  grad_clip: 10.0
+  subtb_lambda: 0.9
+  init_z_sample_count: 128
+  exploration_fraction: 0.125
+  replay_fraction: 0.25
+  replay_capacity: 2048
+  replay_min_size: 128
+  replay_per_topology: 16
+  replay_grid_size: 2
+  lr_min_factor: 0.1
+  max_events: 10000
+model:
+  embedding_size: 32
+  hidden_size: 64
+  transformer_depth: 2
+  transformer_heads: 4
+  continuous_time_head: gamma_mixture
+  time_mixture_components: 4
+  time_hidden_dim: 64
+  time_layers: 2
+evaluation:
+  every: 500
+  progress_samples: 1024
+  final_samples: 20000
+  reference_samples: 20000
+  batch_size: 128
+  reference_seed: 200007
+  policy_seed: 300007
+  tv_target: 0.03
+  independent_checks: 128

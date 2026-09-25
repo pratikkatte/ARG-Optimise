@@ -35,7 +35,7 @@ def main(argv=None):
         if args.generate_poc:
             if args.config is None or any(x is not None for x in (args.replicate_dir, args.trees, args.mutation_rate)):
                 parser.error('--generate-poc requires --config and supplies dataset, trees and rate')
-            from validation.poc_dataset import generate_poc, load_poc_config
+            from paper.poc.poc_dataset import generate_poc, load_poc_config
             args.replicate_dir, args.trees, args.mutation_rate = generate_poc(load_poc_config(args.config))
         elif args.config is not None or any(x is None for x in (args.replicate_dir, args.trees, args.mutation_rate)):
             parser.error('Scoring requires --replicate-dir, --trees and --mutation-rate')

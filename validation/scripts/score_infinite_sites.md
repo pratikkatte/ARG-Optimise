@@ -3,7 +3,7 @@
 To create and score the fixed two-base posterior benchmark:
 
 ```sh
-python validation/scripts/score_infinite_sites.py --generate-poc --config validation/config/poc.yaml
+python validation/scripts/score_infinite_sites.py --generate-poc --config paper/poc/config.yaml
 ```
 
 This optional mode writes the deliberately constructed two-haplotype SNP
