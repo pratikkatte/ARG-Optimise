@@ -1,7 +1,7 @@
 # python train.py --config paper/config/r2.yaml
 dataset_path: paper/datasets/r2/rep0
 resume_checkpoint: null
-output_path: paper/checkpoint/r2/
+output_path: paper/checkpoints/r2/
 device: cuda
 cpu_threads: 1
 max_events: 10000
