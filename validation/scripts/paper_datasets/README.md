@@ -286,3 +286,27 @@ Run numerical/reference checks with:
 ```bash
 python -m pytest -q validation/scripts/paper_datasets/test_figure_3.py
 ```
+
+### Evaluate newly generated paper outputs
+
+All three commands accept the method output roots directly:
+
+```bash
+python validation/scripts/paper_datasets/evaluate.py \
+  --argflow-dir paper/outputs/argflow \
+  --singer-dir paper/outputs/SINGER \
+  --arginfer-dir paper/outputs/ARGInfer
+```
+
+Use the same arguments with `figure_2.py` and `figure_3.py`. Supply all three
+roots together; relative paths are resolved against the repository root.
+Each root contains `r1`, `r2`, and `r4`. ARGFlow must have exactly one
+checkpoint subdirectory containing `manifest.json` per dataset. SINGER uses
+`<dataset>/trees/trees_<index>.trees`; ARGInfer uses `<dataset>/arg<iteration>.arg`
+and its prepared inputs at `inputs/<dataset>` (also used to validate SINGER).
+Existing manifest, hash, genotype, and inventory checks remain enabled.
+The paper protocol expects 1,800 ARGFlow, 1,000 SINGER, and 1,800 ARGInfer draws.
+Results go to `paper/outputs/evaluation`, `paper/outputs/figure_2`, and
+`paper/outputs/figure_3`. Metric and plotting defaults still come from the
+bundled config; `--config` remains available for custom settings and the
+original config-only interface is unchanged.

@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import yaml
+
+from validation.scripts.paper_datasets.cli import load_config
 import tskit
 
 from validation.scripts.paper_datasets.evaluate import (
@@ -138,7 +140,7 @@ def plot(panels, datasets, methods, options, output, filename):
                 ax.text(.97,.045,f'Below range: {row["below_range_percent"]:.2f}%',
                         transform=ax.transAxes,color='white',fontsize=7.5,ha='right',
                         bbox=dict(facecolor='black',edgecolor='none',alpha=.8,pad=1))
-            corr = f'{row["pearson_r"]:.2f}' if row['pearson_r'] is not None else 'undefined'
+            corr = f'{row["pearson_r"]:.3f}' if row['pearson_r'] is not None else 'undefined'
             ax.text(.055,.95,r'RMSE$_{2N_e}$' + f' = {row["rmse_2Ne"]:.3f}\n' + r'$r$' + f' = {corr}',
                     transform=ax.transAxes,va='top',fontsize=9.2,color='#eeeeee',zorder=6)
             for axis in (ax.xaxis, ax.yaxis):
@@ -153,7 +155,7 @@ def plot(panels, datasets, methods, options, output, filename):
             for spine in ax.spines.values():
                 spine.set_color('#777777')
             if i == 0:
-                ax.set_title(method,fontsize=12,pad=9)
+                ax.set_title('ARGFlow' if method == 'ARGFlows' else method,fontsize=12,pad=9)
             if j == 0:
                 ax.text(-.30,1.06,chr(ord('a')+i),transform=ax.transAxes,fontsize=14,fontweight='bold')
                 ax.text(0,1.055,dataset,transform=ax.transAxes,fontsize=10)
@@ -174,9 +176,7 @@ def plot(panels, datasets, methods, options, output, filename):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config',type=Path,default=Path(__file__).with_name('config.yaml'))
-    args = parser.parse_args(argv)
-    config = yaml.safe_load(args.config.read_text())
+    args, config = load_config(parser, argv)
     options = config['figure2']
     output = resolve(options['output_dir'])
     low, high = options['axis_limits_2Ne']
@@ -226,7 +226,7 @@ def main(argv=None):
         figures={name:[dict(dataset=r['dataset'],method=r['method'],checkpoint=r['checkpoint'])
                        for r in panels.values()] for name,panels in variants.items()}))
     caption = ('Figure 2. Pairwise TMRCA reconstruction against simulated truth. '
-        'Columns show ARGFlows, ARGInfer and SINGER; rows show r1, r2 and r4. '
+        'Columns show ARGFlow, ARGInfer and SINGER; rows show r1, r2 and r4. '
         'Posterior means are compared with generating pairwise TMRCAs on shared logarithmic axes, '
         'in units of 2Ne generations. The dashed diagonal denotes exact agreement. '
         'Color shows probability mass per logarithmic bin, weighted by exact genomic span and '

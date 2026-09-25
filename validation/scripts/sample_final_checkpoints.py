@@ -30,27 +30,40 @@ def main():
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', type=int, default=20260924)
+    parser.add_argument('--checkpoint', type=Path,
+                        help='Sample only this checkpoint; dataset defaults to its parent directory.')
+    parser.add_argument('--dataset', choices=('r1', 'r2', 'r4'),
+                        help='Dataset for --checkpoint, verified against checkpoint observations.')
     parser.add_argument('--output-dir', type=Path,
                         default=ROOT / 'validation/datasets/paper_datasets/output/argflow')
     args = parser.parse_args()
     if args.num_args < 1 or args.batch_size < 1:
         parser.error('sample and batch counts must be positive')
+    if args.dataset is not None and args.checkpoint is None:
+        parser.error('--dataset requires --checkpoint')
     torch.set_num_threads(1)
     device = resolve_device(args.device)
     print(f'Device: {device} ({torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"})', flush=True)
-    checkpoints = sorted((ROOT / 'final_checkpoints').glob('*/*.pt'))
-    checkpoints = [p for p in checkpoints if p.parent.name in ('r1', 'r2', 'r4')]
-    if {p.parent.name for p in checkpoints} != {'r1', 'r2', 'r4'}:
-        raise ValueError('Missing dataset checkpoints')
+    if args.checkpoint is not None:
+        checkpoints = [args.checkpoint.resolve()]
+        if not checkpoints[0].is_file():
+            raise ValueError('Checkpoint must exist')
+        if args.dataset is None and checkpoints[0].parent.name not in ('r1', 'r2', 'r4'):
+            raise ValueError('Specify --dataset or use a directory named r1, r2, or r4')
+    else:
+        checkpoints = sorted((ROOT / 'final_checkpoints').glob('*/*.pt'))
+        checkpoints = [p for p in checkpoints if p.parent.name in ('r1', 'r2', 'r4')]
+        if {p.parent.name for p in checkpoints} != {'r1', 'r2', 'r4'}:
+            raise ValueError('Missing dataset checkpoints')
     # Check all destinations before starting any sampling.
     for checkpoint in checkpoints:
-        output = args.output_dir / checkpoint.parent.name / checkpoint.stem
+        output = args.output_dir / (args.dataset or checkpoint.parent.name) / checkpoint.stem
         if output.exists() and any(output.iterdir()):
             raise ValueError(f'Output must be empty: {output}')
     results = []
     for checkpoint_index, checkpoint in enumerate(checkpoints):
         started = time.monotonic()
-        dataset = checkpoint.parent.name
+        dataset = args.dataset or checkpoint.parent.name
         output = args.output_dir / dataset / checkpoint.stem
         data = load_checkpoint(checkpoint)
         generator = generator_from_checkpoint(data, device, optimizer=False)
@@ -62,7 +75,7 @@ def main():
         output.mkdir(parents=True, exist_ok=True)
         manifest = dict(
             schema_version=2, dataset=dataset,
-            checkpoint=str(checkpoint.relative_to(ROOT)),
+            checkpoint=str(checkpoint.relative_to(ROOT) if checkpoint.is_relative_to(ROOT) else checkpoint),
             checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
             model_version=data['metadata']['model_version'], mutation_model='infinite_sites',
             sampling_distribution='learned_policy', posterior_calibration_established=False,

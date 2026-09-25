@@ -20,6 +20,8 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.stats import wasserstein_distance
 import yaml
 
+from validation.scripts.paper_datasets.cli import load_config
+
 from validation.scripts.paper_datasets.evaluate import load_draws, resolve, require, sha256, write_json
 from validation.scripts.plot_paper_posterior_agreement import compare_clades
 from env.snp_data import load_snp_dataset
@@ -155,7 +157,7 @@ def plot(output, datasets, summaries, comparisons, options):
             require(np.isclose(hist.sum(),1), 'Density plot truncated TMRCA mass')
             density = gaussian_filter1d(hist/width, bandwidth/width, mode='reflect')
             ymax = max(ymax,float(density.max()))
-            ax.plot(centers,density,color=COLORS[method],lw=1.8,label=method)
+            ax.plot(centers,density,color=COLORS[method],lw=1.8,label='ARGFlow' if method == 'ARGFlows' else method)
         ax.set_title(dataset,fontsize=14,fontweight='semibold',pad=10)
         ax.set_xscale('symlog',linthresh=2,linscale=2,base=2)
         ax.set_xlim(0,max(2,np.ceil(maximum)))
@@ -164,7 +166,7 @@ def plot(output, datasets, summaries, comparisons, options):
         ax.set_xticks(ticks,labels=[str(x) for x in ticks])
         ax.axvline(2,color='#d6dce2',lw=.6,zorder=0)
         label = 'Mean local $W_1$' if annotation=='local_mean' else 'Pooled $W_1$'
-        text = label+'\n'+'\n'.join(f'vs {ref}: {comparisons[dataset,ref][metric_key]:.3f}' for ref in METHODS[1:])
+        text = label+'\n'+'\n'.join(f'vs {ref}: {comparisons[dataset,ref][metric_key]:.4f}' for ref in METHODS[1:])
         ax.text(.98,.97,text,transform=ax.transAxes,ha='right',va='top',fontsize=8,
                 bbox=dict(facecolor='white',edgecolor='none',alpha=.9,pad=2))
         if col==0:
@@ -184,13 +186,13 @@ def plot(output, datasets, summaries, comparisons, options):
             sub.set(xlim=(-.025,1.025),ylim=(-.025,1.025),aspect='equal',xticks=[0,.5,1],yticks=[0,.5,1])
             sub.set_xticklabels(['0','.5','1']); sub.set_yticklabels(['0','.5','1'])
             sub.set_title(reference,color=COLORS[reference],fontsize=9,pad=6)
-            sub.text(.04,.97,f'RMSE\n{comparisons[dataset,reference]["clade_rmse"]:.4f}',
+            sub.text(.04,.97,f'RMSE\n{comparisons[dataset,reference]["clade_rmse"]:.5f}',
                      transform=sub.transAxes,va='top',fontsize=7,
                      bbox=dict(facecolor='white',edgecolor='none',alpha=.85,pad=1))
             if j:
                 sub.set_yticklabels([])
             elif col==0:
-                sub.set_ylabel('ARGFlows clade probability',labelpad=5)
+                sub.set_ylabel('ARGFlow clade probability',labelpad=5)
     for ax in axes:
         ax.set_ylim(0,ymax*1.23)
     fig.text(.085,.913,'(a) Pairwise TMRCA posterior distributions',fontsize=10)
@@ -213,9 +215,8 @@ def plot(output, datasets, summaries, comparisons, options):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config',type=Path,default=Path(__file__).with_name('config.yaml'))
-    args=parser.parse_args(argv)
-    config=yaml.safe_load(args.config.read_text()); options=config['figure3']
+    args, config = load_config(parser, argv)
+    options=config['figure3']
     require(tuple(options['methods'])==METHODS,'Expected ARGFlows, ARGInfer, SINGER method order')
     require(options['wasserstein_annotation'] in ('local_mean','pooled'),'Unknown Wasserstein annotation')
     require(options['clade_normalization'] in ('fixed_universe','shared_union'),'Unknown clade normalization')
@@ -301,7 +302,7 @@ def main(argv=None):
                    if options['clade_normalization']=='fixed_universe'
                    else 'the shared local union of clades observed in any of the three methods')
     caption=('Figure 3. Posterior-summary agreement across inference methods. '
-        '(a) Pooled marginal pairwise TMRCA distributions for ARGFlows, ARGInfer and SINGER '
+        '(a) Pooled marginal pairwise TMRCA distributions for ARGFlow, ARGInfer and SINGER '
         'across r1, r2 and r4. Draws and haplotype pairs have equal weight and genomic positions '
         'are weighted by exact span. Curves use a common Gaussian smoothing bandwidth; '
         'annotations report '+annotation+'. Distances use unsmoothed empirical samples in '

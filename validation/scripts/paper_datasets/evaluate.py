@@ -22,6 +22,8 @@ import numpy as np
 import tskit
 import yaml
 
+from validation.scripts.paper_datasets.cli import load_config
+
 from env.snp_data import load_snp_dataset
 from validation.scripts.evaluate_arginfer import (
     extract_features, inventory, validate_inputs, arg_to_ts, check_mutations)
@@ -304,9 +306,7 @@ def write_table(output, rows, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=Path(__file__).with_name('config.yaml'))
-    args = parser.parse_args(argv)
-    config = yaml.safe_load(args.config.read_text())
+    args, config = load_config(parser, argv)
     require(bool(config['metrics']) and set(config['metrics']) <= set(METRICS), 'Unknown/empty metrics')
     require(len(set(config['metrics'])) == len(config['metrics']), 'Duplicate metrics')
     require(config['brier_normalization'] in ('observed_union', 'fixed_universe'), 'Unknown Brier normalization')
