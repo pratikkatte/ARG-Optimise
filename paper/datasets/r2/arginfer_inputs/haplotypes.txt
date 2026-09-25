@@ -1,0 +1,10 @@
+A	T	T	A	A	A	G	A	G	A	G	T	T	G	A	G	G	G	C	C	G	G	A	A	T	G	C	G	G	G	T	G	A	G	C	G	C	G	C	A	T	G	T	G	T
+A	T	T	A	T	A	G	A	G	A	G	T	T	G	A	G	G	G	C	C	G	G	A	A	A	G	C	G	T	G	T	G	A	G	C	G	A	C	A	T	G	G	A	T	A
+G	T	G	A	A	A	G	C	G	A	G	T	T	G	A	G	C	G	A	C	G	G	A	A	T	G	C	G	G	G	T	G	T	G	C	G	C	C	C	T	T	T	T	G	T
+G	T	G	A	A	A	G	C	G	A	G	T	T	G	A	G	C	G	A	C	G	G	A	A	T	G	C	G	G	G	T	G	T	G	C	G	C	C	C	T	T	T	T	G	T
+G	T	G	C	A	T	A	C	G	C	T	C	T	G	A	G	G	G	A	T	G	A	A	A	T	G	C	G	G	G	T	G	T	T	C	G	C	C	A	T	G	G	A	T	A
+A	T	T	A	A	A	G	A	G	A	G	T	T	G	A	G	G	G	C	C	G	G	A	A	T	G	C	G	G	G	T	G	A	G	C	G	C	G	C	A	T	G	T	G	T
+A	A	G	A	A	A	G	C	G	A	T	C	C	T	G	A	G	A	A	C	A	G	T	G	T	C	T	C	G	A	G	T	T	G	T	G	C	C	C	T	T	T	T	G	T
+G	T	G	A	A	A	G	C	G	A	G	T	T	G	A	G	C	G	A	C	G	G	A	A	T	G	C	G	G	G	T	G	T	G	C	G	C	C	C	T	T	T	T	G	T
+A	T	G	A	A	A	G	C	T	A	G	T	T	G	A	G	C	G	A	C	G	G	A	A	T	G	C	G	G	G	T	G	T	G	C	G	C	C	C	T	T	T	T	G	T
+G	T	G	C	A	T	A	C	G	C	T	C	T	G	A	G	G	G	A	T	G	A	A	A	T	G	C	G	G	G	T	G	T	T	C	C	C	C	A	T	G	G	A	T	A

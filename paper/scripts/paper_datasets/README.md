@@ -3,45 +3,41 @@
 ## Quick start: the three scripts we ran
 
 Run these commands from the repository root, in order. All three scripts use
-the adjacent [config.yaml](config.yaml) and the existing `phylogfn_orig` environment.
+the adjacent [config.yaml](config.yaml).
 They evaluate saved samples; they do not rerun training or sampling.
 
 ```bash
 # 1. Section 5.1 / Table 2: accuracy and uncertainty metrics
-conda run --no-capture-output -n phylogfn_orig python \
-  paper/scripts/paper_datasets/evaluate.py
+python paper/scripts/paper_datasets/evaluate.py
 
 # 2. Figure 2: posterior-mean pairwise TMRCA versus simulated truth
-conda run --no-capture-output -n phylogfn_orig python \
-  paper/scripts/paper_datasets/figure_2.py
+python paper/scripts/paper_datasets/figure_2.py
 
 # 3. Figure 3: posterior-summary agreement with ARGInfer and SINGER
-conda run --no-capture-output -n phylogfn_orig python \
-  paper/scripts/paper_datasets/figure_3.py
+python paper/scripts/paper_datasets/figure_3.py
 ```
 
 | Script | Main outputs, relative to the repository root |
 | --- | --- |
-| [evaluate.py](evaluate.py) | `validation/paper_datasets/report/section_5_1_final_checkpoints/section_5_1.csv` and `.md` |
-| [figure_2.py](figure_2.py) | `validation/paper_datasets/report/figure_2_final_checkpoints/figure_2.png`, `.pdf`, and `.svg` |
-| [figure_3.py](figure_3.py) | `validation/paper_datasets/report/figure_3_final_checkpoints/figure_3.png`, `.pdf`, `.svg`, and `metrics.csv` |
+| [evaluate.py](evaluate.py) | `paper/outputs/evaluation/section_5_1.csv` and `.md` |
+| [figure_2.py](figure_2.py) | `paper/outputs/figure_2/figure_2.png`, `.pdf`, and `.svg` |
+| [figure_3.py](figure_3.py) | `paper/outputs/figure_3/figure_3.png`, `.pdf`, `.svg`, and `metrics.csv` |
 
 The current configuration uses `fixed_universe` normalization (1,012 clades)
-for the table's Brier score and Figure 3's clade RMSE. Both main figures select
-r1 checkpoint `1900_491fgs0e`, r2 `6600`, and r4 `1750`. Figure 2 also saves an
-alternative using r1 `5650`. Figure 3 annotates pair-and-position-averaged
+for the table's Brier score and Figure 3's clade RMSE. The table and both figures
+use the published ARGFlow checkpoints: r1 `r1_checkpoint_5650` (run 491fgs0e),
+r2 `checkpoint_4650`, and r4 `from1750_best_eval_step4300`. Figure 3 annotates pair-and-position-averaged
 Wasserstein distance (`local_mean`), with pooled distance saved separately.
 
 ## Reproduce the Section 5.1 table
 
-From the repository root, using the existing environment with ARGInfer installed:
+From the repository root, with ARGInfer installed (it is needed to read the
+saved ARGInfer samples):
 
 ```bash
-conda run --no-capture-output -n phylogfn_orig python \
-  paper/scripts/paper_datasets/evaluate.py
+python paper/scripts/paper_datasets/evaluate.py
 ```
 
-Or use `/private/home/pkatte/anaconda3/envs/phylogfn_orig/bin/python` directly.
 The script also works from this directory with `python evaluate.py`.
 It evaluates saved files on CPU; no training or GPU inference is needed.
 
@@ -83,8 +79,8 @@ absolute. The working directory does not change their interpretation.
 
 ## Included draws
 
-The supplied configuration evaluates all four final ARGFlows checkpoints,
-1,000 draws each; 1,000 SINGER draws per dataset (files 100–1099); and 1,800
+The supplied configuration evaluates one ARGFlows checkpoint per dataset,
+1,800 draws each; 1,000 SINGER draws per dataset (files 100–1099); and 1,800
 ARGInfer draws per dataset (saved iterations 201,000–2,000,000). ARGInfer's
 unnumbered `arg.arg` scratch file is excluded. No additional burn-in is applied.
 Different checkpoints and datasets are evaluated separately, never pooled.
@@ -141,8 +137,7 @@ used rounded integer VCF positions; their input identity/mutation checks preserv
 those coordinates. All methods are evaluated against the same unmodified
 simulated truth. This small input-coordinate difference should remain disclosed.
 
-Default outputs are under
-`validation/paper_datasets/report/section_5_1_final_checkpoints/`:
+Default outputs are under `paper/outputs/evaluation/`:
 
 - `section_5_1.csv` and `section_5_1.md`: complete comparison table.
 - `<dataset>/<method>/<source>/results.json`: metrics, both Brier definitions,
@@ -165,8 +160,7 @@ python -m pytest -q paper/scripts/paper_datasets/test_evaluate.py
 ## Reproduce Figure 2
 
 ```bash
-conda run --no-capture-output -n phylogfn_orig python \
-  paper/scripts/paper_datasets/figure_2.py
+python paper/scripts/paper_datasets/figure_2.py
 ```
 
 This script uses the same datasets and saved sources as the table. It recomputes
@@ -179,14 +173,12 @@ pilot-checkpoint figures. The `--config` argument accepts another YAML file.
 The `figure2` section of `config.yaml` controls output location, method order,
 ARGFlows checkpoint selection, logarithmic axis limits, number of histogram bins,
 color limits, resolution, and whether alternative checkpoint figures are saved.
-The main figure uses r1 `checkpoint_1900_491fgs0e`, r2 `checkpoint_6600`, and r4
-`checkpoint_1750`, as selected by the user. A second full figure changes only the
-r1 ARGFlows panel to `checkpoint_5650`. Dataset row order follows the YAML.
+The figure uses the same published checkpoints as the table. Dataset row order
+follows the YAML.
 
-Figure outputs are under `validation/paper_datasets/report/figure_2_final_checkpoints/`:
+Figure outputs are under `paper/outputs/figure_2/`:
 
 - `figure_2.png`, `figure_2.pdf`, `figure_2.svg`: main Figure 2.
-- `figure_2_r1_checkpoint_5650.*`: alternative r1 checkpoint.
 - `caption.txt`: manuscript caption.
 - Per-source NPZ files: exact truth/posterior-mean TMRCA pairs, normalized
   span/pair weights, histogram mass, and below-range mass.
@@ -213,16 +205,14 @@ python -m pytest -q paper/scripts/paper_datasets/test_figure_2.py
 ## Reproduce Figure 3
 
 ```bash
-conda run --no-capture-output -n phylogfn_orig python \
-  paper/scripts/paper_datasets/figure_3.py
+python paper/scripts/paper_datasets/figure_3.py
 ```
 
 The script accepts `--config /path/to/config.yaml` and uses the `figure3` section.
 It reads the saved draws, checks their identity/structure, computes exact
 posterior-summary comparisons, and exports PNG/PDF/SVG versions of Figure 3.
-The main ARGFlows checkpoints match Figure 2: r1 `1900_491fgs0e`, r2 `6600`,
-and r4 `1750`. Each ARGFlows and SINGER ensemble has 1,000 draws; each ARGInfer
-ensemble has 1,800. No additional burn-in, inference, or importance weighting
+The ARGFlows checkpoints match Table 2 and Figure 2. Each ARGFlows and ARGInfer
+ensemble has 1,800 draws; each SINGER ensemble has 1,000. No additional burn-in, inference, or importance weighting
 is introduced.
 
 The new figure corrects a difference between the old Figure 3 code and the
@@ -265,7 +255,7 @@ the shared loaders may read truth to verify input haplotype identity.
 not change the metric. Plot bin widths, smoothing bandwidth, clade bins, color
 limits, and DPI are configurable separately. These affect rendering only.
 
-Outputs are under `validation/paper_datasets/report/figure_3_final_checkpoints/`:
+Outputs are under `paper/outputs/figure_3/`:
 
 - `figure_3.png`, `.pdf`, `.svg`, and `caption.txt`.
 - `metrics.csv` / `metrics.json`: both Wasserstein definitions, both clade RMSE
@@ -303,7 +293,9 @@ roots together; relative paths are resolved against the repository root.
 Each root contains `r1`, `r2`, and `r4`. ARGFlow must have exactly one
 checkpoint subdirectory containing `manifest.json` per dataset. SINGER uses
 `<dataset>/trees/trees_<index>.trees`; ARGInfer uses `<dataset>/arg<iteration>.arg`
-and its prepared inputs at `inputs/<dataset>` (also used to validate SINGER).
+and prepared inputs at `paper/datasets/<dataset>/arginfer_inputs/`
+(also used to validate SINGER). Directory overrides change sample locations;
+inputs remain beside each configured dataset.
 Existing manifest, hash, genotype, and inventory checks remain enabled.
 The paper protocol expects 1,800 ARGFlow, 1,000 SINGER, and 1,800 ARGInfer draws.
 Results go to `paper/outputs/evaluation`, `paper/outputs/figure_2`, and

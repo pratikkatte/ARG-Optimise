@@ -32,7 +32,7 @@ def load_config(path):
     unknown = supplied.keys() - DEFAULTS.keys()
     if unknown:
         raise ValueError('unknown settings: ' + ', '.join(sorted(map(str, unknown))))
-    config = {**supplied}
+    config = {**DEFAULTS, **supplied}
     for key, minimum in [('num_replicates', 1), ('num_samples', 2),
                          ('sequence_length', 1), ('seed', 1)]:
         if type(config[key]) is not int or config[key] < minimum:

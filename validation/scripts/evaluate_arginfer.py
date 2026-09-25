@@ -499,7 +499,7 @@ def run(args):
             args.rank_bins > 0 and args.diagnostic_positions > 0 and args.min_ess > 0,
             'Invalid nonpositive setting or negative burn-in')
     dataset = args.dataset_dir.resolve()
-    input_dir = (args.input_dir or dataset.parent.parent/'arginfer_inputs'/dataset.parent.name).resolve()
+    input_dir = (args.input_dir or dataset.parent/'arginfer_inputs').resolve()
     metadata, manifest, truth_ts, data = validate_inputs(dataset, input_dir)
     files, available = inventory(args.arg_dir, args.burnin_samples, args.expected_thin)
     require(len(files) >= 8, 'At least eight retained samples are required')
@@ -668,7 +668,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--arg-dir', type=Path, required=True)
     parser.add_argument('--dataset-dir', type=Path, required=True)
-    parser.add_argument('--input-dir', type=Path, help='Default: paper_datasets/arginfer_inputs/<dataset>')
+    parser.add_argument('--input-dir', type=Path, help='Default: <dataset-directory>/../arginfer_inputs')
     parser.add_argument('--output-dir', type=Path, required=True, help='Must not exist')
     parser.add_argument('--burnin-samples', type=int, default=0, help='Additional saved draws to discard; original burn-in already removed')
     parser.add_argument('--expected-thin', type=int, default=1000)

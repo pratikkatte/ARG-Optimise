@@ -19,12 +19,12 @@ def main():
     cfg=json.loads((Path(__file__).with_name('appendix_e1.json')).read_text())
     checks=[]
     for j in cfg['datasets']:
-        path=Path(j['manifest']); d=json.loads(path.read_text())
-        ck=Path(j['checkpoint']); c=load_checkpoint(ck); m=c['metadata']
+        path=ROOT/j['manifest']; d=json.loads(path.read_text())
+        ck=ROOT/j['checkpoint']; c=load_checkpoint(ck); m=c['metadata']
         assert m['wandb_id']==j['run_id'] and m['step']==j['step']
         assert hashlib.sha256(ck.read_bytes()).hexdigest()==d['checkpoint_sha256']
         g=generator_from_checkpoint(c,torch.device('cpu'),optimizer=False); g.eval()
-        observed=load_snp_dataset((ROOT/'validation/datasets/paper_datasets')/j['dataset']/'rep0')
+        observed=load_snp_dataset((ROOT/'paper/datasets')/j['dataset']/'rep0')
         np.testing.assert_array_equal(observed.genotypes,g.env.snp_data.genotypes)
         np.testing.assert_array_equal(observed.positions,g.env.snp_data.positions)
         # Include both ends of the ensemble, rather than only its first batch.
@@ -46,7 +46,7 @@ def main():
             sampling_seed=d.get('base_seed'),batch_size=d.get('batch_size'),
             likelihood_error_all_draws=max(abs(r['log_likelihood']-r['independent_log_likelihood']) for r in d['samples']))
         checks.append(check); print(json.dumps(check),flush=True)
-    out=Path(cfg['output']).parent
+    out=(ROOT/cfg['output']).parent
     out.mkdir(parents=True,exist_ok=True)
     (out/'verification.json').write_text(json.dumps(checks,indent=2)+'\n')
 

@@ -5,7 +5,7 @@ import numpy as np
 
 ROOT=Path(__file__).resolve().parents[2]
 CONFIG=Path(__file__).with_name('appendix_e1.json')
-OUT=Path(json.loads(CONFIG.read_text())['output']).parent
+OUT=(ROOT/json.loads(CONFIG.read_text())['output']).parent
 
 def main():
     fits=json.loads((OUT/'plots/density_metrics.json').read_text())

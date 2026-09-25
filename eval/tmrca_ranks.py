@@ -2,7 +2,6 @@
 
 This is a Python implementation of the paper's diagnostic, not a source port:
 the inspected SINGER repository does not contain the benchmark calculation.
-See docs/EVALUATION.md for source provenance and finite-rank conventions.
 """
 import numpy as np
 

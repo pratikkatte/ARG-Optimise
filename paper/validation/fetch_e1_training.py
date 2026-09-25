@@ -19,7 +19,7 @@ def main():
     parser.add_argument('run_ids', nargs='+')
     args = parser.parse_args()
     cfg = json.loads(Path(__file__).with_name('appendix_e1.json').read_text())
-    out = Path(cfg['output']).parent / 'training'
+    out = (ROOT/cfg['output']).parent / 'training'
     out.mkdir(parents=True, exist_ok=True)
     api = wandb.Api(timeout=45)
     for rid in args.run_ids:

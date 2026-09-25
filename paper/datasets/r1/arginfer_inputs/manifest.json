@@ -1,0 +1,12 @@
+{
+  "source_vcf": "/workspace/ARG-Optimise/paper/datasets/r1/rep0/r1.vcf",
+  "source_sha256": "05826d07d5bd6ed8fd43e7eacc0562443328f3e63c1913ab30cee3deac834583",
+  "num_haplotypes": 10,
+  "num_snps": 16,
+  "sequence_length": 25000,
+  "population_size": 10000.0,
+  "mutation_rate": 1e-08,
+  "recombination_rate": 1e-08,
+  "coordinates": "Unchanged integer VCF positions; project legacy rounding convention",
+  "ancestral_alleles": "REF, documented as known simulated ancestral allele"
+}

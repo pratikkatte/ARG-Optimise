@@ -152,7 +152,7 @@ def load_draws(name, dataset_dir, observations, source, config):
     else:
         # Both baselines received the VCF's integer coordinates, not the original
         # continuous simulation positions. Verify their data in those coordinates.
-        input_dir = resolve(source.get('input_dir', f'validation/datasets/paper_datasets/arginfer_inputs/{name}'))
+        input_dir = resolve(source.get('input_dir', str(dataset_dir.parent / 'arginfer_inputs')))
         _, _, _, observed = validate_inputs(dataset_dir, input_dir)
         provenance['baseline_input_manifest'] = dict(path=str(input_dir/'manifest.json'),
                                                      sha256=sha256(input_dir/'manifest.json'))

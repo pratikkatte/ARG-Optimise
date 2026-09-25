@@ -20,7 +20,9 @@ def test_directories_replace_archived_sources(tmp_path):
         sources = settings['sources']
         assert [s['expected_samples'] for s in sources] == [1800, 1000, 1800]
         assert sources[0]['directory'] == str(tmp_path / 'argflow' / dataset / 'checkpoint')
-        assert sources[1]['input_dir'] == str(tmp_path / 'arginfer' / 'inputs' / dataset)
+        expected_inputs = str(Path(settings['dataset_dir']).parent / 'arginfer_inputs')
+        assert sources[1]['input_dir'] == expected_inputs
+        assert sources[2]['input_dir'] == expected_inputs
         assert sources[2]['directory'] == str(tmp_path / 'arginfer' / dataset)
         assert config['figure2']['main_argflows_checkpoints'][dataset] == 'checkpoint'
         assert config['figure3']['main_argflows_checkpoints'][dataset] == 'checkpoint'
@@ -38,4 +40,4 @@ def test_partial_overrides_rejected():
 
 def test_config_only_preserved():
     _, config = load_config(argparse.ArgumentParser(), [])
-    assert config['datasets']['r1']['sources'][0]['directory'].startswith('validation/')
+    assert config['datasets']['r1']['sources'][0]['directory'].startswith('paper/outputs/')

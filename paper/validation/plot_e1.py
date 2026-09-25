@@ -28,7 +28,7 @@ def main():
     parser.add_argument('--config', type=Path, required=True)
     args=parser.parse_args()
     cfg=json.loads(args.config.read_text())
-    out=Path(cfg['output']); out.mkdir(parents=True,exist_ok=True)
+    out=ROOT/cfg['output']; out.mkdir(parents=True,exist_ok=True)
     jobs=cfg['datasets']; n=len(jobs)
     plt.rcParams.update({'font.size':11, 'axes.spines.top':False,
                          'axes.spines.right':False, 'pdf.fonttype':42})
@@ -36,9 +36,9 @@ def main():
     residual_fig,resaxs=plt.subplots(1,n,figsize=(3.2*n,2.8),squeeze=False,layout='constrained')
     metrics={}
     for col,j in enumerate(jobs):
-        path=Path(j['manifest']); manifest=json.loads(path.read_text())
+        path=ROOT/j['manifest']; manifest=json.loads(path.read_text())
         assert manifest['status']=='complete'
-        assert manifest['checkpoint_sha256']==hashlib.sha256(Path(j['checkpoint']).read_bytes()).hexdigest()
+        assert manifest['checkpoint_sha256']==hashlib.sha256((ROOT/j['checkpoint']).read_bytes()).hexdigest()
         records=manifest['samples']
         ll=np.array([r['log_likelihood'] for r in records])
         prior=np.array([r['log_prior'] for r in records])

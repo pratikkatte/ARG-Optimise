@@ -1,8 +1,8 @@
 # Paper scripts
 
-Run commands from the repository root. Input and output locations for existing
-experiments are unchanged by this reorganization.
+Run commands from the repository root. Outputs go to `paper/outputs/`.
 
+- `run_arginfer.sh`, `run_singer.sh`: run the ARGInfer and SINGER baselines for one dataset.
 - [Simulation](simulate_infinite_sites.md): `simulate_infinite_sites.py` and its tests.
 - [Manuscript table and figures](paper_datasets/README.md): the `paper_datasets/`
   folder includes the evaluation runner, figures, configuration, helpers, and tests.

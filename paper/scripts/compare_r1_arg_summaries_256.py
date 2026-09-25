@@ -93,16 +93,16 @@ def comparison_plots(summaries, output):
 
 def run(output):
     require(not output.exists(), f'Output exists: {output}')
-    base = ROOT/'validation/datasets/paper_datasets'
+    base = ROOT/'paper/datasets'
     comparison_root = ROOT/'validation/reports/gfn_arginfer_style/r1_best5900'
-    metadata, inputs, truth_ts, data = validate_inputs(base/'r1/rep0', base/'arginfer_inputs/r1')
+    metadata, inputs, truth_ts, data = validate_inputs(base/'r1/rep0', base/'r1/arginfer_inputs')
     observations = load_snp_dataset(base/'r1/rep0')
     manifest_path = comparison_root/'draws/manifest.json'
     manifest = json.loads(manifest_path.read_text())
     require(manifest['haplotype_ids'] == list(observations.haplotype_ids), 'GFN sample order differs from truth/input')
     records = manifest['samples']
     require(len(records) == 256 and [r['index'] for r in records] == list(range(256)), 'Expected original 256 GFN draws')
-    arg_files, _ = inventory(base/'output/arginfer/r1/job_38078901')
+    arg_files, _ = inventory(ROOT/'paper/outputs/ARGInfer/r1')
     arg_files = arg_files[:256]
     n, length = inputs['num_haplotypes'], inputs['sequence_length']
     pairs = list(itertools.combinations(range(n), 2))
@@ -146,7 +146,7 @@ def run(output):
     ad.to_csv(output/'arginfer_ess.csv')
     importance = importance_stats([r['log_importance_weight'] for r in records])
     require(np.isclose(importance['ess'], manifest['summary']['importance_ess']), 'Importance ESS mismatch')
-    integer_positions = np.loadtxt(base/'arginfer_inputs/r1/positions.txt')
+    integer_positions = np.loadtxt(base/'r1/arginfer_inputs/positions.txt')
     protocol = dict(dataset='r1/rep0', draws_per_method=256, weights='equal within each method; GFN unweighted',
                     arginfer_iterations=[arg_files[0][0], arg_files[-1][0]], arginfer_spacing=1000,
                     gfn_checkpoint_step=5900, gfn_seed=manifest['seed'],

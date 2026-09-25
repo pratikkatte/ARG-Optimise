@@ -78,17 +78,22 @@ def convert(source, name):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--datasets", type=Path, required=True, help="paper_datasets directory")
-    parser.add_argument("--output", type=Path, required=True, help="New destination directory")
+    parser.add_argument("--datasets", type=Path, required=True, help="Directory containing r1, r2, and r4")
+    parser.add_argument("--output", type=Path,
+                        help="Optional output root; defaults to <datasets>/<dataset>/arginfer_inputs")
     parser.add_argument("--replicate", default="rep0")
     args = parser.parse_args()
-    if args.output.exists():
+    if args.output is not None and args.output.exists():
         parser.error(f"Output already exists; use a new directory: {args.output}")
     prepared = {name: convert(args.datasets / name / args.replicate, name) for name in ("r1", "r2", "r4")}
-    args.output.mkdir(parents=True, exist_ok=False)
+    destinations = {name: (args.output / name if args.output is not None else
+                          args.datasets / name / 'arginfer_inputs') for name in prepared}
+    for dest in destinations.values():
+        if dest.exists():
+            parser.error(f"Output already exists; use a new directory: {dest}")
     for name, (files, n, m) in prepared.items():
-        dest = args.output / name
-        dest.mkdir()
+        dest = destinations[name]
+        dest.mkdir(parents=True)
         for filename, contents in files.items():
             (dest / filename).write_text(contents)
         print(f"{name}: {n} haplotypes, {m} SNPs -> {dest}")

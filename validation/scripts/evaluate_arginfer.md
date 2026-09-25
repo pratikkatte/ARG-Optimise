@@ -53,7 +53,7 @@ is ignored because it has no saved iteration and is not a posterior draw. Point
 are reported: regular spacing alone cannot establish that a chain ran for its
 entire intended duration. `--expected-thin` defaults to 1,000.
 
-The input directory defaults to `paper_datasets/arginfer_inputs/<dataset>` and
+The input directory defaults to `<dataset-directory>/../arginfer_inputs` and
 can be overridden with `--input-dir`. The evaluator reproduces the expected
 input text from the dataset VCF and compares haplotypes, ancestral alleles,
 positions, sample identities, and manifest settings/hash. It verifies truth

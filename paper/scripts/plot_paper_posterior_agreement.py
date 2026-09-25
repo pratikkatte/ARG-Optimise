@@ -28,8 +28,9 @@ from validation.scripts.evaluate_arginfer import (
     arg_to_ts, inventory, validate_inputs, check_mutations, extract_features, sha256)
 from env.snp_data import load_snp_dataset
 
-BASE = ROOT / 'validation/datasets/paper_datasets'
-DEFAULT_OUT = ROOT / 'validation/paper_datasets/report/posterior_agreement'
+BASE = ROOT / 'paper/datasets'
+OUTPUTS = ROOT / 'paper/outputs'
+DEFAULT_OUT = ROOT / 'paper/outputs/posterior_agreement'
 METHODS = ('ARGFlow', 'ARGInfer', 'SINGER')
 DATASETS = ('r1', 'r2', 'r4')
 COLORS = {'ARGFlow': '#0072B2', 'ARGInfer': '#D55E00', 'SINGER': '#009E73'}
@@ -54,14 +55,14 @@ def sources(dataset, method, out):
                      seed=manifest['seed'], checkpoint_step={'r1': 5900, 'r2': 200, 'r4': 500}[dataset],
                      fresh_for_figure3=dataset != 'r1', importance_weighted=False)
     elif method == 'ARGInfer':
-        files, _ = inventory(BASE / 'output/arginfer' / dataset / 'job_38078901')
+        files, _ = inventory(OUTPUTS / 'ARGInfer' / dataset)
         if dataset == 'r1':
             files = files[:256]
         paths = [p for _, p in files]
         extra = dict(iteration_first=files[0][0], iteration_last=files[-1][0],
                      additional_burnin=0, saved_iteration_spacing=1000)
     else:
-        paths = sorted((BASE / 'output/singer' / dataset / 'trees').glob('trees_*.trees'),
+        paths = sorted((OUTPUTS / 'SINGER' / dataset / 'trees').glob('trees_*.trees'),
                        key=lambda p: int(p.stem.split('_')[-1]))
         assert [int(p.stem.split('_')[-1]) for p in paths] == list(range(100, 1100))
         extra = dict(time_units='Generation units follow the existing SINGER converter/evaluation convention; input metadata may be unknown.')
@@ -111,7 +112,7 @@ def prepare(dataset, method, out):
         saved = json.loads(provenance.read_text())
         if saved['input_fingerprint'] == fingerprint:
             return dict(np.load(cache)), saved
-    _, manifest, _, observed = validate_inputs(BASE / dataset / 'rep0', BASE / 'arginfer_inputs' / dataset)
+    _, manifest, _, observed = validate_inputs(BASE / dataset / 'rep0', BASE / dataset / 'arginfer_inputs')
     assert manifest['population_size'] == SCALE / 2
     observations = load_snp_dataset(BASE / dataset / 'rep0')
     def trees():
@@ -370,7 +371,7 @@ def main():
     (out / 'caption.md').write_text(caption + '\n')
     (out / 'README.md').write_text('# Figure 3: posterior agreement\n\n' + caption + '\n\n' + notes +
         '\n\nReproduce after generating the documented fresh draws:\n\n```bash\n'
-        '/private/home/pkatte/anaconda3/envs/phylogfn_orig/bin/python paper/scripts/plot_paper_posterior_agreement.py\n```\n\n'
+        'python paper/scripts/plot_paper_posterior_agreement.py\n```\n\n'
         'Per-method NPZs preserve empirical TMRCA masses and exact clade count-change tracks. '
         'Comparison NPZs preserve unbinned probability coordinates and normalized span weights; '
         'clade_density NPZs preserve the displayed bin edges and mass percentages. '

@@ -16,7 +16,7 @@ import psutil
 import yaml
 
 ROOT=Path(__file__).resolve().parents[2]
-OUTPUT=ROOT/'suplemental/poc'
+OUTPUT=ROOT/'paper/outputs/poc'
 
 
 def record(**value):

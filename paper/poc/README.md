@@ -6,7 +6,7 @@ it is not a standalone package.
 
 `config.yaml` was recovered from the parent of commit `6dd6839`. Its scientific
 and training settings are unchanged. Outputs retain the configured location
-`suplemental/poc/`, relative to the repository root.
+`paper/outputs/poc/`, relative to the repository root.
 
 Run commands from the repository root, using an environment with the repository
 dependencies plus SciPy and pytest installed:
@@ -24,9 +24,9 @@ CPU. Use `--resume` to resume saved runs.
 After training, audit each seed and produce the supplement summary:
 
 ```bash
-python paper/poc/audit_poc.py --run suplemental/poc/runs/main_gamma_mixture_seed7
-python paper/poc/audit_poc.py --run suplemental/poc/runs/main_gamma_mixture_seed17
-python paper/poc/audit_poc.py --run suplemental/poc/runs/main_gamma_mixture_seed27
+python paper/poc/audit_poc.py --run paper/outputs/poc/runs/main_gamma_mixture_seed7
+python paper/poc/audit_poc.py --run paper/outputs/poc/runs/main_gamma_mixture_seed17
+python paper/poc/audit_poc.py --run paper/outputs/poc/runs/main_gamma_mixture_seed27
 python paper/poc/summarize_poc.py
 ```
 

@@ -35,7 +35,7 @@ def main():
     parser.add_argument('--dataset', choices=('r1', 'r2', 'r4'),
                         help='Dataset for --checkpoint, verified against checkpoint observations.')
     parser.add_argument('--output-dir', type=Path,
-                        default=ROOT / 'validation/datasets/paper_datasets/output/argflow')
+                        default=ROOT / 'paper/outputs/argflow')
     args = parser.parse_args()
     if args.num_args < 1 or args.batch_size < 1:
         parser.error('sample and batch counts must be positive')
@@ -51,7 +51,7 @@ def main():
         if args.dataset is None and checkpoints[0].parent.name not in ('r1', 'r2', 'r4'):
             raise ValueError('Specify --dataset or use a directory named r1, r2, or r4')
     else:
-        checkpoints = sorted((ROOT / 'final_checkpoints').glob('*/*.pt'))
+        checkpoints = sorted((ROOT / 'paper/checkpoints/final').glob('*/*.pt'))
         checkpoints = [p for p in checkpoints if p.parent.name in ('r1', 'r2', 'r4')]
         if {p.parent.name for p in checkpoints} != {'r1', 'r2', 'r4'}:
             raise ValueError('Missing dataset checkpoints')
@@ -67,7 +67,7 @@ def main():
         output = args.output_dir / dataset / checkpoint.stem
         data = load_checkpoint(checkpoint)
         generator = generator_from_checkpoint(data, device, optimizer=False)
-        observed = load_snp_dataset(ROOT / 'validation/datasets/paper_datasets' / dataset / 'rep0')
+        observed = load_snp_dataset(ROOT / 'paper/datasets' / dataset / 'rep0')
         np.testing.assert_array_equal(observed.genotypes, generator.env.snp_data.genotypes)
         np.testing.assert_array_equal(observed.positions, generator.env.snp_data.positions)
         assert observed.haplotype_ids == generator.env.snp_data.haplotype_ids

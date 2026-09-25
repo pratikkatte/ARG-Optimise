@@ -2,7 +2,7 @@
 # python validation/scripts/score_infinite_sites.py --generate-poc --config paper/poc/config.yaml
 # python paper/poc/run_poc.py --config paper/poc/config.yaml
 # Hand-constructed observations, not a selected favorable simulation replicate.
-output_dir: suplemental/poc
+output_dir: paper/outputs/poc
 dataset:
   name: two_locus_two_haplotype
   num_samples: 2

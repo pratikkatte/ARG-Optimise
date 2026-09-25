@@ -1,10 +1,22 @@
+# Python / tool caches
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Experiment tracking and local runs
 wandb/
-checkpoints/
-*.sbatch
-*.sbatch
-pg.ipynb
 /runs/
+logs/
+validation/reports/
+
+# Large artifacts (checkpoints, posterior draws, evaluation outputs)
+checkpoints/
+/paper/outputs/
+
+# Cluster job scripts
+*.sbatch
+*.sbatch.*
 *.batch
-/paper/output/
+
+pg.ipynb

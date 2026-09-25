@@ -24,7 +24,7 @@ def load_config(parser, argv=None):
             if len(manifests) != 1:
                 parser.error(f'Expected exactly one ARGFlow sample manifest under {argflow / dataset}, found {len(manifests)}')
             sample_dir = manifests[0].parent
-            inputs = arginfer / 'inputs' / dataset
+            inputs = Path(settings['dataset_dir']).parent / 'arginfer_inputs'
             settings['sources'] = [
                 dict(method='ARGFlows', format='argflow', directory=str(sample_dir), expected_samples=1800),
                 dict(method='SINGER', format='singer', directory=str(singer / dataset / 'trees'),

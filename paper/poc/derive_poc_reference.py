@@ -67,7 +67,7 @@ def derive():
 
 if __name__=='__main__':
     result=derive()
-    path=Path(__file__).resolve().parents[2]/'suplemental/poc/reference/analytic_moments.json'
+    path=Path(__file__).resolve().parents[2]/'paper/outputs/poc/reference/analytic_moments.json'
     path.parent.mkdir(parents=True,exist_ok=True)
     path.write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result,indent=2))

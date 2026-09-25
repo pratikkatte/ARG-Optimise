@@ -7,10 +7,10 @@ python validation/scripts/score_infinite_sites.py --generate-poc --config paper/
 ```
 
 This optional mode writes the deliberately constructed two-haplotype SNP
-bundle and one reference candidate under `suplemental/poc/dataset/rep0`, then
+bundle and one reference candidate under `paper/outputs/poc/dataset/rep0`, then
 prints and saves the candidate's independent likelihood. It is separate from
 random msprime simulation and requires the POC reference dependencies. See
-[the experiment protocol](../../suplemental/poc/README.md) for training and
+[the experiment protocol](../../paper/poc/README.md) for training and
 full-history posterior evaluation.
 
 From the repository root:
