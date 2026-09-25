@@ -1,5 +1,5 @@
 # python train.py --config paper/config/r4.yaml
-dataset_path: paper/datasets/paper_datasets/r4/rep0
+dataset_path: paper/datasets/r4/rep0
 resume_checkpoint: null
 output_path: paper/checkpoint/r4
 device: cuda

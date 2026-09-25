@@ -1,0 +1,103 @@
+# Paths are relative to this repository root, regardless of the working directory.
+output_dir: validation/paper_datasets/report/section_5_1_final_checkpoints
+metrics:
+  - pair_tmrca_rmse
+  - rooted_rf
+  - clade_brier
+  - tmrca_coverage
+  - tmrca_interval_width
+credible_level: 0.90
+# observed_union matches the old Section 5.1 table; fixed_universe uses 2^n-n-2.
+# Both Brier scores are saved whenever clade_brier is enabled.
+brier_normalization: fixed_universe
+chunk_size: 64
+expected_samples: 1000
+verify_sample_hashes: true
+figure2:
+  output_dir: validation/paper_datasets/report/figure_2_final_checkpoints
+  methods: [ARGFlows, ARGInfer, SINGER]
+  main_argflows_checkpoints:
+    r1: checkpoint_1900_491fgs0e
+    r2: checkpoint_6600
+    r4: checkpoint_1750
+  save_alternatives: true
+  axis_limits_2Ne: [0.01, 10.0]
+  bins: 80
+  color_limits_percent: [0.001, 100.0]
+  dpi: 300
+figure3:
+  output_dir: validation/paper_datasets/report/figure_3_final_checkpoints
+  methods: [ARGFlows, ARGInfer, SINGER]
+  main_argflows_checkpoints:
+    r1: checkpoint_1900_491fgs0e
+    r2: checkpoint_6600
+    r4: checkpoint_1750
+  wasserstein_annotation: local_mean
+  clade_normalization: fixed_universe
+  chunk_size: 16
+  density_bin_width_2Ne: 0.025
+  density_bandwidth_2Ne: 0.10
+  clade_bins: 25
+  clade_color_limits_percent: [0.00001, 100.0]
+  dpi: 300
+datasets:
+  r1:
+    enabled: true
+    dataset_dir: validation/datasets/paper_datasets/r1/rep0
+    sources:
+      - method: ARGFlows
+        format: argflow
+        directory: validation/datasets/paper_datasets/output/argflow/r1/checkpoint_1900_491fgs0e
+      - method: ARGFlows
+        format: argflow
+        directory: validation/datasets/paper_datasets/output/argflow/r1/checkpoint_5650
+      - method: SINGER
+        format: singer
+        directory: validation/datasets/paper_datasets/output/singer/r1/trees
+        unknown_time_units: generations
+        burnin_samples: 0
+      - method: ARGInfer
+        format: arginfer
+        directory: validation/datasets/paper_datasets/output/arginfer/r1/job_38078901
+        input_dir: validation/datasets/paper_datasets/arginfer_inputs/r1
+        expected_samples: 1800
+        burnin_samples: 0
+        expected_thin: 1000
+  r2:
+    enabled: true
+    dataset_dir: validation/datasets/paper_datasets/r2/rep0
+    sources:
+      - method: ARGFlows
+        format: argflow
+        directory: validation/datasets/paper_datasets/output/argflow/r2/checkpoint_6600
+      - method: SINGER
+        format: singer
+        directory: validation/datasets/paper_datasets/output/singer/r2/trees
+        unknown_time_units: generations
+        burnin_samples: 0
+      - method: ARGInfer
+        format: arginfer
+        directory: validation/datasets/paper_datasets/output/arginfer/r2/job_38078901
+        input_dir: validation/datasets/paper_datasets/arginfer_inputs/r2
+        expected_samples: 1800
+        burnin_samples: 0
+        expected_thin: 1000
+  r4:
+    enabled: true
+    dataset_dir: validation/datasets/paper_datasets/r4/rep0
+    sources:
+      - method: ARGFlows
+        format: argflow
+        directory: validation/datasets/paper_datasets/output/argflow/r4/checkpoint_1750
+      - method: SINGER
+        format: singer
+        directory: validation/datasets/paper_datasets/output/singer/r4/trees
+        unknown_time_units: generations
+        burnin_samples: 0
+      - method: ARGInfer
+        format: arginfer
+        directory: validation/datasets/paper_datasets/output/arginfer/r4/job_38078901
+        input_dir: validation/datasets/paper_datasets/arginfer_inputs/r4
+        expected_samples: 1800
+        burnin_samples: 0
+        expected_thin: 1000

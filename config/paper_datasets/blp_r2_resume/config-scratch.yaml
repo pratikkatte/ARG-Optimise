@@ -1,7 +1,8 @@
-# python train.py --config paper/config/r2.yaml
-dataset_path: paper/datasets/r2/rep0
-resume_checkpoint: null
-output_path: paper/checkpoint/r2/
+# r2 / original 25 kb rep0: continue the selected checkpoint at update 700.
+# Run from /u/pratikkatte7/ARG-Optimise on the cluster in train.sbatch.blp.
+# The launch script also passes the resume checkpoint explicitly.
+dataset_path: validation/datasets/paper_datasets/r2/rep0
+output_path: runs/paper_datasets_stable/blp_r2_lambda09_batch64_from_0
 device: cuda
 cpu_threads: 1
 max_events: 10000
@@ -13,26 +14,36 @@ seed: 7
 verbose: true
 wandb: true
 wandb_project: ARG-Optimise
-wandb_name: r2_run
+wandb_name: blp_r2_lambda09_batch64_from_0
 wandb_mode: online
 
+# Match the saved training objective: SubTB + 0.25 * TB.
 event_policy: cwr_residual
 loss_type: subtb
 subtb_lambda: 0.9
 tb_loss_weight: 0.25
 flow_head_version: 6
-flow_scale_mode: empirical
-flow_lr: 0.001
+flow_scale_mode: fixed
+flow_lr: 0.0003
 policy_lr: 0.0001
-encoder_lr: null
-flow_encoder_mode: frozen_initial
+encoder_lr: 0.0001
+flow_encoder_grad_scale: 0.1
 grad_clip: 10.0
 flow_warmup_steps: 0
-flow_warmup_episodes: 128
-init_z_sample_count: 200
-init_z_batch_size: 1
+flow_warmup_episodes: 128  # Inactive legacy field.
+init_z_sample_count: 64  # Inherited; initialization is not repeated on resume.
+init_z_batch_size: 16
 
-exploration_fraction: 0.0
+# Restore optimizer moments and the existing 10,000-update cosine schedule.
+# The 50-update LR warm-up already happened; it does not restart at update 701.
+lr_schedule: cosine
+lr_schedule_steps: 10000
+lr_warmup_steps: 50
+lr_warmup_start_factor: 0.1
+lr_min_factor: 0.1
+
+# Preserve checkpoint-700 exploration and replay settings/buffer.
+exploration_fraction: 0.1
 replay_fraction: 0.15
 replay_capacity: 2048
 replay_grid_size: 16
@@ -42,22 +53,24 @@ policy_temperature_schedule: constant
 policy_temperature_start: 1.0
 policy_temperature_anneal_steps: 0
 
+# Full resumable snapshots and a separate GPU evaluator every 50 updates.
+# The evaluator shares the allocated GPU with training; it runs one request at a time.
 checkpoint_every: 50
 eval_every: 50
 eval_async: true
 eval_async_device: cuda
-eval_async_shutdown_seconds: 1800
-eval_episodes: 256
-eval_batch_size: 16
+eval_async_shutdown_seconds: 1800  # Drain pending work after training ends, up to 30 min.
+eval_episodes: 512
+eval_batch_size: 32
 eval_seed: 100007
 eval_initial: false
 eval_independent_likelihood: true
 eval_density_slope: true
 best_checkpoint_metric: eval_log_weight_std
-terminal_eval: true
+terminal_eval: true  # Optional tree-truth summaries; ESS/density still run.
 terminal_eval_grid_size: 100
 terminal_eval_repeats: 3
-terminal_eval_repeat_every: 50
+terminal_eval_repeat_every: 1000
 tmrca_method: point_accuracy
 
 # Original r2 scientific rates and complete observations; no SNP thinning.
@@ -73,15 +86,16 @@ time_mixture_components: 4
 time_layers: 4
 time_parameterization: bounded_v1
 
+# Exact compact architecture stored in checkpoint 700.
 embedding_size: 64
 hidden_size: 128
-transformer_depth: 6
+transformer_depth: 2
 transformer_heads: 4
 transformer_mlp_ratio: 2.0
 dropout: 0.0
 attention_dropout: 0.0
-state_feature_transform: identity
-initial_recombination_bias: 0.0
+state_feature_transform: signed_log
+initial_recombination_bias: -1.5
 breakpoint_policy: sparse_mixture
 breakpoint_mixture_hidden_dim: 128
 breakpoint_mixture_layers: 4
@@ -90,6 +104,7 @@ breakpoint_dropout: 0.0
 breakpoint_gap_hidden_size: 64
 breakpoint_gap_layers: 1
 
+# Standalone analysis settings, separate from periodic evaluation above.
 evaluation:
   checkpoint: best_eval
   metrics: [density_fit, ess, posterior_summary]

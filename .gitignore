@@ -5,3 +5,6 @@ checkpoints/
 *.sbatch
 *.sbatch
 pg.ipynb
+/runs/
+*.batch
+/paper/output/

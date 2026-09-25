@@ -25,4 +25,4 @@ Do not change scientific rates, architecture, optimizer settings, or objective w
 
 The first measured pilots use batch 32, two transformer layers, `initial_recombination_bias: -1.5`, one microbatch, and 50 warm-up updates. The bias changes only the starting residual event policy, retains positive probability for every compatible event, and is learned normally afterward. Their frozen source/configs/logs are in `runs/paper_datasets_stable/pilot_20260921_a`. The larger batch-64/depth-6 templates above remain explicit alternatives; pilot evidence will determine the recommended final configuration.
 
-`validation/scripts/run_convergence_pilots.py` snapshots source and launches bounded, separately logged experiments. `validation/scripts/evaluate_convergence.py` compares repeated fresh-policy samples and one fixed independent history bank; it never reports an ESS on a selected bank.
+The historical convergence-pilot launcher has been retired. `validation/scripts/evaluate_convergence.py` compares repeated fresh-policy samples and one fixed independent history bank; it never reports an ESS on a selected bank.
