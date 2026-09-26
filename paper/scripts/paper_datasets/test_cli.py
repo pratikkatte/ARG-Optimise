@@ -18,7 +18,7 @@ def test_directories_replace_archived_sources(tmp_path):
     _, config = load_config(argparse.ArgumentParser(), argv)
     for dataset, settings in config['datasets'].items():
         sources = settings['sources']
-        assert [s['expected_samples'] for s in sources] == [1800, 1000, 1800]
+        assert [s['expected_samples'] for s in sources] == [1000, 1000, 1000]
         assert sources[0]['directory'] == str(tmp_path / 'argflow' / dataset / 'checkpoint')
         expected_inputs = str(Path(settings['dataset_dir']).parent / 'arginfer_inputs')
         assert sources[1]['input_dir'] == expected_inputs

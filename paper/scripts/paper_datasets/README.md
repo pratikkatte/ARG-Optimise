@@ -62,8 +62,10 @@ absolute. The working directory does not change their interpretation.
   `fixed_universe` uses all possible nontrivial rooted clades. Both are saved
   in JSON whenever `clade_brier` is requested. The supplied configuration now
   defaults to `fixed_universe`, using the same denominator for every method.
-- `expected_samples`: required retained draw count; sources can override it.
-  Changing it does not truncate inputs: unexpected counts fail validation.
+- `expected_samples`: evaluated draw count (1,000); sources can override it.
+- `sample_selection`: `first` selects the first expected number of draws after
+  burn-in, in manifest order for ARGFlow and saved-iteration order for baselines.
+  Too few draws fail validation. `all` requires an exact inventory count.
 - `burnin_samples`: additional saved draws to discard, available for baselines.
   Update a source's expected count if changing burn-in.
 - `expected_thin`: ARGInfer saved-iteration spacing (default 1,000).
@@ -79,10 +81,12 @@ absolute. The working directory does not change their interpretation.
 
 ## Included draws
 
-The supplied configuration evaluates one ARGFlows checkpoint per dataset,
-1,800 draws each; 1,000 SINGER draws per dataset (files 100–1099); and 1,800
-ARGInfer draws per dataset (saved iterations 201,000–2,000,000). ARGInfer's
-unnumbered `arg.arg` scratch file is excluded. No additional burn-in is applied.
+The supplied configuration evaluates 1,000 draws from each method per dataset.
+For larger archives, it uses the first 1,000 after burn-in. ARGFlow follows
+manifest order, SINGER uses files 100–1099, and ARGInfer uses saved iterations
+201,000–1,200,000. The unnumbered `arg.arg` scratch file is excluded.
+The supplied full archives remain unchanged. Selection counts, indices, and
+sample hashes are recorded in the evaluation results.
 Different checkpoints and datasets are evaluated separately, never pooled.
 The table reports the number of draws; equal counts do not imply equal effective
 sample sizes for independent policy draws and correlated MCMC draws.

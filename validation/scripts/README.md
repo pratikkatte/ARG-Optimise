@@ -6,13 +6,12 @@ with `--help`; some workflows require external inference programs or saved data.
 
 ## Simulation and scoring
 
-- [Canonical simulator](../../paper/scripts/simulate_infinite_sites.py):
+- [Dataset simulator](../../paper/scripts/simulate_infinite_sites.py):
   `python paper/scripts/simulate_infinite_sites.py --config paper/datasets/r1_dataset.yaml`.
-- [Simulator compatibility entry point](simulate_infinite_sites.py): preserves
-  the old command and imports. Always pass `--config`; its original default
-  `validation/config/config.yaml` is absent. The canonical default
-  `paper/config/config.yaml` is also absent. See the [simulator guide](../../paper/scripts/simulate_infinite_sites.md).
-- [Full ARG simulation and exports](merge_msprime.md).
+  Its guide and tests also live in `paper/scripts/`; the old compatibility
+  entry point has been removed. Pass `--config` explicitly because the default
+  `paper/config/config.yaml` is absent. See the
+  [simulator guide](../../paper/scripts/simulate_infinite_sites.md).
 - [Candidate scoring](score_infinite_sites.md), `sample_infinite_sites.py`,
   `validate_infinite_sites_neural.py`, and `validate_rep0_neural_run.py`.
 - The small posterior correctness experiment lives in [paper/poc](../../paper/poc/README.md).
@@ -21,9 +20,12 @@ with `--help`; some workflows require external inference programs or saved data.
 
 - [GFN runner](run_gfn.md), `run_singer.sh`, and `run_tsinfer_tsdate.py`.
 - SINGER convergence: the shell launchers use `singer_convergence.py`.
-- `point_accuracy_gfn.py`, `point_accuracy_singer.py`, and
-  `point_accuracy_tsinferdate.py` share `point_accuracy_common.py`.
-  `plot_point_accuracy.py` and `point_accuracy_subtb.py` remain compatibility CLIs.
+- The [point-accuracy plotters](../../paper/validation/script/README.md) live in
+  `paper/validation/script/`: `point_accuracy_gfn.py`, `point_accuracy_singer.py`,
+  and `point_accuracy_tsinferdate.py` share `point_accuracy_common.py`.
+  `plot_point_accuracy.py` also lives there. The former plotting paths here
+  have been removed; use the new paths. `point_accuracy_subtb.py` remains a
+  separate metrics CLI.
 - `prepare_arginfer_inputs.py` prepares ARGinfer inputs;
   `evaluate_arginfer.py` evaluates saved results.
 

@@ -24,7 +24,7 @@ PUBLISHED = {
 def test_published_checkpoint(dataset):
     torch.set_num_threads(1)  # small models; oversubscribing threads is far slower
     name = PUBLISHED[dataset]
-    checkpoint = ROOT / 'paper/checkpoints/final' / dataset / f'{name}.pt'
+    checkpoint = ROOT / 'paper/checkpoints' / dataset / 'checkpoint.pt'
     manifest_path = ROOT / 'paper/outputs/argflow' / dataset / name / 'manifest.json'
     if not checkpoint.is_file() or not manifest_path.is_file():
         pytest.skip('published checkpoints/draws are not installed')

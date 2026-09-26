@@ -36,13 +36,14 @@ The published checkpoints and posterior samples are distributed separately
 from the code. Place them at:
 
 ```
-paper/checkpoints/final/{r1,r2,r4}/*.pt
+paper/checkpoints/{r1,r2,r4}/checkpoint.pt
 paper/outputs/argflow/{r1,r2,r4}/<checkpoint>/     # 1,800 ARGFlow draws + manifest.json
 paper/outputs/SINGER/{r1,r2,r4}/trees/            # SINGER draws
 paper/outputs/ARGInfer/{r1,r2,r4}/                # ARGInfer draws
 ```
 
-Then, from the repository root (CPU only):
+Evaluation selects the first 1,000 draws per method after burn-in, preserving
+the supplied archives. Then, from the repository root (CPU only):
 
 ```bash
 python paper/scripts/paper_datasets/evaluate.py   # Table 2  -> paper/outputs/evaluation/
@@ -61,10 +62,10 @@ python paper/scripts/simulate_infinite_sites.py --config paper/datasets/r1_datas
 # 2. Train (GPU); checkpoints go to paper/checkpoints/<dataset>/
 python train.py --config paper/config/r1.yaml
 
-# 3. Sample 1,800 ARGs from a checkpoint -> paper/outputs/argflow/<dataset>/<checkpoint>/
+# 3. Sample 1,000 ARGs from a checkpoint -> paper/outputs/argflow/<dataset>/<checkpoint>/
 python validation/scripts/sample_final_checkpoints.py \
   --checkpoint paper/checkpoints/r1/checkpoints/best_.pt --dataset r1 \
-  --num-args 1800 --seed 20260925
+  --num-args 1000 --seed 20260925
 
 # 4. Baselines (prepared inputs are included under each dataset)
 bash paper/scripts/run_arginfer.sh r1

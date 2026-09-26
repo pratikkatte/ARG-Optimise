@@ -26,15 +26,16 @@ def load_config(parser, argv=None):
             sample_dir = manifests[0].parent
             inputs = Path(settings['dataset_dir']).parent / 'arginfer_inputs'
             settings['sources'] = [
-                dict(method='ARGFlows', format='argflow', directory=str(sample_dir), expected_samples=1800),
+                dict(method='ARGFlows', format='argflow', directory=str(sample_dir), expected_samples=1000),
                 dict(method='SINGER', format='singer', directory=str(singer / dataset / 'trees'),
                      input_dir=str(inputs), expected_samples=1000, burnin_samples=0,
                      unknown_time_units='generations'),
                 dict(method='ARGInfer', format='arginfer', directory=str(arginfer / dataset),
-                     input_dir=str(inputs), expected_samples=1800, burnin_samples=0, expected_thin=1000),
+                     input_dir=str(inputs), expected_samples=1000, burnin_samples=0, expected_thin=1000),
             ]
             for figure in ('figure2', 'figure3'):
                 config[figure]['main_argflows_checkpoints'][dataset] = sample_dir.name
+        config['sample_selection'] = 'first'
         config['output_dir'] = 'paper/outputs/evaluation'
         config['figure2']['output_dir'] = 'paper/outputs/figure_2'
         config['figure3']['output_dir'] = 'paper/outputs/figure_3'

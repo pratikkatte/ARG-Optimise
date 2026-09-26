@@ -125,6 +125,17 @@ def topology_metrics(truth, draws, n):
                 clade_brier_sum=float(brier_sum), clade_universe_size=universe_size)
 
 
+def select_draw_files(files, expected, selection):
+    """Select a deterministic prefix after burn-in, or require an exact inventory."""
+    require(type(expected) is int and expected > 0, 'Invalid expected_samples')
+    require(selection in ('all', 'first'), 'Unknown sample_selection')
+    if selection == 'first':
+        require(len(files) >= expected, f'Expected at least {expected} draws, found {len(files)}')
+        return files[:expected]
+    require(len(files) == expected, f'Expected {expected} draws, found {len(files)}')
+    return files
+
+
 def load_draws(name, dataset_dir, observations, source, config):
     directory = resolve(source['directory'])
     kind = source['format']
@@ -172,7 +183,11 @@ def load_draws(name, dataset_dir, observations, source, config):
             files = files[burnin:]
         else:
             raise ValueError(f'Unknown format: {kind}')
-    require(len(files) == expected, f'Expected {expected} draws, found {len(files)} in {directory}')
+    selection = source.get('sample_selection', config.get('sample_selection', 'all'))
+    provenance['post_burnin_samples'] = len(files)
+    provenance['sample_selection'] = selection
+    files = select_draw_files(files, expected, selection)
+    provenance['selected_samples'] = len(files)
     provenance['first_index'], provenance['last_index'] = files[0][0], files[-1][0]
     draws, hashes = [], []
     for i, (index, path) in enumerate(files):

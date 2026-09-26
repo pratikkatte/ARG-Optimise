@@ -101,3 +101,19 @@ def test_invalid_credible_level(level):
     truth = feature([0, 10], [[2, 3]], [()])
     with pytest.raises(ValueError, match='Credible level'):
         time_metrics(truth, [truth], 1, ['tmrca_coverage'], level=level)
+
+
+def test_draw_selection_preserves_order_and_checks_available_samples():
+    from paper.scripts.paper_datasets.evaluate import select_draw_files
+    files = [(i, Path(f'{i}.trees')) for i in (201000, 202000, 203000)]
+    assert select_draw_files(files, 2, 'first') == files[:2]
+    assert len(files) == 3
+    assert select_draw_files(files, 3, 'all') == files
+    with pytest.raises(ValueError, match='at least'):
+        select_draw_files(files, 4, 'first')
+    with pytest.raises(ValueError, match='Expected 2'):
+        select_draw_files(files, 2, 'all')
+    with pytest.raises(ValueError, match='Unknown'):
+        select_draw_files(files, 2, 'random')
+    with pytest.raises(ValueError, match='Invalid'):
+        select_draw_files(files, 0, 'first')

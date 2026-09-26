@@ -47,7 +47,7 @@ python -m arginfer infer \
   --Ne 10000 \
   --mutation_rate 1e-8 \
   --recombination_rate "$rate" \
-  --iteration 2000001 \
+  --iteration 1200001 \
   --burn 200000 \
   --thin 1000 \
   --outpath "$out" \

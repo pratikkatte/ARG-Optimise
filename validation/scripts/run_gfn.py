@@ -93,7 +93,7 @@ def build_workflow(args):
                  "--device", args.device, "--seed", str(seed)]
     if args.temperature is not None:
         inference.extend(["--temperature", str(args.temperature)])
-    validation = [sys.executable, str(REPO_ROOT / "validation/scripts/point_accuracy_gfn.py"),
+    validation = [sys.executable, str(REPO_ROOT / "paper/validation/script/point_accuracy_gfn.py"),
                   "--truth-trees", str(truth), "--ne", str(ne), "--nspl", str(nspl),
                   "--input-dir", str(output), "--sample-prefix", "arg_",
                   "--output-prefix", str(output / "validation" / "gfn_")]

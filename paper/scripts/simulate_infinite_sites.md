@@ -7,15 +7,11 @@ python3 paper/scripts/simulate_infinite_sites.py --config paper/datasets/r1_data
 ```
 
 The canonical implementation lives in `paper/scripts/simulate_infinite_sites.py`.
-The old `validation/scripts/simulate_infinite_sites.py` command remains as a
-compatibility entry point, including its importable functions and constants.
-Pass `--config` explicitly: the canonical command defaults to
-`paper/config/config.yaml`, while the compatibility command retains
-`validation/config/config.yaml`. These default files are currently absent;
-neither command silently selects another dataset.
+The old compatibility entry point in `validation/scripts/` has been removed. Pass `--config` explicitly: the command retains its default of
+`paper/config/config.yaml`, which is currently absent; it does not silently
+select another dataset.
 
-The simulator is independent of
-`merge_msprime.py` and needs only msprime, its tskit dependency, and PyYAML.
+The simulator needs only msprime, its tskit dependency, and PyYAML.
 No reference genome, reference download, or FASTA conversion is involved.
 
 The first [ARGsims script](https://github.com/deboraycb/ARGsims/blob/main/scripts/1_msprime_sim.py)

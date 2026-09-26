@@ -11,7 +11,8 @@ credible_level: 0.90
 # Both Brier scores are saved whenever clade_brier is enabled.
 brier_normalization: fixed_universe
 chunk_size: 64
-expected_samples: 1800
+expected_samples: 1000
+sample_selection: first
 verify_sample_hashes: true
 figure2:
   output_dir: paper/outputs/figure_2
@@ -59,7 +60,7 @@ datasets:
         format: arginfer
         directory: paper/outputs/ARGInfer/r1
         input_dir: paper/datasets/r1/arginfer_inputs
-        expected_samples: 1800
+        expected_samples: 1000
         burnin_samples: 0
         expected_thin: 1000
   r2:
@@ -80,7 +81,7 @@ datasets:
         format: arginfer
         directory: paper/outputs/ARGInfer/r2
         input_dir: paper/datasets/r2/arginfer_inputs
-        expected_samples: 1800
+        expected_samples: 1000
         burnin_samples: 0
         expected_thin: 1000
   r4:
@@ -101,6 +102,6 @@ datasets:
         format: arginfer
         directory: paper/outputs/ARGInfer/r4
         input_dir: paper/datasets/r4/arginfer_inputs
-        expected_samples: 1800
+        expected_samples: 1000
         burnin_samples: 0
         expected_thin: 1000

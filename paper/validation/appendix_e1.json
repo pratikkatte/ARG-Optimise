@@ -4,7 +4,7 @@
     {
       "dataset": "r1",
       "manifest": "paper/outputs/argflow/r1/r1_checkpoint_5650/manifest.json",
-      "checkpoint": "paper/checkpoints/final/r1/r1_checkpoint_5650.pt",
+      "checkpoint": "paper/checkpoints/r1/checkpoint.pt",
       "step": 5650,
       "run_id": "491fgs0e",
       "training_segment": 1
@@ -12,7 +12,7 @@
     {
       "dataset": "r2",
       "manifest": "paper/outputs/argflow/r2/checkpoint_4650/manifest.json",
-      "checkpoint": "paper/checkpoints/final/r2/checkpoint_4650.pt",
+      "checkpoint": "paper/checkpoints/r2/checkpoint.pt",
       "step": 4650,
       "run_id": "3f6fhtpg",
       "training_segment": 0
@@ -20,7 +20,7 @@
     {
       "dataset": "r4",
       "manifest": "paper/outputs/argflow/r4/from1750_best_eval_step4300/manifest.json",
-      "checkpoint": "paper/checkpoints/final/r4/from1750_best_eval_step4300.pt",
+      "checkpoint": "paper/checkpoints/r4/checkpoint.pt",
       "step": 4300,
       "run_id": "nv7o9rk7",
       "training_segment": 0

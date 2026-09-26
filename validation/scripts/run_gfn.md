@@ -7,7 +7,7 @@ python validation/scripts/run_gfn.py runs/human_2kb_super_easy
 ```
 
 This selects `checkpoints/best_eval_loss.pt`, generates 100 ARG samples with
-`infer.py`, and runs `validation/scripts/point_accuracy_gfn.py` on all samples
+`infer.py`, and runs `paper/validation/script/point_accuracy_gfn.py` on all samples
 against the dataset's replicate 0 truth. The checkpoint's saved seed is used.
 Device selection defaults to automatic CUDA/CPU detection; batch size is 1.
 

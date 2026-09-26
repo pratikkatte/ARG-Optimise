@@ -51,7 +51,7 @@ def main():
         if args.dataset is None and checkpoints[0].parent.name not in ('r1', 'r2', 'r4'):
             raise ValueError('Specify --dataset or use a directory named r1, r2, or r4')
     else:
-        checkpoints = sorted((ROOT / 'paper/checkpoints/final').glob('*/*.pt'))
+        checkpoints = sorted((ROOT / 'paper/checkpoints').glob('*/*.pt'))
         checkpoints = [p for p in checkpoints if p.parent.name in ('r1', 'r2', 'r4')]
         if {p.parent.name for p in checkpoints} != {'r1', 'r2', 'r4'}:
             raise ValueError('Missing dataset checkpoints')
