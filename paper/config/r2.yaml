@@ -12,7 +12,7 @@ grad_accum_steps: 1  # One full batch of 64; no sequential microbatch split.
 seed: 7
 verbose: true
 wandb: true
-wandb_project: ARG-Optimise
+wandb_project: argflow
 wandb_name: r2_run
 wandb_mode: online
 

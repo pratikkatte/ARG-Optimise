@@ -16,7 +16,7 @@ DEFAULTS = dict(
     replay_fraction=.25, replay_min_size=8, replay_capacity=2048, replay_grid_size=16,
     replay_per_topology=4, exploration_fraction=0., max_events=10000, chunk_steps=16,
     checkpoint_every=10, resume_checkpoint=None, cpu_threads=1, grad_accum_steps=1,
-    verbose=True, wandb=False, wandb_project='ARG-Optimise', wandb_entity=None,
+    verbose=True, wandb=False, wandb_project='argflow', wandb_entity=None,
     wandb_name=None, wandb_mode='online',
     lr_schedule='constant', lr_schedule_steps=0, lr_warmup_steps=0,
     lr_warmup_start_factor=.1, lr_min_factor=.1,

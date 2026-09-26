@@ -12,7 +12,7 @@ grad_accum_steps: 1
 seed: 7
 verbose: true
 wandb: true
-wandb_project: ARG-Optimise
+wandb_project: argflow
 wandb_name: r1_run
 wandb_mode: online
 

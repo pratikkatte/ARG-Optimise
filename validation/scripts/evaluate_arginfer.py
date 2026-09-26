@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Validate saved, trusted ARGinfer pickles without running inference.
-
-See evaluate_arginfer.md for definitions, limitations, and one-dataset commands.
-"""
+"""Validate saved, trusted ARGinfer pickles without running inference."""
 from __future__ import annotations
 
 import argparse

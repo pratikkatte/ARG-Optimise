@@ -17,13 +17,15 @@ KEEP = {
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run_ids', nargs='+')
+    parser.add_argument('--entity', required=True, help='W&B entity owning the runs')
+    parser.add_argument('--project', default='argflow', help='W&B project')
     args = parser.parse_args()
     cfg = json.loads(Path(__file__).with_name('appendix_e1.json').read_text())
     out = (ROOT/cfg['output']).parent / 'training'
     out.mkdir(parents=True, exist_ok=True)
     api = wandb.Api(timeout=45)
     for rid in args.run_ids:
-        run = api.run('pratikkatte/ARG-Optimise/' + rid)
+        run = api.run(f'{args.entity}/{args.project}/{rid}')
         rows = [{k: v for k, v in row.items() if k in KEEP}
                 for row in run.scan_history(page_size=1000)]
         data = dict(run_id=rid, name=run.name, url=run.url, state=run.state,

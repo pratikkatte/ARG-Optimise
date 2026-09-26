@@ -1,5 +1,5 @@
 {
-  "source_vcf": "/workspace/ARG-Optimise/paper/datasets/r1/rep0/r1.vcf",
+  "source_vcf": "paper/datasets/r1/rep0/r1.vcf",
   "source_sha256": "05826d07d5bd6ed8fd43e7eacc0562443328f3e63c1913ab30cee3deac834583",
   "num_haplotypes": 10,
   "num_snps": 16,

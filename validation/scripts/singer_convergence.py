@@ -105,7 +105,7 @@ def load_dependencies():
     except ImportError as exc:
         raise ValueError(
             "Diagnostic dependencies are unavailable. Install arviz==0.22.0, tskit, "
-            "pandas and matplotlib in phylogfn_orig, or set SINGER_DIAGNOSTICS_PATH "
+            "pandas and matplotlib in the active environment, or set SINGER_DIAGNOSTICS_PATH "
             "to a compatible supplemental package directory. " + str(exc)
         ) from exc
     return az, plt, np, pd, tskit

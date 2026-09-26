@@ -19,14 +19,13 @@ with `--help`; some workflows require external inference programs or saved data.
 
 ## Baseline inference and point accuracy
 
-- [GFN runner](run_gfn.md), [SINGER runner](run_singer.md), and `run_tsinfer_tsdate.py`.
-- [SINGER convergence](run_singer_convergence.md): the shell launchers use
-  `singer_convergence.py`.
+- [GFN runner](run_gfn.md), `run_singer.sh`, and `run_tsinfer_tsdate.py`.
+- SINGER convergence: the shell launchers use `singer_convergence.py`.
 - `point_accuracy_gfn.py`, `point_accuracy_singer.py`, and
   `point_accuracy_tsinferdate.py` share `point_accuracy_common.py`.
   `plot_point_accuracy.py` and `point_accuracy_subtb.py` remain compatibility CLIs.
 - `prepare_arginfer_inputs.py` prepares ARGinfer inputs;
-  [ARGinfer evaluation](evaluate_arginfer.md) evaluates saved results.
+  `evaluate_arginfer.py` evaluates saved results.
 
 ## Manuscript evaluation
 
